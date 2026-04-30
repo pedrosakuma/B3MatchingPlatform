@@ -29,10 +29,19 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     private readonly Channel<byte[]> _sendQueue;
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<ulong> _nowNanos;
+    private readonly EntryPointSessionOptions _options;
+    private readonly Action<EntryPointSession, string>? _onClosed;
     private long _msgSeqNum;
     private int _isOpen = 1;
+    // Watchdog state (milliseconds since process start, monotonic).
+    private long _lastInboundMs;
+    private long _lastOutboundMs;
+    // Set true while we are waiting on the grace window after sending a probe;
+    // cleared as soon as any inbound frame arrives. Prevents flooding probes.
+    private int _probeOutstanding;
     private Task? _recvTask;
     private Task? _sendTask;
+    private Task? _watchdogTask;
 
     public long ConnectionId { get; }
     public uint EnteringFirm { get; }
@@ -41,7 +50,9 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     public EntryPointSession(long connectionId, uint enteringFirm, uint sessionId,
         Stream stream, IEntryPointEngineSink sink, Func<ulong>? nowNanos = null,
-        int sendQueueCapacity = DefaultSendQueueCapacity)
+        int sendQueueCapacity = DefaultSendQueueCapacity,
+        EntryPointSessionOptions? options = null,
+        Action<EntryPointSession, string>? onClosed = null)
     {
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
@@ -49,22 +60,31 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         _stream = stream;
         _sink = sink;
         _nowNanos = nowNanos ?? DefaultNowNanos;
+        _options = options ?? EntryPointSessionOptions.Default;
+        _options.Validate();
+        _onClosed = onClosed;
         _sendQueue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(sendQueueCapacity)
         {
             SingleReader = true,
             SingleWriter = false,
             FullMode = BoundedChannelFullMode.DropWrite,
         });
+        long now = NowMs();
+        Volatile.Write(ref _lastInboundMs, now);
+        Volatile.Write(ref _lastOutboundMs, now);
     }
 
     public void Start()
     {
         _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
         _sendTask = Task.Run(() => RunSendLoopAsync(_cts.Token));
+        _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
     }
 
     private static ulong DefaultNowNanos()
         => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
+
+    private static long NowMs() => Environment.TickCount64;
 
     private async Task RunReceiveLoopAsync(CancellationToken ct)
     {
@@ -77,13 +97,17 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var hdrErr))
                 {
                     _sink.OnDecodeError(this, hdrErr ?? "invalid header");
-                    Close();
+                    Close("decode-error");
                     return;
                 }
                 var bodyBuf = ArrayPool<byte>.Shared.Rent(info.BodyLength);
                 try
                 {
                     await ReadExactlyAsync(_stream, bodyBuf.AsMemory(0, info.BodyLength), ct).ConfigureAwait(false);
+                    // Any well-framed inbound frame counts as liveness, including
+                    // session-layer Sequence (heartbeat) frames.
+                    Volatile.Write(ref _lastInboundMs, NowMs());
+                    Volatile.Write(ref _probeOutstanding, 0);
                     var body = bodyBuf.AsSpan(0, info.BodyLength);
                     DispatchInbound(info, body);
                 }
@@ -98,7 +122,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         catch (IOException) { }
         finally
         {
-            Close();
+            Close("recv-eof");
         }
     }
 
@@ -107,6 +131,10 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         ulong now = _nowNanos();
         switch (info.TemplateId)
         {
+            case EntryPointFrameReader.TidSequence:
+                // Session-layer heartbeat / sequence sync. Liveness already
+                // recorded by the receive loop; nothing else to do.
+                return;
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(body, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                     _sink.EnqueueNewOrder(no, this, noClOrd);
@@ -118,8 +146,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
                 break;
             case EntryPointFrameReader.TidOrderCancelRequest:
-                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out _, out var cnErr))
-                    _sink.EnqueueCancel(cn, this, cnClOrd);
+                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
+                    _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
                 else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
                 break;
             default:
@@ -137,10 +165,11 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 try
                 {
                     await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                    Volatile.Write(ref _lastOutboundMs, NowMs());
                 }
                 catch (IOException)
                 {
-                    Close();
+                    Close("send-io-error");
                     return;
                 }
                 // Frames enqueued here are plain `new byte[]` (see TryEnqueueExact),
@@ -150,8 +179,81 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         catch (OperationCanceledException) { }
         finally
         {
-            Close();
+            Close("send-loop-exit");
         }
+    }
+
+    /// <summary>
+    /// Periodic watchdog that drives the FIXP-style heartbeat + idle-timeout
+    /// policy. Runs on its own task; never touches the socket directly —
+    /// instead it enqueues <c>Sequence</c> frames into the same bounded
+    /// channel the send loop drains, so all writes remain serialised.
+    /// </summary>
+    private async Task RunWatchdogLoopAsync(CancellationToken ct)
+    {
+        // Tick at a fraction of the smallest configured interval so we react
+        // promptly without busy-polling. Capped to keep tests responsive.
+        int tickMs = Math.Max(1, Math.Min(_options.HeartbeatIntervalMs,
+            Math.Min(_options.IdleTimeoutMs, _options.TestRequestGraceMs)) / 4);
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(tickMs, ct).ConfigureAwait(false);
+                if (!IsOpen) return;
+
+                long now = NowMs();
+                long sinceIn = now - Volatile.Read(ref _lastInboundMs);
+                long sinceOut = now - Volatile.Read(ref _lastOutboundMs);
+
+                // Idle teardown: if a probe is outstanding and grace elapsed
+                // without any inbound, close. The grace clock starts from the
+                // moment the probe was sent (i.e. _lastOutboundMs was bumped),
+                // so we measure the additional silence beyond idleTimeoutMs.
+                if (sinceIn >= (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs &&
+                    Volatile.Read(ref _probeOutstanding) == 1)
+                {
+                    // Seam for issue #11: a future BusinessReject (templateId=206)
+                    // should be enqueued here before close so the peer learns
+                    // the reason. Today we close with a logged reason string.
+                    Close("idle-timeout");
+                    return;
+                }
+
+                // Probe (FIXP TestRequest equivalent): if we've been silent on
+                // the inbound side past the idle threshold and we haven't
+                // already sent a probe in this idle stretch, send one.
+                if (sinceIn >= _options.IdleTimeoutMs &&
+                    Interlocked.CompareExchange(ref _probeOutstanding, 1, 0) == 0)
+                {
+                    EnqueueSequence();
+                    continue;
+                }
+
+                // Regular heartbeat: only when no other outbound traffic has
+                // been sent within the heartbeat interval. This naturally
+                // suppresses heartbeats while ER traffic is flowing.
+                if (sinceOut >= _options.HeartbeatIntervalMs)
+                {
+                    EnqueueSequence();
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception)
+        {
+            // Watchdog must never crash the session silently; tear down on
+            // unexpected error so the listener can drop the connection.
+            Close("watchdog-error");
+        }
+    }
+
+    private void EnqueueSequence()
+    {
+        if (!IsOpen) return;
+        var frame = new byte[SessionFrameEncoder.SequenceTotal];
+        SessionFrameEncoder.EncodeSequence(frame, NextMsgSeqNum());
+        TryEnqueue(frame);
     }
 
     private static async Task ReadExactlyAsync(Stream s, byte[] buf, CancellationToken ct)
@@ -172,7 +274,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     {
         if (!IsOpen) return false;
         if (_sendQueue.Writer.TryWrite(frame)) return true;
-        Close();
+        Close("send-queue-full");
         return false;
     }
 
@@ -209,13 +311,13 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueueExact(frame, n);
     }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!IsOpen) return false;
         var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportCancelTotal);
         int n = ExecutionReportEncoder.EncodeExecReportCancel(frame.AsSpan(0, ExecutionReportEncoder.ExecReportCancelTotal),
             SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            e.Side, clOrdIdValue, origClOrdIdValue: 0, e.OrderId,
+            e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
             e.SecurityId, e.OrderId,
             (ulong)e.RptSeq, e.TransactTimeNanos,
             cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);
@@ -259,6 +361,30 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueue(exact);
     }
 
+    public bool WriteSessionReject(byte terminationCode)
+    {
+        if (!IsOpen) return false;
+        var frame = ArrayPool<byte>.Shared.Rent(SessionRejectEncoder.TerminateTotal);
+        int n = SessionRejectEncoder.EncodeTerminate(frame.AsSpan(0, SessionRejectEncoder.TerminateTotal),
+            SessionId, 0, terminationCode);
+        bool result = TryEnqueueExact(frame, n);
+        Close();
+        return result;
+    }
+
+    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null)
+    {
+        if (!IsOpen) return false;
+        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
+        var frame = ArrayPool<byte>.Shared.Rent(BusinessMessageRejectEncoder.TotalSize(textLen));
+        int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
+            frame.AsSpan(0, BusinessMessageRejectEncoder.TotalSize(textLen)),
+            SessionId, NextMsgSeqNum(), _nowNanos(),
+            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+        return TryEnqueueExact(frame, n);
+    }
+
     private static byte MapRejectReason(RejectReason r) => r switch
     {
         // OrdRejReason wire codes: 0=BrokerExchangeOption (generic), 1=UnknownSymbol,
@@ -267,18 +393,28 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         _ => 0,
     };
 
-    public void Close()
+    public void Close() => Close("close");
+
+    /// <summary>
+    /// Closes the session with a diagnostic reason. The reason is forwarded to
+    /// the optional <c>onClosed</c> callback supplied at construction so the
+    /// listener (or tests) can log it. <see cref="Close()"/> is the
+    /// no-reason convenience overload.
+    /// </summary>
+    public void Close(string reason)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
         _sendQueue.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
+        try { _onClosed?.Invoke(this, reason); } catch { }
     }
 
     public async ValueTask DisposeAsync()
     {
-        Close();
+        Close("dispose");
         try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); } catch { }
         try { if (_sendTask != null) await _sendTask.ConfigureAwait(false); } catch { }
+        try { if (_watchdogTask != null) await _watchdogTask.ConfigureAwait(false); } catch { }
         _cts.Dispose();
     }
 }

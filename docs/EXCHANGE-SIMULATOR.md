@@ -66,13 +66,20 @@ Exposes:
 
 ```json
 {
-  "tcp": { "listen": "0.0.0.0:9876", "enteringFirm": 1 },
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
+  },
   "channels": [
     {
       "channelNumber": 84,
       "incrementalGroup": "224.0.20.84",
       "incrementalPort": 30084,
       "ttl": 1,
+      "selfTradePrevention": "none",
       "instruments": "config/instruments-eqt.json",
       "snapshot": {
         "group": "224.0.20.184",
@@ -96,8 +103,35 @@ Exposes:
 * `tcp.listen` — bind address for the EntryPoint TCP server.
 * `tcp.enteringFirm` — uint stamped on every accepted order (single-firm
   default; per-session firm assignment is not yet implemented).
+* `tcp.heartbeatIntervalMs` — server emits a `Sequence` (templateId=9, used
+  as heartbeat by B3) when no other outbound traffic has been sent within
+  this window. Default `30000`.
+* `tcp.idleTimeoutMs` — inbound silence after which the server sends a
+  `Sequence` probe (the FIXP equivalent of FIX `TestRequest`). Default
+  `30000`.
+* `tcp.testRequestGraceMs` — additional silence the server tolerates after
+  the probe before tearing down the connection. Default `5000`. On teardown
+  the session is closed; a `BusinessReject` (templateId=206) framing the
+  reason is the responsibility of issue #11 — `EntryPointSession.Close(reason)`
+  exposes the seam.
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
+* `channels[].selfTradePrevention` — per-channel self-trade prevention policy
+  evaluated each time an aggressor would cross against a resting order from
+  the same `EnteringFirm`. One of:
+  * `none` (default) — trade as today; firms can self-trade.
+  * `cancel-aggressor` — cancel the aggressor's residual quantity and stop
+    further matching. Trades already executed against other firms stand. The
+    originating session receives an `ExecutionReport_Reject` with reason
+    `SelfTradePrevention`; no MBO event is emitted (the aggressor never
+    rested).
+  * `cancel-resting` — cancel the conflicting resting order and continue
+    matching the aggressor against the next maker. Each canceled resting
+    order produces a `DeleteOrder_MBO_51` and an `ExecutionReport_Cancel`
+    routed to the original resting-order owner (cancel reason
+    `SelfTradePrevention`).
+  * `cancel-both` — cancel both the conflicting resting order and the
+    aggressor's residual; stop further matching.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
 * `instrumentDefinition` *(optional)* — enables a dedicated
@@ -132,10 +166,20 @@ Exposes:
 | 100         | SimpleNewOrderV2    | 82          |
 | 101         | SimpleModifyOrderV2 | 98          |
 | 105         | OrderCancelRequest  | 76          |
+| 9           | Sequence (heartbeat)| 4           |
 
-v1 limitation: `Cancel` and `Modify` require an explicit `OrderID`.
-`OrigClOrdID`-only lookup (find the order by its original client id) is
-deferred to a later milestone.
+The `Sequence` frame doubles as the FIXP-style heartbeat: any inbound
+frame (including `Sequence`) resets the server's idle timer. Clients
+should emit `Sequence` periodically (default cadence: ≤ `idleTimeoutMs`)
+to keep the session alive.
+
+`Cancel` and `Modify` accept either an explicit engine-assigned `OrderID` or
+the original `OrigClOrdID` (the `ClOrdID` of the order being modified/cancelled).
+The integration layer maintains a per-channel `(EnteringFirm, ClOrdID) → OrderID`
+index that is populated when an order rests on the book and evicted when the
+order leaves (cancel or full fill). Submitting both fields is allowed; the
+explicit `OrderID` wins. If neither is present, or if the `OrigClOrdID` is
+unknown to the channel, an `ExecutionReport_Reject` is returned.
 
 ### Outbound (TCP execution reports)
 
@@ -146,6 +190,13 @@ deferred to a later milestone.
 | 202         | ExecutionReport_CancelV2    | 156         |
 | 203         | ExecutionReport_TradeV2     | 154         |
 | 204         | ExecutionReport_RejectV2    | 138         |
+| 9           | Sequence (heartbeat/probe)  | 4           |
+
+The server emits `Sequence` frames in two situations: (1) periodically
+when the outbound link has been silent for `heartbeatIntervalMs`, and
+(2) as a probe when the inbound link has been silent for `idleTimeoutMs`.
+If the client does not respond within `testRequestGraceMs`, the session
+is closed.
 
 ### Outbound (UMDF multicast)
 

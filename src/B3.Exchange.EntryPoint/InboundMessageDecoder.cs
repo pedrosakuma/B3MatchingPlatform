@@ -104,11 +104,9 @@ internal static class InboundMessageDecoder
         ulong orderId = MemoryMarshal.Read<ulong>(body.Slice(SimpleModifyOrderOffsets.OrderID, 8));
         ulong origClOrdId = MemoryMarshal.Read<ulong>(body.Slice(SimpleModifyOrderOffsets.OrigClOrdID, 8));
 
-        if (orderId == 0)
+        if (orderId == 0 && origClOrdId == 0)
         {
-            // v1 limitation: replace requires explicit OrderID (engine-assigned).
-            // Lookup by OrigClOrdID is the integration layer's responsibility.
-            error = "SimpleModifyOrder requires OrderID; OrigClOrdID-only replace not supported in v1";
+            error = "SimpleModifyOrder requires either OrderID or OrigClOrdID";
             return false;
         }
         if (priceMantissa == PriceNull)
@@ -142,9 +140,9 @@ internal static class InboundMessageDecoder
         ulong orderId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelRequestOffsets.OrderID, 8));
         ulong origClOrdId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelRequestOffsets.OrigClOrdID, 8));
 
-        if (orderId == 0)
+        if (orderId == 0 && origClOrdId == 0)
         {
-            error = "OrderCancelRequest requires OrderID; OrigClOrdID-only cancel not supported in v1";
+            error = "OrderCancelRequest requires either OrderID or OrigClOrdID";
             return false;
         }
 

@@ -18,6 +18,16 @@ public sealed class TcpConfig
 {
     [JsonPropertyName("listen")] public string Listen { get; set; } = "0.0.0.0:9876";
     [JsonPropertyName("enteringFirm")] public uint EnteringFirm { get; set; } = 1;
+    /// <summary>Server-side heartbeat (Sequence) interval in milliseconds.
+    /// A heartbeat is only emitted when no other outbound traffic has been
+    /// sent within this window. Default: 30 s.</summary>
+    [JsonPropertyName("heartbeatIntervalMs")] public int HeartbeatIntervalMs { get; set; } = 30_000;
+    /// <summary>Inbound silence in milliseconds before the server emits a
+    /// Sequence probe (FIXP TestRequest equivalent). Default: 30 s.</summary>
+    [JsonPropertyName("idleTimeoutMs")] public int IdleTimeoutMs { get; set; } = 30_000;
+    /// <summary>Additional grace window after the probe before the session is
+    /// closed for inactivity. Default: 5 s.</summary>
+    [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
 }
 
 public sealed class ChannelConfig
@@ -28,6 +38,17 @@ public sealed class ChannelConfig
     [JsonPropertyName("localInterface")] public string? LocalInterface { get; set; }
     [JsonPropertyName("ttl")] public byte Ttl { get; set; } = 1;
     [JsonPropertyName("instruments")] public string InstrumentsFile { get; set; } = "";
+
+    /// <summary>
+    /// Self-trade prevention policy applied by this channel's matching engine.
+    /// Defaults to <c>none</c> (preserves legacy behaviour). Accepted values
+    /// (case-insensitive): <c>none</c>, <c>cancel-aggressor</c>,
+    /// <c>cancel-resting</c>, <c>cancel-both</c>.
+    /// </summary>
+    [JsonPropertyName("selfTradePrevention")]
+    [JsonConverter(typeof(SelfTradePreventionJsonConverter))]
+    public B3.Exchange.Matching.SelfTradePrevention SelfTradePrevention { get; set; }
+        = B3.Exchange.Matching.SelfTradePrevention.None;
 
     /// <summary>
     /// Optional snapshot publisher configuration. When omitted, the channel
@@ -42,6 +63,34 @@ public sealed class ChannelConfig
     /// instrument definitions are published for this channel.
     /// </summary>
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
+}
+
+public sealed class SelfTradePreventionJsonConverter : JsonConverter<B3.Exchange.Matching.SelfTradePrevention>
+{
+    public override B3.Exchange.Matching.SelfTradePrevention Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var s = reader.GetString();
+        return s?.ToLowerInvariant() switch
+        {
+            null or "" or "none" => B3.Exchange.Matching.SelfTradePrevention.None,
+            "cancel-aggressor" => B3.Exchange.Matching.SelfTradePrevention.CancelAggressor,
+            "cancel-resting" => B3.Exchange.Matching.SelfTradePrevention.CancelResting,
+            "cancel-both" => B3.Exchange.Matching.SelfTradePrevention.CancelBoth,
+            _ => throw new JsonException($"unknown selfTradePrevention value '{s}' (expected: none|cancel-aggressor|cancel-resting|cancel-both)"),
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, B3.Exchange.Matching.SelfTradePrevention value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value switch
+        {
+            B3.Exchange.Matching.SelfTradePrevention.None => "none",
+            B3.Exchange.Matching.SelfTradePrevention.CancelAggressor => "cancel-aggressor",
+            B3.Exchange.Matching.SelfTradePrevention.CancelResting => "cancel-resting",
+            B3.Exchange.Matching.SelfTradePrevention.CancelBoth => "cancel-both",
+            _ => throw new JsonException($"unknown SelfTradePrevention value: {value}"),
+        });
+    }
 }
 
 /// <summary>
