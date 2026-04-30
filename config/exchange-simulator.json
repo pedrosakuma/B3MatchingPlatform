@@ -1,0 +1,19 @@
+{
+  // B3 Exchange Simulator host config.
+  // - tcp.listen: where to accept inbound EntryPoint clients (TCP).
+  // - channels[*]: one matching engine + one outbound multicast group per
+  //   UMDF channel. instruments file partitions instruments across channels.
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1
+  },
+  "channels": [
+    {
+      "channelNumber": 84,
+      "incrementalGroup": "224.0.20.84",
+      "incrementalPort": 30084,
+      "ttl": 1,
+      "instruments": "config/instruments-eqt.json"
+    }
+  ]
+}

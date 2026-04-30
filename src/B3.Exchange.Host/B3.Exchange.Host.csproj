@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>B3.Exchange.Host</RootNamespace>
+    <AssemblyName>B3.Exchange.Host</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
+    <ProjectReference Include="..\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
+    <ProjectReference Include="..\B3.Exchange.EntryPoint\B3.Exchange.EntryPoint.csproj" />
+    <ProjectReference Include="..\B3.Exchange.Integration\B3.Exchange.Integration.csproj" />
+  </ItemGroup>
+
+</Project>

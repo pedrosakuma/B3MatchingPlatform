@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.Exchange.Integration</RootNamespace>
+    <AssemblyName>B3.Exchange.Integration</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
+    <ProjectReference Include="..\B3.Exchange.EntryPoint\B3.Exchange.EntryPoint.csproj" />
+    <ProjectReference Include="..\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Exchange.Integration.Tests" />
+  </ItemGroup>
+
+</Project>

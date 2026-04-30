@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.Exchange.Matching</RootNamespace>
+    <AssemblyName>B3.Exchange.Matching</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
+  </ItemGroup>
+
+</Project>

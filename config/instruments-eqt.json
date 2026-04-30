@@ -1,0 +1,14 @@
+[
+  // Real-ish B3 equities sample. SecurityIDs use the high-bit prefix the
+  // synthetic publisher already uses (sym_idx in upper bits) so they
+  // don't collide with anything from PCAPs.
+  { "symbol": "PETR4", "securityId": 900000000001, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRPETRACNPR6", "securityType": "CS" },
+  { "symbol": "VALE3", "securityId": 900000000002, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRVALEACNOR0", "securityType": "CS" },
+  { "symbol": "ITUB4", "securityId": 900000000003, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRITUBACNPR1", "securityType": "CS" }
+]
