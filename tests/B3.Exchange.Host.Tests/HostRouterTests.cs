@@ -3,6 +3,7 @@ using B3.Exchange.Host;
 using B3.Exchange.Integration;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -33,7 +34,7 @@ public class HostRouterTests
     public void UnknownInstrument_RoutesToInlineRejectWithoutDispatcher()
     {
         var routing = new Dictionary<long, ChannelDispatcher>(); // empty
-        var router = new HostRouter(routing, () => 1_000UL);
+        var router = new HostRouter(routing, NullLogger<HostRouter>.Instance, () => 1_000UL);
         var reply = new RecordingReply();
         router.EnqueueNewOrder(
             new NewOrderCommand("1", SecurityId: 12345, Side.Buy, OrderType.Limit, TimeInForce.Day, 100, 100, 1, 0),
@@ -60,11 +61,12 @@ public class HostRouterTests
         };
         var pkt = new NoopPacketSink();
         var disp = new ChannelDispatcher(channelNumber: 1,
-            engineFactory: s => new MatchingEngine(new[] { inst }, s),
+            engineFactory: s => new MatchingEngine(new[] { inst }, s, NullLogger<MatchingEngine>.Instance),
             packetSink: pkt,
+            logger: NullLogger<ChannelDispatcher>.Instance,
             nowNanos: () => 1_000UL);
         // Dispatcher loop not started; we read inbound queue directly.
-        var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp });
+        var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp }, NullLogger<HostRouter>.Instance);
         var reply = new RecordingReply();
 
         router.EnqueueNewOrder(
