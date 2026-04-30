@@ -30,11 +30,32 @@ public sealed class ChannelConfig
     [JsonPropertyName("instruments")] public string InstrumentsFile { get; set; } = "";
 
     /// <summary>
+    /// Optional snapshot publisher configuration. When omitted, the channel
+    /// publishes only the incremental feed; consumers connecting mid-session
+    /// have no way to bootstrap the order book.
+    /// </summary>
+    [JsonPropertyName("snapshot")] public SnapshotChannelConfig? Snapshot { get; set; }
+
+    /// <summary>
     /// Optional: enables the periodic <c>SecurityDefinition_12</c> publisher
     /// on a dedicated InstrumentDef multicast group. When omitted, no
     /// instrument definitions are published for this channel.
     /// </summary>
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
+}
+
+/// <summary>
+/// Per-channel snapshot publisher config. Multicast group/port MUST be
+/// distinct from the incremental channel — consumers subscribe to both
+/// independently.
+/// </summary>
+public sealed class SnapshotChannelConfig
+{
+    [JsonPropertyName("group")] public string Group { get; set; } = "";
+    [JsonPropertyName("port")] public int Port { get; set; }
+    [JsonPropertyName("ttl")] public byte? Ttl { get; set; }
+    [JsonPropertyName("cadenceMs")] public int CadenceMs { get; set; } = 1000;
+    [JsonPropertyName("maxEntriesPerChunk")] public int? MaxEntriesPerChunk { get; set; }
 }
 
 public sealed class InstrumentDefinitionConfig
