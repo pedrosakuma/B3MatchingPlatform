@@ -20,7 +20,9 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
     private readonly Dictionary<long, InstrumentRuntime> _instruments;
     private readonly Random _rng;
     private readonly TimeSpan _tickInterval;
+#pragma warning disable CS0414
     private readonly Action<string>? _logInfo;
+#pragma warning restore CS0414
     private readonly Action<string>? _logWarn;
     private readonly CancellationTokenSource _cts;
     private readonly Dictionary<ulong, OrderTracking> _byClOrd = new();
