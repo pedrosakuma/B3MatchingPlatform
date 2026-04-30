@@ -22,20 +22,33 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly HostConfig _config;
     private readonly Action<string>? _log;
     private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
+    private readonly Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? _snapshotSinkFactory;
+    private readonly Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? _instrumentDefSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
+    private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
+    private readonly List<Timer> _snapshotTimers = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
 
     public ExchangeHost(HostConfig config, Action<string>? log = null,
-        Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null)
+        Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
+        Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? snapshotSinkFactory = null,
+        Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? instrumentDefSinkFactory = null)
     {
         _config = config;
         _log = log;
         _packetSinkFactory = packetSinkFactory;
+        _snapshotSinkFactory = snapshotSinkFactory;
+        _instrumentDefSinkFactory = instrumentDefSinkFactory;
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
+
+    public IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
+
+    /// <summary>Snapshot of the InstrumentDef publishers, primarily for tests.</summary>
+    public IReadOnlyList<InstrumentDefinitionPublisher> InstrumentDefinitionPublishers => _instrumentDefPublishers;
 
     public Task StartAsync()
     {
@@ -54,9 +67,18 @@ public sealed class ExchangeHost : IAsyncDisposable
                 sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
+
+            // Capture the engine via a side-channel so we can build a snapshot
+            // source that reads through the live book on the dispatcher thread.
+            MatchingEngine? capturedEngine = null;
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
-                engineFactory: s => new MatchingEngine(instruments, s),
+                engineFactory: s =>
+                {
+                    var e = new MatchingEngine(instruments, s, ch.SelfTradePrevention);
+                    capturedEngine = e;
+                    return e;
+                },
                 packetSink: sink);
             disp.Start();
             _dispatchers.Add(disp);
@@ -67,6 +89,65 @@ public sealed class ExchangeHost : IAsyncDisposable
                 routing.Add(inst.SecurityId, disp);
             }
             _log?.Invoke($"channel {ch.ChannelNumber}: {instruments.Count} instruments → {ch.IncrementalGroup}:{ch.IncrementalPort}");
+
+            if (ch.Snapshot != null)
+            {
+                var snap = ch.Snapshot;
+                IUmdfPacketSink snapSink;
+                if (_snapshotSinkFactory != null)
+                {
+                    snapSink = _snapshotSinkFactory(ch, snap);
+                }
+                else
+                {
+                    var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
+                    snapSink = new MulticastUdpPacketSink(IPAddress.Parse(snap.Group), snap.Port, local, snap.Ttl ?? ch.Ttl);
+                }
+                if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
+
+                var ids = instruments.Select(i => i.SecurityId).ToArray();
+                var source = new MatchingEngineSnapshotSource(capturedEngine!, ids);
+                int chunkCap = snap.MaxEntriesPerChunk ?? 30;
+                var rotator = new SnapshotRotator(
+                    channelNumber: ch.ChannelNumber,
+                    source: source,
+                    sink: snapSink,
+                    maxEntriesPerChunk: chunkCap);
+                disp.AttachSnapshotRotator(rotator);
+
+                var cadence = TimeSpan.FromMilliseconds(Math.Max(50, snap.CadenceMs));
+                var capturedDisp = disp;
+                var timer = new Timer(_ => capturedDisp.EnqueueSnapshotTick(), null, cadence, cadence);
+                _snapshotTimers.Add(timer);
+                _log?.Invoke($"channel {ch.ChannelNumber}: snapshot → {snap.Group}:{snap.Port} every {cadence.TotalMilliseconds:n0}ms");
+            }
+
+            if (ch.InstrumentDefinition is { } idCfg)
+            {
+                IUmdfPacketSink idSink;
+                if (_instrumentDefSinkFactory != null)
+                {
+                    idSink = _instrumentDefSinkFactory(ch, idCfg);
+                }
+                else
+                {
+                    var local = idCfg.LocalInterface != null
+                        ? IPAddress.Parse(idCfg.LocalInterface)
+                        : (ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null);
+                    idSink = new MulticastUdpPacketSink(IPAddress.Parse(idCfg.Group), idCfg.Port, local, idCfg.Ttl);
+                }
+                if (idSink is IDisposable idd) _ownedSinks.Add(idd);
+                byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
+                var publisher = new InstrumentDefinitionPublisher(
+                    channelNumber: idChan,
+                    instruments: instruments,
+                    sink: idSink,
+                    cadence: TimeSpan.FromMilliseconds(idCfg.CadenceMs));
+                publisher.Start();
+                _instrumentDefPublishers.Add(publisher);
+                _log?.Invoke(
+                    $"channel {ch.ChannelNumber}: instrument-def → {idCfg.Group}:{idCfg.Port} every {idCfg.CadenceMs}ms");
+            }
         }
 
         _router = new HostRouter(routing);
@@ -96,7 +177,9 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
+        foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
     }
