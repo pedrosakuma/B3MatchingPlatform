@@ -13,6 +13,14 @@ public static class EntryPointFrameReader
 {
     public const ushort SchemaId = 1;
 
+    /// <summary>Outbound (session-level): Terminate (V0). Used as a
+    /// "SessionReject" — see <see cref="SessionRejectEncoder"/>.</summary>
+    public const ushort TidTerminate = 7;
+
+    /// <summary>Outbound (business-level): BusinessMessageReject (V0). See
+    /// <see cref="BusinessMessageRejectEncoder"/>.</summary>
+    public const ushort TidBusinessMessageReject = 206;
+
     /// <summary>Inbound: SimpleNewOrder (V2).</summary>
     public const ushort TidSimpleNewOrder = 100;
     /// <summary>Inbound: SimpleModifyOrder (V2).</summary>

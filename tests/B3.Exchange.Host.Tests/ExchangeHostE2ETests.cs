@@ -137,6 +137,78 @@ public class ExchangeHostE2ETests
         Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, er.TemplateId);
     }
 
+    [Fact]
+    public async Task MalformedFrame_UnknownTemplateId_ProducesSessionRejectAndClosesConnection()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // Send a header with a templateId the server does not recognise. No
+        // body is sent — the server rejects the header and tears down before
+        // attempting to read the body.
+        var hdr = new byte[8];
+        EntryPointFrameReader.WriteHeader(hdr.AsSpan(0, 8),
+            blockLength: 0, templateId: 0xABCD, version: 0);
+        await stream.WriteAsync(hdr);
+
+        var rej = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
+        Assert.Equal(EntryPointFrameReader.TidTerminate, rej.TemplateId);
+        Assert.Equal((ushort)0, rej.Version);
+        Assert.Equal(SessionRejectEncoder.TerminationCode.UnrecognizedMessage, rej.Body[12]);
+
+        // Connection MUST be closed by the server after the Terminate is
+        // flushed. ReadAsync returns 0 on a clean half-close.
+        var trailer = new byte[1];
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        int read = await stream.ReadAsync(trailer.AsMemory(0, 1), cts.Token);
+        Assert.Equal(0, read);
+    }
+
+    [Fact]
+    public async Task WellFramedButInvalidBody_ProducesBusinessRejectAndKeepsConnectionOpen()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // Well-framed SimpleNewOrder but with an invalid Side byte ('X').
+        // Decode succeeds at the framing layer and fails inside
+        // InboundMessageDecoder.TryDecodeNewOrder, which is the
+        // BusinessMessageReject path.
+        var bad = BuildSimpleNewOrder(clOrdId: 7777, secId: Petr,
+            side: 'X', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+        await stream.WriteAsync(bad);
+
+        var rej = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
+        Assert.Equal(EntryPointFrameReader.TidBusinessMessageReject, rej.TemplateId);
+        // RefSeqNum lives at body offset 20 and echoes the inbound MsgSeqNum
+        // we wrote at offset 4 of the SimpleNewOrder body (== 0 in the
+        // builder, since we don't populate that field). What we really care
+        // about is BusinessRejectRefID = ClOrdID (7777) at offset 24.
+        Assert.Equal(7777UL,
+            BinaryPrimitives.ReadUInt64LittleEndian(rej.Body.AsSpan(24, 8)));
+
+        // Critically: the session must remain open. Send a *valid* order
+        // and expect ER_New to come back on the same connection.
+        var ok = BuildSimpleNewOrder(clOrdId: 8888, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+        await stream.WriteAsync(ok);
+
+        var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er.TemplateId);
+    }
+
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,
         char tif, long qty, long priceMantissa)
     {
@@ -169,6 +241,19 @@ public class ExchangeHostE2ETests
         ushort version = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(6, 2));
         var body = new byte[blockLength];
         await ReadExactAsync(stream, body, cts.Token);
+        // BusinessMessageReject carries two trailing varData segments
+        // (memo + text). Drain them so the next ReadFrameAsync starts on a
+        // fresh frame header.
+        if (templateId == EntryPointFrameReader.TidBusinessMessageReject)
+        {
+            var len = new byte[1];
+            await ReadExactAsync(stream, len, cts.Token);
+            int memoLen = len[0];
+            if (memoLen > 0) await ReadExactAsync(stream, new byte[memoLen], cts.Token);
+            await ReadExactAsync(stream, len, cts.Token);
+            int textLen = len[0];
+            if (textLen > 0) await ReadExactAsync(stream, new byte[textLen], cts.Token);
+        }
         return new ReadFrame(templateId, version, body);
     }
 

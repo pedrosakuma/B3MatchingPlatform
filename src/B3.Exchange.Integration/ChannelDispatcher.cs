@@ -99,11 +99,6 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
                 case WorkKind.New: _engine.Submit(item.NewOrder!); break;
                 case WorkKind.Cancel: _engine.Cancel(item.Cancel!); break;
                 case WorkKind.Replace: _engine.Replace(item.Replace!); break;
-                case WorkKind.DecodeError:
-                    _currentReply?.WriteExecutionReportReject(
-                        new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
-                        _currentClOrdId);
-                    break;
             }
         }
         finally
@@ -161,7 +156,11 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, reply, clOrdIdValue, origClOrdIdValue, null, null, cmd));
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, reply, 0, 0, null, null, null));
+    {
+        // Logging hook only — the EntryPointSession emits the appropriate
+        // SessionReject (Terminate) or BusinessMessageReject directly. We
+        // do not enqueue any work onto the dispatcher for decode errors.
+    }
 
     // ====== IMatchingEventSink ======
 
@@ -285,7 +284,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError }
+    internal enum WorkKind : byte { New, Cancel, Replace }
 
     internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId);
 

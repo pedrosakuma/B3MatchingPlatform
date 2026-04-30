@@ -51,12 +51,10 @@ public sealed class HostRouter : IEntryPointEngineSink
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
     {
-        // Best-effort: send a generic reject and rely on the session to close
-        // its own connection if the decode error was fatal.
-        reply.WriteExecutionReportReject(
-            new RejectEvent(ClOrdId: "0", SecurityId: 0, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
-            clOrdIdValue: 0);
+        // Logging hook only. The EntryPointSession itself emits the
+        // appropriate SessionReject (Terminate) or BusinessMessageReject
+        // and decides whether to close the connection — the router has no
+        // additional context to add here.
     }
 
     private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)

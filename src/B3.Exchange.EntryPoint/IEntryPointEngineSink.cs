@@ -42,6 +42,26 @@ public interface IEntryPointResponseChannel
 
     /// <summary>Inbound message rejected synchronously (validation, unknown order, etc.).</summary>
     bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue);
+
+    /// <summary>
+    /// Send a session-level reject (B3 <c>Terminate</c> with the given
+    /// <paramref name="terminationCode"/>) and gracefully close the
+    /// connection after the frame is flushed to the wire. Used when the
+    /// inbound stream is no longer recoverable (bad header, unknown
+    /// templateId, schema-version mismatch, body length mismatch, ...).
+    /// Returns <c>false</c> if the channel was already closed.
+    /// </summary>
+    bool WriteSessionReject(byte terminationCode);
+
+    /// <summary>
+    /// Send a business-level reject (B3 <c>BusinessMessageReject</c>) for a
+    /// well-framed inbound message that failed business validation. The
+    /// session is kept open; the client may retry with a corrected
+    /// message. <paramref name="refSeqNum"/> echoes the offending message's
+    /// inbound MsgSeqNum so the client can correlate.
+    /// </summary>
+    bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null);
 }
 
 /// <summary>

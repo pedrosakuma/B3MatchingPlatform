@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using B3.Exchange.Matching;
 
@@ -28,9 +29,11 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     private readonly IEntryPointEngineSink _sink;
     private readonly Channel<byte[]> _sendQueue;
     private readonly CancellationTokenSource _cts = new();
+    private readonly CancellationTokenSource _recvCts = new();
     private readonly Func<ulong> _nowNanos;
     private long _msgSeqNum;
     private int _isOpen = 1;
+    private int _closingAfterFlush;
     private Task? _recvTask;
     private Task? _sendTask;
 
@@ -59,7 +62,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     public void Start()
     {
-        _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
+        _recvTask = Task.Run(() => RunReceiveLoopAsync(_recvCts.Token));
         _sendTask = Task.Run(() => RunSendLoopAsync(_cts.Token));
     }
 
@@ -76,8 +79,14 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 await ReadExactlyAsync(_stream, headerBuf, ct).ConfigureAwait(false);
                 if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var hdrErr))
                 {
+                    // Session-level fault: we cannot reliably resync the
+                    // stream (no skip semantics for unknown templates / bad
+                    // BlockLength). Send Terminate and close after flush.
                     _sink.OnDecodeError(this, hdrErr ?? "invalid header");
-                    Close();
+                    byte code = hdrErr != null && hdrErr.StartsWith("unsupported template", StringComparison.Ordinal)
+                        ? SessionRejectEncoder.TerminationCode.UnrecognizedMessage
+                        : SessionRejectEncoder.TerminationCode.DecodingError;
+                    WriteSessionReject(code);
                     return;
                 }
                 var bodyBuf = ArrayPool<byte>.Shared.Rent(info.BodyLength);
@@ -98,34 +107,56 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         catch (IOException) { }
         finally
         {
-            Close();
+            // Receive side done. If we initiated a graceful shutdown
+            // (close-after-flush), do NOT cancel the send loop; it must
+            // drain pending frames first. Otherwise tear everything down.
+            if (Volatile.Read(ref _closingAfterFlush) == 0)
+                Close();
         }
     }
 
     private void DispatchInbound(EntryPointFrameReader.FrameInfo info, ReadOnlySpan<byte> body)
     {
         ulong now = _nowNanos();
+        // InboundBusinessHeader: SessionID@0 (uint32) | MsgSeqNum@4 (uint32).
+        // All supported inbound messages start with this header, so the
+        // refSeqNum used for any reject is the uint32 at body offset 4.
+        uint refSeqNum = body.Length >= 8 ? MemoryMarshal.Read<uint>(body.Slice(4, 4)) : 0u;
+        // ClOrdID is at body offset 20 (uint64) for all supported templates;
+        // surfaced on BusinessMessageReject as BusinessRejectRefID.
+        ulong clOrdRef = body.Length >= 28 ? MemoryMarshal.Read<ulong>(body.Slice(20, 8)) : 0UL;
         switch (info.TemplateId)
         {
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(body, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                     _sink.EnqueueNewOrder(no, this, noClOrd);
-                else _sink.OnDecodeError(this, noErr ?? "decode error: SimpleNewOrder");
+                else SendBusinessReject(info.TemplateId, refSeqNum, clOrdRef, noErr ?? "decode error: SimpleNewOrder");
                 break;
             case EntryPointFrameReader.TidSimpleModifyOrder:
                 if (InboundMessageDecoder.TryDecodeReplace(body, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
                     _sink.EnqueueReplace(rp, this, rpClOrd, rpOrigClOrd);
-                else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
+                else SendBusinessReject(info.TemplateId, refSeqNum, clOrdRef, rpErr ?? "decode error: SimpleModifyOrder");
                 break;
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out _, out var cnErr))
                     _sink.EnqueueCancel(cn, this, cnClOrd);
-                else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
+                else SendBusinessReject(info.TemplateId, refSeqNum, clOrdRef, cnErr ?? "decode error: OrderCancelRequest");
                 break;
             default:
+                // ExpectedInboundBlockLength gates this branch — unreachable
+                // unless someone adds a new TID without a decode arm.
                 _sink.OnDecodeError(this, $"unsupported templateId={info.TemplateId}");
+                WriteSessionReject(SessionRejectEncoder.TerminationCode.UnrecognizedMessage);
                 break;
         }
+    }
+
+    private void SendBusinessReject(ushort templateId, uint refSeqNum, ulong clOrdRef, string reason)
+    {
+        _sink.OnDecodeError(this, reason);
+        byte refMsg = BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId);
+        WriteBusinessMessageReject(refMsg, refSeqNum, clOrdRef,
+            BusinessMessageRejectEncoder.Reason.InvalidField, reason);
     }
 
     private async Task RunSendLoopAsync(CancellationToken ct)
@@ -150,6 +181,11 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         catch (OperationCanceledException) { }
         finally
         {
+            // Make sure the peer observes EOF once we've stopped sending —
+            // particularly important after a graceful close-after-flush
+            // (SessionReject) where we want the client to see the Terminate
+            // followed by a clean disconnect.
+            try { _stream.Dispose(); } catch { }
             Close();
         }
     }
@@ -247,6 +283,39 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueueExact(frame, n);
     }
 
+    public bool WriteSessionReject(byte terminationCode)
+    {
+        // Atomically transition open → closing-after-flush so concurrent
+        // writers stop enqueuing once we've decided to terminate.
+        if (Interlocked.Exchange(ref _isOpen, 0) == 0) return false;
+        Volatile.Write(ref _closingAfterFlush, 1);
+
+        var frame = new byte[SessionRejectEncoder.TerminateTotal];
+        int n = SessionRejectEncoder.EncodeTerminate(frame, SessionId, sessionVerId: 0UL, terminationCode);
+        // Bypass IsOpen guard: enqueue directly + complete writer so the
+        // send loop drains this last frame and exits cleanly.
+        var exact = new byte[n];
+        Buffer.BlockCopy(frame, 0, exact, 0, n);
+        bool queued = _sendQueue.Writer.TryWrite(exact);
+        _sendQueue.Writer.TryComplete();
+        // Stop the receive loop; we've already decided the session is dead.
+        try { _recvCts.Cancel(); } catch { }
+        return queued;
+    }
+
+    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null)
+    {
+        if (!IsOpen) return false;
+        int needed = BusinessMessageRejectEncoder.TotalSize(
+            text == null ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength));
+        var frame = ArrayPool<byte>.Shared.Rent(needed);
+        int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(frame.AsSpan(0, needed),
+            SessionId, NextMsgSeqNum(), _nowNanos(),
+            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+        return TryEnqueueExact(frame, n);
+    }
+
     private bool TryEnqueueExact(byte[] frame, int written)
     {
         // Send loop writes the entire array, so we must hand it a tight buffer.
@@ -269,8 +338,17 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     public void Close()
     {
-        if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
+        if (Interlocked.Exchange(ref _isOpen, 0) == 0)
+        {
+            // Already marked closed (possibly by graceful shutdown). Force
+            // the cancellation path so any blocking receive/send returns.
+            _sendQueue.Writer.TryComplete();
+            try { _recvCts.Cancel(); } catch { }
+            try { _cts.Cancel(); } catch { }
+            return;
+        }
         _sendQueue.Writer.TryComplete();
+        try { _recvCts.Cancel(); } catch { }
         try { _cts.Cancel(); } catch { }
     }
 
@@ -280,5 +358,6 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); } catch { }
         try { if (_sendTask != null) await _sendTask.ConfigureAwait(false); } catch { }
         _cts.Dispose();
+        _recvCts.Dispose();
     }
 }
