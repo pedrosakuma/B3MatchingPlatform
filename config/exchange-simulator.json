@@ -13,7 +13,20 @@
       "incrementalGroup": "224.0.20.84",
       "incrementalPort": 30084,
       "ttl": 1,
-      "instruments": "config/instruments-eqt.json"
+      "instruments": "config/instruments-eqt.json",
+      // Optional snapshot publisher. Multicast group/port MUST be distinct
+      // from the incremental channel; consumers subscribe to both
+      // independently and use the snapshot to bootstrap the order book on
+      // mid-session connect. cadenceMs is the per-channel rotation period —
+      // each tick publishes one instrument's complete snapshot, then the
+      // rotator advances to the next instrument.
+      "snapshot": {
+        "group": "224.0.20.184",
+        "port": 30184,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      }
     }
   ]
 }

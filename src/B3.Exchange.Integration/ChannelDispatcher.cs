@@ -43,8 +43,17 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
 
+    private SnapshotRotator? _snapshotRotator;
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
+
+    /// <summary>
+    /// The snapshot rotator bound to this dispatcher, if any. Always invoked
+    /// on the dispatch thread via a <see cref="WorkKind.SnapshotRotation"/>
+    /// work item so it observes a stable book.
+    /// </summary>
+    public SnapshotRotator? SnapshotRotator => _snapshotRotator;
 
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
         Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity)
@@ -88,6 +97,15 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     internal void ProcessOne(in WorkItem item)
     {
+        if (item.Kind == WorkKind.SnapshotRotation)
+        {
+            // Snapshot ticks bypass the per-command incremental packet buffer
+            // entirely — they have their own sink + sequence space owned by
+            // the rotator and emit one or more complete packets directly.
+            _snapshotRotator?.PublishNext();
+            return;
+        }
+
         _currentReply = item.Reply;
         _currentClOrdId = item.ClOrdId;
         _currentOrigClOrdId = item.OrigClOrdId;
@@ -162,6 +180,29 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, reply, 0, 0, null, null, null));
+
+    /// <summary>
+    /// Attaches a <see cref="SnapshotRotator"/> to this dispatcher. May only
+    /// be called once. After this returns, any caller (typically a
+    /// <see cref="System.Threading.Timer"/>) may invoke
+    /// <see cref="EnqueueSnapshotTick"/> to schedule a snapshot publish on
+    /// the dispatch thread.
+    /// </summary>
+    public void AttachSnapshotRotator(SnapshotRotator rotator)
+    {
+        ArgumentNullException.ThrowIfNull(rotator);
+        if (_snapshotRotator != null)
+            throw new InvalidOperationException("snapshot rotator already attached");
+        _snapshotRotator = rotator;
+    }
+
+    /// <summary>
+    /// Posts a snapshot tick into the inbound queue. Returns <c>false</c> if
+    /// the queue is full (snapshots are idempotent — losing a tick simply
+    /// defers the next refresh by one period). Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueSnapshotTick()
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null!, 0, 0, null, null, null));
 
     // ====== IMatchingEventSink ======
 
@@ -285,7 +326,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError }
+    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation }
 
     internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId);
 
