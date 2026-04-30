@@ -152,6 +152,12 @@ public sealed class ExchangeHost : IAsyncDisposable
 
         _router = new HostRouter(routing);
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
+        var sessionOptions = new EntryPointSessionOptions
+        {
+            HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
+            IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
+            TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
+        };
         _listener = new EntryPointListener(listenEp, _router,
             identityFactory: remote =>
             {
@@ -160,7 +166,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                     ConnectionId: connectionId,
                     EnteringFirm: _config.Tcp.EnteringFirm,
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
-            });
+            },
+            sessionOptions: sessionOptions,
+            onSessionClosed: (s, reason) => _log?.Invoke($"session {s.ConnectionId} closed: {reason}"));
         _listener.Start();
         _log?.Invoke($"listening on {_listener.LocalEndpoint}");
         return Task.CompletedTask;
