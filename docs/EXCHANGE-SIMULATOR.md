@@ -176,6 +176,8 @@ healthcheck).
 | `/health/live`   | 200 if every dispatcher loop has ticked within `http.livenessStaleMs`; else 503 |
 | `/health/ready`  | 200 once every registered `IReadinessProbe` reports ready; else 503             |
 | `/metrics`       | Prometheus 0.0.4 text exposition (always 200)                                   |
+| `POST /channel/{ch}/snapshot-now`  | Operator command — forces a snapshot publish on the next dispatcher cycle. 202 on enqueue, 404 unknown channel, 503 if the dispatcher's inbound queue is full. |
+| `POST /channel/{ch}/bump-version`  | Operator command — atomically bumps the incremental + snapshot `SequenceVersion`, clears the order book, resets `RptSeq` to 0, and emits a `ChannelReset_11` frame on the incremental channel under the new version. 202 on enqueue, 404 unknown channel, 503 if the queue is full. |
 
 `/metrics` series:
 
@@ -199,6 +201,37 @@ one snapshot / definition per loaded instrument since startup.
 Until those land, the host registers a single `StartupReadinessProbe`
 that flips ready as soon as `ExchangeHost.StartAsync` returns, so
 `/health/ready` is effectively equivalent to `/health/live` for now.
+
+### Operator endpoints (issue #6)
+
+`POST /channel/{ch}/snapshot-now` and `POST /channel/{ch}/bump-version`
+are operator-driven hooks intended for exercising consumer recovery /
+epoch handling against a live simulator without restarting it. Both
+dispatch their work via the channel's bounded inbound queue, so the
+HTTP handler returns 202 as soon as the work item is enqueued (404 if
+the channel number is unknown, 503 if the queue is full).
+
+`bump-version` is the heart of the channel-reset path:
+
+1. The dispatcher clears every per-instrument book and resets the
+   engine's `RptSeq` counter to 0.
+2. The incremental `SequenceVersion` is incremented and `SequenceNumber`
+   is rebased to 0.
+3. The attached snapshot rotator's `SequenceVersion` is incremented in
+   lockstep (its `SequenceNumber` is rebased to 0 the same way).
+4. A single `ChannelReset_11` frame is emitted on the incremental
+   channel, packed into a one-message packet whose header carries the
+   NEW `SequenceVersion` and `SequenceNumber=1`.
+
+No per-order `DeleteOrder_MBO_51` frames are emitted ahead of the
+`ChannelReset` — per the schema, `ChannelReset` is the canonical signal
+for consumers to drop all per-channel state, and emitting redundant
+deletes alongside it would risk consumers seeing cancels for orders
+they have already discarded.
+
+The next snapshot publish (whether triggered by the configured cadence
+or by an operator `snapshot-now`) reflects the empty book stamped with
+the new versions.
 
 ### Docker `HEALTHCHECK`
 

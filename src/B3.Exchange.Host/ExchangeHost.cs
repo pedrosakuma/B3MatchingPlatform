@@ -214,7 +214,8 @@ public sealed class ExchangeHost : IAsyncDisposable
         {
             IReadOnlyList<IReadinessProbe> probeSnapshot;
             lock (_probesLock) probeSnapshot = _probes.ToList();
-            _http = new HttpServer(_config.Http, _metrics, probeSnapshot,
+            var dispatchersByChannel = _dispatchers.ToDictionary(d => d.ChannelNumber);
+            _http = new HttpServer(_config.Http, _metrics, probeSnapshot, dispatchersByChannel,
                 msg => _logger.LogInformation("{Message}", msg));
             await _http.StartAsync().ConfigureAwait(false);
         }
