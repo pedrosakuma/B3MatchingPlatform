@@ -112,17 +112,20 @@ public sealed class HttpServer : IAsyncDisposable
 
     private static IPEndPoint ParseEndpoint(string s)
     {
-        // Use IPEndPoint.Parse for robust parsing of IPv4, IPv6, and hostname:port formats
+        // Use IPEndPoint.Parse for robust parsing of IPv4, IPv6, and numeric host:port formats.
+        // Note: IPEndPoint.Parse does not support hostname resolution (e.g., localhost:8080).
+        // For hostname support, parse separately and use DNS resolution if needed.
         if (!s.Contains(':'))
             throw new FormatException($"expected host:port, got '{s}'");
 
         try
         {
+            // IPEndPoint.Parse supports "[IPv6]:port" and "IPv4:port" formats.
             return IPEndPoint.Parse(s);
         }
         catch (Exception ex)
         {
-            throw new FormatException($"failed to parse endpoint '{s}'", ex);
+            throw new FormatException($"failed to parse endpoint '{s}' (IP literal and port only; hostname resolution not supported)", ex);
         }
     }
 

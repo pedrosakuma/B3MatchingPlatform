@@ -90,13 +90,13 @@ public class HttpServerTests
         var http = host.HttpEndpoint!;
 
         using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
-        var ready = await client.GetAsync("/health/ready");
+        using var ready = await client.GetAsync("/health/ready");
         Assert.Equal(System.Net.HttpStatusCode.ServiceUnavailable, ready.StatusCode);
         var body = await ready.Content.ReadAsStringAsync();
         Assert.Contains("snapshot-rotator", body);
 
         rotatorProbe.MarkReady();
-        var ready2 = await client.GetAsync("/health/ready");
+        using var ready2 = await client.GetAsync("/health/ready");
         Assert.Equal(System.Net.HttpStatusCode.OK, ready2.StatusCode);
     }
 
@@ -112,7 +112,7 @@ public class HttpServerTests
         using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
 
         // Healthy first.
-        var live = await client.GetAsync("/health/live");
+        using var live = await client.GetAsync("/health/live");
         Assert.Equal(System.Net.HttpStatusCode.OK, live.StatusCode);
 
         // Wedge the dispatcher loop without disposing.

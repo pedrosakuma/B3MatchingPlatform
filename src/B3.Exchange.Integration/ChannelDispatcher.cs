@@ -122,27 +122,25 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             {
                 RecordHeartbeat();
                 Task<bool> waitTask = reader.WaitToReadAsync(ct).AsTask();
-                Task completed;
+                bool more;
                 try
                 {
-                    completed = await Task.WhenAny(waitTask, Task.Delay(HeartbeatInterval, ct))
+                    more = await waitTask.WaitAsync(HeartbeatInterval, ct)
                         .ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    // Timeout: loop and re-record the heartbeat on next iteration.
+                    continue;
                 }
                 catch (OperationCanceledException) { return; }
 
-                if (completed == waitTask)
+                if (!more) return; // channel completed
+                while (reader.TryRead(out var item))
                 {
-                    bool more;
-                    try { more = await waitTask.ConfigureAwait(false); }
-                    catch (OperationCanceledException) { return; }
-                    if (!more) return; // channel completed
-                    while (reader.TryRead(out var item))
-                    {
-                        ProcessOne(item);
-                        RecordHeartbeat();
-                    }
+                    ProcessOne(item);
+                    RecordHeartbeat();
                 }
-                // else: timeout — loop and re-record the heartbeat.
             }
         }
         catch (OperationCanceledException) { }

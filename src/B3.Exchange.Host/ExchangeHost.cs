@@ -66,9 +66,13 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// rotator (#1) and instrument-definition publisher (#2) once they
     /// land — each subsystem registers its own probe so /health/ready
     /// only flips green when every dependency is satisfied.
+    /// Must be called before <see cref="StartAsync"/>.
     /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown if called after <see cref="StartAsync"/>.</exception>
     public void RegisterReadinessProbe(IReadinessProbe probe)
     {
+        if (_http != null)
+            throw new InvalidOperationException("Cannot register readiness probes after StartAsync has been called; probes are snapshotted at startup.");
         lock (_probesLock) _probes.Add(probe);
     }
 
