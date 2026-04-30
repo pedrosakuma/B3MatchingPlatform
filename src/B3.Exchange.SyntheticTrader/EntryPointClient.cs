@@ -120,11 +120,37 @@ public sealed class EntryPointClient : IAsyncDisposable
     {
         if (!IsOpen) return false;
         var frame = new byte[HeaderSize + NewOrderBlockLen];
-        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, HeaderSize),
+        EncodeNewOrder(frame, clOrdId, securityId, side, type, tif, qty, priceMantissa);
+        _logDebug?.Invoke($"send NEW clord={clOrdId} sec={securityId} side={side} qty={qty} px={priceMantissa} tif={tif}");
+        return Enqueue(frame);
+    }
+
+    public bool SendCancel(ulong clOrdId, long securityId, ulong orderId, ulong origClOrdId, OrderSide side)
+    {
+        if (!IsOpen) return false;
+        var frame = new byte[HeaderSize + CancelBlockLen];
+        EncodeCancel(frame, clOrdId, securityId, orderId, origClOrdId, side);
+        _logDebug?.Invoke($"send CXL clord={clOrdId} sec={securityId} orderId={orderId}");
+        return Enqueue(frame);
+    }
+
+    /// <summary>
+    /// Encodes a SimpleNewOrderV2 frame (8-byte SBE header + 82-byte body)
+    /// into <paramref name="frame"/>. Exposed as <c>internal static</c> so
+    /// wire-format compatibility tests can round-trip it through the host's
+    /// <c>InboundMessageDecoder</c> without standing up a TCP connection.
+    /// </summary>
+    internal static int EncodeNewOrder(Span<byte> frame, ulong clOrdId, long securityId, OrderSide side,
+        OrderTypeIntent type, OrderTifIntent tif, long qty, long priceMantissa)
+    {
+        if (frame.Length < HeaderSize + NewOrderBlockLen)
+            throw new ArgumentException("buffer too small for SimpleNewOrderV2", nameof(frame));
+        EntryPointFrameReader.WriteHeader(frame.Slice(0, HeaderSize),
             blockLength: NewOrderBlockLen,
             templateId: EntryPointFrameReader.TidSimpleNewOrder,
             version: 2);
-        var body = frame.AsSpan(HeaderSize);
+        var body = frame.Slice(HeaderSize, NewOrderBlockLen);
+        body.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(NewOrderClOrdID, 8), clOrdId);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(NewOrderSecurityID, 8), securityId);
         body[NewOrderSide] = side == OrderSide.Buy ? (byte)'1' : (byte)'2';
@@ -138,27 +164,60 @@ public sealed class EntryPointClient : IAsyncDisposable
         };
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(NewOrderQty, 8), qty);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(NewOrderPrice, 8), priceMantissa);
-        _logDebug?.Invoke($"send NEW clord={clOrdId} sec={securityId} side={side} qty={qty} px={priceMantissa} tif={tif}");
-        return Enqueue(frame);
+        return HeaderSize + NewOrderBlockLen;
     }
 
-    public bool SendCancel(ulong clOrdId, long securityId, ulong orderId, ulong origClOrdId, OrderSide side)
+    /// <summary>
+    /// Encodes an OrderCancelRequest frame (8-byte SBE header + 76-byte body).
+    /// </summary>
+    internal static int EncodeCancel(Span<byte> frame, ulong clOrdId, long securityId, ulong orderId,
+        ulong origClOrdId, OrderSide side)
     {
-        if (!IsOpen) return false;
-        var frame = new byte[HeaderSize + CancelBlockLen];
-        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, HeaderSize),
+        if (frame.Length < HeaderSize + CancelBlockLen)
+            throw new ArgumentException("buffer too small for OrderCancelRequest", nameof(frame));
+        EntryPointFrameReader.WriteHeader(frame.Slice(0, HeaderSize),
             blockLength: CancelBlockLen,
             templateId: EntryPointFrameReader.TidOrderCancelRequest,
             version: 0);
-        var body = frame.AsSpan(HeaderSize);
+        var body = frame.Slice(HeaderSize, CancelBlockLen);
+        body.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(CancelClOrdID, 8), clOrdId);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(CancelSecurityID, 8), securityId);
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(CancelOrderID, 8), orderId);
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(CancelOrigClOrdID, 8), origClOrdId);
         body[CancelSide] = side == OrderSide.Buy ? (byte)'1' : (byte)'2';
-        _logDebug?.Invoke($"send CXL clord={clOrdId} sec={securityId} orderId={orderId}");
-        return Enqueue(frame);
+        return HeaderSize + CancelBlockLen;
     }
+
+    /// <summary>Decodes an ER_New body. Exposed for wire-format tests.</summary>
+    internal static ExecReportNew DecodeExecReportNew(ReadOnlySpan<byte> body) => new(
+        ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErClOrdId, 8)),
+        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)),
+        Side: SideFromByte(body[ErSide]),
+        OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErNewOrderId, 8)));
+
+    /// <summary>Decodes an ER_Trade body. Exposed for wire-format tests.</summary>
+    internal static ExecReportTrade DecodeExecReportTrade(ReadOnlySpan<byte> body) => new(
+        ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErClOrdId, 8)),
+        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)),
+        Side: SideFromByte(body[ErSide]),
+        OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErTradeOrderId, 8)),
+        LastQty: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErTradeLastQty, 8)),
+        LastPxMantissa: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErTradeLastPx, 8)),
+        LeavesQty: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErTradeLeavesQty, 8)),
+        CumQty: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErTradeCumQty, 8)));
+
+    /// <summary>Decodes an ER_Cancel body. Exposed for wire-format tests.</summary>
+    internal static ExecReportCancel DecodeExecReportCancel(ReadOnlySpan<byte> body) => new(
+        ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErClOrdId, 8)),
+        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)),
+        Side: SideFromByte(body[ErSide]),
+        OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErCancelOrderId, 8)));
+
+    /// <summary>Decodes an ER_Reject body. Exposed for wire-format tests.</summary>
+    internal static ExecReportReject DecodeExecReportReject(ReadOnlySpan<byte> body) => new(
+        ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErClOrdId, 8)),
+        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)));
 
     private bool Enqueue(byte[] frame)
     {
@@ -244,46 +303,28 @@ public sealed class EntryPointClient : IAsyncDisposable
             {
                 case EntryPointFrameReader.TidExecutionReportNew:
                     {
-                        var er = new ExecReportNew(
-                            ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(ErClOrdId, 8)),
-                            SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErSecurityId, 8)),
-                            Side: SideFromByte(body[ErSide]),
-                            OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErNewOrderId, 8)));
+                        var er = DecodeExecReportNew(body);
                         _logDebug?.Invoke($"recv ER_NEW clord={er.ClOrdId} orderId={er.OrderId} side={er.Side}");
                         OnNew?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportTrade:
                     {
-                        var er = new ExecReportTrade(
-                            ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(ErClOrdId, 8)),
-                            SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErSecurityId, 8)),
-                            Side: SideFromByte(body[ErSide]),
-                            OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErTradeOrderId, 8)),
-                            LastQty: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErTradeLastQty, 8)),
-                            LastPxMantissa: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErTradeLastPx, 8)),
-                            LeavesQty: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErTradeLeavesQty, 8)),
-                            CumQty: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErTradeCumQty, 8)));
+                        var er = DecodeExecReportTrade(body);
                         _logDebug?.Invoke($"recv ER_TRADE clord={er.ClOrdId} orderId={er.OrderId} side={er.Side} lastQty={er.LastQty} lastPx={er.LastPxMantissa} leaves={er.LeavesQty}");
                         OnTrade?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportCancel:
                     {
-                        var er = new ExecReportCancel(
-                            ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(ErClOrdId, 8)),
-                            SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErSecurityId, 8)),
-                            Side: SideFromByte(body[ErSide]),
-                            OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErCancelOrderId, 8)));
+                        var er = DecodeExecReportCancel(body);
                         _logDebug?.Invoke($"recv ER_CXL clord={er.ClOrdId} orderId={er.OrderId}");
                         OnCancel?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportReject:
                     {
-                        var er = new ExecReportReject(
-                            ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(ErClOrdId, 8)),
-                            SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(ErSecurityId, 8)));
+                        var er = DecodeExecReportReject(body);
                         _logDebug?.Invoke($"recv ER_REJ clord={er.ClOrdId}");
                         OnReject?.Invoke(er);
                         break;
