@@ -28,6 +28,30 @@ public sealed class ChannelConfig
     [JsonPropertyName("localInterface")] public string? LocalInterface { get; set; }
     [JsonPropertyName("ttl")] public byte Ttl { get; set; } = 1;
     [JsonPropertyName("instruments")] public string InstrumentsFile { get; set; } = "";
+
+    /// <summary>
+    /// Optional: enables the periodic <c>SecurityDefinition_12</c> publisher
+    /// on a dedicated InstrumentDef multicast group. When omitted, no
+    /// instrument definitions are published for this channel.
+    /// </summary>
+    [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
+}
+
+public sealed class InstrumentDefinitionConfig
+{
+    /// <summary>
+    /// UMDF channel number stamped on the InstrumentDef PacketHeader.
+    /// Defaults to the parent channel's <c>ChannelNumber</c> when 0.
+    /// </summary>
+    [JsonPropertyName("channelNumber")] public byte ChannelNumber { get; set; }
+
+    [JsonPropertyName("group")] public string Group { get; set; } = "";
+    [JsonPropertyName("port")] public int Port { get; set; }
+    [JsonPropertyName("localInterface")] public string? LocalInterface { get; set; }
+    [JsonPropertyName("ttl")] public byte Ttl { get; set; } = 1;
+
+    /// <summary>Cycle period in milliseconds. Defaults to 5000 (5 s).</summary>
+    [JsonPropertyName("cadenceMs")] public int CadenceMs { get; set; } = 5_000;
 }
 
 public static class HostConfigLoader
