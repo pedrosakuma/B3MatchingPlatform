@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.EntryPoint.Tests;
 
@@ -42,6 +43,7 @@ public class EntryPointHeartbeatTests
         await using var listener = new EntryPointListener(
             new IPEndPoint(IPAddress.Loopback, 0),
             new NoOpEngineSink(),
+            NullLoggerFactory.Instance,
             sessionOptions: options,
             onSessionClosed: (s, reason) => { lock (closures) { closures.Add(reason); } sem.Release(); });
         listener.Start();
@@ -93,6 +95,7 @@ public class EntryPointHeartbeatTests
         await using var listener = new EntryPointListener(
             new IPEndPoint(IPAddress.Loopback, 0),
             new NoOpEngineSink(),
+            NullLoggerFactory.Instance,
             sessionOptions: options,
             onSessionClosed: (s, reason) => { lock (closures) { closures.Add(reason); } });
         listener.Start();
@@ -133,6 +136,7 @@ public class EntryPointHeartbeatTests
         await using var listener = new EntryPointListener(
             new IPEndPoint(IPAddress.Loopback, 0),
             new NoOpEngineSink(),
+            NullLoggerFactory.Instance,
             sessionOptions: options);
         listener.Start();
         var ep = listener.LocalEndpoint!;
