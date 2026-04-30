@@ -26,6 +26,16 @@
         "ttl": 1,
         "cadenceMs": 1000,
         "maxEntriesPerChunk": 30
+      },
+      // Optional: periodic SecurityDefinition_12 publisher on a dedicated
+      // multicast group so consumers without a pre-loaded instrument list
+      // can resolve every SecurityID referenced on the incremental channel.
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "224.0.21.84",
+        "port": 31084,
+        "ttl": 1,
+        "cadenceMs": 5000
       }
     }
   ]

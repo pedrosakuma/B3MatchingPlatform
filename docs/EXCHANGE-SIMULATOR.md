@@ -80,6 +80,13 @@ Exposes:
         "ttl": 1,
         "cadenceMs": 1000,
         "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "224.0.21.84",
+        "port": 31084,
+        "ttl": 1,
+        "cadenceMs": 5000
       }
     }
   ]
@@ -93,6 +100,15 @@ Exposes:
   UMDF channel.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
+* `instrumentDefinition` *(optional)* — enables a dedicated
+  `SecurityDefinition_12` publisher on its own multicast group so
+  late-joining consumers can resolve every SecurityID seen on MBO/Trade
+  frames without a pre-loaded instrument list.
+  * `channelNumber` — UMDF channel number stamped on the InstrumentDef
+    PacketHeader. Defaults to the parent channel's number when 0.
+  * `group` / `port` / `ttl` / `localInterface` — multicast destination.
+  * `cadenceMs` — how often (ms) to re-emit the full instrument list.
+    Defaults to 5000 (5 s).
 * `snapshot` (optional) — per-channel snapshot publisher. When present, the
   host opens a second multicast socket on `group:port` and a per-channel
   `SnapshotRotator` round-robins through the channel's instruments,
@@ -149,6 +165,13 @@ Two distinct multicast streams per channel:
 
 Both streams are compatible with the existing `B3.Umdf.ConsoleApp` consumer
 in this repo.
+
+When the optional `instrumentDefinition` block is configured per channel,
+the host also emits `SecurityDefinition_12` (`SecurityDefinition_d` in FIX
+terms) frames to a dedicated multicast group every `cadenceMs`
+milliseconds (default 5 s). One full cycle covers every configured
+instrument; frames are packed into ≤1400-byte UDP datagrams with
+monotonic `SequenceNumber`s on the InstrumentDef channel.
 
 ## Sending an order with `nc`
 
