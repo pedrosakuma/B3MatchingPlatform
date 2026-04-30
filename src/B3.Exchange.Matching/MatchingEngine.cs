@@ -66,6 +66,25 @@ public sealed class MatchingEngine
     public SelfTradePrevention SelfTradePrevention => _stp;
 
     /// <summary>
+    /// Hard reset of every per-instrument book and the engine's
+    /// <c>RptSeq</c> counter. Designed for the operator-initiated
+    /// channel-reset path (issue #6): the dispatcher invokes this on
+    /// the dispatch thread, paired with a <c>ChannelReset_11</c> emission
+    /// and a <c>SequenceVersion</c> bump on both the incremental and
+    /// snapshot channels. Order-id and trade-id allocators are
+    /// intentionally NOT reset — those identifiers must remain unique
+    /// for the lifetime of the host so audit/replay tools can distinguish
+    /// pre- and post-reset entities.
+    /// </summary>
+    public void ResetForChannelReset()
+    {
+        if (_dispatching)
+            throw new InvalidOperationException("cannot reset while a command is being dispatched");
+        foreach (var book in _booksById.Values) book.Clear();
+        _rptSeq = 0;
+    }
+
+    /// <summary>
     /// Returns the <see cref="LimitOrderBook"/>'s public snapshot iterator.
     /// Throws <see cref="KeyNotFoundException"/> if the security id is unknown.
     /// </summary>
