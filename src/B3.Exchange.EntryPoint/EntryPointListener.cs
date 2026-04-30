@@ -17,6 +17,8 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly IPEndPoint _endpoint;
     private readonly IEntryPointEngineSink _sink;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
+    private readonly EntryPointSessionOptions _sessionOptions;
+    private readonly Action<EntryPointSession, string>? _onSessionClosed;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -38,11 +40,16 @@ public sealed class EntryPointListener : IAsyncDisposable
     }
 
     public EntryPointListener(IPEndPoint endpoint, IEntryPointEngineSink sink,
-        Func<EndPoint?, AcceptedConnection>? identityFactory = null)
+        Func<EndPoint?, AcceptedConnection>? identityFactory = null,
+        EntryPointSessionOptions? sessionOptions = null,
+        Action<EntryPointSession, string>? onSessionClosed = null)
     {
         _endpoint = endpoint;
         _sink = sink;
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
+        _sessionOptions = sessionOptions ?? EntryPointSessionOptions.Default;
+        _sessionOptions.Validate();
+        _onSessionClosed = onSessionClosed;
     }
 
     private AcceptedConnection DefaultIdentityFactory(EndPoint? remote)
@@ -72,7 +79,16 @@ public sealed class EntryPointListener : IAsyncDisposable
                 sock.NoDelay = true;
                 var identity = _identityFactory(sock.RemoteEndPoint);
                 var stream = new NetworkStream(sock, ownsSocket: true);
-                var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId, stream, _sink);
+
+                // Wrap onClosed to remove session from _sessions before invoking external callback
+                Action<EntryPointSession, string> onClosed = (s, reason) =>
+                {
+                    lock (_lock) _sessions.Remove(s);
+                    _onSessionClosed?.Invoke(s, reason);
+                };
+
+                var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
+                    stream, _sink, options: _sessionOptions, onClosed: onClosed);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
             }
