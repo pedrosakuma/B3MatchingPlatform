@@ -74,7 +74,21 @@ Exposes:
       "incrementalPort": 30084,
       "ttl": 1,
       "selfTradePrevention": "none",
-      "instruments": "config/instruments-eqt.json"
+      "instruments": "config/instruments-eqt.json",
+      "snapshot": {
+        "group": "224.0.20.184",
+        "port": 30184,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "224.0.21.84",
+        "port": 31084,
+        "ttl": 1,
+        "cadenceMs": 5000
+      }
     }
   ]
 }
@@ -103,6 +117,26 @@ Exposes:
     aggressor's residual; stop further matching.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
+* `instrumentDefinition` *(optional)* — enables a dedicated
+  `SecurityDefinition_12` publisher on its own multicast group so
+  late-joining consumers can resolve every SecurityID seen on MBO/Trade
+  frames without a pre-loaded instrument list.
+  * `channelNumber` — UMDF channel number stamped on the InstrumentDef
+    PacketHeader. Defaults to the parent channel's number when 0.
+  * `group` / `port` / `ttl` / `localInterface` — multicast destination.
+  * `cadenceMs` — how often (ms) to re-emit the full instrument list.
+    Defaults to 5000 (5 s).
+* `snapshot` (optional) — per-channel snapshot publisher. When present, the
+  host opens a second multicast socket on `group:port` and a per-channel
+  `SnapshotRotator` round-robins through the channel's instruments,
+  publishing a `SnapshotFullRefresh_Header_30` + chunked
+  `SnapshotFullRefresh_Orders_MBO_71` frames every `cadenceMs`
+  milliseconds. The snapshot channel maintains its own `SequenceVersion` /
+  `SequenceNumber` state, distinct from the incremental channel.
+  `maxEntriesPerChunk` caps the per-`Orders_71` group size (defaults to
+  30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
+  `snapshot` block to publish only the incremental feed (no bootstrap for
+  mid-session consumers).
 
 ## Wire protocol
 
@@ -132,9 +166,29 @@ deferred to a later milestone.
 
 ### Outbound (UMDF multicast)
 
-Standard B3 UMDF inc packets — `PacketHeader` (16 bytes) + framed
-`Order_MBO_50`, `DeleteOrder_MBO_51`, `Trade_53` messages. Compatible with
-the existing `B3.Umdf.ConsoleApp` consumer in this repo.
+Two distinct multicast streams per channel:
+
+* **Incremental** — `PacketHeader` (16 bytes) + framed `Order_MBO_50`,
+  `DeleteOrder_MBO_51`, `Trade_53` messages. One UDP packet per inbound
+  command (events emitted while processing a single command are batched
+  into one packet ≤1400 bytes, with a monotonic `SequenceNumber`).
+* **Snapshot** (optional) — `PacketHeader` + `SnapshotFullRefresh_Header_30`
+  + one or more `SnapshotFullRefresh_Orders_MBO_71` chunk frames. A
+  per-channel rotator publishes a complete snapshot for one instrument per
+  tick, round-robining through the channel's instruments. Empty / illiquid
+  instruments emit a header-only packet with `LastRptSeq` absent (per B3
+  §7.4). Snapshot packets carry their own `SequenceVersion` / `SequenceNumber`
+  separate from the incremental channel.
+
+Both streams are compatible with the existing `B3.Umdf.ConsoleApp` consumer
+in this repo.
+
+When the optional `instrumentDefinition` block is configured per channel,
+the host also emits `SecurityDefinition_12` (`SecurityDefinition_d` in FIX
+terms) frames to a dedicated multicast group every `cadenceMs`
+milliseconds (default 5 s). One full cycle covers every configured
+instrument; frames are packed into ≤1400-byte UDP datagrams with
+monotonic `SequenceNumber`s on the InstrumentDef channel.
 
 ## Sending an order with `nc`
 
