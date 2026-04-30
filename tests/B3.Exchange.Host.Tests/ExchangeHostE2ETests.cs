@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Integration;
+using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -135,6 +136,85 @@ public class ExchangeHostE2ETests
 
         var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
         Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, er.TemplateId);
+    }
+
+    [Fact]
+    public async Task InstrumentDefinitionPublisher_EmitsAllInstrumentsWithinOneCycle()
+    {
+        var (cfg, mboSink) = BuildConfig();
+        // Enable InstrumentDef publisher with a short cadence so the host
+        // emits a full cycle inside the test deadline.
+        cfg.Channels[0].InstrumentDefinition = new InstrumentDefinitionConfig
+        {
+            ChannelNumber = 184,
+            Group = "239.255.43.184",
+            Port = 31184,
+            Ttl = 0,
+            CadenceMs = 50,
+        };
+
+        var idSink = new RecordingPacketSink();
+        await using var host = new ExchangeHost(cfg,
+            packetSinkFactory: _ => mboSink,
+            instrumentDefSinkFactory: (_, _) => idSink);
+        await host.StartAsync();
+
+        // Wait up to 2s for the first cycle.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (idSink.Packets)
+            {
+                if (idSink.Packets.Count > 0) break;
+            }
+            await Task.Delay(20);
+        }
+
+        // Decode every SecurityDefinition_12 frame across all packets and
+        // assert the consumer can resolve every configured SecurityID +
+        // Symbol — i.e. a fresh subscriber learns the instrument table from
+        // the bus alone.
+        var instruments = B3.Exchange.Instruments.InstrumentLoader.LoadFromFile(
+            cfg.Channels[0].InstrumentsFile);
+        var expectedSecIds = instruments.Select(i => i.SecurityId).ToHashSet();
+        var expectedSymbols = instruments.Select(i => i.Symbol).ToHashSet();
+
+        var seenSecIds = new HashSet<long>();
+        var seenSymbols = new HashSet<string>();
+
+        const int FrameOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        const int FrameSize = FrameOffset + WireOffsets.SecDefBodyTotal;
+
+        byte[][] snapshot;
+        lock (idSink.Packets) snapshot = idSink.Packets.ToArray();
+        Assert.NotEmpty(snapshot);
+
+        foreach (var packet in snapshot)
+        {
+            // PacketHeader stamps configured InstrumentDef channel number.
+            Assert.Equal((byte)184, packet[WireOffsets.PacketHeaderChannelOffset]);
+            int p = WireOffsets.PacketHeaderSize;
+            while (p + FrameSize <= packet.Length)
+            {
+                var bodySpan = packet.AsSpan(p + FrameOffset, WireOffsets.SecDefBlockLength);
+                long secId = MemoryMarshal.Read<long>(bodySpan.Slice(WireOffsets.SecDefSecurityIdOffset, 8));
+                seenSecIds.Add(secId);
+                var symBytes = bodySpan.Slice(WireOffsets.SecDefSymbolOffset, 20);
+                int n = symBytes.IndexOf((byte)0);
+                if (n < 0) n = symBytes.Length;
+                seenSymbols.Add(System.Text.Encoding.ASCII.GetString(symBytes.Slice(0, n)));
+                p += FrameSize;
+
+                // Every emitted frame should also be SBE-decodable.
+                Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodySpan, out _));
+            }
+        }
+
+        Assert.Superset(expectedSecIds, seenSecIds);
+        Assert.True(expectedSecIds.IsSubsetOf(seenSecIds),
+            $"missing SecurityIDs: {string.Join(",", expectedSecIds.Except(seenSecIds))}");
+        Assert.True(expectedSymbols.IsSubsetOf(seenSymbols),
+            $"missing symbols: {string.Join(",", expectedSymbols.Except(seenSymbols))}");
     }
 
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,
