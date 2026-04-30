@@ -50,6 +50,8 @@ public class ChannelDispatcherTests
         public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) { Cancels.Add(e); Calls.Add("Cancel"); if (CaptureCancelIds) CancelIds.Add((clOrdIdValue, origClOrdIdValue)); return true; }
         public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) { Calls.Add("Modify"); return true; }
         public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue) { Rejects.Add(e); Calls.Add("Reject"); return true; }
+        public bool WriteSessionReject(byte terminationCode) { Calls.Add("SessionReject"); return true; }
+        public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason, string? text = null) { Calls.Add("BusinessReject"); return true; }
     }
 
     private static (ChannelDispatcher disp, RecordingPacketSink pkt) NewDispatcher()
