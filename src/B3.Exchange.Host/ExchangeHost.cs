@@ -34,6 +34,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly MetricsRegistry _metrics = new();
     private readonly StartupReadinessProbe _startupProbe = new("startup");
     private readonly List<IReadinessProbe> _probes = new();
+    private readonly object _probesLock = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
     private HttpServer? _http;
@@ -66,7 +67,10 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// land — each subsystem registers its own probe so /health/ready
     /// only flips green when every dependency is satisfied.
     /// </summary>
-    public void RegisterReadinessProbe(IReadinessProbe probe) => _probes.Add(probe);
+    public void RegisterReadinessProbe(IReadinessProbe probe)
+    {
+        lock (_probesLock) _probes.Add(probe);
+    }
 
     public async Task StartAsync()
     {
@@ -204,7 +208,9 @@ public sealed class ExchangeHost : IAsyncDisposable
 
         if (_config.Http != null)
         {
-            _http = new HttpServer(_config.Http, _metrics, _probes,
+            IReadOnlyList<IReadinessProbe> probeSnapshot;
+            lock (_probesLock) probeSnapshot = _probes.ToList();
+            _http = new HttpServer(_config.Http, _metrics, probeSnapshot,
                 msg => _logger.LogInformation("{Message}", msg));
             await _http.StartAsync().ConfigureAwait(false);
         }
