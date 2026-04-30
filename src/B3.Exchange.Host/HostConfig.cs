@@ -55,7 +55,7 @@ public sealed class ChannelConfig
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
 }
 
-internal sealed class SelfTradePreventionJsonConverter : JsonConverter<B3.Exchange.Matching.SelfTradePrevention>
+public sealed class SelfTradePreventionJsonConverter : JsonConverter<B3.Exchange.Matching.SelfTradePrevention>
 {
     public override B3.Exchange.Matching.SelfTradePrevention Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
@@ -78,7 +78,7 @@ internal sealed class SelfTradePreventionJsonConverter : JsonConverter<B3.Exchan
             B3.Exchange.Matching.SelfTradePrevention.CancelAggressor => "cancel-aggressor",
             B3.Exchange.Matching.SelfTradePrevention.CancelResting => "cancel-resting",
             B3.Exchange.Matching.SelfTradePrevention.CancelBoth => "cancel-both",
-            _ => "none",
+            _ => throw new JsonException($"unknown SelfTradePrevention value: {value}"),
         });
     }
 }

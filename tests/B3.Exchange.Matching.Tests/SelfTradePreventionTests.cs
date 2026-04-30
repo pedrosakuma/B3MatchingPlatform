@@ -1,5 +1,3 @@
-using B3.Exchange.Instruments;
-
 namespace B3.Exchange.Matching.Tests;
 
 using static TestFactory;

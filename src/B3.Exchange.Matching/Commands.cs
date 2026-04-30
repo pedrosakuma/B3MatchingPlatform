@@ -7,7 +7,8 @@ public enum TimeInForce : byte { Day, IOC, FOK }
 public enum OrderType : byte { Limit, Market }
 
 /// <summary>
-/// Reasons a matching command can be rejected without any state change.
+/// Reasons a matching command can be rejected. Some rejects occur before any state change;
+/// others (e.g., <see cref="SelfTradePrevention"/>) may occur after fills against other firms.
 /// </summary>
 public enum RejectReason : byte
 {

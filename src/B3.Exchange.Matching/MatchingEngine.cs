@@ -90,6 +90,26 @@ public sealed class MatchingEngine
                 long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: cmd.Type == OrderType.Market);
                 if (fillable < cmd.Quantity)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.FokUnfillable, cmd.EnteredAtNanos); return; }
+
+                // If STP is enabled, FOK must check for self-trades: orders from the same firm
+                // would be prevented from matching, so reject FOK as unfillable if any exist.
+                if (_stp != SelfTradePrevention.None)
+                {
+                    bool isMarketOrder = cmd.Type == OrderType.Market;
+                    foreach (var level in book.OppositeLevels(cmd.Side))
+                    {
+                        if (!isMarketOrder && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, cmd.PriceMantissa))
+                            break;
+
+                        var order = level.Head;
+                        while (order is not null)
+                        {
+                            if (order.EnteringFirm == cmd.EnteringFirm)
+                            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.FokUnfillable, cmd.EnteredAtNanos); return; }
+                            order = order.Next;
+                        }
+                    }
+                }
             }
 
             // Market order with empty opposite book: reject early — we never want a
