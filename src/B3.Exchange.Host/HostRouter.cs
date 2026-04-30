@@ -1,6 +1,7 @@
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Host;
 
@@ -17,11 +18,15 @@ namespace B3.Exchange.Host;
 public sealed class HostRouter : IEntryPointEngineSink
 {
     private readonly IReadOnlyDictionary<long, ChannelDispatcher> _bySecId;
+    private readonly ILogger<HostRouter> _logger;
     private readonly Func<ulong> _nowNanos;
 
-    public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, Func<ulong>? nowNanos = null)
+    public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, ILogger<HostRouter> logger,
+        Func<ulong>? nowNanos = null)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         _bySecId = routing;
+        _logger = logger;
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
 
@@ -53,6 +58,7 @@ public sealed class HostRouter : IEntryPointEngineSink
     {
         // Best-effort: send a generic reject and rely on the session to close
         // its own connection if the decode error was fatal.
+        _logger.LogWarning("inbound decode error from connection {ConnectionId}: {Error}", reply.ConnectionId, error);
         reply.WriteExecutionReportReject(
             new RejectEvent(ClOrdId: "0", SecurityId: 0, OrderIdOrZero: 0,
                 Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
@@ -61,6 +67,8 @@ public sealed class HostRouter : IEntryPointEngineSink
 
     private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)
     {
+        _logger.LogWarning("rejecting clOrdId={ClOrdId} from connection {ConnectionId}: unknown securityId={SecurityId}",
+            clOrdIdValue, reply.ConnectionId, secId);
         reply.WriteExecutionReportReject(
             new RejectEvent(ClOrdId: clOrdIdValue.ToString(), SecurityId: secId, OrderIdOrZero: 0,
                 Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),

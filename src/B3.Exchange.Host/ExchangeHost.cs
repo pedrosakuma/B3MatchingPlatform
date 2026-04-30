@@ -3,6 +3,8 @@ using B3.Exchange.EntryPoint;
 using B3.Exchange.Instruments;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Host;
 
@@ -20,18 +22,20 @@ namespace B3.Exchange.Host;
 public sealed class ExchangeHost : IAsyncDisposable
 {
     private readonly HostConfig _config;
-    private readonly Action<string>? _log;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<ExchangeHost> _logger;
     private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
     private readonly List<IDisposable> _ownedSinks = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
 
-    public ExchangeHost(HostConfig config, Action<string>? log = null,
+    public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null)
     {
         _config = config;
-        _log = log;
+        _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+        _logger = _loggerFactory.CreateLogger<ExchangeHost>();
         _packetSinkFactory = packetSinkFactory;
     }
 
@@ -39,6 +43,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public Task StartAsync()
     {
+        _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
         var routing = new Dictionary<long, ChannelDispatcher>();
         foreach (var ch in _config.Channels)
         {
@@ -51,13 +56,16 @@ public sealed class ExchangeHost : IAsyncDisposable
             else
             {
                 var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
+                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort,
+                    _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, ch.Ttl);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
+            var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
-                engineFactory: s => new MatchingEngine(instruments, s),
-                packetSink: sink);
+                engineFactory: s => new MatchingEngine(instruments, s, engineLogger),
+                packetSink: sink,
+                logger: _loggerFactory.CreateLogger<ChannelDispatcher>());
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -66,12 +74,13 @@ public sealed class ExchangeHost : IAsyncDisposable
                     throw new InvalidOperationException($"SecurityId {inst.SecurityId} mapped to multiple channels");
                 routing.Add(inst.SecurityId, disp);
             }
-            _log?.Invoke($"channel {ch.ChannelNumber}: {instruments.Count} instruments → {ch.IncrementalGroup}:{ch.IncrementalPort}");
+            _logger.LogInformation("channel {ChannelNumber}: {InstrumentCount} instruments → {Group}:{Port}",
+                ch.ChannelNumber, instruments.Count, ch.IncrementalGroup, ch.IncrementalPort);
         }
 
-        _router = new HostRouter(routing);
+        _router = new HostRouter(routing, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
-        _listener = new EntryPointListener(listenEp, _router,
+        _listener = new EntryPointListener(listenEp, _router, _loggerFactory,
             identityFactory: remote =>
             {
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
@@ -81,7 +90,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
             });
         _listener.Start();
-        _log?.Invoke($"listening on {_listener.LocalEndpoint}");
+        _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
         return Task.CompletedTask;
     }
 
@@ -96,6 +105,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("exchange host shutting down");
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
