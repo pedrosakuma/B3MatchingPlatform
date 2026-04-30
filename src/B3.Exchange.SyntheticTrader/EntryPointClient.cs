@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -65,6 +66,20 @@ public sealed class EntryPointClient : IAsyncDisposable
     // pathological values that would let a malformed peer force giant
     // allocations and OOM the process.
     private const int MaxAcceptedBlockLength = 1024;
+
+    // Per-template expected block lengths (mirroring ExecutionReportEncoder
+    // constants in B3.Exchange.EntryPoint, which is internal). Used as a
+    // tighter, schema-aware validation before allocating the body buffer.
+    // Returns -1 for unknown template IDs (caller falls back to MaxAcceptedBlockLength).
+    private static int ExpectedBlockLength(ushort templateId) => templateId switch
+    {
+        EntryPointFrameReader.TidExecutionReportNew => 144,
+        EntryPointFrameReader.TidExecutionReportModify => 160,
+        EntryPointFrameReader.TidExecutionReportCancel => 156,
+        EntryPointFrameReader.TidExecutionReportTrade => 154,
+        EntryPointFrameReader.TidExecutionReportReject => 138,
+        _ => -1,
+    };
 
     private const int HeaderSize = 8;
 
@@ -307,15 +322,30 @@ public sealed class EntryPointClient : IAsyncDisposable
                     Close($"unexpected schemaId={schemaId}");
                     return;
                 }
-                if (blockLength == 0 || blockLength > MaxAcceptedBlockLength)
+                int expected = ExpectedBlockLength(templateId);
+                if (expected >= 0 && blockLength != expected)
+                {
+                    _logWarn?.Invoke($"unexpected blockLength={blockLength} for tid={templateId} (expected={expected}), dropping connection");
+                    Close($"unexpected blockLength={blockLength} for tid={templateId}");
+                    return;
+                }
+                if (expected < 0 && (blockLength == 0 || blockLength > MaxAcceptedBlockLength))
                 {
                     _logWarn?.Invoke($"unreasonable blockLength={blockLength} for tid={templateId}, dropping connection");
                     Close($"unreasonable blockLength={blockLength}");
                     return;
                 }
-                var body = new byte[blockLength];
-                await ReadExactAsync(_stream, body, ct).ConfigureAwait(false);
-                Dispatch(templateId, version, body);
+                // Rent the body buffer to avoid per-frame heap allocations under load.
+                var body = ArrayPool<byte>.Shared.Rent(blockLength);
+                try
+                {
+                    await ReadExactAsync(_stream, body.AsMemory(0, blockLength), ct).ConfigureAwait(false);
+                    Dispatch(templateId, version, body, blockLength);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(body);
+                }
             }
         }
         catch (OperationCanceledException) { }
@@ -334,36 +364,37 @@ public sealed class EntryPointClient : IAsyncDisposable
         }
     }
 
-    private void Dispatch(ushort templateId, ushort version, byte[] body)
+    private void Dispatch(ushort templateId, ushort version, byte[] body, int blockLength)
     {
+        ReadOnlySpan<byte> slice = body.AsSpan(0, blockLength);
         try
         {
             switch (templateId)
             {
                 case EntryPointFrameReader.TidExecutionReportNew:
                     {
-                        var er = DecodeExecReportNew(body);
+                        var er = DecodeExecReportNew(slice);
                         _logDebug?.Invoke($"recv ER_NEW clord={er.ClOrdId} orderId={er.OrderId} side={er.Side}");
                         OnNew?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportTrade:
                     {
-                        var er = DecodeExecReportTrade(body);
+                        var er = DecodeExecReportTrade(slice);
                         _logDebug?.Invoke($"recv ER_TRADE clord={er.ClOrdId} orderId={er.OrderId} side={er.Side} lastQty={er.LastQty} lastPx={er.LastPxMantissa} leaves={er.LeavesQty}");
                         OnTrade?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportCancel:
                     {
-                        var er = DecodeExecReportCancel(body);
+                        var er = DecodeExecReportCancel(slice);
                         _logDebug?.Invoke($"recv ER_CXL clord={er.ClOrdId} orderId={er.OrderId}");
                         OnCancel?.Invoke(er);
                         break;
                     }
                 case EntryPointFrameReader.TidExecutionReportReject:
                     {
-                        var er = DecodeExecReportReject(body);
+                        var er = DecodeExecReportReject(slice);
                         _logDebug?.Invoke($"recv ER_REJ clord={er.ClOrdId} origClord={er.OrigClOrdId} orderId={er.OrderId} reason={er.RejectReason}");
                         OnReject?.Invoke(er);
                         break;
@@ -387,6 +418,17 @@ public sealed class EntryPointClient : IAsyncDisposable
         while (read < buf.Length)
         {
             int n = await stream.ReadAsync(buf.AsMemory(read), ct).ConfigureAwait(false);
+            if (n <= 0) throw new EndOfStreamException();
+            read += n;
+        }
+    }
+
+    private static async Task ReadExactAsync(NetworkStream stream, Memory<byte> buf, CancellationToken ct)
+    {
+        int read = 0;
+        while (read < buf.Length)
+        {
+            int n = await stream.ReadAsync(buf.Slice(read), ct).ConfigureAwait(false);
             if (n <= 0) throw new EndOfStreamException();
             read += n;
         }

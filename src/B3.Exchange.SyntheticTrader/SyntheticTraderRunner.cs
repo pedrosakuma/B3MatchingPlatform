@@ -181,9 +181,20 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
                     {
                         perStrategy.PendingByTag[intent.ClientTag] = clOrd;
                     }
+                    // A null client means we're under test (no transport); treat that as
+                    // "send succeeded" so test seams keep working. In production, when the
+                    // client is present and SendNewOrder returns false (closed / backpressure),
+                    // we roll back the tracking entries we just inserted so they don't linger
+                    // forever — no ack will ever arrive for an order that never went out.
                     bool ok = _client?.SendNewOrder(clOrd, intent.SecurityId, intent.Side, intent.Type, intent.Tif,
-                        intent.Quantity, intent.PriceMantissa) ?? false;
-                    if (ok) Interlocked.Increment(ref _ordersSent);
+                        intent.Quantity, intent.PriceMantissa) ?? true;
+                    if (!ok)
+                    {
+                        lock (_byClOrd) _byClOrd.Remove(clOrd);
+                        lock (inst.Sync) perStrategy.PendingByTag.Remove(intent.ClientTag);
+                        break;
+                    }
+                    Interlocked.Increment(ref _ordersSent);
                     break;
                 }
             case OrderIntentKind.Cancel:
@@ -349,6 +360,16 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Detach event handlers BEFORE cancelling so a still-live client cannot
+        // dispatch into a half-disposed runner (which would NPE / mutate disposed
+        // state). After detach, the client may continue running independently.
+        if (_client is not null)
+        {
+            _client.OnNew -= OnExecNew;
+            _client.OnTrade -= OnExecTrade;
+            _client.OnCancel -= OnExecCancel;
+            _client.OnReject -= OnExecReject;
+        }
         try { _cts.Cancel(); } catch { }
         try { if (_tickTask != null) await _tickTask.ConfigureAwait(false); } catch { }
         _cts.Dispose();
