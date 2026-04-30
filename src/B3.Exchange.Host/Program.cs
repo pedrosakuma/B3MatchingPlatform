@@ -10,7 +10,7 @@ using var loggerFactory = LoggerFactory.Create(builder =>
         {
             o.IncludeScopes = true;
             o.UseUtcTimestamp = true;
-            o.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
+            o.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ";
         });
     }
     else
