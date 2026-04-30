@@ -1,0 +1,34 @@
+{
+  // Sample synthetic trader config: connect to local host on 9876, run a
+  // market-maker + noise-taker pair on PETR4. Seed is fixed for repro.
+  "host": { "host": "127.0.0.1", "port": 9876 },
+  "firm": 1,
+  "seed": 42,
+  "tickIntervalMs": 100,
+  "instruments": [
+    {
+      "securityId": 900000000001,
+      "tickSize": 100,
+      "lotSize": 100,
+      "initialMidMantissa": 123400,
+      "midDriftProbability": 0.1,
+      "strategies": [
+        {
+          "kind": "marketMaker",
+          "name": "mm-petr4",
+          "levelsPerSide": 3,
+          "quoteSpacingTicks": 1,
+          "replaceDistanceTicks": 5,
+          "quantity": 100
+        },
+        {
+          "kind": "noiseTaker",
+          "name": "noise-petr4",
+          "orderProbability": 0.3,
+          "maxLotMultiple": 3,
+          "crossTicks": 2
+        }
+      ]
+    }
+  ]
+}
