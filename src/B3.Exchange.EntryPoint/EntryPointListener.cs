@@ -37,6 +37,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         _sink = sink;
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
         _sessionOptions = sessionOptions ?? EntryPointSessionOptions.Default;
+        _sessionOptions.Validate();
         _onSessionClosed = onSessionClosed;
     }
 
@@ -67,8 +68,16 @@ public sealed class EntryPointListener : IAsyncDisposable
                 sock.NoDelay = true;
                 var identity = _identityFactory(sock.RemoteEndPoint);
                 var stream = new NetworkStream(sock, ownsSocket: true);
+
+                // Wrap onClosed to remove session from _sessions before invoking external callback
+                Action<EntryPointSession, string> onClosed = (s, reason) =>
+                {
+                    lock (_lock) _sessions.Remove(s);
+                    _onSessionClosed?.Invoke(s, reason);
+                };
+
                 var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
-                    stream, _sink, options: _sessionOptions, onClosed: _onSessionClosed);
+                    stream, _sink, options: _sessionOptions, onClosed: onClosed);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
             }

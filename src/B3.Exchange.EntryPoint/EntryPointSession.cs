@@ -210,7 +210,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 // without any inbound, close. The grace clock starts from the
                 // moment the probe was sent (i.e. _lastOutboundMs was bumped),
                 // so we measure the additional silence beyond idleTimeoutMs.
-                if (sinceIn >= (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs)
+                if (sinceIn >= (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs &&
+                    Volatile.Read(ref _probeOutstanding) == 1)
                 {
                     // Seam for issue #11: a future BusinessReject (templateId=206)
                     // should be enqueued here before close so the peer learns

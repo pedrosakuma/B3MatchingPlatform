@@ -15,7 +15,7 @@ public class EntryPointHeartbeatTests
     private sealed class NoOpEngineSink : IEntryPointEngineSink
     {
         public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue) { }
-        public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue) { }
+        public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void OnDecodeError(IEntryPointResponseChannel reply, string error) { }
     }
