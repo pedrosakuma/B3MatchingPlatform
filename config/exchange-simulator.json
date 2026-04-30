@@ -5,7 +5,10 @@
   //   UMDF channel. instruments file partitions instruments across channels.
   "tcp": {
     "listen": "0.0.0.0:9876",
-    "enteringFirm": 1
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
   },
   "channels": [
     {
