@@ -79,7 +79,9 @@ public sealed class EntryPointListener : IAsyncDisposable
                     identity.ConnectionId, sock.RemoteEndPoint, identity.SessionId);
                 var stream = new NetworkStream(sock, ownsSocket: true);
 
-                // Wrap onClosed to remove session from _sessions before invoking external callback
+                // Wrap onClosed to remove session from _sessions (so the
+                // disconnected EntryPointSession + its NetworkStream/Socket
+                // become GC-eligible) before invoking the external callback.
                 Action<EntryPointSession, string> onClosed = (s, reason) =>
                 {
                     lock (_lock) _sessions.Remove(s);

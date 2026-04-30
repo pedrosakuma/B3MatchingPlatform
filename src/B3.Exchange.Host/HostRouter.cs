@@ -18,6 +18,7 @@ namespace B3.Exchange.Host;
 public sealed class HostRouter : IEntryPointEngineSink
 {
     private readonly IReadOnlyDictionary<long, ChannelDispatcher> _bySecId;
+    private readonly IReadOnlyList<ChannelDispatcher> _allDispatchers;
     private readonly ILogger<HostRouter> _logger;
     private readonly Func<ulong> _nowNanos;
 
@@ -26,6 +27,9 @@ public sealed class HostRouter : IEntryPointEngineSink
     {
         ArgumentNullException.ThrowIfNull(logger);
         _bySecId = routing;
+        // De-duplicate by reference: the routing map keys by SecurityId but
+        // many securities share one dispatcher.
+        _allDispatchers = routing.Values.Distinct().ToList();
         _logger = logger;
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
@@ -61,6 +65,17 @@ public sealed class HostRouter : IEntryPointEngineSink
         // and decides whether to close the connection — the router has no
         // additional context to add here.
         _logger.LogWarning("inbound decode error from connection {ConnectionId}: {Error}", reply.ConnectionId, error);
+    }
+
+    public void OnSessionClosed(IEntryPointResponseChannel reply)
+    {
+        // A single session may have placed orders on any channel, so fan the
+        // notification out to ALL dispatchers. Each one enqueues a release
+        // command on its own dispatch thread (see
+        // ChannelDispatcher.OnSessionClosed) so the engine's
+        // single-threaded contract is preserved.
+        foreach (var disp in _allDispatchers)
+            disp.OnSessionClosed(reply);
     }
 
     private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)

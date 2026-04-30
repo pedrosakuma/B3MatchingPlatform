@@ -169,6 +169,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
                         new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
                         _currentClOrdId);
                     break;
+                case WorkKind.ReleaseOwner:
+                    if (item.Reply is not null) ReleaseOwnerOnDispatchThread(item.Reply);
+                    break;
             }
             LogCommandProcessed(ChannelNumber, item.Kind, _currentClOrdId);
         }
@@ -202,6 +205,27 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     {
         if (_packetWritten == 0) return;
         // Patch packet header with the live seq number + send time.
+        //
+        // SequenceNumber wraparound (uint, ~4.29 billion packets):
+        //   At 100 packets/sec → ~1.36 years before overflow.
+        //   At 10 000 packets/sec → ~5 days.
+        // On overflow we bump SequenceVersion (B3 UMDF field intended for
+        // exactly this kind of restart / rollover signal) and reset the
+        // counter. Downstream consumers treat a new SequenceVersion as a
+        // discontinuity and resync from snapshot — same code path they use
+        // for a host restart.
+        if (SequenceNumber == uint.MaxValue)
+        {
+            SequenceVersion++;
+            SequenceNumber = 0;
+            // The packet buffer's SequenceVersion was written by
+            // ReserveOrFlush with the pre-bump value; rewrite it now so the
+            // on-wire header matches the new (version, seq) tuple.
+            ushort newVer = SequenceVersion;
+            System.Runtime.InteropServices.MemoryMarshal.Write(
+                _packetBuf.AsSpan(B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSequenceVersionOffset, 2),
+                in newVer);
+        }
         SequenceNumber++;
         ulong now = _nowNanos();
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
@@ -209,6 +233,38 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
         LogPacketFlushed(ChannelNumber, SequenceNumber, _packetWritten);
         _packetWritten = 0;
+    }
+
+    /// <summary>Test seam: fast-forward <see cref="SequenceNumber"/> close
+    /// to <c>uint.MaxValue</c> to exercise the wraparound path without
+    /// publishing billions of packets. Must be called before any work is
+    /// processed (i.e. before <see cref="Start"/>) — there is no
+    /// thread-safety contract beyond "called from the test thread on a
+    /// quiescent dispatcher".</summary>
+    internal void TestSetSequenceNumber(uint value) => SequenceNumber = value;
+
+    private void ReleaseOwnerOnDispatchThread(IEntryPointResponseChannel reply)
+    {
+        // Sweep the orderId → reply map and drop every entry whose reply is
+        // the disconnected session. The orders themselves stay in the book
+        // (they ARE the book — passive liquidity for other sessions). We
+        // simply forget who to route the passive-side ER to: subsequent
+        // fills against those orders will publish the UMDF MBO/Trade frames
+        // as normal, but no ER_Trade is sent (there is nobody listening).
+        //
+        // After this sweep, the dispatcher holds no strong reference to
+        // `reply`, so the EntryPointSession (and its NetworkStream / Socket)
+        // becomes eligible for GC once the listener has also dropped it
+        // from its live-sessions list.
+        if (_orderOwners.Count == 0) return;
+        List<long>? toRemove = null;
+        foreach (var (orderId, owner) in _orderOwners)
+        {
+            if (ReferenceEquals(owner.Reply, reply))
+                (toRemove ??= new List<long>()).Add(orderId);
+        }
+        if (toRemove != null)
+            foreach (var oid in toRemove) _orderOwners.Remove(oid);
     }
 
     private Span<byte> ReserveOrFlush(int frameSize)
@@ -282,6 +338,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     /// </summary>
     public bool EnqueueSnapshotTick()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null, 0, 0, null, null, null));
+
+    public void OnSessionClosed(IEntryPointResponseChannel reply)
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.ReleaseOwner, reply, 0, 0, null, null, null));
 
     // ====== IMatchingEventSink ======
 
@@ -414,7 +473,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation }
+    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation, ReleaseOwner }
 
     internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
 

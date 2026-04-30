@@ -83,4 +83,18 @@ public interface IEntryPointEngineSink
     /// invalid block length, malformed body). The integration layer may close
     /// the connection or emit a generic reject.</summary>
     void OnDecodeError(IEntryPointResponseChannel reply, string error);
+
+    /// <summary>
+    /// Called once when a session's transport closes (peer disconnect, IO
+    /// error, host shutdown). The integration layer MUST drop any cached
+    /// references to <paramref name="reply"/> so the disconnected
+    /// <see cref="EntryPointSession"/> can be garbage-collected.
+    ///
+    /// The session's resting orders stay on the book — they ARE the book —
+    /// but any reply-channel back-references (e.g. orderId → reply maps used
+    /// to route passive-side fills) MUST be released. After this call the
+    /// integration layer treats further passive fills on those orders as
+    /// "unowned" (no ER emitted) until / unless a fresh session takes over.
+    /// </summary>
+    void OnSessionClosed(IEntryPointResponseChannel reply);
 }

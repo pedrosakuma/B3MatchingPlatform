@@ -19,6 +19,7 @@ public class EntryPointHeartbeatTests
         public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void OnDecodeError(IEntryPointResponseChannel reply, string error) { }
+        public void OnSessionClosed(IEntryPointResponseChannel reply) { }
     }
 
     private static byte[] BuildSequenceFrame(uint nextSeq)

@@ -420,6 +420,11 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         _logger.LogInformation("entrypoint session {ConnectionId} closing", ConnectionId);
         _sendQueue.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
+        // Notify the engine sink so it releases any cached references to this
+        // session (see IEntryPointEngineSink.OnSessionClosed). Without this the
+        // ChannelDispatcher's order-owners map keeps the session rooted for
+        // the lifetime of every resting order it placed → unbounded memory.
+        try { _sink.OnSessionClosed(this); } catch { }
         try { _onClosed?.Invoke(this, reason); } catch { }
     }
 
