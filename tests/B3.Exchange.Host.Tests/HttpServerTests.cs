@@ -61,13 +61,13 @@ public class HttpServerTests
 
         using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
 
-        var live = await client.GetAsync("/health/live");
+        using var live = await client.GetAsync("/health/live");
         Assert.Equal(System.Net.HttpStatusCode.OK, live.StatusCode);
 
-        var ready = await client.GetAsync("/health/ready");
+        using var ready = await client.GetAsync("/health/ready");
         Assert.Equal(System.Net.HttpStatusCode.OK, ready.StatusCode);
 
-        var metrics = await client.GetAsync("/metrics");
+        using var metrics = await client.GetAsync("/metrics");
         Assert.Equal(System.Net.HttpStatusCode.OK, metrics.StatusCode);
         var body = await metrics.Content.ReadAsStringAsync();
         Assert.Contains("exch_orders_in_total", body);
@@ -124,7 +124,7 @@ public class HttpServerTests
         System.Net.HttpStatusCode last = System.Net.HttpStatusCode.OK;
         while (DateTime.UtcNow < deadline)
         {
-            var resp = await client.GetAsync("/health/live");
+            using var resp = await client.GetAsync("/health/live");
             last = resp.StatusCode;
             if (last == System.Net.HttpStatusCode.ServiceUnavailable) break;
             await Task.Delay(100);

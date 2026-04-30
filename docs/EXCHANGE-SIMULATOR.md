@@ -190,7 +190,7 @@ healthcheck).
 
 ### Readiness today vs. once issues #1/#2 land
 
-`IReadinessProbe` is an `OR-of-AND` composition: the host's overall
+`IReadinessProbe` implementations are combined using logical AND: the host's overall
 readiness is the AND of every registered probe. The snapshot rotator
 (issue #1) and instrument-definition publisher (issue #2) will each
 register their own probe and flip ready once they have emitted at least

@@ -112,11 +112,18 @@ public sealed class HttpServer : IAsyncDisposable
 
     private static IPEndPoint ParseEndpoint(string s)
     {
-        var idx = s.LastIndexOf(':');
-        if (idx < 0) throw new FormatException($"expected host:port, got '{s}'");
-        var host = s.Substring(0, idx);
-        var port = int.Parse(s.Substring(idx + 1));
-        return new IPEndPoint(IPAddress.Parse(host), port);
+        // Use IPEndPoint.Parse for robust parsing of IPv4, IPv6, and hostname:port formats
+        if (!s.Contains(':'))
+            throw new FormatException($"expected host:port, got '{s}'");
+
+        try
+        {
+            return IPEndPoint.Parse(s);
+        }
+        catch (Exception ex)
+        {
+            throw new FormatException($"failed to parse endpoint '{s}'", ex);
+        }
     }
 
     public async ValueTask DisposeAsync()
