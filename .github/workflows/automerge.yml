@@ -1,0 +1,41 @@
+name: Auto-merge
+
+# Enables PR auto-merge for trusted automated PRs (Dependabot, Copilot)
+# once required status checks pass. Branch protection on `main` should
+# require the CI checks before merge — auto-merge will then complete the
+# merge automatically when they go green.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable-automerge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    if: >
+      github.event.pull_request.draft == false &&
+      (
+        github.event.pull_request.user.login == 'dependabot[bot]' ||
+        github.event.pull_request.user.login == 'github-actions[bot]' ||
+        github.event.pull_request.user.login == 'Copilot' ||
+        contains(github.event.pull_request.labels.*.name, 'automerge')
+      )
+
+    steps:
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Approve Dependabot patch/minor updates
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr review --approve "$PR_URL"

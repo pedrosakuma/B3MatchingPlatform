@@ -30,7 +30,8 @@ project.fragment.lock.json
 *.swp
 *.swo
 *~
-.vscode/
+.vscode/*
+!.vscode/mcp.json
 
 ## OS
 .DS_Store
