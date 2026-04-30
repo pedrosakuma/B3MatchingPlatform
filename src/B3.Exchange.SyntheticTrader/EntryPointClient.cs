@@ -54,6 +54,17 @@ public sealed class EntryPointClient : IAsyncDisposable
     private const int ErTradeOrderId = 108;
     // ER_Cancel (202): OrderID @ 80.
     private const int ErCancelOrderId = 80;
+    // ER_Reject (204): OrdRejReason @ 44, OrderID @ 64, OrigClOrdID @ 72.
+    private const int ErRejectReason = 44;
+    private const int ErRejectOrderId = 64;
+    private const int ErRejectOrigClOrdId = 72;
+
+    // Maximum ER body block length we are willing to allocate from the wire.
+    // The largest known ExecutionReport block (ER_Modify) is 160 bytes; we
+    // allow a generous upper bound to absorb minor schema bumps but reject
+    // pathological values that would let a malformed peer force giant
+    // allocations and OOM the process.
+    private const int MaxAcceptedBlockLength = 1024;
 
     private const int HeaderSize = 8;
 
@@ -217,14 +228,36 @@ public sealed class EntryPointClient : IAsyncDisposable
     /// <summary>Decodes an ER_Reject body. Exposed for wire-format tests.</summary>
     internal static ExecReportReject DecodeExecReportReject(ReadOnlySpan<byte> body) => new(
         ClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErClOrdId, 8)),
-        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)));
+        SecurityId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErSecurityId, 8)),
+        OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErRejectOrderId, 8)),
+        OrigClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErRejectOrigClOrdId, 8)),
+        RejectReason: body[ErRejectReason]);
 
     private bool Enqueue(byte[] frame)
     {
         if (!IsOpen) return false;
-        if (_sendQueue.Writer.TryWrite(frame)) return true;
-        // Bounded with Wait — falling here only happens if writer is closed.
-        return false;
+        try
+        {
+            while (true)
+            {
+                if (_sendQueue.Writer.TryWrite(frame)) return true;
+                // Bounded channel with FullMode=Wait: TryWrite returns false
+                // both when the writer is closed AND when the queue is full.
+                // Honor backpressure rather than silently dropping the frame.
+                if (!_sendQueue.Writer.WaitToWriteAsync(_cts.Token).AsTask().GetAwaiter().GetResult())
+                {
+                    return false;
+                }
+            }
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     private async Task RunSendLoopAsync(CancellationToken ct)
@@ -272,6 +305,12 @@ public sealed class EntryPointClient : IAsyncDisposable
                 {
                     _logWarn?.Invoke($"unexpected schemaId={schemaId}, dropping connection");
                     Close($"unexpected schemaId={schemaId}");
+                    return;
+                }
+                if (blockLength == 0 || blockLength > MaxAcceptedBlockLength)
+                {
+                    _logWarn?.Invoke($"unreasonable blockLength={blockLength} for tid={templateId}, dropping connection");
+                    Close($"unreasonable blockLength={blockLength}");
                     return;
                 }
                 var body = new byte[blockLength];
@@ -325,7 +364,7 @@ public sealed class EntryPointClient : IAsyncDisposable
                 case EntryPointFrameReader.TidExecutionReportReject:
                     {
                         var er = DecodeExecReportReject(body);
-                        _logDebug?.Invoke($"recv ER_REJ clord={er.ClOrdId}");
+                        _logDebug?.Invoke($"recv ER_REJ clord={er.ClOrdId} origClord={er.OrigClOrdId} orderId={er.OrderId} reason={er.RejectReason}");
                         OnReject?.Invoke(er);
                         break;
                     }
@@ -376,4 +415,4 @@ public readonly record struct ExecReportNew(ulong ClOrdId, long SecurityId, Orde
 public readonly record struct ExecReportTrade(ulong ClOrdId, long SecurityId, OrderSide Side, long OrderId,
     long LastQty, long LastPxMantissa, long LeavesQty, long CumQty);
 public readonly record struct ExecReportCancel(ulong ClOrdId, long SecurityId, OrderSide Side, long OrderId);
-public readonly record struct ExecReportReject(ulong ClOrdId, long SecurityId);
+public readonly record struct ExecReportReject(ulong ClOrdId, long SecurityId, long OrderId, ulong OrigClOrdId, byte RejectReason);

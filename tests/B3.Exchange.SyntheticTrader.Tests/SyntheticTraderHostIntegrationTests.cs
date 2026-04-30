@@ -18,9 +18,12 @@ public class SyntheticTraderHostIntegrationTests
 
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
-        public int PacketCount;
+        private int _packetCount;
+
+        public int PacketCount => Volatile.Read(ref _packetCount);
+
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet)
-            => Interlocked.Increment(ref PacketCount);
+            => Interlocked.Increment(ref _packetCount);
     }
 
     private static string ResolveRepoFile(string relPath)

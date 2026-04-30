@@ -289,9 +289,28 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
 
     private void OnExecReject(ExecReportReject er)
     {
+        // ER_Reject is used for both new-order rejects (ClOrdId == the
+        // submitted order's clord, registered in _byClOrd) and cancel
+        // rejects (ClOrdId == the cancel-request's clord, which we
+        // intentionally do not register). Resolve via _byClOrd first; on
+        // miss fall back to OrigClOrdId (when present) and finally to
+        // OrderId so cancel-reject failures can still be surfaced to the
+        // owning strategy instead of being silently dropped.
         OrderTracking? tracking;
         lock (_byClOrd) _byClOrd.TryGetValue(er.ClOrdId, out tracking);
-        if (tracking is null) return;
+        if (tracking is null && er.OrigClOrdId != 0)
+        {
+            lock (_byClOrd) _byClOrd.TryGetValue(er.OrigClOrdId, out tracking);
+        }
+        if (tracking is null && er.OrderId != 0)
+        {
+            lock (_byOrderId) _byOrderId.TryGetValue(er.OrderId, out tracking);
+        }
+        if (tracking is null)
+        {
+            _logWarn?.Invoke($"reject for unknown clord={er.ClOrdId} origClord={er.OrigClOrdId} orderId={er.OrderId} reason={er.RejectReason}");
+            return;
+        }
         if (_instruments.TryGetValue(tracking.SecurityId, out var inst))
         {
             lock (inst.Sync) tracking.PerStrategy.PendingByTag.Remove(tracking.ClientTag);

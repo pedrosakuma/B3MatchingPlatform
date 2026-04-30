@@ -134,8 +134,8 @@ public class RunnerHandlerTests
         runner.TestRaiseCancel(new ExecReportCancel(ClOrdId: 8002, SecurityId: Sec, Side: OrderSide.Buy, OrderId: 1004));
 
         // Reject 5 and 6 — pre-ack rejection.
-        runner.TestRaiseReject(new ExecReportReject(ClOrdId: 5, SecurityId: Sec));
-        runner.TestRaiseReject(new ExecReportReject(ClOrdId: 6, SecurityId: Sec));
+        runner.TestRaiseReject(new ExecReportReject(ClOrdId: 5, SecurityId: Sec, OrderId: 0, OrigClOrdId: 0, RejectReason: 0));
+        runner.TestRaiseReject(new ExecReportReject(ClOrdId: 6, SecurityId: Sec, OrderId: 0, OrigClOrdId: 0, RejectReason: 0));
 
         Assert.Equal(0, runner.ByClOrdCount);
         Assert.Equal(0, runner.ByOrderIdCount);
