@@ -118,8 +118,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
                 break;
             case EntryPointFrameReader.TidOrderCancelRequest:
-                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out _, out var cnErr))
-                    _sink.EnqueueCancel(cn, this, cnClOrd);
+                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
+                    _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
                 else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
                 break;
             default:
@@ -209,13 +209,13 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueueExact(frame, n);
     }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!IsOpen) return false;
         var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportCancelTotal);
         int n = ExecutionReportEncoder.EncodeExecReportCancel(frame.AsSpan(0, ExecutionReportEncoder.ExecReportCancelTotal),
             SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            e.Side, clOrdIdValue, origClOrdIdValue: 0, e.OrderId,
+            e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
             e.SecurityId, e.OrderId,
             (ulong)e.RptSeq, e.TransactTimeNanos,
             cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);

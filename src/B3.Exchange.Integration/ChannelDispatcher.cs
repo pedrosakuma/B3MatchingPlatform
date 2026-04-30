@@ -37,6 +37,15 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private readonly ushort _tradeDate;
 
     private readonly Dictionary<long, OrderOwnership> _orderOwners = new();
+    /// <summary>
+    /// Per-channel reverse index from <c>(EnteringFirm, ClOrdID)</c> to engine-assigned
+    /// <c>orderId</c>. Populated when an order enters the book (<see cref="OnOrderAccepted"/>)
+    /// and evicted when it leaves (<see cref="OnOrderCanceled"/>, fully-filled
+    /// <see cref="OnOrderFilled"/>). Allows clients to send Cancel/Replace by their own
+    /// <c>OrigClOrdID</c> without tracking the engine-assigned id.
+    /// All access happens on the dispatch thread, so no synchronisation is required.
+    /// </summary>
+    private readonly Dictionary<(uint Firm, ulong ClOrdId), long> _clOrdIdIndex = new();
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
     private IEntryPointResponseChannel? _currentReply;
@@ -97,8 +106,36 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
             switch (item.Kind)
             {
                 case WorkKind.New: _engine.Submit(item.NewOrder!); break;
-                case WorkKind.Cancel: _engine.Cancel(item.Cancel!); break;
-                case WorkKind.Replace: _engine.Replace(item.Replace!); break;
+                case WorkKind.Cancel:
+                    {
+                        var cancel = item.Cancel!;
+                        if (cancel.OrderId == 0)
+                        {
+                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            {
+                                EmitUnknownOrderIdReject(cancel.ClOrdId, cancel.SecurityId, cancel.EnteredAtNanos);
+                                break;
+                            }
+                            cancel = cancel with { OrderId = resolvedId };
+                        }
+                        _engine.Cancel(cancel);
+                        break;
+                    }
+                case WorkKind.Replace:
+                    {
+                        var replace = item.Replace!;
+                        if (replace.OrderId == 0)
+                        {
+                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            {
+                                EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
+                                break;
+                            }
+                            replace = replace with { OrderId = resolvedId };
+                        }
+                        _engine.Replace(replace);
+                        break;
+                    }
                 case WorkKind.DecodeError:
                     _currentReply?.WriteExecutionReportReject(
                         new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
@@ -113,6 +150,23 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
         }
+    }
+
+    private bool TryResolveByClOrdId(IEntryPointResponseChannel reply, ulong origClOrdId, out long orderId)
+    {
+        if (origClOrdId != 0 && _clOrdIdIndex.TryGetValue((reply.EnteringFirm, origClOrdId), out orderId))
+            return true;
+        orderId = 0;
+        return false;
+    }
+
+    private void EmitUnknownOrderIdReject(string clOrdId, long securityId, ulong nowNanos)
+    {
+        // Surface the failure directly as an ER_Reject so the client gets a
+        // clear, deterministic response instead of a silently dropped command.
+        _currentReply?.WriteExecutionReportReject(
+            new RejectEvent(clOrdId, securityId, 0, RejectReason.UnknownOrderId, nowNanos),
+            _currentClOrdId);
     }
 
     private void FlushPacket()
@@ -154,8 +208,8 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.New, reply, clOrdIdValue, 0, cmd, null, null));
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, 0, null, cmd, null));
+    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, origClOrdIdValue, null, cmd, null));
 
     public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, reply, clOrdIdValue, origClOrdIdValue, null, null, cmd));
@@ -168,7 +222,11 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     public void OnOrderAccepted(in OrderAcceptedEvent e)
     {
         if (_currentReply != null)
-            _orderOwners[e.OrderId] = new OrderOwnership(_currentReply, _currentClOrdId);
+        {
+            _orderOwners[e.OrderId] = new OrderOwnership(_currentReply, _currentClOrdId, _currentReply.EnteringFirm);
+            if (_currentClOrdId != 0)
+                _clOrdIdIndex[(_currentReply.EnteringFirm, _currentClOrdId)] = e.OrderId;
+        }
 
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
@@ -216,7 +274,9 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
         if (_orderOwners.Remove(e.OrderId, out var owner))
         {
-            owner.Reply.WriteExecutionReportCancel(e, owner.ClOrdId);
+            if (owner.ClOrdId != 0)
+                _clOrdIdIndex.Remove((owner.EnteringFirm, owner.ClOrdId));
+            owner.Reply.WriteExecutionReportCancel(e, _currentClOrdId != 0 ? _currentClOrdId : owner.ClOrdId, owner.ClOrdId);
         }
     }
 
@@ -234,7 +294,8 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
             e.SecurityId, e.OrderId, entryType, e.FinalFilledQuantity, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        _orderOwners.Remove(e.OrderId);
+        if (_orderOwners.Remove(e.OrderId, out var owner) && owner.ClOrdId != 0)
+            _clOrdIdIndex.Remove((owner.EnteringFirm, owner.ClOrdId));
     }
 
     public void OnTrade(in TradeEvent e)
@@ -287,7 +348,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     internal enum WorkKind : byte { New, Cancel, Replace, DecodeError }
 
-    internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId);
+    internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
 
     internal sealed record WorkItem(
         WorkKind Kind,

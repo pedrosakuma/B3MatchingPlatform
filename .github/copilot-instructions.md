@@ -107,8 +107,9 @@ Layered projects under `src/` (build order roughly bottom-up):
   not flushed individually.
 - **Prices are implicit /10000 mantissas** on the wire (see the worked example
   in `docs/EXCHANGE-SIMULATOR.md`).
-- **EntryPoint v1 limitation:** `Cancel` and `Modify` require an explicit
-  `OrderID`; `OrigClOrdID`-only lookup is not implemented.
+- **Cancel/Replace lookup:** `Cancel` and `Modify` accept either an explicit
+  engine `OrderID` or `OrigClOrdID`. The `(EnteringFirm, ClOrdID) → OrderID`
+  index lives in `ChannelDispatcher` and is mutated only on the dispatch thread.
 - **Single-tenant:** every TCP session shares `tcp.enteringFirm` from config;
   per-session firm assignment is not implemented.
 - **Schemas are vendored.** Do not hand-edit files under `schemas/`; regenerate

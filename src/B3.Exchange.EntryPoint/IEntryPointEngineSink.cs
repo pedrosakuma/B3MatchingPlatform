@@ -34,7 +34,7 @@ public interface IEntryPointResponseChannel
     bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty);
 
     /// <summary>Order canceled (client cancel, IOC remainder, replace-lost-priority).</summary>
-    bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue);
+    bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>Order modified (in-place priority-preserving replace).</summary>
     bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
@@ -56,7 +56,7 @@ public interface IEntryPointResponseChannel
 public interface IEntryPointEngineSink
 {
     void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue);
-    void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue);
+    void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
     void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>Called when a frame fails decoding (unsupported template,

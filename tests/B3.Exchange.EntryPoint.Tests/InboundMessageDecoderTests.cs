@@ -41,22 +41,78 @@ public class InboundMessageDecoderTests
     }
 
     [Fact]
-    public void RejectsCancelWithoutOrderId()
+    public void RejectsCancelWithoutOrderIdAndOrigClOrdId()
     {
         Span<byte> body = stackalloc byte[76];
         body.Clear();
         var ok = InboundMessageDecoder.TryDecodeCancel(body, 0UL, out _, out _, out _, out var err);
         Assert.False(ok);
         Assert.Contains("OrderID", err);
+        Assert.Contains("OrigClOrdID", err);
     }
 
     [Fact]
-    public void RejectsReplaceWithoutOrderId()
+    public void RejectsReplaceWithoutOrderIdAndOrigClOrdId()
     {
         Span<byte> body = stackalloc byte[98];
         body.Clear();
         var ok = InboundMessageDecoder.TryDecodeReplace(body, 0UL, out _, out _, out _, out var err);
         Assert.False(ok);
         Assert.Contains("OrderID", err);
+        Assert.Contains("OrigClOrdID", err);
+    }
+
+    [Fact]
+    public void DecodesCancelByOrigClOrdIdOnly()
+    {
+        Span<byte> body = stackalloc byte[76];
+        body.Clear();
+        ulong clOrdId = 42UL;
+        long secId = 123L;
+        ulong orderId = 0UL;          // not provided
+        ulong origClOrdId = 7UL;     // resolution key
+        MemoryMarshal.Write(body.Slice(20, 8), in clOrdId);
+        MemoryMarshal.Write(body.Slice(28, 8), in secId);
+        MemoryMarshal.Write(body.Slice(36, 8), in orderId);
+        MemoryMarshal.Write(body.Slice(44, 8), in origClOrdId);
+        body[52] = (byte)'1';
+
+        var ok = InboundMessageDecoder.TryDecodeCancel(body, 9_000UL,
+            out var cmd, out var clOrd, out var origClOrd, out var err);
+
+        Assert.True(ok, err);
+        Assert.Equal(clOrdId, clOrd);
+        Assert.Equal(origClOrdId, origClOrd);
+        Assert.Equal(0L, cmd.OrderId);   // unresolved at decode time
+        Assert.Equal(secId, cmd.SecurityId);
+    }
+
+    [Fact]
+    public void DecodesReplaceByOrigClOrdIdOnly()
+    {
+        Span<byte> body = stackalloc byte[98];
+        body.Clear();
+        ulong clOrdId = 99UL;
+        long secId = 555L;
+        long qty = 200L;
+        long price = 100_000L;
+        ulong orderId = 0UL;
+        ulong origClOrdId = 42UL;
+        MemoryMarshal.Write(body.Slice(20, 8), in clOrdId);
+        MemoryMarshal.Write(body.Slice(48, 8), in secId);
+        MemoryMarshal.Write(body.Slice(60, 8), in qty);
+        MemoryMarshal.Write(body.Slice(68, 8), in price);
+        MemoryMarshal.Write(body.Slice(76, 8), in orderId);
+        MemoryMarshal.Write(body.Slice(84, 8), in origClOrdId);
+
+        var ok = InboundMessageDecoder.TryDecodeReplace(body, 9_000UL,
+            out var cmd, out var clOrd, out var origClOrd, out var err);
+
+        Assert.True(ok, err);
+        Assert.Equal(clOrdId, clOrd);
+        Assert.Equal(origClOrdId, origClOrd);
+        Assert.Equal(0L, cmd.OrderId);
+        Assert.Equal(qty, cmd.NewQuantity);
+        Assert.Equal(price, cmd.NewPriceMantissa);
     }
 }

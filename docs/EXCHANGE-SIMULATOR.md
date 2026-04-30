@@ -99,9 +99,13 @@ Exposes:
 | 101         | SimpleModifyOrderV2 | 98          |
 | 105         | OrderCancelRequest  | 76          |
 
-v1 limitation: `Cancel` and `Modify` require an explicit `OrderID`.
-`OrigClOrdID`-only lookup (find the order by its original client id) is
-deferred to a later milestone.
+`Cancel` and `Modify` accept either an explicit engine-assigned `OrderID` or
+the original `OrigClOrdID` (the `ClOrdID` of the order being modified/cancelled).
+The integration layer maintains a per-channel `(EnteringFirm, ClOrdID) → OrderID`
+index that is populated when an order rests on the book and evicted when the
+order leaves (cancel or full fill). Submitting both fields is allowed; the
+explicit `OrderID` wins. If neither is present, or if the `OrigClOrdID` is
+unknown to the channel, an `ExecutionReport_Reject` is returned.
 
 ### Outbound (TCP execution reports)
 
