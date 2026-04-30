@@ -129,7 +129,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
                         var cancel = item.Cancel!;
                         if (cancel.OrderId == 0)
                         {
-                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            if (item.Reply is null || !TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
                             {
                                 EmitUnknownOrderIdReject(cancel.ClOrdId, cancel.SecurityId, cancel.EnteredAtNanos);
                                 break;
@@ -144,7 +144,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
                         var replace = item.Replace!;
                         if (replace.OrderId == 0)
                         {
-                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            if (item.Reply is null || !TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
                             {
                                 EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
                                 break;
@@ -256,7 +256,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     /// defers the next refresh by one period). Safe to call from any thread.
     /// </summary>
     public bool EnqueueSnapshotTick()
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null!, 0, 0, null, null, null));
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null, 0, 0, null, null, null));
 
     // ====== IMatchingEventSink ======
 
@@ -393,7 +393,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     internal sealed record WorkItem(
         WorkKind Kind,
-        IEntryPointResponseChannel Reply,
+        IEntryPointResponseChannel? Reply,
         ulong ClOrdId,
         ulong OrigClOrdId,
         NewOrderCommand? NewOrder,
