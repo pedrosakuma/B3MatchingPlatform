@@ -46,8 +46,15 @@ public class HostRouterTests
     {
         var inst = new Instrument
         {
-            Symbol = "TEST", SecurityId = 42, TickSize = 0.01m, LotSize = 1,
-            MinPrice = 0.01m, MaxPrice = 1000m, Currency = "BRL", Isin = "X", SecurityType = "CS"
+            Symbol = "TEST",
+            SecurityId = 42,
+            TickSize = 0.01m,
+            LotSize = 1,
+            MinPrice = 0.01m,
+            MaxPrice = 1000m,
+            Currency = "BRL",
+            Isin = "X",
+            SecurityType = "CS"
         };
         var pkt = new NoopPacketSink();
         var disp = new ChannelDispatcher(channelNumber: 1,

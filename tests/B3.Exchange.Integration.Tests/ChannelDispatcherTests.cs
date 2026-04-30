@@ -13,9 +13,15 @@ public class ChannelDispatcherTests
 
     private static Instrument Petr4 => new()
     {
-        Symbol = "PETR4", SecurityId = Petr, TickSize = 0.01m, LotSize = 100,
-        MinPrice = 0.01m, MaxPrice = 1_000m, Currency = "BRL",
-        Isin = "BRPETRACNPR6", SecurityType = "EQUITY",
+        Symbol = "PETR4",
+        SecurityId = Petr,
+        TickSize = 0.01m,
+        LotSize = 100,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000m,
+        Currency = "BRL",
+        Isin = "BRPETRACNPR6",
+        SecurityType = "EQUITY",
     };
 
     private static long Px(decimal p) => (long)(p * 10_000m);
