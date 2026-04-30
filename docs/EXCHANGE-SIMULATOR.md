@@ -67,6 +67,7 @@ Exposes:
 ```json
 {
   "tcp": { "listen": "0.0.0.0:9876", "enteringFirm": 1 },
+  "http": { "listen": "0.0.0.0:8080", "livenessStaleMs": 5000 },
   "channels": [
     {
       "channelNumber": 84,
@@ -82,10 +83,60 @@ Exposes:
 * `tcp.listen` — bind address for the EntryPoint TCP server.
 * `tcp.enteringFirm` — uint stamped on every accepted order (single-firm
   default; per-session firm assignment is not yet implemented).
+* `http` — **optional** Kestrel-hosted operability endpoint exposing
+  `/health/live`, `/health/ready`, and `/metrics`. Omit the entire block to
+  disable HTTP.
+  * `http.listen` — bind address. Default `0.0.0.0:8080`.
+  * `http.livenessStaleMs` — `/health/live` returns 503 if any dispatcher
+    has not heartbeat within this window. Default `5000` (5 s). Each
+    dispatcher records a heartbeat on every loop wakeup (1 s timer +
+    every processed command), so a stuck or dead loop is detected within
+    `livenessStaleMs + ~1s`.
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
+
+## Operability endpoints
+
+Only enabled when the `http` config block is present. All endpoints are
+plain HTTP (no TLS, no auth — assume an in-cluster scrape target / sidecar
+healthcheck).
+
+| Path             | Status semantics                                                                |
+|------------------|---------------------------------------------------------------------------------|
+| `/health/live`   | 200 if every dispatcher loop has ticked within `http.livenessStaleMs`; else 503 |
+| `/health/ready`  | 200 once every registered `IReadinessProbe` reports ready; else 503             |
+| `/metrics`       | Prometheus 0.0.4 text exposition (always 200)                                   |
+
+`/metrics` series:
+
+| Metric                                        | Type    | Labels             | Notes                                                                 |
+|-----------------------------------------------|---------|--------------------|-----------------------------------------------------------------------|
+| `exch_orders_in_total`                        | counter | `channel`          | NewOrder / Cancel / Replace commands processed.                        |
+| `exch_packets_out_total`                      | counter | `channel`          | UMDF packets handed to the multicast sink.                            |
+| `exch_snapshots_emitted_total`                | counter | `channel`          | Stub — incremented by the snapshot rotator (issue #1) once merged.    |
+| `exch_instrument_defs_emitted_total`          | counter | `channel`          | Stub — incremented by the instrument-definition publisher (issue #2). |
+| `exch_dispatch_loop_last_tick_unixms`         | gauge   | `channel`          | Unix ms of the dispatcher loop's last heartbeat.                       |
+| `exch_send_queue_depth`                       | gauge   | `channel,session`  | Per-`EntryPointSession` outbound queue. `channel="all"` because the queue is shared across channels. |
+
+### Readiness today vs. once issues #1/#2 land
+
+`IReadinessProbe` is an `OR-of-AND` composition: the host's overall
+readiness is the AND of every registered probe. The snapshot rotator
+(issue #1) and instrument-definition publisher (issue #2) will each
+register their own probe and flip ready once they have emitted at least
+one snapshot / definition per loaded instrument since startup.
+
+Until those land, the host registers a single `StartupReadinessProbe`
+that flips ready as soon as `ExchangeHost.StartAsync` returns, so
+`/health/ready` is effectively equivalent to `/health/live` for now.
+
+### Docker `HEALTHCHECK`
+
+`Dockerfile` ships a `HEALTHCHECK` that hits `/health/live` via `wget`.
+If you disable HTTP in your config, override `HEALTHCHECK NONE` in a
+derived image.
 
 ## Wire protocol
 

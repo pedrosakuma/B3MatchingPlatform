@@ -26,6 +26,14 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
 
+    /// <summary>
+    /// Maximum time the dispatch loop will block waiting for new work before
+    /// emitting a liveness heartbeat. Kept short (1s) so the
+    /// <c>/health/live</c> default threshold (5s) is comfortably exceeded
+    /// only when the loop thread is actually wedged.
+    /// </summary>
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
+
     public byte ChannelNumber { get; }
     public ushort SequenceVersion { get; private set; }
     public uint SequenceNumber { get; private set; }
@@ -35,6 +43,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private readonly IUmdfPacketSink _packetSink;
     private readonly Func<ulong> _nowNanos;
     private readonly ushort _tradeDate;
+    private readonly ChannelMetrics? _metrics;
 
     private readonly Dictionary<long, OrderOwnership> _orderOwners = new();
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
@@ -47,12 +56,14 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private Task? _loopTask;
 
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
-        Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity)
+        Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
+        ChannelMetrics? metrics = null)
     {
         ChannelNumber = channelNumber;
         _packetSink = packetSink;
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _tradeDate = tradeDate;
+        _metrics = metrics;
         SequenceVersion = 1;
         SequenceNumber = 0;
         _inbound = System.Threading.Channels.Channel.CreateBounded<WorkItem>(
@@ -76,15 +87,45 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
+        // Heartbeat is recorded on every loop wakeup (whether triggered by
+        // new work or by the periodic timeout) so a stuck/dead dispatch
+        // thread is detected by /health/live within HeartbeatInterval +
+        // probe threshold.
         try
         {
-            await foreach (var item in _inbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            var reader = _inbound.Reader;
+            while (!ct.IsCancellationRequested)
             {
-                ProcessOne(item);
+                RecordHeartbeat();
+                Task<bool> waitTask = reader.WaitToReadAsync(ct).AsTask();
+                Task completed;
+                try
+                {
+                    completed = await Task.WhenAny(waitTask, Task.Delay(HeartbeatInterval, ct))
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { return; }
+
+                if (completed == waitTask)
+                {
+                    bool more;
+                    try { more = await waitTask.ConfigureAwait(false); }
+                    catch (OperationCanceledException) { return; }
+                    if (!more) return; // channel completed
+                    while (reader.TryRead(out var item))
+                    {
+                        ProcessOne(item);
+                        RecordHeartbeat();
+                    }
+                }
+                // else: timeout — loop and re-record the heartbeat.
             }
         }
         catch (OperationCanceledException) { }
     }
+
+    private void RecordHeartbeat()
+        => _metrics?.RecordTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
     internal void ProcessOne(in WorkItem item)
     {
@@ -96,9 +137,9 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         {
             switch (item.Kind)
             {
-                case WorkKind.New: _engine.Submit(item.NewOrder!); break;
-                case WorkKind.Cancel: _engine.Cancel(item.Cancel!); break;
-                case WorkKind.Replace: _engine.Replace(item.Replace!); break;
+                case WorkKind.New: _metrics?.IncOrdersIn(); _engine.Submit(item.NewOrder!); break;
+                case WorkKind.Cancel: _metrics?.IncOrdersIn(); _engine.Cancel(item.Cancel!); break;
+                case WorkKind.Replace: _metrics?.IncOrdersIn(); _engine.Replace(item.Replace!); break;
                 case WorkKind.DecodeError:
                     _currentReply?.WriteExecutionReportReject(
                         new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
@@ -124,6 +165,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), SequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
+        _metrics?.IncPacketsOut();
         _packetWritten = 0;
     }
 
@@ -276,6 +318,18 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     }
 
     // ====== shutdown ======
+
+    /// <summary>
+    /// Test hook: simulate a wedged dispatcher by cancelling the loop
+    /// without disposing. Subsequent enqueues remain accepted by the
+    /// channel but will never be processed, so liveness probes can verify
+    /// that <c>/health/live</c> flips to 503 within the configured stale
+    /// threshold.
+    /// </summary>
+    internal void KillForTesting()
+    {
+        try { _cts.Cancel(); } catch { }
+    }
 
     public async ValueTask DisposeAsync()
     {

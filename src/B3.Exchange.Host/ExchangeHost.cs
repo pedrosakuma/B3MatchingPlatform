@@ -24,8 +24,12 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
     private readonly List<IDisposable> _ownedSinks = new();
+    private readonly MetricsRegistry _metrics = new();
+    private readonly StartupReadinessProbe _startupProbe = new("startup");
+    private readonly List<IReadinessProbe> _probes = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
+    private HttpServer? _http;
 
     public ExchangeHost(HostConfig config, Action<string>? log = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null)
@@ -33,11 +37,23 @@ public sealed class ExchangeHost : IAsyncDisposable
         _config = config;
         _log = log;
         _packetSinkFactory = packetSinkFactory;
+        _probes.Add(_startupProbe);
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
+    public IPEndPoint? HttpEndpoint => _http?.LocalEndpoint;
+    public MetricsRegistry Metrics => _metrics;
+    internal IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
 
-    public Task StartAsync()
+    /// <summary>
+    /// Register an additional readiness probe. Intended for the snapshot
+    /// rotator (#1) and instrument-definition publisher (#2) once they
+    /// land — each subsystem registers its own probe so /health/ready
+    /// only flips green when every dependency is satisfied.
+    /// </summary>
+    public void RegisterReadinessProbe(IReadinessProbe probe) => _probes.Add(probe);
+
+    public async Task StartAsync()
     {
         var routing = new Dictionary<long, ChannelDispatcher>();
         foreach (var ch in _config.Channels)
@@ -54,10 +70,12 @@ public sealed class ExchangeHost : IAsyncDisposable
                 sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
+            var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s => new MatchingEngine(instruments, s),
-                packetSink: sink);
+                packetSink: sink,
+                metrics: channelMetrics);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -82,7 +100,32 @@ public sealed class ExchangeHost : IAsyncDisposable
             });
         _listener.Start();
         _log?.Invoke($"listening on {_listener.LocalEndpoint}");
-        return Task.CompletedTask;
+
+        _metrics.SetSessionProvider(new ListenerSessionProvider(_listener));
+
+        if (_config.Http != null)
+        {
+            _http = new HttpServer(_config.Http, _metrics, _probes, _log);
+            await _http.StartAsync().ConfigureAwait(false);
+        }
+
+        _startupProbe.MarkReady();
+    }
+
+    private sealed class ListenerSessionProvider : ISessionMetricsProvider
+    {
+        private readonly EntryPointListener _listener;
+        public ListenerSessionProvider(EntryPointListener listener) { _listener = listener; }
+        public IEnumerable<SessionQueueSample> Sample()
+        {
+            foreach (var s in _listener.ActiveSessions)
+            {
+                if (!s.IsOpen) continue;
+                yield return new SessionQueueSample(
+                    SessionId: "conn-" + s.ConnectionId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    QueueDepth: s.SendQueueDepth);
+            }
+        }
     }
 
     private static IPEndPoint ParseEndpoint(string s)
@@ -96,6 +139,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();

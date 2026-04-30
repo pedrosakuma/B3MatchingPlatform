@@ -26,6 +26,17 @@ public sealed class EntryPointListener : IAsyncDisposable
 
     public IPEndPoint? LocalEndpoint => (IPEndPoint?)_listener?.LocalEndpoint;
 
+    /// <summary>
+    /// Snapshot of currently active sessions for diagnostics / metrics.
+    /// Closed sessions remain in the list until <see cref="DisposeAsync"/>
+    /// runs; callers should filter on <see cref="EntryPointSession.IsOpen"/>
+    /// if they only want live ones.
+    /// </summary>
+    public IReadOnlyList<EntryPointSession> ActiveSessions
+    {
+        get { lock (_lock) return _sessions.ToArray(); }
+    }
+
     public EntryPointListener(IPEndPoint endpoint, IEntryPointEngineSink sink,
         Func<EndPoint?, AcceptedConnection>? identityFactory = null)
     {

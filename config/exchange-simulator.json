@@ -7,6 +7,15 @@
     "listen": "0.0.0.0:9876",
     "enteringFirm": 1
   },
+  // Optional Kestrel-hosted operability endpoint. Remove this block to
+  // disable HTTP entirely. Exposes:
+  //   GET /health/live   liveness (dispatcher heartbeats fresher than livenessStaleMs)
+  //   GET /health/ready  readiness (all registered probes ready)
+  //   GET /metrics       Prometheus 0.0.4 text exposition
+  "http": {
+    "listen": "0.0.0.0:8080",
+    "livenessStaleMs": 5000
+  },
   "channels": [
     {
       "channelNumber": 84,

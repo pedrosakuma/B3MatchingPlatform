@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="B3.Exchange.Integration.Tests" />
+    <InternalsVisibleTo Include="B3.Exchange.Host.Tests" />
   </ItemGroup>
 
 </Project>
