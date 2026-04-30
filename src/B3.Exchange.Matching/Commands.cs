@@ -22,6 +22,33 @@ public enum RejectReason : byte
     MarketNoLiquidity,
     MarketNotImmediateOrCancel,
     InvalidTimeInForceForMarket,
+    /// <summary>The aggressor would have crossed against a resting order from
+    /// the same <see cref="NewOrderCommand.EnteringFirm"/> and the channel's
+    /// <see cref="SelfTradePrevention"/> policy is configured to cancel the
+    /// aggressor's residual quantity.</summary>
+    SelfTradePrevention,
+}
+
+/// <summary>
+/// Per-channel self-trade prevention policy. Evaluated by the engine each time
+/// an aggressor would cross against a resting order whose
+/// <c>EnteringFirm</c> matches the aggressor's. Default <see cref="None"/>
+/// preserves the original "trade as today" behaviour.
+/// </summary>
+public enum SelfTradePrevention : byte
+{
+    /// <summary>No self-trade prevention; aggressor and maker trade normally.</summary>
+    None,
+    /// <summary>Cancel the aggressor's remaining (post-other-firm-fills) residual
+    /// and stop further matching. Trades already executed against other firms
+    /// stand. The conflicting resting order is left untouched.</summary>
+    CancelAggressor,
+    /// <summary>Cancel the conflicting resting order and continue matching the
+    /// aggressor against the next maker (which may be from a different firm).</summary>
+    CancelResting,
+    /// <summary>Cancel both the conflicting resting order and the aggressor's
+    /// residual; stop further matching.</summary>
+    CancelBoth,
 }
 
 /// <summary>
@@ -38,6 +65,10 @@ public enum CancelReason : byte
     /// <summary>Replace lost time priority — old resting order is logically deleted
     /// before the new one is inserted (caller emits DEL+NEW MBO frames).</summary>
     ReplaceLostPriority,
+    /// <summary>Resting order removed by the channel's <see cref="SelfTradePrevention"/>
+    /// policy because an incoming aggressor from the same firm would have
+    /// crossed against it.</summary>
+    SelfTradePrevention,
 }
 
 /// <summary>

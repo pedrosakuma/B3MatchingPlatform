@@ -73,6 +73,7 @@ Exposes:
       "incrementalGroup": "224.0.20.84",
       "incrementalPort": 30084,
       "ttl": 1,
+      "selfTradePrevention": "none",
       "instruments": "config/instruments-eqt.json"
     }
   ]
@@ -84,6 +85,22 @@ Exposes:
   default; per-session firm assignment is not yet implemented).
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
+* `channels[].selfTradePrevention` — per-channel self-trade prevention policy
+  evaluated each time an aggressor would cross against a resting order from
+  the same `EnteringFirm`. One of:
+  * `none` (default) — trade as today; firms can self-trade.
+  * `cancel-aggressor` — cancel the aggressor's residual quantity and stop
+    further matching. Trades already executed against other firms stand. The
+    originating session receives an `ExecutionReport_Reject` with reason
+    `SelfTradePrevention`; no MBO event is emitted (the aggressor never
+    rested).
+  * `cancel-resting` — cancel the conflicting resting order and continue
+    matching the aggressor against the next maker. Each canceled resting
+    order produces a `DeleteOrder_MBO_51` and an `ExecutionReport_Cancel`
+    routed to the original resting-order owner (cancel reason
+    `SelfTradePrevention`).
+  * `cancel-both` — cancel both the conflicting resting order and the
+    aggressor's residual; stop further matching.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
 

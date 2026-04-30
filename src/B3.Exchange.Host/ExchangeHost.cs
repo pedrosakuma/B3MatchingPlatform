@@ -56,7 +56,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             if (sink is IDisposable d) _ownedSinks.Add(d);
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
-                engineFactory: s => new MatchingEngine(instruments, s),
+                engineFactory: s => new MatchingEngine(instruments, s, ch.SelfTradePrevention),
                 packetSink: sink);
             disp.Start();
             _dispatchers.Add(disp);
