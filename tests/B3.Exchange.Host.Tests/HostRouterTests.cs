@@ -22,7 +22,7 @@ public class HostRouterTests
         public List<RejectEvent> Rejects { get; } = new();
         public bool WriteExecutionReportNew(in OrderAcceptedEvent e) => true;
         public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
-        public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue) => true;
+        public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
         public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) => true;
         public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue) { Rejects.Add(e); return true; }
     }

@@ -33,10 +33,10 @@ public sealed class HostRouter : IEntryPointEngineSink
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
-            disp.EnqueueCancel(cmd, reply, clOrdIdValue);
+            disp.EnqueueCancel(cmd, reply, clOrdIdValue, origClOrdIdValue);
         else
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
