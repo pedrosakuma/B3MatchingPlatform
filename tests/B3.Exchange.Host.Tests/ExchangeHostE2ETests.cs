@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Integration;
+using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -135,6 +136,190 @@ public class ExchangeHostE2ETests
 
         var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
         Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, er.TemplateId);
+    }
+
+    [Fact]
+    public async Task CancelByOrigClOrdId_RoundTripsExecutionReportCancel_WithBothClOrdIdAndOrigClOrdId()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // BUY PETR4 100 @ 12.34 with ClOrdId=4242 (rests).
+        var newOrder = BuildSimpleNewOrder(clOrdId: 4242, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+        await stream.WriteAsync(newOrder);
+
+        var erNew = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, erNew.TemplateId);
+
+        // Cancel by OrigClOrdID only (OrderID=0). New ClOrdId=4243.
+        var cancel = BuildOrderCancelRequest(clOrdId: 4243, secId: Petr,
+            orderId: 0, origClOrdId: 4242, side: '1');
+        await stream.WriteAsync(cancel);
+
+        var erCancel = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, erCancel.TemplateId);
+
+        // ER_Cancel body must carry both ClOrdID=4243 and OrigClOrdID=4242.
+        // Per ExecutionReportEncoder layout: ClOrdID@20, OrigClOrdID@28.
+        ulong clOrdIdField = BinaryPrimitives.ReadUInt64LittleEndian(erCancel.Body.AsSpan(20, 8));
+        ulong origClOrdIdField = BinaryPrimitives.ReadUInt64LittleEndian(erCancel.Body.AsSpan(88, 8));
+        Assert.Equal(4243UL, clOrdIdField);
+        Assert.Equal(4242UL, origClOrdIdField);
+    }
+
+    [Fact]
+    public async Task ReplaceByOrigClOrdId_LostPriority_RoundTripsCancelThenNew_WithOrigClOrdId()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        var newOrder = BuildSimpleNewOrder(clOrdId: 5000, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+        await stream.WriteAsync(newOrder);
+        var erNew = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, erNew.TemplateId);
+
+        // Replace by OrigClOrdID with a NEW PRICE (loses priority): expect ER_Cancel+ER_New.
+        var replace = BuildSimpleModifyOrder(clOrdId: 5001, secId: Petr,
+            side: '1', qty: 100, priceMantissa: 123_500, orderId: 0, origClOrdId: 5000);
+        await stream.WriteAsync(replace);
+
+        var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, er2.TemplateId);
+        ulong clOrd = BinaryPrimitives.ReadUInt64LittleEndian(er2.Body.AsSpan(20, 8));
+        ulong origClOrd = BinaryPrimitives.ReadUInt64LittleEndian(er2.Body.AsSpan(88, 8));
+        Assert.Equal(5001UL, clOrd);
+        Assert.Equal(5000UL, origClOrd);
+
+        var er3 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er3.TemplateId);
+    }
+
+    [Fact]
+    public async Task InstrumentDefinitionPublisher_EmitsAllInstrumentsWithinOneCycle()
+    {
+        var (cfg, mboSink) = BuildConfig();
+        // Enable InstrumentDef publisher with a short cadence so the host
+        // emits a full cycle inside the test deadline.
+        cfg.Channels[0].InstrumentDefinition = new InstrumentDefinitionConfig
+        {
+            ChannelNumber = 184,
+            Group = "239.255.43.184",
+            Port = 31184,
+            Ttl = 0,
+            CadenceMs = 50,
+        };
+
+        var idSink = new RecordingPacketSink();
+        await using var host = new ExchangeHost(cfg,
+            packetSinkFactory: _ => mboSink,
+            instrumentDefSinkFactory: (_, _) => idSink);
+        await host.StartAsync();
+
+        // Wait up to 2s for the first cycle.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (idSink.Packets)
+            {
+                if (idSink.Packets.Count > 0) break;
+            }
+            await Task.Delay(20);
+        }
+
+        // Decode every SecurityDefinition_12 frame across all packets and
+        // assert the consumer can resolve every configured SecurityID +
+        // Symbol — i.e. a fresh subscriber learns the instrument table from
+        // the bus alone.
+        var instruments = B3.Exchange.Instruments.InstrumentLoader.LoadFromFile(
+            cfg.Channels[0].InstrumentsFile);
+        var expectedSecIds = instruments.Select(i => i.SecurityId).ToHashSet();
+        var expectedSymbols = instruments.Select(i => i.Symbol).ToHashSet();
+
+        var seenSecIds = new HashSet<long>();
+        var seenSymbols = new HashSet<string>();
+
+        const int FrameOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        const int FrameSize = FrameOffset + WireOffsets.SecDefBodyTotal;
+
+        byte[][] snapshot;
+        lock (idSink.Packets) snapshot = idSink.Packets.ToArray();
+        Assert.NotEmpty(snapshot);
+
+        foreach (var packet in snapshot)
+        {
+            // PacketHeader stamps configured InstrumentDef channel number.
+            Assert.Equal((byte)184, packet[WireOffsets.PacketHeaderChannelOffset]);
+            int p = WireOffsets.PacketHeaderSize;
+            while (p + FrameSize <= packet.Length)
+            {
+                var bodySpan = packet.AsSpan(p + FrameOffset, WireOffsets.SecDefBlockLength);
+                long secId = MemoryMarshal.Read<long>(bodySpan.Slice(WireOffsets.SecDefSecurityIdOffset, 8));
+                seenSecIds.Add(secId);
+                var symBytes = bodySpan.Slice(WireOffsets.SecDefSymbolOffset, 20);
+                int n = symBytes.IndexOf((byte)0);
+                if (n < 0) n = symBytes.Length;
+                seenSymbols.Add(System.Text.Encoding.ASCII.GetString(symBytes.Slice(0, n)));
+                p += FrameSize;
+
+                // Every emitted frame should also be SBE-decodable.
+                Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodySpan, out _));
+            }
+        }
+
+        Assert.Superset(expectedSecIds, seenSecIds);
+        Assert.True(expectedSecIds.IsSubsetOf(seenSecIds),
+            $"missing SecurityIDs: {string.Join(",", expectedSecIds.Except(seenSecIds))}");
+        Assert.True(expectedSymbols.IsSubsetOf(seenSymbols),
+            $"missing symbols: {string.Join(",", expectedSymbols.Except(seenSymbols))}");
+    }
+
+    private static byte[] BuildOrderCancelRequest(ulong clOrdId, long secId, ulong orderId, ulong origClOrdId, char side)
+    {
+        // 8-byte SBE MessageHeader + 76-byte OrderCancelRequest (V6) body.
+        var frame = new byte[8 + 76];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, 8),
+            blockLength: 76, templateId: EntryPointFrameReader.TidOrderCancelRequest, version: 0);
+
+        var body = frame.AsSpan(8);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(28, 8), secId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(36, 8), orderId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(44, 8), origClOrdId);
+        body[52] = (byte)side;
+        return frame;
+    }
+
+    private static byte[] BuildSimpleModifyOrder(ulong clOrdId, long secId, char side, long qty,
+        long priceMantissa, ulong orderId, ulong origClOrdId)
+    {
+        // 8-byte SBE MessageHeader + 98-byte SimpleModifyOrderV2 body.
+        var frame = new byte[8 + 98];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, 8),
+            blockLength: 98, templateId: EntryPointFrameReader.TidSimpleModifyOrder, version: 2);
+
+        var body = frame.AsSpan(8);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
+        body[56] = (byte)side;
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(60, 8), qty);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(76, 8), orderId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(84, 8), origClOrdId);
+        return frame;
     }
 
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,

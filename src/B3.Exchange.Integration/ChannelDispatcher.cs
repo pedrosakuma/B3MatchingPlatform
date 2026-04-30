@@ -39,14 +39,32 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     private readonly ushort _tradeDate;
 
     private readonly Dictionary<long, OrderOwnership> _orderOwners = new();
+    /// <summary>
+    /// Per-channel reverse index from <c>(EnteringFirm, ClOrdID)</c> to engine-assigned
+    /// <c>orderId</c>. Populated when an order enters the book (<see cref="OnOrderAccepted"/>)
+    /// and evicted when it leaves (<see cref="OnOrderCanceled"/>, fully-filled
+    /// <see cref="OnOrderFilled"/>). Allows clients to send Cancel/Replace by their own
+    /// <c>OrigClOrdID</c> without tracking the engine-assigned id.
+    /// All access happens on the dispatch thread, so no synchronisation is required.
+    /// </summary>
+    private readonly Dictionary<(uint Firm, ulong ClOrdId), long> _clOrdIdIndex = new();
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
     private IEntryPointResponseChannel? _currentReply;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
 
+    private SnapshotRotator? _snapshotRotator;
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
+
+    /// <summary>
+    /// The snapshot rotator bound to this dispatcher, if any. Always invoked
+    /// on the dispatch thread via a <see cref="WorkKind.SnapshotRotation"/>
+    /// work item so it observes a stable book.
+    /// </summary>
+    public SnapshotRotator? SnapshotRotator => _snapshotRotator;
 
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
         ILogger<ChannelDispatcher> logger,
@@ -98,6 +116,15 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     internal void ProcessOne(in WorkItem item)
     {
+        if (item.Kind == WorkKind.SnapshotRotation)
+        {
+            // Snapshot ticks bypass the per-command incremental packet buffer
+            // entirely — they have their own sink + sequence space owned by
+            // the rotator and emit one or more complete packets directly.
+            _snapshotRotator?.PublishNext();
+            return;
+        }
+
         _currentReply = item.Reply;
         _currentClOrdId = item.ClOrdId;
         _currentOrigClOrdId = item.OrigClOrdId;
@@ -107,8 +134,36 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             switch (item.Kind)
             {
                 case WorkKind.New: _engine.Submit(item.NewOrder!); break;
-                case WorkKind.Cancel: _engine.Cancel(item.Cancel!); break;
-                case WorkKind.Replace: _engine.Replace(item.Replace!); break;
+                case WorkKind.Cancel:
+                    {
+                        var cancel = item.Cancel!;
+                        if (cancel.OrderId == 0)
+                        {
+                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            {
+                                EmitUnknownOrderIdReject(cancel.ClOrdId, cancel.SecurityId, cancel.EnteredAtNanos);
+                                break;
+                            }
+                            cancel = cancel with { OrderId = resolvedId };
+                        }
+                        _engine.Cancel(cancel);
+                        break;
+                    }
+                case WorkKind.Replace:
+                    {
+                        var replace = item.Replace!;
+                        if (replace.OrderId == 0)
+                        {
+                            if (!TryResolveByClOrdId(item.Reply, item.OrigClOrdId, out var resolvedId))
+                            {
+                                EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
+                                break;
+                            }
+                            replace = replace with { OrderId = resolvedId };
+                        }
+                        _engine.Replace(replace);
+                        break;
+                    }
                 case WorkKind.DecodeError:
                     _currentReply?.WriteExecutionReportReject(
                         new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
@@ -124,6 +179,23 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
         }
+    }
+
+    private bool TryResolveByClOrdId(IEntryPointResponseChannel reply, ulong origClOrdId, out long orderId)
+    {
+        if (origClOrdId != 0 && _clOrdIdIndex.TryGetValue((reply.EnteringFirm, origClOrdId), out orderId))
+            return true;
+        orderId = 0;
+        return false;
+    }
+
+    private void EmitUnknownOrderIdReject(string clOrdId, long securityId, ulong nowNanos)
+    {
+        // Surface the failure directly as an ER_Reject so the client gets a
+        // clear, deterministic response instead of a silently dropped command.
+        _currentReply?.WriteExecutionReportReject(
+            new RejectEvent(clOrdId, securityId, 0, RejectReason.UnknownOrderId, nowNanos),
+            _currentClOrdId);
     }
 
     private void FlushPacket()
@@ -169,9 +241,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             LogQueueFull(ChannelNumber, WorkKind.New);
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, 0, null, cmd, null)))
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, origClOrdIdValue, null, cmd, null)))
             LogQueueFull(ChannelNumber, WorkKind.Cancel);
     }
 
@@ -188,12 +260,39 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             LogQueueFull(ChannelNumber, WorkKind.DecodeError);
     }
 
+    /// <summary>
+    /// Attaches a <see cref="SnapshotRotator"/> to this dispatcher. May only
+    /// be called once. After this returns, any caller (typically a
+    /// <see cref="System.Threading.Timer"/>) may invoke
+    /// <see cref="EnqueueSnapshotTick"/> to schedule a snapshot publish on
+    /// the dispatch thread.
+    /// </summary>
+    public void AttachSnapshotRotator(SnapshotRotator rotator)
+    {
+        ArgumentNullException.ThrowIfNull(rotator);
+        if (_snapshotRotator != null)
+            throw new InvalidOperationException("snapshot rotator already attached");
+        _snapshotRotator = rotator;
+    }
+
+    /// <summary>
+    /// Posts a snapshot tick into the inbound queue. Returns <c>false</c> if
+    /// the queue is full (snapshots are idempotent — losing a tick simply
+    /// defers the next refresh by one period). Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueSnapshotTick()
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null!, 0, 0, null, null, null));
+
     // ====== IMatchingEventSink ======
 
     public void OnOrderAccepted(in OrderAcceptedEvent e)
     {
         if (_currentReply != null)
-            _orderOwners[e.OrderId] = new OrderOwnership(_currentReply, _currentClOrdId);
+        {
+            _orderOwners[e.OrderId] = new OrderOwnership(_currentReply, _currentClOrdId, _currentReply.EnteringFirm);
+            if (_currentClOrdId != 0)
+                _clOrdIdIndex[(_currentReply.EnteringFirm, _currentClOrdId)] = e.OrderId;
+        }
 
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
@@ -241,7 +340,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
         if (_orderOwners.Remove(e.OrderId, out var owner))
         {
-            owner.Reply.WriteExecutionReportCancel(e, owner.ClOrdId);
+            if (owner.ClOrdId != 0)
+                _clOrdIdIndex.Remove((owner.EnteringFirm, owner.ClOrdId));
+            owner.Reply.WriteExecutionReportCancel(e, _currentClOrdId != 0 ? _currentClOrdId : owner.ClOrdId, owner.ClOrdId);
         }
     }
 
@@ -259,7 +360,8 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             e.SecurityId, e.OrderId, entryType, e.FinalFilledQuantity, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        _orderOwners.Remove(e.OrderId);
+        if (_orderOwners.Remove(e.OrderId, out var owner) && owner.ClOrdId != 0)
+            _clOrdIdIndex.Remove((owner.EnteringFirm, owner.ClOrdId));
     }
 
     public void OnTrade(in TradeEvent e)
@@ -312,9 +414,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError }
+    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation }
 
-    internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId);
+    internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
 
     internal sealed record WorkItem(
         WorkKind Kind,

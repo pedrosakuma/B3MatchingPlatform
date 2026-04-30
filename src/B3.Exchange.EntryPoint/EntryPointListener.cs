@@ -20,6 +20,8 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<EntryPointListener> _logger;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
+    private readonly EntryPointSessionOptions _sessionOptions;
+    private readonly Action<EntryPointSession, string>? _onSessionClosed;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -31,7 +33,9 @@ public sealed class EntryPointListener : IAsyncDisposable
 
     public EntryPointListener(IPEndPoint endpoint, IEntryPointEngineSink sink,
         ILoggerFactory loggerFactory,
-        Func<EndPoint?, AcceptedConnection>? identityFactory = null)
+        Func<EndPoint?, AcceptedConnection>? identityFactory = null,
+        EntryPointSessionOptions? sessionOptions = null,
+        Action<EntryPointSession, string>? onSessionClosed = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _endpoint = endpoint;
@@ -39,6 +43,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<EntryPointListener>();
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
+        _sessionOptions = sessionOptions ?? EntryPointSessionOptions.Default;
+        _sessionOptions.Validate();
+        _onSessionClosed = onSessionClosed;
     }
 
     private AcceptedConnection DefaultIdentityFactory(EndPoint? remote)
@@ -71,8 +78,17 @@ public sealed class EntryPointListener : IAsyncDisposable
                 _logger.LogInformation("accepted connection {ConnectionId} from {Remote} sessionId={SessionId}",
                     identity.ConnectionId, sock.RemoteEndPoint, identity.SessionId);
                 var stream = new NetworkStream(sock, ownsSocket: true);
+
+                // Wrap onClosed to remove session from _sessions before invoking external callback
+                Action<EntryPointSession, string> onClosed = (s, reason) =>
+                {
+                    lock (_lock) _sessions.Remove(s);
+                    _onSessionClosed?.Invoke(s, reason);
+                };
+
                 var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
-                    stream, _sink, _loggerFactory.CreateLogger<EntryPointSession>());
+                    stream, _sink, _loggerFactory.CreateLogger<EntryPointSession>(),
+                    options: _sessionOptions, onClosed: onClosed);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
             }

@@ -66,14 +66,35 @@ Exposes:
 
 ```json
 {
-  "tcp": { "listen": "0.0.0.0:9876", "enteringFirm": 1 },
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
+  },
   "channels": [
     {
       "channelNumber": 84,
       "incrementalGroup": "224.0.20.84",
       "incrementalPort": 30084,
       "ttl": 1,
-      "instruments": "config/instruments-eqt.json"
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-eqt.json",
+      "snapshot": {
+        "group": "224.0.20.184",
+        "port": 30184,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "224.0.21.84",
+        "port": 31084,
+        "ttl": 1,
+        "cadenceMs": 5000
+      }
     }
   ]
 }
@@ -82,10 +103,57 @@ Exposes:
 * `tcp.listen` — bind address for the EntryPoint TCP server.
 * `tcp.enteringFirm` — uint stamped on every accepted order (single-firm
   default; per-session firm assignment is not yet implemented).
+* `tcp.heartbeatIntervalMs` — server emits a `Sequence` (templateId=9, used
+  as heartbeat by B3) when no other outbound traffic has been sent within
+  this window. Default `30000`.
+* `tcp.idleTimeoutMs` — inbound silence after which the server sends a
+  `Sequence` probe (the FIXP equivalent of FIX `TestRequest`). Default
+  `30000`.
+* `tcp.testRequestGraceMs` — additional silence the server tolerates after
+  the probe before tearing down the connection. Default `5000`. On teardown
+  the session is closed; a `BusinessReject` (templateId=206) framing the
+  reason is the responsibility of issue #11 — `EntryPointSession.Close(reason)`
+  exposes the seam.
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
+* `channels[].selfTradePrevention` — per-channel self-trade prevention policy
+  evaluated each time an aggressor would cross against a resting order from
+  the same `EnteringFirm`. One of:
+  * `none` (default) — trade as today; firms can self-trade.
+  * `cancel-aggressor` — cancel the aggressor's residual quantity and stop
+    further matching. Trades already executed against other firms stand. The
+    originating session receives an `ExecutionReport_Reject` with reason
+    `SelfTradePrevention`; no MBO event is emitted (the aggressor never
+    rested).
+  * `cancel-resting` — cancel the conflicting resting order and continue
+    matching the aggressor against the next maker. Each canceled resting
+    order produces a `DeleteOrder_MBO_51` and an `ExecutionReport_Cancel`
+    routed to the original resting-order owner (cancel reason
+    `SelfTradePrevention`).
+  * `cancel-both` — cancel both the conflicting resting order and the
+    aggressor's residual; stop further matching.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
+* `instrumentDefinition` *(optional)* — enables a dedicated
+  `SecurityDefinition_12` publisher on its own multicast group so
+  late-joining consumers can resolve every SecurityID seen on MBO/Trade
+  frames without a pre-loaded instrument list.
+  * `channelNumber` — UMDF channel number stamped on the InstrumentDef
+    PacketHeader. Defaults to the parent channel's number when 0.
+  * `group` / `port` / `ttl` / `localInterface` — multicast destination.
+  * `cadenceMs` — how often (ms) to re-emit the full instrument list.
+    Defaults to 5000 (5 s).
+* `snapshot` (optional) — per-channel snapshot publisher. When present, the
+  host opens a second multicast socket on `group:port` and a per-channel
+  `SnapshotRotator` round-robins through the channel's instruments,
+  publishing a `SnapshotFullRefresh_Header_30` + chunked
+  `SnapshotFullRefresh_Orders_MBO_71` frames every `cadenceMs`
+  milliseconds. The snapshot channel maintains its own `SequenceVersion` /
+  `SequenceNumber` state, distinct from the incremental channel.
+  `maxEntriesPerChunk` caps the per-`Orders_71` group size (defaults to
+  30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
+  `snapshot` block to publish only the incremental feed (no bootstrap for
+  mid-session consumers).
 
 ## Wire protocol
 
@@ -98,10 +166,20 @@ Exposes:
 | 100         | SimpleNewOrderV2    | 82          |
 | 101         | SimpleModifyOrderV2 | 98          |
 | 105         | OrderCancelRequest  | 76          |
+| 9           | Sequence (heartbeat)| 4           |
 
-v1 limitation: `Cancel` and `Modify` require an explicit `OrderID`.
-`OrigClOrdID`-only lookup (find the order by its original client id) is
-deferred to a later milestone.
+The `Sequence` frame doubles as the FIXP-style heartbeat: any inbound
+frame (including `Sequence`) resets the server's idle timer. Clients
+should emit `Sequence` periodically (default cadence: ≤ `idleTimeoutMs`)
+to keep the session alive.
+
+`Cancel` and `Modify` accept either an explicit engine-assigned `OrderID` or
+the original `OrigClOrdID` (the `ClOrdID` of the order being modified/cancelled).
+The integration layer maintains a per-channel `(EnteringFirm, ClOrdID) → OrderID`
+index that is populated when an order rests on the book and evicted when the
+order leaves (cancel or full fill). Submitting both fields is allowed; the
+explicit `OrderID` wins. If neither is present, or if the `OrigClOrdID` is
+unknown to the channel, an `ExecutionReport_Reject` is returned.
 
 ### Outbound (TCP execution reports)
 
@@ -112,12 +190,39 @@ deferred to a later milestone.
 | 202         | ExecutionReport_CancelV2    | 156         |
 | 203         | ExecutionReport_TradeV2     | 154         |
 | 204         | ExecutionReport_RejectV2    | 138         |
+| 9           | Sequence (heartbeat/probe)  | 4           |
+
+The server emits `Sequence` frames in two situations: (1) periodically
+when the outbound link has been silent for `heartbeatIntervalMs`, and
+(2) as a probe when the inbound link has been silent for `idleTimeoutMs`.
+If the client does not respond within `testRequestGraceMs`, the session
+is closed.
 
 ### Outbound (UMDF multicast)
 
-Standard B3 UMDF inc packets — `PacketHeader` (16 bytes) + framed
-`Order_MBO_50`, `DeleteOrder_MBO_51`, `Trade_53` messages. Compatible with
-the existing `B3.Umdf.ConsoleApp` consumer in this repo.
+Two distinct multicast streams per channel:
+
+* **Incremental** — `PacketHeader` (16 bytes) + framed `Order_MBO_50`,
+  `DeleteOrder_MBO_51`, `Trade_53` messages. One UDP packet per inbound
+  command (events emitted while processing a single command are batched
+  into one packet ≤1400 bytes, with a monotonic `SequenceNumber`).
+* **Snapshot** (optional) — `PacketHeader` + `SnapshotFullRefresh_Header_30`
+  + one or more `SnapshotFullRefresh_Orders_MBO_71` chunk frames. A
+  per-channel rotator publishes a complete snapshot for one instrument per
+  tick, round-robining through the channel's instruments. Empty / illiquid
+  instruments emit a header-only packet with `LastRptSeq` absent (per B3
+  §7.4). Snapshot packets carry their own `SequenceVersion` / `SequenceNumber`
+  separate from the incremental channel.
+
+Both streams are compatible with the existing `B3.Umdf.ConsoleApp` consumer
+in this repo.
+
+When the optional `instrumentDefinition` block is configured per channel,
+the host also emits `SecurityDefinition_12` (`SecurityDefinition_d` in FIX
+terms) frames to a dedicated multicast group every `cadenceMs`
+milliseconds (default 5 s). One full cycle covers every configured
+instrument; frames are packed into ≤1400-byte UDP datagrams with
+monotonic `SequenceNumber`s on the InstrumentDef channel.
 
 ## Sending an order with `nc`
 

@@ -25,21 +25,34 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<ExchangeHost> _logger;
     private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
+    private readonly Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? _snapshotSinkFactory;
+    private readonly Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? _instrumentDefSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
+    private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
+    private readonly List<Timer> _snapshotTimers = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
-        Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null)
+        Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
+        Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? snapshotSinkFactory = null,
+        Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? instrumentDefSinkFactory = null)
     {
         _config = config;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _logger = _loggerFactory.CreateLogger<ExchangeHost>();
         _packetSinkFactory = packetSinkFactory;
+        _snapshotSinkFactory = snapshotSinkFactory;
+        _instrumentDefSinkFactory = instrumentDefSinkFactory;
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
+
+    public IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
+
+    /// <summary>Snapshot of the InstrumentDef publishers, primarily for tests.</summary>
+    public IReadOnlyList<InstrumentDefinitionPublisher> InstrumentDefinitionPublishers => _instrumentDefPublishers;
 
     public Task StartAsync()
     {
@@ -61,9 +74,18 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
             var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
+
+            // Capture the engine via a side-channel so we can build a snapshot
+            // source that reads through the live book on the dispatcher thread.
+            MatchingEngine? capturedEngine = null;
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
-                engineFactory: s => new MatchingEngine(instruments, s, engineLogger),
+                engineFactory: s =>
+                {
+                    var e = new MatchingEngine(instruments, s, engineLogger, ch.SelfTradePrevention);
+                    capturedEngine = e;
+                    return e;
+                },
                 packetSink: sink,
                 logger: _loggerFactory.CreateLogger<ChannelDispatcher>());
             disp.Start();
@@ -76,10 +98,78 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             _logger.LogInformation("channel {ChannelNumber}: {InstrumentCount} instruments → {Group}:{Port}",
                 ch.ChannelNumber, instruments.Count, ch.IncrementalGroup, ch.IncrementalPort);
+
+            if (ch.Snapshot != null)
+            {
+                var snap = ch.Snapshot;
+                IUmdfPacketSink snapSink;
+                if (_snapshotSinkFactory != null)
+                {
+                    snapSink = _snapshotSinkFactory(ch, snap);
+                }
+                else
+                {
+                    var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
+                    snapSink = new MulticastUdpPacketSink(IPAddress.Parse(snap.Group), snap.Port,
+                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, snap.Ttl ?? ch.Ttl);
+                }
+                if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
+
+                var ids = instruments.Select(i => i.SecurityId).ToArray();
+                var source = new MatchingEngineSnapshotSource(capturedEngine!, ids);
+                int chunkCap = snap.MaxEntriesPerChunk ?? 30;
+                var rotator = new SnapshotRotator(
+                    channelNumber: ch.ChannelNumber,
+                    source: source,
+                    sink: snapSink,
+                    maxEntriesPerChunk: chunkCap);
+                disp.AttachSnapshotRotator(rotator);
+
+                var cadence = TimeSpan.FromMilliseconds(Math.Max(50, snap.CadenceMs));
+                var capturedDisp = disp;
+                var timer = new Timer(_ => capturedDisp.EnqueueSnapshotTick(), null, cadence, cadence);
+                _snapshotTimers.Add(timer);
+                _logger.LogInformation("channel {ChannelNumber}: snapshot → {Group}:{Port} every {CadenceMs:n0}ms",
+                    ch.ChannelNumber, snap.Group, snap.Port, cadence.TotalMilliseconds);
+            }
+
+            if (ch.InstrumentDefinition is { } idCfg)
+            {
+                IUmdfPacketSink idSink;
+                if (_instrumentDefSinkFactory != null)
+                {
+                    idSink = _instrumentDefSinkFactory(ch, idCfg);
+                }
+                else
+                {
+                    var local = idCfg.LocalInterface != null
+                        ? IPAddress.Parse(idCfg.LocalInterface)
+                        : (ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null);
+                    idSink = new MulticastUdpPacketSink(IPAddress.Parse(idCfg.Group), idCfg.Port,
+                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, idCfg.Ttl);
+                }
+                if (idSink is IDisposable idd) _ownedSinks.Add(idd);
+                byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
+                var publisher = new InstrumentDefinitionPublisher(
+                    channelNumber: idChan,
+                    instruments: instruments,
+                    sink: idSink,
+                    cadence: TimeSpan.FromMilliseconds(idCfg.CadenceMs));
+                publisher.Start();
+                _instrumentDefPublishers.Add(publisher);
+                _logger.LogInformation("channel {ChannelNumber}: instrument-def → {Group}:{Port} every {CadenceMs}ms",
+                    ch.ChannelNumber, idCfg.Group, idCfg.Port, idCfg.CadenceMs);
+            }
         }
 
         _router = new HostRouter(routing, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
+        var sessionOptions = new EntryPointSessionOptions
+        {
+            HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
+            IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
+            TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
+        };
         _listener = new EntryPointListener(listenEp, _router, _loggerFactory,
             identityFactory: remote =>
             {
@@ -88,7 +178,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                     ConnectionId: connectionId,
                     EnteringFirm: _config.Tcp.EnteringFirm,
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
-            });
+            },
+            sessionOptions: sessionOptions,
+            onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason));
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
         return Task.CompletedTask;
@@ -106,7 +198,9 @@ public sealed class ExchangeHost : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _logger.LogInformation("exchange host shutting down");
+        foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
+        foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
     }

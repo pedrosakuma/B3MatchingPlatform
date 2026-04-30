@@ -38,10 +38,10 @@ public sealed class HostRouter : IEntryPointEngineSink
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
-            disp.EnqueueCancel(cmd, reply, clOrdIdValue);
+            disp.EnqueueCancel(cmd, reply, clOrdIdValue, origClOrdIdValue);
         else
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
@@ -56,13 +56,11 @@ public sealed class HostRouter : IEntryPointEngineSink
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
     {
-        // Best-effort: send a generic reject and rely on the session to close
-        // its own connection if the decode error was fatal.
+        // Logging hook only. The EntryPointSession itself emits the
+        // appropriate SessionReject (Terminate) or BusinessMessageReject
+        // and decides whether to close the connection — the router has no
+        // additional context to add here.
         _logger.LogWarning("inbound decode error from connection {ConnectionId}: {Error}", reply.ConnectionId, error);
-        reply.WriteExecutionReportReject(
-            new RejectEvent(ClOrdId: "0", SecurityId: 0, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
-            clOrdIdValue: 0);
     }
 
     private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)
