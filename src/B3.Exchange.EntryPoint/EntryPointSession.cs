@@ -146,8 +146,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
                 break;
             case EntryPointFrameReader.TidOrderCancelRequest:
-                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out _, out var cnErr))
-                    _sink.EnqueueCancel(cn, this, cnClOrd);
+                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
+                    _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
                 else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
                 break;
             default:
@@ -310,13 +310,13 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueueExact(frame, n);
     }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!IsOpen) return false;
         var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportCancelTotal);
         int n = ExecutionReportEncoder.EncodeExecReportCancel(frame.AsSpan(0, ExecutionReportEncoder.ExecReportCancelTotal),
             SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            e.Side, clOrdIdValue, origClOrdIdValue: 0, e.OrderId,
+            e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
             e.SecurityId, e.OrderId,
             (ulong)e.RptSeq, e.TransactTimeNanos,
             cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);
@@ -358,6 +358,30 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         Buffer.BlockCopy(frame, 0, exact, 0, written);
         ArrayPool<byte>.Shared.Return(frame);
         return TryEnqueue(exact);
+    }
+
+    public bool WriteSessionReject(byte terminationCode)
+    {
+        if (!IsOpen) return false;
+        var frame = ArrayPool<byte>.Shared.Rent(SessionRejectEncoder.TerminateTotal);
+        int n = SessionRejectEncoder.EncodeTerminate(frame.AsSpan(0, SessionRejectEncoder.TerminateTotal),
+            SessionId, 0, terminationCode);
+        bool result = TryEnqueueExact(frame, n);
+        Close();
+        return result;
+    }
+
+    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null)
+    {
+        if (!IsOpen) return false;
+        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
+        var frame = ArrayPool<byte>.Shared.Rent(BusinessMessageRejectEncoder.TotalSize(textLen));
+        int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
+            frame.AsSpan(0, BusinessMessageRejectEncoder.TotalSize(textLen)),
+            SessionId, NextMsgSeqNum(), _nowNanos(),
+            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+        return TryEnqueueExact(frame, n);
     }
 
     private static byte MapRejectReason(RejectReason r) => r switch

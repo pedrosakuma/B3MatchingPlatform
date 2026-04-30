@@ -14,6 +14,7 @@ public sealed class MatchingEngine
     private readonly Dictionary<long, InstrumentTradingRules> _rulesById;
     private readonly Dictionary<long, LimitOrderBook> _booksById;
     private readonly IMatchingEventSink _sink;
+    private readonly SelfTradePrevention _stp;
 
     private long _nextOrderId = 1;
     private uint _nextTradeId = 1;
@@ -21,11 +22,13 @@ public sealed class MatchingEngine
 
     private bool _dispatching;
 
-    public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink)
+    public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink,
+        SelfTradePrevention selfTradePrevention = SelfTradePrevention.None)
     {
         ArgumentNullException.ThrowIfNull(instruments);
         ArgumentNullException.ThrowIfNull(sink);
         _sink = sink;
+        _stp = selfTradePrevention;
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
         foreach (var i in instruments)
@@ -38,6 +41,7 @@ public sealed class MatchingEngine
 
     public uint CurrentRptSeq => _rptSeq;
     public long PeekNextOrderId => _nextOrderId;
+    public SelfTradePrevention SelfTradePrevention => _stp;
 
     /// <summary>
     /// Returns the <see cref="LimitOrderBook"/>'s public snapshot iterator.
@@ -86,6 +90,26 @@ public sealed class MatchingEngine
                 long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: cmd.Type == OrderType.Market);
                 if (fillable < cmd.Quantity)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.FokUnfillable, cmd.EnteredAtNanos); return; }
+
+                // If STP is enabled, FOK must check for self-trades: orders from the same firm
+                // would be prevented from matching, so reject FOK as unfillable if any exist.
+                if (_stp != SelfTradePrevention.None)
+                {
+                    bool isMarketOrder = cmd.Type == OrderType.Market;
+                    foreach (var level in book.OppositeLevels(cmd.Side))
+                    {
+                        if (!isMarketOrder && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, cmd.PriceMantissa))
+                            break;
+
+                        var order = level.Head;
+                        while (order is not null)
+                        {
+                            if (order.EnteringFirm == cmd.EnteringFirm)
+                            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.FokUnfillable, cmd.EnteredAtNanos); return; }
+                            order = order.Next;
+                        }
+                    }
+                }
             }
 
             // Market order with empty opposite book: reject early — we never want a
@@ -184,6 +208,7 @@ public sealed class MatchingEngine
         long aggressorOrderIdForTrades = _nextOrderId++;
         bool isMarket = cmd.Type == OrderType.Market;
         long limitPx = cmd.PriceMantissa;
+        bool stpAggressorCanceled = false;
 
         // Walk opposite levels in priority order. We snapshot the level list to a
         // local copy (LimitOrderBook.OppositeLevels) so removing a level mid-iter
@@ -191,6 +216,7 @@ public sealed class MatchingEngine
         foreach (var level in book.OppositeLevels(cmd.Side))
         {
             if (aggressorRemaining == 0) break;
+            if (stpAggressorCanceled) break;
             if (!isMarket && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, limitPx)) break;
 
             // Within a level, consume FIFO from Head.
@@ -198,6 +224,29 @@ public sealed class MatchingEngine
             while (maker is not null && aggressorRemaining > 0)
             {
                 var next = maker.Next; // capture before mutation
+
+                // Self-trade prevention: maker and aggressor share EnteringFirm.
+                if (_stp != SelfTradePrevention.None && maker.EnteringFirm == cmd.EnteringFirm)
+                {
+                    switch (_stp)
+                    {
+                        case SelfTradePrevention.CancelResting:
+                            // Cancel the conflicting maker and continue matching
+                            // the aggressor against the next maker / level.
+                            EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
+                            maker = next;
+                            continue;
+                        case SelfTradePrevention.CancelBoth:
+                            EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
+                            stpAggressorCanceled = true;
+                            break;
+                        case SelfTradePrevention.CancelAggressor:
+                            stpAggressorCanceled = true;
+                            break;
+                    }
+                    break;
+                }
+
                 long tradeQty = Math.Min(aggressorRemaining, maker.RemainingQuantity);
                 long tradePx = maker.PriceMantissa;
 
@@ -258,6 +307,17 @@ public sealed class MatchingEngine
 
         // Aggressor has remainder?
         if (aggressorRemaining == 0) return;
+
+        if (stpAggressorCanceled)
+        {
+            // STP canceled the aggressor's residual. The aggressor never rested
+            // on the book, so no MBO event is emitted (mirrors the IOC-remainder
+            // pattern). The originating session is informed via a Reject ER —
+            // any trades already executed against other firms still stand.
+            Reject(cmd.ClOrdId, cmd.SecurityId, aggressorOrderIdForTrades,
+                RejectReason.SelfTradePrevention, cmd.EnteredAtNanos);
+            return;
+        }
 
         if (isMarket)
         {

@@ -75,7 +75,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
                 {
-                    var e = new MatchingEngine(instruments, s);
+                    var e = new MatchingEngine(instruments, s, ch.SelfTradePrevention);
                     capturedEngine = e;
                     return e;
                 },

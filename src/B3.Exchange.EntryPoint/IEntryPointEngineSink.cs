@@ -34,7 +34,7 @@ public interface IEntryPointResponseChannel
     bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty);
 
     /// <summary>Order canceled (client cancel, IOC remainder, replace-lost-priority).</summary>
-    bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue);
+    bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>Order modified (in-place priority-preserving replace).</summary>
     bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
@@ -42,6 +42,26 @@ public interface IEntryPointResponseChannel
 
     /// <summary>Inbound message rejected synchronously (validation, unknown order, etc.).</summary>
     bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue);
+
+    /// <summary>
+    /// Send a session-level reject (B3 <c>Terminate</c> with the given
+    /// <paramref name="terminationCode"/>) and gracefully close the
+    /// connection after the frame is flushed to the wire. Used when the
+    /// inbound stream is no longer recoverable (bad header, unknown
+    /// templateId, schema-version mismatch, body length mismatch, ...).
+    /// Returns <c>false</c> if the channel was already closed.
+    /// </summary>
+    bool WriteSessionReject(byte terminationCode);
+
+    /// <summary>
+    /// Send a business-level reject (B3 <c>BusinessMessageReject</c>) for a
+    /// well-framed inbound message that failed business validation. The
+    /// session is kept open; the client may retry with a corrected
+    /// message. <paramref name="refSeqNum"/> echoes the offending message's
+    /// inbound MsgSeqNum so the client can correlate.
+    /// </summary>
+    bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null);
 }
 
 /// <summary>
@@ -56,7 +76,7 @@ public interface IEntryPointResponseChannel
 public interface IEntryPointEngineSink
 {
     void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue);
-    void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue);
+    void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
     void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>Called when a frame fails decoding (unsupported template,
