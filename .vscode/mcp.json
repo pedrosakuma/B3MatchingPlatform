@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "github": {
+      "type": "copilot",
+      "description": "GitHub MCP — repos, issues, PRs, Actions, code search (companion repo SbeB3UmdfConsumer)"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/pedrotravi/SbeB3Exchange"
+      ],
+      "type": "stdio",
+      "description": "Filesystem MCP — structured access to schemas/, config/, src/, tests/"
+    }
+  }
+}
