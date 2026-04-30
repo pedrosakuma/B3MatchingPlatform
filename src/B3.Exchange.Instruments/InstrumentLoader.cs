@@ -145,14 +145,14 @@ public static class InstrumentLoader
                 case JsonTokenType.Number:
                     return reader.GetDecimal();
                 case JsonTokenType.String:
-                {
-                    var s = reader.GetString();
-                    if (string.IsNullOrWhiteSpace(s)) return null;
-                    if (decimal.TryParse(s, System.Globalization.NumberStyles.Number,
-                            System.Globalization.CultureInfo.InvariantCulture, out var d))
-                        return d;
-                    throw new JsonException($"Invalid decimal: '{s}'");
-                }
+                    {
+                        var s = reader.GetString();
+                        if (string.IsNullOrWhiteSpace(s)) return null;
+                        if (decimal.TryParse(s, System.Globalization.NumberStyles.Number,
+                                System.Globalization.CultureInfo.InvariantCulture, out var d))
+                            return d;
+                        throw new JsonException($"Invalid decimal: '{s}'");
+                    }
                 default:
                     throw new JsonException($"Expected number or string for decimal, got {reader.TokenType}");
             }

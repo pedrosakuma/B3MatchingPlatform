@@ -196,8 +196,15 @@ public class InstrumentRulesTests
     {
         var bad = new Instrument
         {
-            Symbol = "X", SecurityId = 1, TickSize = 0.000001m, LotSize = 1,
-            MinPrice = 1m, MaxPrice = 2m, Currency = "BRL", Isin = "X", SecurityType = "EQUITY",
+            Symbol = "X",
+            SecurityId = 1,
+            TickSize = 0.000001m,
+            LotSize = 1,
+            MinPrice = 1m,
+            MaxPrice = 2m,
+            Currency = "BRL",
+            Isin = "X",
+            SecurityType = "EQUITY",
         };
         Assert.Throws<ArgumentException>((Action)(() => { _ = new InstrumentTradingRules(bad); }));
     }
@@ -207,8 +214,15 @@ public class InstrumentRulesTests
     {
         var bad = new Instrument
         {
-            Symbol = "X", SecurityId = 1, TickSize = 0.05m, LotSize = 1,
-            MinPrice = 0.07m, MaxPrice = 1m, Currency = "BRL", Isin = "X", SecurityType = "EQUITY",
+            Symbol = "X",
+            SecurityId = 1,
+            TickSize = 0.05m,
+            LotSize = 1,
+            MinPrice = 0.07m,
+            MaxPrice = 1m,
+            Currency = "BRL",
+            Isin = "X",
+            SecurityType = "EQUITY",
         };
         Assert.Throws<ArgumentException>((Action)(() => { _ = new InstrumentTradingRules(bad); }));
     }

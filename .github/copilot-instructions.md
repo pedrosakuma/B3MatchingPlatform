@@ -30,6 +30,22 @@ dotnet test tests/B3.Exchange.Matching.Tests --filter "FullyQualifiedName~Matchi
 dotnet test tests/B3.Exchange.Matching.Tests --filter "FullyQualifiedName~MatchingTests.SomeMethodName"
 ```
 
+### Pre-PR checklist (mirrors required CI checks)
+
+CI on `main` requires `Build & Test` and `Format check` to pass before
+auto-merge will complete. Run these locally before opening a PR — they are
+the same commands CI runs and they are fast:
+
+```bash
+dotnet restore SbeB3Exchange.slnx
+dotnet build   SbeB3Exchange.slnx --no-restore -c Release          # warnings-as-errors
+dotnet test    SbeB3Exchange.slnx --no-build   -c Release
+dotnet format  SbeB3Exchange.slnx --verify-no-changes --no-restore --severity warn
+```
+
+If `dotnet format` reports diffs, run it without `--verify-no-changes` to
+apply the fixes, then re-run the verification.
+
 Docker:
 
 ```bash
