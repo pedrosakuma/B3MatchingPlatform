@@ -11,6 +11,7 @@ namespace B3.Exchange.Host;
 public sealed class HostConfig
 {
     [JsonPropertyName("tcp")] public TcpConfig Tcp { get; set; } = new();
+    [JsonPropertyName("http")] public HttpConfig? Http { get; set; }
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 }
 
@@ -28,6 +29,23 @@ public sealed class TcpConfig
     /// <summary>Additional grace window after the probe before the session is
     /// closed for inactivity. Default: 5 s.</summary>
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
+}
+
+/// <summary>
+/// Optional Kestrel-hosted HTTP endpoint exposing /health/live,
+/// /health/ready, and /metrics. Omit the <c>http</c> object from the
+/// config to disable HTTP entirely.
+/// </summary>
+public sealed class HttpConfig
+{
+    [JsonPropertyName("listen")] public string Listen { get; set; } = "0.0.0.0:8080";
+
+    /// <summary>
+    /// Liveness staleness threshold in milliseconds. /health/live returns
+    /// 503 if any registered dispatcher has not ticked within this many
+    /// milliseconds. Default 5000 (5s).
+    /// </summary>
+    [JsonPropertyName("livenessStaleMs")] public int LivenessStaleMs { get; set; } = 5000;
 }
 
 public sealed class ChannelConfig
