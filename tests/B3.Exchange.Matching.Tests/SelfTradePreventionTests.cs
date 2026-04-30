@@ -1,5 +1,6 @@
 namespace B3.Exchange.Matching.Tests;
 
+using Microsoft.Extensions.Logging.Abstractions;
 using static TestFactory;
 
 public class SelfTradePreventionTests
@@ -10,7 +11,7 @@ public class SelfTradePreventionTests
     private static MatchingEngine NewEngine(SelfTradePrevention stp, out RecordingSink sink)
     {
         sink = new RecordingSink();
-        return new MatchingEngine(new[] { Petr4 }, sink, stp);
+        return new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance, stp);
     }
 
     [Fact]

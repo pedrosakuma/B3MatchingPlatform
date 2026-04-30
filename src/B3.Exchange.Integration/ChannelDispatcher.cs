@@ -1,5 +1,6 @@
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Integration;
 
@@ -21,7 +22,7 @@ namespace B3.Exchange.Integration;
 /// guarantees that the engine and the event-sink callbacks always run on the
 /// dedicated dispatch thread — there is no cross-thread call into the engine.
 /// </summary>
-public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSink, IAsyncDisposable
+public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSink, IAsyncDisposable
 {
     private const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
@@ -41,6 +42,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     private readonly System.Threading.Channels.Channel<WorkItem> _inbound;
     private readonly MatchingEngine _engine;
     private readonly IUmdfPacketSink _packetSink;
+    private readonly ILogger<ChannelDispatcher> _logger;
     private readonly Func<ulong> _nowNanos;
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
@@ -74,11 +76,14 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     public SnapshotRotator? SnapshotRotator => _snapshotRotator;
 
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
+        ILogger<ChannelDispatcher> logger,
         Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
         ChannelMetrics? metrics = null)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         ChannelNumber = channelNumber;
         _packetSink = packetSink;
+        _logger = logger;
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _tradeDate = tradeDate;
         _metrics = metrics;
@@ -99,6 +104,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     public void Start()
     {
+        _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
         _loopTask = Task.Factory.StartNew(() => RunLoopAsync(_cts.Token),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
     }
@@ -140,6 +146,10 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
             }
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
+        }
     }
 
     private void RecordHeartbeat()
@@ -206,6 +216,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
                         _currentClOrdId);
                     break;
             }
+            LogCommandProcessed(ChannelNumber, item.Kind, _currentClOrdId);
         }
         finally
         {
@@ -243,6 +254,7 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), SequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
         _metrics?.IncPacketsOut();
+        LogPacketFlushed(ChannelNumber, SequenceNumber, _packetWritten);
         _packetWritten = 0;
     }
 
@@ -271,16 +283,29 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
     // ====== IEntryPointEngineSink ======
 
     public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.New, reply, clOrdIdValue, 0, cmd, null, null));
+    {
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, reply, clOrdIdValue, 0, cmd, null, null)))
+            LogQueueFull(ChannelNumber, WorkKind.New);
+    }
 
     public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, origClOrdIdValue, null, cmd, null));
+    {
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, origClOrdIdValue, null, cmd, null)))
+            LogQueueFull(ChannelNumber, WorkKind.Cancel);
+    }
 
     public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, reply, clOrdIdValue, origClOrdIdValue, null, null, cmd));
+    {
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, reply, clOrdIdValue, origClOrdIdValue, null, null, cmd)))
+            LogQueueFull(ChannelNumber, WorkKind.Replace);
+    }
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, reply, 0, 0, null, null, null));
+    {
+        _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, reply, 0, 0, null, null, null)))
+            LogQueueFull(ChannelNumber, WorkKind.DecodeError);
+    }
 
     /// <summary>
     /// Attaches a <see cref="SnapshotRotator"/> to this dispatcher. May only
@@ -440,6 +465,8 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("channel {ChannelNumber} dispatcher stopping (sequenceNumber={SequenceNumber})",
+            ChannelNumber, SequenceNumber);
         _inbound.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
         if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
@@ -458,4 +485,18 @@ public sealed class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSin
         NewOrderCommand? NewOrder,
         CancelOrderCommand? Cancel,
         ReplaceOrderCommand? Replace);
+
+    // ====== high-frequency log messages (LoggerMessage source-gen) ======
+
+    [LoggerMessage(EventId = 1001, Level = LogLevel.Debug,
+        Message = "channel {ChannelNumber} processed {WorkKind} clOrdId={ClOrdId}")]
+    private partial void LogCommandProcessed(byte channelNumber, WorkKind workKind, ulong clOrdId);
+
+    [LoggerMessage(EventId = 1002, Level = LogLevel.Trace,
+        Message = "channel {ChannelNumber} flushed UMDF packet seq={Sequence} bytes={Bytes}")]
+    private partial void LogPacketFlushed(byte channelNumber, uint sequence, int bytes);
+
+    [LoggerMessage(EventId = 1003, Level = LogLevel.Warning,
+        Message = "channel {ChannelNumber} inbound queue full; dropped {WorkKind} (slow consumer)")]
+    private partial void LogQueueFull(byte channelNumber, WorkKind workKind);
 }

@@ -3,6 +3,8 @@ using B3.Exchange.EntryPoint;
 using B3.Exchange.Instruments;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Host;
 
@@ -20,7 +22,8 @@ namespace B3.Exchange.Host;
 public sealed class ExchangeHost : IAsyncDisposable
 {
     private readonly HostConfig _config;
-    private readonly Action<string>? _log;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<ExchangeHost> _logger;
     private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
     private readonly Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? _snapshotSinkFactory;
     private readonly Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? _instrumentDefSinkFactory;
@@ -36,13 +39,14 @@ public sealed class ExchangeHost : IAsyncDisposable
     private HostRouter? _router;
     private HttpServer? _http;
 
-    public ExchangeHost(HostConfig config, Action<string>? log = null,
+    public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
         Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? snapshotSinkFactory = null,
         Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? instrumentDefSinkFactory = null)
     {
         _config = config;
-        _log = log;
+        _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+        _logger = _loggerFactory.CreateLogger<ExchangeHost>();
         _packetSinkFactory = packetSinkFactory;
         _snapshotSinkFactory = snapshotSinkFactory;
         _instrumentDefSinkFactory = instrumentDefSinkFactory;
@@ -70,6 +74,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async Task StartAsync()
     {
+        _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
         var routing = new Dictionary<long, ChannelDispatcher>();
         foreach (var ch in _config.Channels)
         {
@@ -82,9 +87,11 @@ public sealed class ExchangeHost : IAsyncDisposable
             else
             {
                 var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
+                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort,
+                    _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, ch.Ttl);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
+            var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
 
             var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
             // Capture the engine via a side-channel so we can build a snapshot
@@ -94,11 +101,12 @@ public sealed class ExchangeHost : IAsyncDisposable
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
                 {
-                    var e = new MatchingEngine(instruments, s, ch.SelfTradePrevention);
+                    var e = new MatchingEngine(instruments, s, engineLogger, ch.SelfTradePrevention);
                     capturedEngine = e;
                     return e;
                 },
                 packetSink: sink,
+                logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
                 metrics: channelMetrics);
             disp.Start();
             _dispatchers.Add(disp);
@@ -108,7 +116,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                     throw new InvalidOperationException($"SecurityId {inst.SecurityId} mapped to multiple channels");
                 routing.Add(inst.SecurityId, disp);
             }
-            _log?.Invoke($"channel {ch.ChannelNumber}: {instruments.Count} instruments → {ch.IncrementalGroup}:{ch.IncrementalPort}");
+            _logger.LogInformation("channel {ChannelNumber}: {InstrumentCount} instruments → {Group}:{Port}",
+                ch.ChannelNumber, instruments.Count, ch.IncrementalGroup, ch.IncrementalPort);
 
             if (ch.Snapshot != null)
             {
@@ -121,7 +130,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 else
                 {
                     var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-                    snapSink = new MulticastUdpPacketSink(IPAddress.Parse(snap.Group), snap.Port, local, snap.Ttl ?? ch.Ttl);
+                    snapSink = new MulticastUdpPacketSink(IPAddress.Parse(snap.Group), snap.Port,
+                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, snap.Ttl ?? ch.Ttl);
                 }
                 if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
 
@@ -139,7 +149,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 var capturedDisp = disp;
                 var timer = new Timer(_ => capturedDisp.EnqueueSnapshotTick(), null, cadence, cadence);
                 _snapshotTimers.Add(timer);
-                _log?.Invoke($"channel {ch.ChannelNumber}: snapshot → {snap.Group}:{snap.Port} every {cadence.TotalMilliseconds:n0}ms");
+                _logger.LogInformation("channel {ChannelNumber}: snapshot → {Group}:{Port} every {CadenceMs:n0}ms",
+                    ch.ChannelNumber, snap.Group, snap.Port, cadence.TotalMilliseconds);
             }
 
             if (ch.InstrumentDefinition is { } idCfg)
@@ -154,7 +165,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                     var local = idCfg.LocalInterface != null
                         ? IPAddress.Parse(idCfg.LocalInterface)
                         : (ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null);
-                    idSink = new MulticastUdpPacketSink(IPAddress.Parse(idCfg.Group), idCfg.Port, local, idCfg.Ttl);
+                    idSink = new MulticastUdpPacketSink(IPAddress.Parse(idCfg.Group), idCfg.Port,
+                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, idCfg.Ttl);
                 }
                 if (idSink is IDisposable idd) _ownedSinks.Add(idd);
                 byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
@@ -165,12 +177,12 @@ public sealed class ExchangeHost : IAsyncDisposable
                     cadence: TimeSpan.FromMilliseconds(idCfg.CadenceMs));
                 publisher.Start();
                 _instrumentDefPublishers.Add(publisher);
-                _log?.Invoke(
-                    $"channel {ch.ChannelNumber}: instrument-def → {idCfg.Group}:{idCfg.Port} every {idCfg.CadenceMs}ms");
+                _logger.LogInformation("channel {ChannelNumber}: instrument-def → {Group}:{Port} every {CadenceMs}ms",
+                    ch.ChannelNumber, idCfg.Group, idCfg.Port, idCfg.CadenceMs);
             }
         }
 
-        _router = new HostRouter(routing);
+        _router = new HostRouter(routing, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new EntryPointSessionOptions
         {
@@ -178,7 +190,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
         };
-        _listener = new EntryPointListener(listenEp, _router,
+        _listener = new EntryPointListener(listenEp, _router, _loggerFactory,
             identityFactory: remote =>
             {
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
@@ -188,9 +200,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
             },
             sessionOptions: sessionOptions,
-            onSessionClosed: (s, reason) => _log?.Invoke($"session {s.ConnectionId} closed: {reason}"));
+            onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason));
         _listener.Start();
-        _log?.Invoke($"listening on {_listener.LocalEndpoint}");
+        _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 
         _metrics.SetSessionProvider(new ListenerSessionProvider(_listener));
 
@@ -198,7 +210,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         {
             IReadOnlyList<IReadinessProbe> probeSnapshot;
             lock (_probesLock) probeSnapshot = _probes.ToList();
-            _http = new HttpServer(_config.Http, _metrics, probeSnapshot, _log);
+            _http = new HttpServer(_config.Http, _metrics, probeSnapshot);
             await _http.StartAsync().ConfigureAwait(false);
         }
 
@@ -232,6 +244,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("exchange host shutting down");
         if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);

@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Threading.Channels;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.EntryPoint;
 
@@ -26,6 +27,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     private readonly Stream _stream;
     private readonly IEntryPointEngineSink _sink;
+    private readonly ILogger<EntryPointSession> _logger;
     private readonly Channel<byte[]> _sendQueue;
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<ulong> _nowNanos;
@@ -57,16 +59,19 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     public int SendQueueDepth => _sendQueue.Reader.Count;
 
     public EntryPointSession(long connectionId, uint enteringFirm, uint sessionId,
-        Stream stream, IEntryPointEngineSink sink, Func<ulong>? nowNanos = null,
+        Stream stream, IEntryPointEngineSink sink, ILogger<EntryPointSession> logger,
+        Func<ulong>? nowNanos = null,
         int sendQueueCapacity = DefaultSendQueueCapacity,
         EntryPointSessionOptions? options = null,
         Action<EntryPointSession, string>? onClosed = null)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
         _stream = stream;
         _sink = sink;
+        _logger = logger;
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _options = options ?? EntryPointSessionOptions.Default;
         _options.Validate();
@@ -84,6 +89,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     public void Start()
     {
+        _logger.LogInformation("entrypoint session opened: connectionId={ConnectionId} sessionId={SessionId} firm={EnteringFirm}",
+            ConnectionId, SessionId, EnteringFirm);
         _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
         _sendTask = Task.Run(() => RunSendLoopAsync(_cts.Token));
         _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
@@ -127,7 +134,10 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         }
         catch (OperationCanceledException) { }
         catch (EndOfStreamException) { }
-        catch (IOException) { }
+        catch (IOException ex)
+        {
+            _logger.LogWarning(ex, "entrypoint session {ConnectionId} receive IO error", ConnectionId);
+        }
         finally
         {
             Close("recv-eof");
@@ -137,6 +147,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     private void DispatchInbound(EntryPointFrameReader.FrameInfo info, ReadOnlySpan<byte> body)
     {
         ulong now = _nowNanos();
+        _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} length={Length}",
+            ConnectionId, info.TemplateId, info.BodyLength);
         switch (info.TemplateId)
         {
             case EntryPointFrameReader.TidSequence:
@@ -175,8 +187,9 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                     await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
                     Volatile.Write(ref _lastOutboundMs, NowMs());
                 }
-                catch (IOException)
+                catch (IOException ex)
                 {
+                    _logger.LogWarning(ex, "entrypoint session {ConnectionId} send IO error; closing", ConnectionId);
                     Close("send-io-error");
                     return;
                 }
@@ -412,6 +425,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     public void Close(string reason)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
+        _logger.LogInformation("entrypoint session {ConnectionId} closing", ConnectionId);
         _sendQueue.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
         try { _onClosed?.Invoke(this, reason); } catch { }
