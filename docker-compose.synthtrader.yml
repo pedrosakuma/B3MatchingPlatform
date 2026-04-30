@@ -1,9 +1,10 @@
 # Example docker-compose: one exchange host + one synthetic trader.
 #
-# The synth trader connects to the host on the host-network address
-# `exchange:9876`. The exchange uses host networking for its multicast
-# publisher (B3 UMDF) — adjust to bridge mode if you don't need multicast
-# observable from the host.
+# NOTE: Both services use network_mode: host. With host networking, inter-service
+# DNS names (e.g., "exchange") are NOT available. The synth trader accesses the host
+# on 127.0.0.1:9876 (see synthetic-trader.json config). The exchange uses host
+# networking for its multicast publisher (B3 UMDF) — adjust to bridge mode if you
+# don't need multicast observable from the host.
 #
 # Usage:
 #   docker compose -f docker-compose.synthtrader.yml up --build
