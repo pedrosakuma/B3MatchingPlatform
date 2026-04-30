@@ -16,7 +16,7 @@ namespace B3.Exchange.SyntheticTrader;
 /// </summary>
 public sealed class SyntheticTraderRunner : IAsyncDisposable
 {
-    private readonly EntryPointClient _client;
+    private readonly EntryPointClient? _client;
     private readonly Dictionary<long, InstrumentRuntime> _instruments;
     private readonly Random _rng;
     private readonly TimeSpan _tickInterval;
@@ -24,6 +24,11 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
     private readonly Action<string>? _logWarn;
     private readonly CancellationTokenSource _cts;
     private readonly Dictionary<ulong, OrderTracking> _byClOrd = new();
+    // OrderId -> tracking. Populated on ER_New, removed on terminal events.
+    // Lets cancel ERs (whose ClOrdId is the *cancel-request's*, not the
+    // original order's) resolve to the originating tracking in O(1) without
+    // iterating the per-strategy LiveByTag dictionaries.
+    private readonly Dictionary<long, OrderTracking> _byOrderId = new();
     private long _clOrdSeq;
     private long _ticksRun;
     private long _ordersSent;
@@ -34,6 +39,11 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
     public long OrdersSent => Interlocked.Read(ref _ordersSent);
     public long TradesObserved => Interlocked.Read(ref _tradesObserved);
 
+    /// <summary>Test seam: number of live entries in the ClOrdID tracking map.</summary>
+    internal int ByClOrdCount { get { lock (_byClOrd) return _byClOrd.Count; } }
+    /// <summary>Test seam: number of live entries in the OrderId tracking map.</summary>
+    internal int ByOrderIdCount { get { lock (_byOrderId) return _byOrderId.Count; } }
+
     public SyntheticTraderRunner(
         EntryPointClient client,
         IEnumerable<(InstrumentConfig cfg, IReadOnlyList<IStrategy> strategies)> instruments,
@@ -42,6 +52,23 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
         Action<string>? logInfo = null,
         Action<string>? logWarn = null,
         CancellationToken ct = default)
+        : this(instruments, rng, tickInterval, logInfo, logWarn, ct, client)
+    {
+    }
+
+    /// <summary>
+    /// Internal ctor for unit tests: omits the wire client so outbound sends
+    /// are no-ops and no event subscriptions are wired. Tests then drive the
+    /// runner via the <c>TestRaise*</c> seams below.
+    /// </summary>
+    internal SyntheticTraderRunner(
+        IEnumerable<(InstrumentConfig cfg, IReadOnlyList<IStrategy> strategies)> instruments,
+        Random rng,
+        TimeSpan tickInterval,
+        Action<string>? logInfo = null,
+        Action<string>? logWarn = null,
+        CancellationToken ct = default,
+        EntryPointClient? client = null)
     {
         _client = client;
         _rng = rng;
@@ -53,10 +80,13 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
             t => t.cfg.SecurityId,
             t => new InstrumentRuntime(t.cfg, t.strategies));
 
-        _client.OnNew += OnExecNew;
-        _client.OnTrade += OnExecTrade;
-        _client.OnCancel += OnExecCancel;
-        _client.OnReject += OnExecReject;
+        if (_client != null)
+        {
+            _client.OnNew += OnExecNew;
+            _client.OnTrade += OnExecTrade;
+            _client.OnCancel += OnExecCancel;
+            _client.OnReject += OnExecReject;
+        }
     }
 
     public void Start()
@@ -143,14 +173,14 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
                 {
                     ulong clOrd = (ulong)Interlocked.Increment(ref _clOrdSeq);
                     var tracking = new OrderTracking(strategy, perStrategy, intent.ClientTag,
-                        intent.SecurityId, intent.Side, intent.PriceMantissa, intent.Quantity);
+                        intent.SecurityId, intent.Side, intent.PriceMantissa, intent.Quantity, clOrd);
                     lock (_byClOrd) _byClOrd[clOrd] = tracking;
                     lock (inst.Sync)
                     {
                         perStrategy.PendingByTag[intent.ClientTag] = clOrd;
                     }
-                    bool ok = _client.SendNewOrder(clOrd, intent.SecurityId, intent.Side, intent.Type, intent.Tif,
-                        intent.Quantity, intent.PriceMantissa);
+                    bool ok = _client?.SendNewOrder(clOrd, intent.SecurityId, intent.Side, intent.Type, intent.Tif,
+                        intent.Quantity, intent.PriceMantissa) ?? false;
                     if (ok) Interlocked.Increment(ref _ordersSent);
                     break;
                 }
@@ -164,7 +194,7 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
                         live = rec.OrderId == 0 ? null : rec;
                     }
                     if (live is null) break;
-                    _client.SendCancel(clOrd, intent.SecurityId, (ulong)live.Value.OrderId, origClOrdId: 0, live.Value.Side);
+                    _client?.SendCancel(clOrd, intent.SecurityId, (ulong)live.Value.OrderId, origClOrdId: 0, live.Value.Side);
                     break;
                 }
         }
@@ -176,6 +206,8 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
         lock (_byClOrd) _byClOrd.TryGetValue(er.ClOrdId, out tracking);
         if (tracking is null) return;
         if (!_instruments.TryGetValue(tracking.SecurityId, out var inst)) return;
+        tracking.OrderId = er.OrderId;
+        lock (_byOrderId) _byOrderId[er.OrderId] = tracking;
         lock (inst.Sync)
         {
             tracking.PerStrategy.LiveByTag[tracking.ClientTag] = new LiveOrderRecord(
@@ -221,34 +253,38 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
                 if (er.LeavesQty == 0) tracking.Strategy.OnRemoved(tracking.ClientTag);
             }
             catch (Exception ex) { _logWarn?.Invoke($"strategy OnFill threw: {ex.Message}"); }
+
+            // Terminal: full fill drops both tracking maps. Partial fills keep
+            // them — more fills (or a cancel) may still arrive for this order.
+            if (er.LeavesQty == 0)
+            {
+                lock (_byClOrd) _byClOrd.Remove(tracking.OriginalClOrdId);
+                lock (_byOrderId) _byOrderId.Remove(tracking.OrderId);
+            }
         }
     }
 
     private void OnExecCancel(ExecReportCancel er)
     {
+        // The cancel ER's ClOrdID is the cancel-request's clord, which we
+        // intentionally do not register in _byClOrd (we'd otherwise leak any
+        // cancel-rejects targeting it). Resolve via the OrderId index instead
+        // — O(1), no enumeration of LiveByTag.
         OrderTracking? tracking;
-        lock (_byClOrd) _byClOrd.TryGetValue(er.ClOrdId, out tracking);
-        // Cancel ER's ClOrdID is the cancel request's clord, not the original
-        // order's. Look up by orderId across live orders if not found.
-        if (tracking is null && _instruments.TryGetValue(er.SecurityId, out var inst))
+        lock (_byOrderId) _byOrderId.TryGetValue(er.OrderId, out tracking);
+        if (tracking is null) return;
+        if (!_instruments.TryGetValue(tracking.SecurityId, out var inst)) return;
+
+        lock (inst.Sync)
         {
-            lock (inst.Sync)
-            {
-                foreach (var per in inst.PerStrategy.Select(t => t.state))
-                {
-                    foreach (var (tag, rec) in per.LiveByTag)
-                    {
-                        if (rec.OrderId == er.OrderId)
-                        {
-                            per.LiveByTag.Remove(tag);
-                            try { per.OwnerStrategy.OnRemoved(tag); }
-                            catch (Exception ex) { _logWarn?.Invoke($"strategy OnRemoved threw: {ex.Message}"); }
-                            return;
-                        }
-                    }
-                }
-            }
+            tracking.PerStrategy.LiveByTag.Remove(tracking.ClientTag);
         }
+        try { tracking.Strategy.OnRemoved(tracking.ClientTag); }
+        catch (Exception ex) { _logWarn?.Invoke($"strategy OnRemoved threw: {ex.Message}"); }
+
+        // Terminal: drop both tracking maps for this order.
+        lock (_byClOrd) _byClOrd.Remove(tracking.OriginalClOrdId);
+        lock (_byOrderId) _byOrderId.Remove(tracking.OrderId);
     }
 
     private void OnExecReject(ExecReportReject er)
@@ -262,6 +298,32 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
         }
         try { tracking.Strategy.OnRemoved(tracking.ClientTag); }
         catch (Exception ex) { _logWarn?.Invoke($"strategy OnRemoved threw: {ex.Message}"); }
+
+        // Terminal: drop both tracking maps. _byOrderId entry only exists if
+        // the order was acked before being rejected (rare race), but Remove
+        // is harmless when absent.
+        lock (_byClOrd) _byClOrd.Remove(tracking.OriginalClOrdId);
+        if (tracking.OrderId != 0)
+            lock (_byOrderId) _byOrderId.Remove(tracking.OrderId);
+    }
+
+    /// <summary>Test seam: synchronously dispatches an ER_New as if it had
+    /// arrived from the wire.</summary>
+    internal void TestRaiseNew(ExecReportNew er) => OnExecNew(er);
+    /// <summary>Test seam: synchronously dispatches an ER_Trade.</summary>
+    internal void TestRaiseTrade(ExecReportTrade er) => OnExecTrade(er);
+    /// <summary>Test seam: synchronously dispatches an ER_Cancel.</summary>
+    internal void TestRaiseCancel(ExecReportCancel er) => OnExecCancel(er);
+    /// <summary>Test seam: synchronously dispatches an ER_Reject.</summary>
+    internal void TestRaiseReject(ExecReportReject er) => OnExecReject(er);
+    /// <summary>Test seam: submits an order intent through the normal
+    /// <c>Submit</c> path. With a null client, the wire send is skipped but
+    /// the tracking maps and PendingByTag are populated identically.</summary>
+    internal void TestSubmit(IStrategy strategy, OrderIntent intent)
+    {
+        var inst = _instruments[intent.SecurityId];
+        var per = inst.PerStrategy.First(t => ReferenceEquals(t.strategy, strategy)).state;
+        Submit(inst, per, strategy, intent);
     }
 
     public async ValueTask DisposeAsync()
@@ -310,12 +372,34 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
 
     private readonly record struct LiveOrderRecord(long OrderId, OrderSide Side, long PriceMantissa, long RemainingQty);
 
-    private sealed record OrderTracking(
-        IStrategy Strategy,
-        PerStrategyState PerStrategy,
-        string ClientTag,
-        long SecurityId,
-        OrderSide Side,
-        long PriceMantissa,
-        long Quantity);
+    private sealed class OrderTracking
+    {
+        public IStrategy Strategy { get; }
+        public PerStrategyState PerStrategy { get; }
+        public string ClientTag { get; }
+        public long SecurityId { get; }
+        public OrderSide Side { get; }
+        public long PriceMantissa { get; }
+        public long Quantity { get; }
+        // ClOrdID used when this order was first sent to the host. The cancel
+        // request, if any, gets its own ClOrdID; we keep the original here so
+        // terminal events (full fill / cancel / reject) can clean up the
+        // _byClOrd entry without needing a reverse lookup.
+        public ulong OriginalClOrdId { get; }
+        // Engine-assigned OrderID, populated on ER_New. Zero before ack.
+        public long OrderId { get; set; }
+
+        public OrderTracking(IStrategy strategy, PerStrategyState perStrategy, string clientTag,
+            long securityId, OrderSide side, long priceMantissa, long quantity, ulong originalClOrdId)
+        {
+            Strategy = strategy;
+            PerStrategy = perStrategy;
+            ClientTag = clientTag;
+            SecurityId = securityId;
+            Side = side;
+            PriceMantissa = priceMantissa;
+            Quantity = quantity;
+            OriginalClOrdId = originalClOrdId;
+        }
+    }
 }
