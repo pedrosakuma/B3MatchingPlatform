@@ -26,7 +26,7 @@ public sealed class MulticastUdpPacketSink : IUmdfPacketSink, IDisposable
             _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, localInterface.GetAddressBytes());
         _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, ttl);
         _destination = new IPEndPoint(group, port);
-        _logger.LogInformation("multicast sink bound to {Group}:{Port} (ttl={Ttl}, iface={Iface})",
+        _logger.LogInformation("multicast sink configured to send to {Group}:{Port} (ttl={Ttl}, iface={Iface})",
             group, port, ttl, (object?)localInterface ?? "default");
     }
 

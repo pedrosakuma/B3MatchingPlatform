@@ -304,7 +304,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     public async ValueTask DisposeAsync()
     {
-        _logger.LogInformation("channel {ChannelNumber} dispatcher stopping (rptSeq={SequenceNumber})",
+        _logger.LogInformation("channel {ChannelNumber} dispatcher stopping (sequenceNumber={SequenceNumber})",
             ChannelNumber, SequenceNumber);
         _inbound.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
