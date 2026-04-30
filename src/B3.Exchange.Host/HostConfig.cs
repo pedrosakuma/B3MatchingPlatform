@@ -28,7 +28,7 @@ public sealed class ChannelConfig
     [JsonPropertyName("localInterface")] public string? LocalInterface { get; set; }
     [JsonPropertyName("ttl")] public byte Ttl { get; set; } = 1;
     [JsonPropertyName("instruments")] public string InstrumentsFile { get; set; } = "";
-    
+
     /// <summary>
     /// Self-trade prevention policy applied by this channel's matching engine.
     /// Defaults to <c>none</c> (preserves legacy behaviour). Accepted values
