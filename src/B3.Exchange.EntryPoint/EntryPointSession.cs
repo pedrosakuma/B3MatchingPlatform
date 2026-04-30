@@ -259,6 +259,30 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         return TryEnqueue(exact);
     }
 
+    public bool WriteSessionReject(byte terminationCode)
+    {
+        if (!IsOpen) return false;
+        var frame = ArrayPool<byte>.Shared.Rent(SessionRejectEncoder.TerminateTotal);
+        int n = SessionRejectEncoder.EncodeTerminate(frame.AsSpan(0, SessionRejectEncoder.TerminateTotal),
+            SessionId, 0, terminationCode);
+        bool result = TryEnqueueExact(frame, n);
+        Close();
+        return result;
+    }
+
+    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null)
+    {
+        if (!IsOpen) return false;
+        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
+        var frame = ArrayPool<byte>.Shared.Rent(BusinessMessageRejectEncoder.TotalSize(textLen));
+        int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
+            frame.AsSpan(0, BusinessMessageRejectEncoder.TotalSize(textLen)),
+            SessionId, NextMsgSeqNum(), _nowNanos(),
+            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+        return TryEnqueueExact(frame, n);
+    }
+
     private static byte MapRejectReason(RejectReason r) => r switch
     {
         // OrdRejReason wire codes: 0=BrokerExchangeOption (generic), 1=UnknownSymbol,
