@@ -23,7 +23,7 @@ namespace B3.Exchange.EntryPoint;
 /// </summary>
 internal static class BusinessMessageRejectEncoder
 {
-    private const int HeaderSize = 8;
+    private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int BusinessHeaderSize = 18;
     public const int BusinessRejectBlock = 36;
     private const ulong UTCTimestampNullValue = ulong.MaxValue;
@@ -81,7 +81,8 @@ internal static class BusinessMessageRejectEncoder
         if (dst.Length < total)
             throw new ArgumentException("buffer too small for BusinessMessageReject", nameof(dst));
 
-        EntryPointFrameReader.WriteHeader(dst, BusinessRejectBlock,
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
+            blockLength: BusinessRejectBlock,
             EntryPointFrameReader.TidBusinessMessageReject, version: 0);
 
         var body = dst.Slice(HeaderSize, BusinessRejectBlock);

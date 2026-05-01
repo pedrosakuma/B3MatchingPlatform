@@ -19,14 +19,14 @@ public class ExecutionReportEncoderTests
             orderQty: 10, priceMantissa: 12_3450L);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportNewTotal, n);
-        // Header: BlockLength=144 @0, TemplateId=200 @2, SchemaId=1 @4, Version=2 @6
-        var hdr = buf.AsSpan(0, 8);
+        // SBE header at offset SOFH(4)..SOFH+8: BlockLength=144, TemplateId=200, SchemaId=1, Version=2
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
         Assert.Equal((ushort)ExecutionReportEncoder.ExecReportNewBlock, MemoryMarshal.Read<ushort>(hdr.Slice(0, 2)));
         Assert.Equal((ushort)EntryPointFrameReader.TidExecutionReportNew, MemoryMarshal.Read<ushort>(hdr.Slice(2, 2)));
         Assert.Equal((ushort)1, MemoryMarshal.Read<ushort>(hdr.Slice(4, 2)));
         Assert.Equal((ushort)2, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
 
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((uint)42, MemoryMarshal.Read<uint>(body.Slice(0, 4)));        // SessionId
         Assert.Equal((uint)1, MemoryMarshal.Read<uint>(body.Slice(4, 4)));         // MsgSeqNum
         Assert.Equal(1_000_000_000UL, MemoryMarshal.Read<ulong>(body.Slice(8, 8)));// SendingTime
@@ -61,7 +61,7 @@ public class ExecutionReportEncoderTests
             tradeDate: 19000, orderQty: 5);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportTradeTotal, n);
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((byte)'2', body[18]);          // Side=Sell
         Assert.Equal((byte)'2', body[19]);          // OrdStatus=Filled (leaves==0)
         Assert.Equal(5L, MemoryMarshal.Read<long>(body.Slice(48, 8)));   // LastQty
@@ -89,7 +89,7 @@ public class ExecutionReportEncoderTests
             cumQty: 0, orderQty: 100, priceMantissa: 12_3450L);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportCancelTotal, n);
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((byte)'4', body[19]);                                          // OrdStatus=Canceled
         Assert.Equal(11UL, MemoryMarshal.Read<ulong>(body.Slice(20, 8)));           // ClOrdID
         Assert.Equal(0L, MemoryMarshal.Read<long>(body.Slice(44, 8)));              // CumQty (overlap)
@@ -110,7 +110,7 @@ public class ExecutionReportEncoderTests
             rejectReason: 5, transactTimeNanos: 0UL);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportRejectTotal, n);
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal(7UL, MemoryMarshal.Read<ulong>(body.Slice(20, 8)));            // ClOrdID
         Assert.Equal(333L, MemoryMarshal.Read<long>(body.Slice(36, 8)));            // SecurityID
         Assert.Equal((byte)5, body[44]);                                            // OrdRejReason
@@ -127,7 +127,7 @@ public class ExecutionReportEncoderTests
             leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportModifyTotal, n);
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((byte)'5', body[19]);                                          // OrdStatus=Replaced
         Assert.Equal(50L, MemoryMarshal.Read<long>(body.Slice(44, 8)));             // LeavesQty (overlap)
         Assert.Equal(25L, MemoryMarshal.Read<long>(body.Slice(72, 8)));             // CumQty

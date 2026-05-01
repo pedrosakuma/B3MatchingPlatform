@@ -19,7 +19,7 @@ namespace B3.Exchange.EntryPoint;
 /// </summary>
 internal static class ExecutionReportEncoder
 {
-    private const int HeaderSize = 8;            // SBE MessageHeader
+    private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;            // SOFH(4) + SBE(8)
     private const int BusinessHeaderSize = 18;
     private const ulong UTCTimestampNullValue = ulong.MaxValue;
     private const long PriceNullMantissa = long.MinValue;
@@ -80,7 +80,8 @@ internal static class ExecutionReportEncoder
         long orderQty, long? priceMantissa)
     {
         if (dst.Length < ExecReportNewTotal) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 2);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportNewTotal,
+            ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 2);
         var body = dst.Slice(HeaderSize, ExecReportNewBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -112,7 +113,8 @@ internal static class ExecutionReportEncoder
         long leavesQty, long cumQty, long orderQty, long priceMantissa)
     {
         if (dst.Length < ExecReportModifyTotal) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 2);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportModifyTotal,
+            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 2);
         var body = dst.Slice(HeaderSize, ExecReportModifyBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -146,7 +148,8 @@ internal static class ExecutionReportEncoder
         long cumQty, long orderQty, long? priceMantissa)
     {
         if (dst.Length < ExecReportCancelTotal) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 2);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportCancelTotal,
+            ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 2);
         var body = dst.Slice(HeaderSize, ExecReportCancelBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -181,7 +184,8 @@ internal static class ExecutionReportEncoder
         bool aggressor, uint tradeId, uint contraBroker, ushort tradeDate, long orderQty)
     {
         if (dst.Length < ExecReportTradeTotal) throw new ArgumentException("buffer too small for ER_Trade", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, ExecReportTradeBlock, EntryPointFrameReader.TidExecutionReportTrade, version: 2);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportTradeTotal,
+            ExecReportTradeBlock, EntryPointFrameReader.TidExecutionReportTrade, version: 2);
         var body = dst.Slice(HeaderSize, ExecReportTradeBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -215,7 +219,8 @@ internal static class ExecutionReportEncoder
         byte rejectReason, ulong transactTimeNanos)
     {
         if (dst.Length < ExecReportRejectTotal) throw new ArgumentException("buffer too small for ER_Reject", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, ExecReportRejectBlock, EntryPointFrameReader.TidExecutionReportReject, version: 2);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportRejectTotal,
+            ExecReportRejectBlock, EntryPointFrameReader.TidExecutionReportReject, version: 2);
         var body = dst.Slice(HeaderSize, ExecReportRejectBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);

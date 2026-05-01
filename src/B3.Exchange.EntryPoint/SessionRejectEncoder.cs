@@ -18,7 +18,7 @@ namespace B3.Exchange.EntryPoint;
 /// </summary>
 internal static class SessionRejectEncoder
 {
-    private const int HeaderSize = 8;
+    private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int TerminateBlock = 13;
     public const int TerminateTotal = HeaderSize + TerminateBlock;
 
@@ -38,7 +38,8 @@ internal static class SessionRejectEncoder
     {
         if (dst.Length < TerminateTotal)
             throw new ArgumentException("buffer too small for Terminate", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, TerminateBlock, EntryPointFrameReader.TidTerminate, version: 0);
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)TerminateTotal,
+            blockLength: TerminateBlock, EntryPointFrameReader.TidTerminate, version: 0);
         var body = dst.Slice(HeaderSize, TerminateBlock);
         body.Clear();
         MemoryMarshal.Write(body.Slice(0, 4), in sessionId);

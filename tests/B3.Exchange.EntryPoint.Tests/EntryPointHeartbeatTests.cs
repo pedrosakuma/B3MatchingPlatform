@@ -24,9 +24,11 @@ public class EntryPointHeartbeatTests
 
     private static byte[] BuildSequenceFrame(uint nextSeq)
     {
-        var f = new byte[12];
-        EntryPointFrameReader.WriteHeader(f, blockLength: 4, templateId: EntryPointFrameReader.TidSequence, version: 0);
-        BitConverter.GetBytes(nextSeq).CopyTo(f, 8);
+        const int total = EntryPointFrameReader.WireHeaderSize + 4;
+        var f = new byte[total];
+        EntryPointFrameReader.WriteHeader(f, messageLength: (ushort)total,
+            blockLength: 4, templateId: EntryPointFrameReader.TidSequence, version: 0);
+        BitConverter.GetBytes(nextSeq).CopyTo(f, EntryPointFrameReader.WireHeaderSize);
         return f;
     }
 
@@ -76,10 +78,11 @@ public class EntryPointHeartbeatTests
         }
         catch (OperationCanceledException) { }
         catch (IOException) { }
-        // We should have received exactly one Sequence probe (12 bytes) before EOF.
-        Assert.Equal(12, total);
-        // Header sanity: templateId == 9 at offset 2.
-        ushort tid = BitConverter.ToUInt16(buf, 2);
+        // We should have received exactly one Sequence probe (SOFH+SBE+4 bytes) before EOF.
+        const int expectedFrameLen = EntryPointFrameReader.WireHeaderSize + 4;
+        Assert.Equal(expectedFrameLen, total);
+        // Header sanity: templateId == 9 at offset SOFH+2.
+        ushort tid = BitConverter.ToUInt16(buf, EntryPointFrameReader.SofhSize + 2);
         Assert.Equal((ushort)EntryPointFrameReader.TidSequence, tid);
     }
 
@@ -149,17 +152,18 @@ public class EntryPointHeartbeatTests
         // Keep inbound alive with one Sequence frame so idle never trips —
         // but with idle/grace at 10s the test would not run long enough to
         // notice anyway. Just read whatever the server sends.
-        byte[] buf = new byte[12];
+        const int expectedFrameLen = EntryPointFrameReader.WireHeaderSize + 4;
+        byte[] buf = new byte[expectedFrameLen];
         int total = 0;
         using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        while (total < 12)
+        while (total < expectedFrameLen)
         {
-            int n = await ns.ReadAsync(buf.AsMemory(total, 12 - total), readCts.Token);
+            int n = await ns.ReadAsync(buf.AsMemory(total, expectedFrameLen - total), readCts.Token);
             if (n == 0) break;
             total += n;
         }
-        Assert.Equal(12, total);
-        Assert.Equal((ushort)EntryPointFrameReader.TidSequence, BitConverter.ToUInt16(buf, 2));
-        Assert.Equal((ushort)4, BitConverter.ToUInt16(buf, 0)); // BlockLength
+        Assert.Equal(expectedFrameLen, total);
+        Assert.Equal((ushort)EntryPointFrameReader.TidSequence, BitConverter.ToUInt16(buf, EntryPointFrameReader.SofhSize + 2));
+        Assert.Equal((ushort)4, BitConverter.ToUInt16(buf, EntryPointFrameReader.SofhSize)); // BlockLength
     }
 }

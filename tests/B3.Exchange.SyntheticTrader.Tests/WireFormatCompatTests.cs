@@ -14,7 +14,7 @@ namespace B3.Exchange.SyntheticTrader.Tests;
 /// </summary>
 public class WireFormatCompatTests
 {
-    private const int SbeHeaderSize = 8;
+    private const int SbeHeaderSize = EntryPointFrameReader.WireHeaderSize;
 
     [Fact]
     public void SimpleNewOrder_RoundTripsThroughHostInboundDecoder()
