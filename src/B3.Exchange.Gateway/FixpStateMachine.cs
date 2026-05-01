@@ -8,7 +8,8 @@ namespace B3.Exchange.Gateway;
 /// See <c>docs/B3-ENTRYPOINT-ARCHITECTURE.md</c> §5 for the full diagram and
 /// acceptance matrix. The single source of truth for transitions is
 /// <see cref="FixpStateMachine.Apply"/>; <c>FixpSession.State</c> must only
-/// ever be mutated through that method.
+/// ever be mutated by feeding events through that function (in practice via
+/// <c>FixpSession.ApplyTransition</c>, which assigns the returned new state).
 /// </para>
 /// </summary>
 public enum FixpState
@@ -51,8 +52,11 @@ public enum FixpEvent
     Negotiate,
     Establish,
     /// <summary>
-    /// Any FIX/SBE application message (NewOrder, Cancel, ExecutionReport,
-    /// etc.). Only legal in <see cref="FixpState.Established"/>.
+    /// Any inbound application-level FIX/SBE business message (e.g.,
+    /// <c>NewOrderSingle</c>, <c>OrderCancelRequest</c>). Outbound messages
+    /// (e.g., <c>ExecutionReport</c>) do not flow through this enum since
+    /// the gateway is the sender, not the receiver, of those frames. Only
+    /// legal in <see cref="FixpState.Established"/>.
     /// </summary>
     ApplicationMessage,
     /// <summary>FIXP <c>Sequence</c> (heartbeat/seq carrier).</summary>
