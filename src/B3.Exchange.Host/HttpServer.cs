@@ -33,6 +33,7 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly IReadOnlyDictionary<byte, ChannelDispatcher> _dispatchers;
     private readonly Func<IEnumerable<SessionDiagnostics>>? _sessionsProvider;
     private readonly IReadOnlyList<FirmInfo> _firms;
+    private readonly Func<int>? _dailyResetTrigger;
     private readonly Action<string>? _log;
     private WebApplication? _app;
 
@@ -41,7 +42,8 @@ public sealed class HttpServer : IAsyncDisposable
         IReadOnlyDictionary<byte, ChannelDispatcher> dispatchers,
         Action<string>? log = null,
         Func<IEnumerable<SessionDiagnostics>>? sessionsProvider = null,
-        IReadOnlyList<FirmInfo>? firms = null)
+        IReadOnlyList<FirmInfo>? firms = null,
+        Func<int>? dailyResetTrigger = null)
     {
         _config = config;
         _metrics = metrics;
@@ -49,6 +51,7 @@ public sealed class HttpServer : IAsyncDisposable
         _dispatchers = dispatchers;
         _sessionsProvider = sessionsProvider;
         _firms = firms ?? Array.Empty<FirmInfo>();
+        _dailyResetTrigger = dailyResetTrigger;
         _log = log;
     }
 
@@ -144,6 +147,24 @@ public sealed class HttpServer : IAsyncDisposable
 
         app.MapPost("/channel/{ch:int}/bump-version", (int ch, HttpContext ctx) =>
             HandleOperatorEnqueue(ctx, ch, d => d.EnqueueOperatorBumpVersion(), "bump-version"));
+
+        // #GAP-09 (#47): on-demand trading-day rollover. Terminates every
+        // live FIXP session so clients reconnect with Negotiate +
+        // Establish(nextSeqNo=1). The scheduled timer (HostConfig.dailyReset)
+        // fires the same path. Returns 202 Accepted with the count of
+        // sessions terminated (0 if the listener has none); 503 if the
+        // host has not yet finished StartAsync.
+        app.MapPost("/admin/daily-reset", (HttpContext ctx) =>
+        {
+            if (_dailyResetTrigger is null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                return Results.Text("daily-reset not wired (host not started)\n", "text/plain");
+            }
+            int closed = _dailyResetTrigger();
+            ctx.Response.StatusCode = StatusCodes.Status202Accepted;
+            return Results.Text($"accepted daily-reset terminated={closed}\n", "text/plain");
+        });
 
         await app.StartAsync(ct).ConfigureAwait(false);
         _app = app;

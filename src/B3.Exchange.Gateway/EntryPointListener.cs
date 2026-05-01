@@ -178,6 +178,55 @@ public sealed class EntryPointListener : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Spec §4.5.1 (#GAP-09 / issue #47): at start of each trading day the
+    /// gateway resets inbound + outbound MsgSeqNum counters to 1 and
+    /// expects every client to reconnect with a fresh
+    /// <c>Negotiate</c>+<c>Establish(nextSeqNo=1)</c>. We implement this
+    /// the conservative way — terminate every live session — because
+    /// per-session in-place reset would have to coordinate the dispatch
+    /// thread, the retransmission ring, the claim ledger, and any
+    /// in-flight Establish handshake atomically. Forcing reconnect makes
+    /// the whole transition trivially correct and is conformant with the
+    /// spec (clients are required to be able to handle this anyway).
+    ///
+    /// <para>Idempotent: calls <see cref="FixpSession.Close(string)"/> on
+    /// each currently-active session; a session that is already closed
+    /// is a no-op via the existing CAS guard. Returns the number of
+    /// sessions that were live at the moment of the snapshot.</para>
+    ///
+    /// <para>Thread-safety: snapshots <see cref="_sessions"/> under
+    /// <see cref="_lock"/>, then iterates outside the lock so
+    /// <c>Close</c> (which takes <c>_attachLock</c> on the session) does
+    /// not nest the listener's mutex. Safe to call from the HTTP thread
+    /// or from the daily-rollover scheduler timer.</para>
+    /// </summary>
+    public int TerminateAllSessions(string reason)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(reason);
+        FixpSession[] snapshot;
+        lock (_lock) snapshot = _sessions.ToArray();
+        int closed = 0;
+        foreach (var s in snapshot)
+        {
+            if (!s.IsOpen) continue;
+            try
+            {
+                s.Close(reason);
+                closed++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "terminate-all-sessions: failed to close session {ConnectionId}",
+                    s.ConnectionId);
+            }
+        }
+        _logger.LogInformation(
+            "terminated {Count} session(s) (reason={Reason})", closed, reason);
+        return closed;
+    }
+
     private async Task RunAcceptLoopAsync(CancellationToken ct)
     {
         try
