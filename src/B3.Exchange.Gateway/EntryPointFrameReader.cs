@@ -60,6 +60,12 @@ public static class EntryPointFrameReader
     public const ushort TidNegotiate = 1;
     /// <summary>Session: Establish (FIXP, inbound only). See spec §4.5.3.</summary>
     public const ushort TidEstablish = 4;
+    /// <summary>Session: RetransmitRequest (FIXP, inbound). See spec §4.5.6.</summary>
+    public const ushort TidRetransmitRequest = 12;
+    /// <summary>Session: Retransmission (FIXP, outbound). See spec §4.5.6.</summary>
+    public const ushort TidRetransmission = 13;
+    /// <summary>Session: RetransmitReject (FIXP, outbound). See spec §4.5.6.</summary>
+    public const ushort TidRetransmitReject = 14;
     /// <summary>Outbound only: NegotiateResponse (template id 2).</summary>
     public const ushort TidNegotiateResponse = 2;
     /// <summary>Outbound only: NegotiateReject (template id 3).</summary>
@@ -89,6 +95,7 @@ public static class EntryPointFrameReader
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
         (TidNegotiate, 0) => 28,                 // NegotiateData.BLOCK_LENGTH (V6 schema, root version 0)
         (TidEstablish, 0) => 42,                 // EstablishData.BLOCK_LENGTH
+        (TidRetransmitRequest, 0) => 20,         // RetransmitRequestData.BLOCK_LENGTH
         _ => -1
     };
 
