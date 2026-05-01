@@ -180,8 +180,23 @@ public sealed class FixpSession : IAsyncDisposable
     /// </summary>
     internal FixpAction ApplyTransition(FixpEvent ev)
     {
-        var t = FixpStateMachine.Apply(State, ev);
+        var prev = State;
+        var t = FixpStateMachine.Apply(prev, ev);
         State = t.NewState;
+        var metrics = _options.LifecycleMetrics;
+        if (metrics != null && t.Action == FixpAction.Accept && prev != t.NewState)
+        {
+            switch (t.NewState)
+            {
+                case FixpState.Established:
+                    metrics.IncEstablished();
+                    if (prev == FixpState.Suspended) metrics.IncRebound();
+                    break;
+                case FixpState.Suspended:
+                    metrics.IncSuspended();
+                    break;
+            }
+        }
         return t.Action;
     }
 

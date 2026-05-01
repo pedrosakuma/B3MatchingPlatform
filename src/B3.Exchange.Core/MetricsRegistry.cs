@@ -58,6 +58,30 @@ public interface ISessionMetricsProvider
 public readonly record struct SessionQueueSample(string SessionId, long QueueDepth);
 
 /// <summary>
+/// Process-wide counters for FIXP session lifecycle events. Exposed via
+/// <see cref="MetricsRegistry.Sessions"/>. All increments are atomic and
+/// safe to call from any thread (state-machine transitions, listener
+/// reaper, etc).
+/// </summary>
+public sealed class SessionLifecycleMetrics
+{
+    private long _established;
+    private long _suspended;
+    private long _rebound;
+    private long _reaped;
+
+    public long Established => Interlocked.Read(ref _established);
+    public long Suspended => Interlocked.Read(ref _suspended);
+    public long Rebound => Interlocked.Read(ref _rebound);
+    public long Reaped => Interlocked.Read(ref _reaped);
+
+    public void IncEstablished() => Interlocked.Increment(ref _established);
+    public void IncSuspended() => Interlocked.Increment(ref _suspended);
+    public void IncRebound() => Interlocked.Increment(ref _rebound);
+    public void IncReaped() => Interlocked.Increment(ref _reaped);
+}
+
+/// <summary>
 /// Central registry of channel metrics + a Prometheus text-format
 /// renderer. Hand-rolled to avoid taking a dependency on
 /// <c>prometheus-net</c> (see issue #5 / project conventions).
@@ -67,6 +91,9 @@ public sealed class MetricsRegistry
     private readonly Dictionary<byte, ChannelMetrics> _channels = new();
     private readonly object _lock = new();
     private ISessionMetricsProvider? _sessions;
+    private readonly SessionLifecycleMetrics _sessionLifecycle = new();
+
+    public SessionLifecycleMetrics Sessions => _sessionLifecycle;
 
     public ChannelMetrics RegisterChannel(byte channelNumber)
     {
@@ -134,7 +161,27 @@ public sealed class MetricsRegistry
             }
         }
 
+        EmitProcessCounter(sb, "exch_session_established_total",
+            "Total FIXP sessions that have transitioned into Established (initial Establish + rebind via #69b).",
+            _sessionLifecycle.Established);
+        EmitProcessCounter(sb, "exch_session_suspended_total",
+            "Total FIXP sessions that have transitioned into Suspended (transport drop while Established, issue #69a).",
+            _sessionLifecycle.Suspended);
+        EmitProcessCounter(sb, "exch_session_rebound_total",
+            "Total successful re-attaches of a Suspended session via Establish on a new TCP connection (issue #69b).",
+            _sessionLifecycle.Rebound);
+        EmitProcessCounter(sb, "exch_session_reaped_total",
+            "Total Suspended FIXP sessions closed by the listener's CoD/suspended reaper after exceeding SuspendedTimeoutMs.",
+            _sessionLifecycle.Reaped);
+
         return sb.ToString();
+    }
+
+    private static void EmitProcessCounter(StringBuilder sb, string name, string help, long value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" counter\n");
+        sb.Append(name).Append(' ').Append(value.ToString(CultureInfo.InvariantCulture)).Append('\n');
     }
 
     private static void EmitCounter(StringBuilder sb, string name, string help,

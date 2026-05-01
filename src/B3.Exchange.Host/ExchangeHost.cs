@@ -205,6 +205,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
+            LifecycleMetrics = _metrics.Sessions,
         };
         // Phase 2 (#42): real Negotiate handshake. The validator is pure
         // (no IO); the claim ledger lives for the host process lifetime
