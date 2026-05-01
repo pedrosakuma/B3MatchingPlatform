@@ -201,6 +201,9 @@ healthcheck).
 | `/metrics`       | Prometheus 0.0.4 text exposition (always 200)                                   |
 | `POST /channel/{ch}/snapshot-now`  | Operator command — forces a snapshot publish on the next dispatcher cycle. 202 on enqueue, 404 unknown channel, 503 if the dispatcher's inbound queue is full. |
 | `POST /channel/{ch}/bump-version`  | Operator command — atomically bumps the incremental + snapshot `SequenceVersion`, clears the order book, resets `RptSeq` to 0, and emits a `ChannelReset_11` frame on the incremental channel under the new version. 202 on enqueue, 404 unknown channel, 503 if the queue is full. |
+| `GET /sessions`                    | JSON array of every currently-attached FIXP session (issue #70). |
+| `GET /sessions/{id}`               | JSON object for a single session by `sessionId` (e.g. `conn-2a`). 404 if unknown. |
+| `GET /firms`                       | JSON array of firms declared in `firms[]`. |
 
 `/metrics` series:
 
@@ -212,6 +215,12 @@ healthcheck).
 | `exch_instrument_defs_emitted_total`          | counter | `channel`          | Stub — incremented by the instrument-definition publisher (issue #2). |
 | `exch_dispatch_loop_last_tick_unixms`         | gauge   | `channel`          | Unix ms of the dispatcher loop's last heartbeat.                       |
 | `exch_send_queue_depth`                       | gauge   | `channel,session`  | Per-`EntryPointSession` outbound queue. `channel="all"` because the queue is shared across channels. |
+| `fixp_session_state`                          | gauge   | `session,firm`     | FIXP state machine value (Idle=0, Negotiated=1, Established=2, Suspended=3, Terminated=4). |
+| `fixp_session_outbound_seq`                   | gauge   | `session`          | Last allocated outbound `MsgSeqNum`.                                  |
+| `fixp_session_inbound_expected_seq`           | gauge   | `session`          | Highest inbound `MsgSeqNum` accepted (for gap detection).             |
+| `fixp_session_retx_buffer_depth`              | gauge   | `session`          | Number of frames currently retained for retransmission.               |
+| `fixp_session_attached_transports`            | gauge   | `session`          | 1 if a TCP transport is currently attached, 0 if Suspended/awaiting rebind. |
+| `fixp_session_last_activity_unixms`           | gauge   | `session`          | Unix ms of the last byte received on the session (liveness).          |
 
 ### Readiness today vs. once issues #1/#2 land
 
@@ -255,6 +264,28 @@ they have already discarded.
 The next snapshot publish (whether triggered by the configured cadence
 or by an operator `snapshot-now`) reflects the empty book stamped with
 the new versions.
+
+### Operator session inspection (issue #70)
+
+`GET /sessions`, `GET /sessions/{id}` and `GET /firms` expose live FIXP
+session state in JSON form so operators can correlate a peer report
+("session is stuck", "I see no fills") with the simulator's view of the
+session without scraping `/metrics`.
+
+```bash
+curl -s http://localhost:8080/firms
+# => [{"id":"FIRM01","name":"Acme","enteringFirmCode":7}]
+
+curl -s http://localhost:8080/sessions
+# => [{"sessionId":"conn-2a","firmId":"FIRM01","state":2,"sessionVerId":1,
+#      "outboundSeq":4291,"inboundExpectedSeq":1027,"retxBufferDepth":4291,
+#      "sendQueueDepth":0,"attachedTransportId":"tx-2a","lastActivityAtMs":1700000123456}]
+
+curl -s http://localhost:8080/sessions/conn-2a
+# => 200 (single object) or 404 if no session with that id is currently registered
+```
+
+`state` mirrors the values exposed by the `fixp_session_state` gauge.
 
 ### Docker `HEALTHCHECK`
 

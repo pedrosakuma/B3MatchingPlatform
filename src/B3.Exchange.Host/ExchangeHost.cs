@@ -242,15 +242,27 @@ public sealed class ExchangeHost : IAsyncDisposable
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 
-        _metrics.SetSessionProvider(new ListenerSessionProvider(_listener));
+        var sessionProvider = new ListenerSessionProvider(_listener, firmRegistry);
+        _metrics.SetSessionProvider(sessionProvider);
 
         if (_config.Http != null)
         {
             IReadOnlyList<IReadinessProbe> probeSnapshot;
             lock (_probesLock) probeSnapshot = _probes.ToList();
             var dispatchersByChannel = _dispatchers.ToDictionary(d => d.ChannelNumber);
+            // Snapshot firms once at startup (FirmRegistry is immutable
+            // after build) and expose them as plain DTOs to HttpServer
+            // to avoid leaking Gateway types into the operator surface.
+            var firmInfos = firmRegistry.Firms.Values
+                .Select(f => new FirmInfo(f.Id, f.Name, f.EnteringFirmCode))
+                .ToList();
+            // Reuse the SAME provider instance that's already wired into
+            // MetricsRegistry so /sessions and /metrics observe exactly
+            // the same snapshot of live sessions on each scrape.
             _http = new HttpServer(_config.Http, _metrics, probeSnapshot, dispatchersByChannel,
-                msg => _logger.LogInformation("{Message}", msg));
+                msg => _logger.LogInformation("{Message}", msg),
+                sessionsProvider: sessionProvider.Sample,
+                firms: firmInfos);
             await _http.StartAsync().ConfigureAwait(false);
         }
 
@@ -260,15 +272,36 @@ public sealed class ExchangeHost : IAsyncDisposable
     private sealed class ListenerSessionProvider : ISessionMetricsProvider
     {
         private readonly EntryPointListener _listener;
-        public ListenerSessionProvider(EntryPointListener listener) { _listener = listener; }
-        public IEnumerable<SessionQueueSample> Sample()
+        private readonly FirmRegistry _firms;
+        public ListenerSessionProvider(EntryPointListener listener, FirmRegistry firms)
         {
+            _listener = listener;
+            _firms = firms;
+        }
+        public IEnumerable<SessionDiagnostics> Sample()
+        {
+            // Build a one-shot reverse index (wire EnteringFirm code → firm Id).
+            // Cheap to rebuild each scrape since firm count is small (a handful)
+            // and FirmRegistry is immutable.
+            var byCode = new Dictionary<uint, string>();
+            foreach (var f in _firms.Firms.Values)
+                byCode[f.EnteringFirmCode] = f.Id;
+
             foreach (var s in _listener.ActiveSessions)
             {
-                if (!s.IsOpen) continue;
-                yield return new SessionQueueSample(
+                if (!s.IsRegistered) continue;
+                var firmId = byCode.TryGetValue(s.EnteringFirm, out var id) ? id : "unknown";
+                yield return new SessionDiagnostics(
                     SessionId: "conn-" + s.ConnectionId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    QueueDepth: s.SendQueueDepth);
+                    FirmId: firmId,
+                    State: (int)s.State,
+                    SessionVerId: s.SessionVerId,
+                    OutboundSeq: s.OutboundSeq,
+                    InboundExpectedSeq: s.LastIncomingSeqNo,
+                    RetxBufferDepth: s.RetxBufferDepth,
+                    SendQueueDepth: s.SendQueueDepth,
+                    AttachedTransportId: s.AttachedTransportId,
+                    LastActivityAtMs: s.LastActivityAtMs);
             }
         }
     }
