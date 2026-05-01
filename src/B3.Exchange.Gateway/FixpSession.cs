@@ -27,16 +27,30 @@ public sealed class FixpSession : IAsyncDisposable
     private const int InboundHeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int DefaultSendQueueCapacity = 1024;
 
-    private readonly TcpTransport _transport;
+    private TcpTransport _transport;
     private readonly IInboundCommandSink _sink;
     private readonly ILogger<FixpSession> _logger;
-    private readonly CancellationTokenSource _cts = new();
+    private readonly ILogger<TcpTransport> _transportLogger;
+    private readonly int _sendQueueCapacity;
+    private CancellationTokenSource _cts = new();
     private readonly Func<ulong> _nowNanos;
     private readonly FixpSessionOptions _options;
     private readonly Action<FixpSession, string>? _onClosed;
     private readonly NegotiationValidator? _validator;
     private readonly EstablishValidator? _establishValidator;
     private readonly SessionClaimRegistry? _claims;
+    /// <summary>
+    /// Serializes lifecycle transitions: <see cref="Suspend"/>,
+    /// <see cref="Close"/>, and <see cref="TryReattach"/> all hold this
+    /// lock so a concurrent reaper-driven Close can't race a peer-driven
+    /// rebind. The dispatch / receive / watchdog hot paths do NOT take
+    /// the lock; they operate on a captured snapshot of
+    /// <see cref="_transport"/> / <see cref="_cts"/> and tolerate the
+    /// snapshot becoming stale across a re-attach (the old transport's
+    /// Close will exit their loops naturally; new loops are started by
+    /// <see cref="TryReattach"/> bound to the new snapshot).
+    /// </summary>
+    private readonly object _attachLock = new();
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
     /// or 0 if no claim is held. Tracked so <see cref="Close"/> can
     /// release the claim using the value from the moment the claim was
@@ -165,6 +179,8 @@ public sealed class FixpSession : IAsyncDisposable
         Identity = new ContractsSessionId("conn-" + connectionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _sink = sink;
         _logger = logger;
+        _transportLogger = transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance;
+        _sendQueueCapacity = sendQueueCapacity;
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
@@ -180,11 +196,24 @@ public sealed class FixpSession : IAsyncDisposable
         // OnTransportClosed handler so transport-driven teardown can be
         // demoted to a Suspend (preserving the FIXP session) when we are
         // in Established state per spec §4.5 (issue #69).
-        _transport = new TcpTransport(connectionId, stream,
-            transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance,
-            sendQueueCapacity,
-            onClose: reason => OnTransportClosed(reason));
+        _transport = CreateBoundTransport(stream);
         Volatile.Write(ref _lastInboundMs, NowMs());
+    }
+
+    /// <summary>
+    /// Builds a <see cref="TcpTransport"/> whose <c>onClose</c> callback
+    /// captures the transport instance and forwards it to
+    /// <see cref="OnTransportClosed(string, TcpTransport?)"/> so a stale
+    /// callback from a previous transport generation (post-rebind, see
+    /// <see cref="TryReattach"/>) is ignored instead of tearing down the
+    /// freshly attached session.
+    /// </summary>
+    private TcpTransport CreateBoundTransport(Stream stream)
+    {
+        TcpTransport? bound = null;
+        bound = new TcpTransport(ConnectionId, stream, _transportLogger, _sendQueueCapacity,
+            onClose: reason => OnTransportClosed(reason, bound));
+        return bound;
     }
 
     public void Start()
@@ -203,7 +232,12 @@ public sealed class FixpSession : IAsyncDisposable
 
     private async Task RunReceiveLoopAsync(CancellationToken ct)
     {
-        var stream = _transport.Stream;
+        // Capture the transport this loop is bound to so a stale callback
+        // after a re-attach (#69b-2) can be detected and ignored: a new
+        // recv loop bound to a fresh transport will be the only owner of
+        // the close decision for the new transport.
+        var ownTransport = _transport;
+        var stream = ownTransport.Stream;
         var headerBuf = new byte[InboundHeaderSize];
         try
         {
@@ -246,8 +280,11 @@ public sealed class FixpSession : IAsyncDisposable
         {
             // Transport-side EOF: defer to the central handler so the
             // Established → Suspended demotion (issue #69) is observed
-            // identically to a transport-callback-driven teardown.
-            OnTransportClosed("recv-eof");
+            // identically to a transport-callback-driven teardown. Pass
+            // the captured transport so a stale callback from a previous
+            // generation (post-rebind) is filtered out by
+            // OnTransportClosed.
+            OnTransportClosed("recv-eof", ownTransport);
         }
     }
 
@@ -733,6 +770,13 @@ public sealed class FixpSession : IAsyncDisposable
     /// </summary>
     private async Task RunWatchdogLoopAsync(CancellationToken ct)
     {
+        // Capture the transport this loop is bound to so a stale tick
+        // after a re-attach (#69b-2) can be detected and a teardown
+        // refused. Without this guard, a watchdog from the OLD transport
+        // could complete its Task.Delay just as the cancellation arrives,
+        // observe stale liveness fields, and call Close("idle-timeout")
+        // against the freshly attached session.
+        var ownTransport = _transport;
         // Tick at a fraction of the smallest configured interval so we react
         // promptly without busy-polling. Capped to keep tests responsive.
         int tickMs = Math.Max(1, Math.Min(_options.HeartbeatIntervalMs,
@@ -743,10 +787,13 @@ public sealed class FixpSession : IAsyncDisposable
             {
                 await Task.Delay(tickMs, ct).ConfigureAwait(false);
                 if (!IsOpen) return;
+                // A re-attach replaced the transport this loop was bound
+                // to; surrender to the new watchdog and exit.
+                if (!ReferenceEquals(_transport, ownTransport)) return;
 
                 long now = NowMs();
                 long sinceIn = now - Volatile.Read(ref _lastInboundMs);
-                long sinceOut = now - _transport.LastOutboundTickMs;
+                long sinceOut = now - ownTransport.LastOutboundTickMs;
 
                 // Idle teardown: if a probe is outstanding and grace elapsed
                 // without any inbound, close. The grace clock starts from the
@@ -756,10 +803,11 @@ public sealed class FixpSession : IAsyncDisposable
                 if (sinceIn >= (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs &&
                     Volatile.Read(ref _probeOutstanding) == 1)
                 {
-                    // Seam for issue #11: a future BusinessReject (templateId=206)
-                    // should be enqueued here before close so the peer learns
-                    // the reason. Today we close with a logged reason string.
-                    Close("idle-timeout");
+                    // Generation-aware close: another reattach could have
+                    // raced in between the snapshot above and the close
+                    // call below; CloseIfTransportCurrent re-validates
+                    // under _attachLock.
+                    CloseIfTransportCurrent("idle-timeout", ownTransport);
                     return;
                 }
 
@@ -940,28 +988,51 @@ public sealed class FixpSession : IAsyncDisposable
 
     public void Close() => Close("close");
 
+    private void OnTransportClosed(string reason) => OnTransportClosed(reason, originatingTransport: null);
+
     /// <summary>
-    /// Routes a transport-side teardown (network IO error, EOF, or
-    /// transport-initiated close) into either a session-preserving
+    /// Routes a transport-side teardown into either a session-preserving
     /// <see cref="Suspend"/> (when we are <see cref="FixpState.Established"/>
     /// per spec §4.5 / issue #69) or a full <see cref="Close"/>. Idempotent
     /// — multiple callers (transport callback, receive-loop finally, watchdog)
     /// converge here without repeating side effects.
+    ///
+    /// <para><paramref name="originatingTransport"/> identifies the transport
+    /// instance whose teardown triggered this call. After a re-attach
+    /// (#69b-2) the OLD transport's recv-loop / send-loop / onClose
+    /// callbacks may still be in flight; if those fire after the new
+    /// transport is installed, they would otherwise erroneously close or
+    /// suspend the freshly attached session. We compare against the
+    /// session's current <c>_transport</c> snapshot and drop the stale
+    /// callback. <c>null</c> means "from an unknown source"; treated as
+    /// authoritative for backward compatibility.</para>
     /// </summary>
-    private void OnTransportClosed(string reason)
+    private void OnTransportClosed(string reason, TcpTransport? originatingTransport)
     {
         if (Volatile.Read(ref _isOpen) == 0) return;
-        // Re-entrancy guard: Suspend() itself calls _transport.Close(...),
-        // which will fire this callback a second time. Once we have detached
-        // (or are about to detach), defer to whichever branch already took
-        // ownership rather than escalating to a full Close.
-        if (Volatile.Read(ref _isAttached) == 0) return;
-        if (State == FixpState.Established)
+        // Decision must run under _attachLock so the generation check and
+        // the actual lifecycle transition can't be split by a concurrent
+        // TryReattach. Without the lock a stale callback could pass the
+        // generation check, get preempted while the new transport is
+        // installed, then close the new generation.
+        lock (_attachLock)
         {
-            Suspend(reason);
-            return;
+            if (Volatile.Read(ref _isOpen) == 0) return;
+            // Stale callback from a prior transport generation — ignore.
+            if (originatingTransport is not null && !ReferenceEquals(originatingTransport, _transport))
+                return;
+            // Re-entrancy guard: Suspend() itself calls _transport.Close(...),
+            // which will fire this callback a second time. Once we have detached
+            // (or are about to detach), defer to whichever branch already took
+            // ownership rather than escalating to a full Close.
+            if (Volatile.Read(ref _isAttached) == 0) return;
+            if (State == FixpState.Established)
+            {
+                SuspendLocked(reason);
+                return;
+            }
+            CloseLocked(reason);
         }
-        Close(reason);
     }
 
     /// <summary>
@@ -976,6 +1047,19 @@ public sealed class FixpSession : IAsyncDisposable
     /// </summary>
     public void Suspend(string reason)
     {
+        lock (_attachLock)
+        {
+            SuspendLocked(reason);
+        }
+    }
+
+    /// <summary>
+    /// Body of <see cref="Suspend(string)"/>; assumes the caller already
+    /// holds <see cref="_attachLock"/>. Idempotent — second caller is a
+    /// no-op via the <see cref="_isAttached"/> CAS.
+    /// </summary>
+    private void SuspendLocked(string reason)
+    {
         // Atomically flip the attachment flag; second caller is a no-op.
         if (Interlocked.Exchange(ref _isAttached, 0) == 0) return;
         _logger.LogInformation("fixp session {ConnectionId} suspending (reason={Reason})",
@@ -983,31 +1067,15 @@ public sealed class FixpSession : IAsyncDisposable
         var action = ApplyTransition(FixpEvent.Detach);
         if (action != FixpAction.Accept || State != FixpState.Suspended)
         {
-            // State machine refused the demotion (e.g. we were already past
-            // Established when the transport died). Fall back to Close so we
-            // don't leave a half-broken session registered.
             _logger.LogInformation(
                 "fixp session {ConnectionId} suspend declined (state={State} action={Action}); closing instead",
                 ConnectionId, State, action);
-            Close(reason);
+            CloseLocked(reason);
             return;
         }
-        // Tear down the dead transport + cancel loops. Claim/registration are
-        // intentionally retained for re-attach. We do NOT call
-        // _sink.OnSessionClosed nor _onClosed because, from the engine's
-        // and the listener's perspective, the FIXP session is still alive.
         try { _cts.Cancel(); } catch { }
         try { _transport.Close(reason); } catch { }
-        // Dispose the dead NetworkStream/socket explicitly. Otherwise the
-        // suspended session keeps the underlying file descriptor open until
-        // re-attach (issue #69b) swaps in a new transport, or until GC
-        // finalizes the stream — under repeated client reconnects this would
-        // leak FDs. The stream owns its socket (NetworkStream(sock,
-        // ownsSocket:true) in EntryPointListener), so disposing it closes
-        // the socket too. Re-attach will install a fresh stream.
         try { _transport.Stream.Dispose(); } catch { }
-        // Stamp the suspension timestamp last, so the reaper only observes
-        // Suspended sessions whose teardown is fully complete.
         Volatile.Write(ref _suspendedSinceMs, NowMs());
     }
 
@@ -1017,7 +1085,38 @@ public sealed class FixpSession : IAsyncDisposable
     /// listener (or tests) can log it. <see cref="Close()"/> is the
     /// no-reason convenience overload.
     /// </summary>
+    /// <summary>
+    /// Generation-aware close: closes the session only if
+    /// <paramref name="originatingTransport"/> is still the current
+    /// transport. Used by background loops (watchdog) that may have
+    /// raced past their cancellation token after a re-attach (#69b-2).
+    /// </summary>
+    private void CloseIfTransportCurrent(string reason, TcpTransport originatingTransport)
+    {
+        lock (_attachLock)
+        {
+            if (!ReferenceEquals(_transport, originatingTransport)) return;
+            CloseLocked(reason);
+        }
+    }
+
     public void Close(string reason)
+    {
+        lock (_attachLock)
+        {
+            CloseLocked(reason);
+        }
+    }
+
+    /// <summary>
+    /// Body of <see cref="Close(string)"/>; assumes the caller already
+    /// holds <see cref="_attachLock"/>. Called directly from
+    /// <see cref="Suspend"/> when the state-machine refuses to demote
+    /// (so we don't try to re-acquire the lock recursively, and so the
+    /// transition from "trying to suspend" to "actually closing" is
+    /// atomic from the perspective of a concurrent re-attach).
+    /// </summary>
+    private void CloseLocked(string reason)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
         Volatile.Write(ref _isAttached, 0);
@@ -1043,6 +1142,114 @@ public sealed class FixpSession : IAsyncDisposable
         // the lifetime of every resting order it placed → unbounded memory.
         try { _sink.OnSessionClosed(Identity); } catch { }
         try { _onClosed?.Invoke(this, reason); } catch { }
+    }
+
+    /// <summary>
+    /// Re-attach a freshly accepted transport to this Suspended FIXP
+    /// session (issue #69b-2). Called by <see cref="EntryPointListener"/>
+    /// after it has parsed the new connection's first frame and
+    /// determined that it is an <c>Establish</c> targeting our
+    /// <see cref="SessionId"/> with a matching <see cref="SessionVerId"/>.
+    /// The buffered first frame must be replayable through
+    /// <paramref name="rebindStream"/> (e.g. a <see cref="PrependedStream"/>);
+    /// the new receive loop will read it, drive
+    /// <see cref="ProcessEstablish"/>, send the <c>EstablishAck</c> and
+    /// transition the state machine Suspended → Established.
+    ///
+    /// <para>Returns <c>false</c> (without disposing
+    /// <paramref name="rebindStream"/>) when the session is no longer
+    /// re-attachable (closed, never suspended, or another re-attach won
+    /// the race). The caller is responsible for closing the new socket
+    /// in that case.</para>
+    /// </summary>
+    public bool TryReattach(Stream rebindStream)
+    {
+        ArgumentNullException.ThrowIfNull(rebindStream);
+        // Snapshot the previous loop tasks so we can JOIN with them
+        // before installing the new transport. This guarantees that any
+        // in-flight dispatch from the old receive loop (which still
+        // reads `_transport`) has fully run to completion before a new
+        // generation can be observed — eliminating the race in which an
+        // old dispatch path's continuation would close or write to the
+        // freshly attached transport.
+        Task? oldRecv;
+        Task? oldWatchdog;
+        lock (_attachLock)
+        {
+            if (Volatile.Read(ref _isOpen) == 0) return false;
+            if (Volatile.Read(ref _isAttached) == 1) return false;
+            if (State != FixpState.Suspended) return false;
+            oldRecv = _recvTask;
+            oldWatchdog = _watchdogTask;
+        }
+        // Drain old loops outside the lock to avoid holding _attachLock
+        // across an await of arbitrary duration. Loops were already
+        // cancelled (and the old stream disposed) in Suspend, so this
+        // join should complete promptly. Bound by a short timeout as a
+        // belt-and-suspenders against runaway tasks; on timeout we skip
+        // the attempt and let the caller close the new socket — the
+        // suspended-session reaper will eventually clean up.
+        if (oldRecv is not null)
+        {
+            try { if (!oldRecv.Wait(TimeSpan.FromSeconds(2))) return false; } catch { }
+        }
+        if (oldWatchdog is not null)
+        {
+            try { if (!oldWatchdog.Wait(TimeSpan.FromSeconds(2))) return false; } catch { }
+        }
+        lock (_attachLock)
+        {
+            // Re-validate after the unlock-await-relock window: a
+            // concurrent Close (e.g. reaper) may have terminated the
+            // session while we waited.
+            if (Volatile.Read(ref _isOpen) == 0) return false;
+            if (Volatile.Read(ref _isAttached) == 1) return false;
+            if (State != FixpState.Suspended) return false;
+
+            _logger.LogInformation(
+                "fixp session {ConnectionId} re-attaching transport (sessionId={SessionId} sessionVerId={SessionVerId})",
+                ConnectionId, SessionId, SessionVerId);
+
+            try { _cts.Dispose(); } catch { }
+            _cts = new CancellationTokenSource();
+            _transport = CreateBoundTransport(rebindStream);
+            Volatile.Write(ref _suspendedSinceMs, 0);
+            Volatile.Write(ref _lastInboundMs, NowMs());
+            Volatile.Write(ref _isAttached, 1);
+
+            // Spin up new send / recv / watchdog loops bound to the fresh
+            // transport + cancellation source. The buffered Establish frame
+            // already inside `rebindStream` will flow through the recv loop
+            // and drive ProcessEstablish → state machine Suspended → Established.
+            _transport.StartSendLoop(_cts.Token);
+            _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
+            _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Atomic suspended-session reap (issue #69b-2): if this session is
+    /// still in <see cref="FixpState.Suspended"/> and its
+    /// <see cref="SuspendedSinceMs"/> is at or before
+    /// <paramref name="thresholdMs"/>, fully closes the session and
+    /// returns <c>true</c>. Otherwise leaves the session untouched and
+    /// returns <c>false</c>. Holds <see cref="_attachLock"/> for the
+    /// duration so a concurrent <see cref="TryReattach"/> cannot race
+    /// in between the snapshot the reaper made and the close decision.
+    /// </summary>
+    internal bool TryReapIfSuspended(long thresholdMs)
+    {
+        lock (_attachLock)
+        {
+            if (Volatile.Read(ref _isOpen) == 0) return false;
+            if (State != FixpState.Suspended) return false;
+            var since = Volatile.Read(ref _suspendedSinceMs);
+            if (since == 0) return false;
+            if (since > thresholdMs) return false;
+            CloseLocked("suspended-timeout");
+            return true;
+        }
     }
 
     public async ValueTask DisposeAsync()

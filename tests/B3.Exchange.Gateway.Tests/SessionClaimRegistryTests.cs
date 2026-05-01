@@ -68,4 +68,31 @@ public class SessionClaimRegistryTests
     {
         Assert.Equal(0UL, new SessionClaimRegistry().CurrentSessionVerId(99999));
     }
+
+    [Fact]
+    public void TryGetActiveClaim_returns_holder_and_version_for_active()
+    {
+        var r = new SessionClaimRegistry();
+        var owner = new object();
+        r.TryClaim(42, 7, owner);
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out var ver));
+        Assert.Same(owner, holder);
+        Assert.Equal(7UL, ver);
+    }
+
+    [Fact]
+    public void TryGetActiveClaim_returns_false_when_unknown()
+    {
+        Assert.False(new SessionClaimRegistry().TryGetActiveClaim(42, out _, out _));
+    }
+
+    [Fact]
+    public void TryGetActiveClaim_returns_false_after_release()
+    {
+        var r = new SessionClaimRegistry();
+        var owner = new object();
+        r.TryClaim(42, 7, owner);
+        r.Release(42, owner);
+        Assert.False(r.TryGetActiveClaim(42, out _, out _));
+    }
 }
