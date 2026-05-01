@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using B3.Exchange.EntryPoint;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using B3.Exchange.SyntheticTrader;
 

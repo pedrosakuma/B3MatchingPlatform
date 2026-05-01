@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <RootNamespace>B3.Exchange.Integration</RootNamespace>
-    <AssemblyName>B3.Exchange.Integration</AssemblyName>
+    <RootNamespace>B3.Exchange.Core</RootNamespace>
+    <AssemblyName>B3.Exchange.Core</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="B3.Exchange.Integration.Tests" />
+    <InternalsVisibleTo Include="B3.Exchange.Core.Tests" />
     <InternalsVisibleTo Include="B3.Exchange.Host.Tests" />
   </ItemGroup>
 

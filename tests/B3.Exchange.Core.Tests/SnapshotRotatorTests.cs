@@ -1,12 +1,12 @@
 using System.Runtime.InteropServices;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 using Side = B3.Exchange.Matching.Side;
 
-namespace B3.Exchange.Integration.Tests;
+namespace B3.Exchange.Core.Tests;
 
 /// <summary>
 /// Unit tests for <see cref="SnapshotRotator"/> using a hand-rolled

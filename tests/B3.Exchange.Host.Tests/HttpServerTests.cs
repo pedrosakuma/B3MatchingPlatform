@@ -1,5 +1,5 @@
 using System.Net.Http;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 
 namespace B3.Exchange.Host.Tests;
 

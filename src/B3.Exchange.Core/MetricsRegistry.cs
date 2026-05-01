@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Text;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Per-channel atomic counters and gauges. All mutating methods are

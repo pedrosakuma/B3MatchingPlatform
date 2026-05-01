@@ -2,7 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Production <see cref="IUmdfPacketSink"/> backed by a UDP multicast socket.

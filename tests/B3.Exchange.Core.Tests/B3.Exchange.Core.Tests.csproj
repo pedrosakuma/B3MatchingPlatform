@@ -15,7 +15,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.EntryPoint\B3.Exchange.EntryPoint.csproj" />
-    <ProjectReference Include="..\..\src\B3.Exchange.Integration\B3.Exchange.Integration.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Core\B3.Exchange.Core.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
   </ItemGroup>
 

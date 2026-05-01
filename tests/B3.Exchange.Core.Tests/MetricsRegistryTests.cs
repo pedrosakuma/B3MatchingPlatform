@@ -1,6 +1,6 @@
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 
-namespace B3.Exchange.Integration.Tests;
+namespace B3.Exchange.Core.Tests;
 
 public class MetricsRegistryTests
 {

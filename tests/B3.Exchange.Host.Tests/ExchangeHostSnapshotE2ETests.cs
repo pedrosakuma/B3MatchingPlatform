@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using B3.Exchange.EntryPoint;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Host.Tests;

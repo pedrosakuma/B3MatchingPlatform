@@ -1,5 +1,5 @@
 using System.Net;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
