@@ -33,6 +33,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     private readonly Func<ulong> _nowNanos;
     private readonly EntryPointSessionOptions _options;
     private readonly Action<EntryPointSession, string>? _onClosed;
+    private readonly SemaphoreSlim _streamWriteLock = new(1, 1);
     private long _msgSeqNum;
     private int _isOpen = 1;
     // Watchdog state (milliseconds since process start, monotonic).
@@ -109,10 +110,10 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
             while (!ct.IsCancellationRequested)
             {
                 await ReadExactlyAsync(_stream, headerBuf, ct).ConfigureAwait(false);
-                if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var hdrErr))
+                if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var headerError, out var hdrMsg))
                 {
-                    _sink.OnDecodeError(this, hdrErr ?? "invalid header");
-                    Close("decode-error");
+                    _sink.OnDecodeError(this, hdrMsg ?? headerError.ToString());
+                    await TerminateAndCloseAsync(MapHeaderErrorToTerminationCode(headerError), $"decode-error:{headerError}").ConfigureAwait(false);
                     return;
                 }
                 var bodyBuf = ArrayPool<byte>.Shared.Rent(info.BodyLength);
@@ -124,7 +125,11 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                     Volatile.Write(ref _lastInboundMs, NowMs());
                     Volatile.Write(ref _probeOutstanding, 0);
                     var body = bodyBuf.AsSpan(0, info.BodyLength);
-                    DispatchInbound(info, body);
+                    if (!await DispatchInboundAsync(info, bodyBuf, info.BodyLength).ConfigureAwait(false))
+                    {
+                        // DispatchInboundAsync already wrote Terminate + closed.
+                        return;
+                    }
                 }
                 finally
                 {
@@ -144,7 +149,56 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         }
     }
 
-    private void DispatchInbound(EntryPointFrameReader.FrameInfo info, ReadOnlySpan<byte> body)
+    /// <summary>
+    /// Maps a header-parse <see cref="EntryPointFrameReader.HeaderError"/>
+    /// to the FIXP <c>TerminationCode</c> the gateway must send before
+    /// dropping the connection (spec §4.5.7 / §4.10).
+    /// </summary>
+    internal static byte MapHeaderErrorToTerminationCode(EntryPointFrameReader.HeaderError error) => error switch
+    {
+        EntryPointFrameReader.HeaderError.InvalidSofhEncodingType => SessionRejectEncoder.TerminationCode.InvalidSofh,
+        EntryPointFrameReader.HeaderError.InvalidSofhMessageLength => SessionRejectEncoder.TerminationCode.InvalidSofh,
+        EntryPointFrameReader.HeaderError.UnsupportedTemplate => SessionRejectEncoder.TerminationCode.UnrecognizedMessage,
+        EntryPointFrameReader.HeaderError.UnsupportedSchema => SessionRejectEncoder.TerminationCode.UnrecognizedMessage,
+        EntryPointFrameReader.HeaderError.BlockLengthMismatch => SessionRejectEncoder.TerminationCode.DecodingError,
+        EntryPointFrameReader.HeaderError.MessageLengthMismatch => SessionRejectEncoder.TerminationCode.DecodingError,
+        EntryPointFrameReader.HeaderError.ShortHeader => SessionRejectEncoder.TerminationCode.DecodingError,
+        _ => SessionRejectEncoder.TerminationCode.Unspecified,
+    };
+
+    /// <summary>
+    /// Sends a Terminate frame with <paramref name="terminationCode"/>
+    /// directly to the underlying stream (bypassing the send queue, which
+    /// might be racing with an in-flight write or about to be cancelled),
+    /// and closes the session. Acquires <see cref="_streamWriteLock"/> so
+    /// it does not collide with the regular send loop.
+    /// </summary>
+    private async Task TerminateAndCloseAsync(byte terminationCode, string reason)
+    {
+        if (!IsOpen) { Close(reason); return; }
+        var frame = new byte[SessionRejectEncoder.TerminateTotal];
+        SessionRejectEncoder.EncodeTerminate(frame, SessionId, 0, terminationCode);
+        try
+        {
+            await _streamWriteLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await _stream.WriteAsync(frame).ConfigureAwait(false);
+                Volatile.Write(ref _lastOutboundMs, NowMs());
+            }
+            finally
+            {
+                _streamWriteLock.Release();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "entrypoint session {ConnectionId} failed to write Terminate({Code})", ConnectionId, terminationCode);
+        }
+        Close(reason);
+    }
+
+    private async Task<bool> DispatchInboundAsync(EntryPointFrameReader.FrameInfo info, byte[] bodyBuf, int bodyLength)
     {
         ulong now = _nowNanos();
         _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} blockLength={BlockLength} varDataLength={VarDataLength}",
@@ -153,15 +207,16 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         // Per spec §3.5, varData segments follow the fixed root block. We
         // validate them here (length-prefixed, declared per-template caps
         // from §4.10) before handing the fixed block to the typed
-        // decoders. A failure here is a decoding error — see #41 for the
-        // session-vs-business reject mapping.
-        var fixedBlock = body.Slice(0, info.BlockLength);
-        var varData = body.Slice(info.BlockLength);
+        // decoders. A varData failure is always DECODING_ERROR per §4.10.
+        var fullBody = new ReadOnlyMemory<byte>(bodyBuf, 0, bodyLength);
+        var fixedBlock = fullBody.Slice(0, info.BlockLength).Span;
+        var varData = fullBody.Slice(info.BlockLength).Span;
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
         if (!EntryPointVarData.TryValidate(varData, spec, out var varErr))
         {
             _sink.OnDecodeError(this, varErr ?? "decode error: varData");
-            return;
+            await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:varData").ConfigureAwait(false);
+            return false;
         }
 
         switch (info.TemplateId)
@@ -169,25 +224,40 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
             case EntryPointFrameReader.TidSequence:
                 // Session-layer heartbeat / sequence sync. Liveness already
                 // recorded by the receive loop; nothing else to do.
-                return;
+                return true;
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
+                {
                     _sink.EnqueueNewOrder(no, this, noClOrd);
-                else _sink.OnDecodeError(this, noErr ?? "decode error: SimpleNewOrder");
-                break;
+                    return true;
+                }
+                _sink.OnDecodeError(this, noErr ?? "decode error: SimpleNewOrder");
+                await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleNewOrder").ConfigureAwait(false);
+                return false;
             case EntryPointFrameReader.TidSimpleModifyOrder:
                 if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
+                {
                     _sink.EnqueueReplace(rp, this, rpClOrd, rpOrigClOrd);
-                else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
-                break;
+                    return true;
+                }
+                _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
+                await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleModifyOrder").ConfigureAwait(false);
+                return false;
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
+                {
                     _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
-                else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
-                break;
+                    return true;
+                }
+                _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
+                await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderCancelRequest").ConfigureAwait(false);
+                return false;
             default:
+                // Unreachable: TryParseInboundHeader has already screened out
+                // unknown templates and returned UnsupportedTemplate.
                 _sink.OnDecodeError(this, $"unsupported templateId={info.TemplateId}");
-                break;
+                await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.UnrecognizedMessage, "decode-error:unsupported").ConfigureAwait(false);
+                return false;
         }
     }
 
@@ -199,7 +269,15 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
             {
                 try
                 {
-                    await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                    await _streamWriteLock.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _streamWriteLock.Release();
+                    }
                     Volatile.Write(ref _lastOutboundMs, NowMs());
                 }
                 catch (IOException ex)
