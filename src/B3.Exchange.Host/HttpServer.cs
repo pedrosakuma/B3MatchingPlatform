@@ -31,18 +31,24 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly MetricsRegistry _metrics;
     private readonly IReadOnlyList<IReadinessProbe> _probes;
     private readonly IReadOnlyDictionary<byte, ChannelDispatcher> _dispatchers;
+    private readonly Func<IEnumerable<SessionDiagnostics>>? _sessionsProvider;
+    private readonly IReadOnlyList<FirmInfo> _firms;
     private readonly Action<string>? _log;
     private WebApplication? _app;
 
     public HttpServer(HttpConfig config, MetricsRegistry metrics,
         IReadOnlyList<IReadinessProbe> probes,
         IReadOnlyDictionary<byte, ChannelDispatcher> dispatchers,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Func<IEnumerable<SessionDiagnostics>>? sessionsProvider = null,
+        IReadOnlyList<FirmInfo>? firms = null)
     {
         _config = config;
         _metrics = metrics;
         _probes = probes;
         _dispatchers = dispatchers;
+        _sessionsProvider = sessionsProvider;
+        _firms = firms ?? Array.Empty<FirmInfo>();
         _log = log;
     }
 
@@ -106,6 +112,26 @@ public sealed class HttpServer : IAsyncDisposable
         app.MapGet("/metrics", () =>
             Results.Text(_metrics.RenderProm(), "text/plain; version=0.0.4; charset=utf-8"));
 
+        // Operator diagnostics endpoints (issue #70). Read-only.
+        app.MapGet("/sessions", () =>
+        {
+            var arr = SnapshotSessions();
+            return Results.Text(SerializeSessions(arr), "application/json");
+        });
+
+        app.MapGet("/sessions/{id}", (string id, HttpContext ctx) =>
+        {
+            var match = SnapshotSessions().FirstOrDefault(s => s.SessionId == id);
+            if (match.SessionId is null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                return Results.Text($"unknown session '{id}'\n", "text/plain");
+            }
+            return Results.Text(SerializeSession(match), "application/json");
+        });
+
+        app.MapGet("/firms", () => Results.Text(SerializeFirms(_firms), "application/json"));
+
         // Operator endpoints (issue #6). All work is dispatched via the
         // channel's inbound queue so the engine state mutation happens on
         // the dispatch thread; the HTTP handler returns 202 Accepted as soon
@@ -132,6 +158,105 @@ public sealed class HttpServer : IAsyncDisposable
             LocalEndpoint = ep;
 
         _log?.Invoke($"http listening on {LocalEndpoint}");
+    }
+
+    private SessionDiagnostics[] SnapshotSessions()
+    {
+        if (_sessionsProvider is null) return Array.Empty<SessionDiagnostics>();
+        return _sessionsProvider().ToArray();
+    }
+
+    // Hand-rolled JSON to keep the slim builder lean (no source-gen, no
+    // Newtonsoft). All field values are well-formed by construction
+    // except SessionId/FirmId/AttachedTransportId which are routed
+    // through JsonEscape.
+
+    private static string SerializeSessions(SessionDiagnostics[] sessions)
+    {
+        var sb = new System.Text.StringBuilder(64 + sessions.Length * 256);
+        sb.Append('[');
+        for (int i = 0; i < sessions.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            AppendSession(sb, sessions[i]);
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    private static string SerializeSession(SessionDiagnostics s)
+    {
+        var sb = new System.Text.StringBuilder(256);
+        AppendSession(sb, s);
+        return sb.ToString();
+    }
+
+    private static void AppendSession(System.Text.StringBuilder sb, SessionDiagnostics s)
+    {
+        sb.Append('{');
+        sb.Append("\"sessionId\":\"").Append(JsonEscape(s.SessionId)).Append("\",");
+        sb.Append("\"firmId\":\"").Append(JsonEscape(s.FirmId)).Append("\",");
+        sb.Append("\"state\":").Append(s.State.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"sessionVerId\":").Append(s.SessionVerId.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"outboundSeq\":").Append(s.OutboundSeq.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"inboundExpectedSeq\":").Append(s.InboundExpectedSeq.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"retxBufferDepth\":").Append(s.RetxBufferDepth.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"sendQueueDepth\":").Append(s.SendQueueDepth.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+        sb.Append("\"attachedTransportId\":");
+        if (s.AttachedTransportId is null) sb.Append("null"); else sb.Append('"').Append(JsonEscape(s.AttachedTransportId)).Append('"');
+        sb.Append(',');
+        sb.Append("\"lastActivityAtMs\":").Append(s.LastActivityAtMs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        sb.Append('}');
+    }
+
+    private static string SerializeFirms(IReadOnlyList<FirmInfo> firms)
+    {
+        var sb = new System.Text.StringBuilder(64 + firms.Count * 96);
+        sb.Append('[');
+        for (int i = 0; i < firms.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            var f = firms[i];
+            sb.Append("{\"id\":\"").Append(JsonEscape(f.Id)).Append("\",")
+              .Append("\"name\":\"").Append(JsonEscape(f.Name)).Append("\",")
+              .Append("\"enteringFirmCode\":").Append(f.EnteringFirmCode.ToString(System.Globalization.CultureInfo.InvariantCulture))
+              .Append('}');
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    private static string JsonEscape(string s)
+    {
+        // Fast path: no escaping needed when there are no quotes, backslashes,
+        // or control chars (< U+0020).
+        bool needs = false;
+        foreach (var c in s)
+        {
+            if (c == '\\' || c == '"' || c < 0x20) { needs = true; break; }
+        }
+        if (!needs) return s;
+        var sb = new System.Text.StringBuilder(s.Length + 8);
+        foreach (var ch in s)
+        {
+            switch (ch)
+            {
+                case '\\': sb.Append("\\\\"); break;
+                case '"': sb.Append("\\\""); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                default:
+                    if (ch < 0x20)
+                        sb.Append("\\u").Append(((int)ch).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+                    else
+                        sb.Append(ch);
+                    break;
+            }
+        }
+        return sb.ToString();
     }
 
     private IResult HandleOperatorEnqueue(HttpContext ctx, int channelNumber,

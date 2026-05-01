@@ -18,7 +18,10 @@ public class MetricsRegistryTests
 
         reg.SetSessionProvider(new StubSessionProvider(new[]
         {
-            new SessionQueueSample("conn-42", 7),
+            new SessionDiagnostics(
+                SessionId: "conn-42", FirmId: "FIRM01", State: 3, SessionVerId: 17,
+                OutboundSeq: 4291, InboundExpectedSeq: 1027, RetxBufferDepth: 4291,
+                SendQueueDepth: 7, AttachedTransportId: "tx-2a", LastActivityAtMs: 1700000123456),
         }));
 
         var text = reg.RenderProm();
@@ -34,9 +37,16 @@ public class MetricsRegistryTests
         Assert.Contains("# TYPE exch_dispatch_loop_last_tick_unixms gauge\n", text);
         Assert.Contains("exch_dispatch_loop_last_tick_unixms{channel=\"84\"} 1700000000000\n", text);
 
-        // Session gauge.
+        // Session gauges (issue #70 + legacy send-queue depth).
         Assert.Contains("# TYPE exch_send_queue_depth gauge\n", text);
         Assert.Contains("exch_send_queue_depth{channel=\"all\",session=\"conn-42\"} 7\n", text);
+        Assert.Contains("# TYPE fixp_session_state gauge\n", text);
+        Assert.Contains("fixp_session_state{session=\"conn-42\",firm=\"FIRM01\"} 3\n", text);
+        Assert.Contains("fixp_session_outbound_seq{session=\"conn-42\"} 4291\n", text);
+        Assert.Contains("fixp_session_inbound_expected_seq{session=\"conn-42\"} 1027\n", text);
+        Assert.Contains("fixp_session_retx_buffer_depth{session=\"conn-42\"} 4291\n", text);
+        Assert.Contains("fixp_session_attached_transports{session=\"conn-42\"} 1\n", text);
+        Assert.Contains("fixp_session_last_activity_unixms{session=\"conn-42\"} 1700000123456\n", text);
     }
 
     [Fact]
@@ -98,8 +108,8 @@ public class MetricsRegistryTests
 
     private sealed class StubSessionProvider : ISessionMetricsProvider
     {
-        private readonly SessionQueueSample[] _samples;
-        public StubSessionProvider(SessionQueueSample[] samples) { _samples = samples; }
-        public IEnumerable<SessionQueueSample> Sample() => _samples;
+        private readonly SessionDiagnostics[] _samples;
+        public StubSessionProvider(SessionDiagnostics[] samples) { _samples = samples; }
+        public IEnumerable<SessionDiagnostics> Sample() => _samples;
     }
 }

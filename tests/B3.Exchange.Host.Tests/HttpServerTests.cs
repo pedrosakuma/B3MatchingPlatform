@@ -190,6 +190,90 @@ public class HttpServerTests
         Assert.Equal(System.Net.HttpStatusCode.NotFound, unknownBump.StatusCode);
     }
 
+    [Fact]
+    public async Task SessionsAndFirms_ExposeOperatorJson_AndUnknownSessionReturns404()
+    {
+        // Issue #70 acceptance: GET /sessions, /sessions/{id}, /firms.
+        var (cfg, sink) = BuildConfig();
+        cfg.Firms.Add(new FirmConfig { Id = "FIRM01", Name = "Acme", EnteringFirmCode = 7 });
+        cfg.Sessions.Add(new SessionConfig { SessionId = "1", FirmId = "FIRM01" });
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var http = host.HttpEndpoint!;
+
+        using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
+
+        // /firms — returns the configured firms as JSON.
+        using var firmsResp = await client.GetAsync("/firms");
+        Assert.Equal(System.Net.HttpStatusCode.OK, firmsResp.StatusCode);
+        var firmsBody = await firmsResp.Content.ReadAsStringAsync();
+        Assert.Contains("\"id\":\"FIRM01\"", firmsBody);
+        Assert.Contains("\"name\":\"Acme\"", firmsBody);
+        Assert.Contains("\"enteringFirmCode\":7", firmsBody);
+
+        // /sessions — returns an empty array when no clients are connected.
+        using var sessionsResp = await client.GetAsync("/sessions");
+        Assert.Equal(System.Net.HttpStatusCode.OK, sessionsResp.StatusCode);
+        var sessionsBody = await sessionsResp.Content.ReadAsStringAsync();
+        Assert.Equal("[]", sessionsBody.Trim());
+
+        // /sessions/{id} — 404 on unknown id.
+        using var unknown = await client.GetAsync("/sessions/conn-99999");
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
+    }
+
+    [Fact]
+    public async Task SessionsEndpoint_RevealsConnectedTcpClient()
+    {
+        // Issue #70: validate /sessions exposes a real connected client.
+        // RequireFixpHandshake=false so a plain TCP connect is enough.
+        var (cfg, sink) = BuildConfig();
+        cfg.Firms.Add(new FirmConfig { Id = "FIRM01", Name = "Acme", EnteringFirmCode = 7 });
+        cfg.Sessions.Add(new SessionConfig { SessionId = "1", FirmId = "FIRM01" });
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var http = host.HttpEndpoint!;
+        var tcp = host.TcpEndpoint!;
+
+        using var tcpClient = new System.Net.Sockets.TcpClient();
+        await tcpClient.ConnectAsync(tcp.Address, tcp.Port);
+
+        using var http_client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
+        // Poll because session registration races the TCP accept.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        string body = "[]";
+        while (DateTime.UtcNow < deadline)
+        {
+            using var resp = await http_client.GetAsync("/sessions");
+            body = await resp.Content.ReadAsStringAsync();
+            if (body.Contains("\"sessionId\"", StringComparison.Ordinal)) break;
+            await Task.Delay(50);
+        }
+
+        // Parse the JSON to validate shape and pick out the session id.
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        Assert.Equal(System.Text.Json.JsonValueKind.Array, doc.RootElement.ValueKind);
+        Assert.True(doc.RootElement.GetArrayLength() >= 1, "expected at least one session in /sessions");
+        var first = doc.RootElement[0];
+        var sid = first.GetProperty("sessionId").GetString()!;
+        Assert.StartsWith("conn-", sid);
+        Assert.Equal("FIRM01", first.GetProperty("firmId").GetString());
+        // State 0..4 are valid (Idle..Terminated). For an unauthenticated
+        // TCP connect with handshake disabled the session sits in Idle (0).
+        var state = first.GetProperty("state").GetInt32();
+        Assert.InRange(state, 0, 4);
+        Assert.StartsWith("tx-", first.GetProperty("attachedTransportId").GetString());
+        Assert.True(first.GetProperty("lastActivityAtMs").GetInt64() > 0);
+
+        // /sessions/{id} returns the same single session object.
+        using var oneResp = await http_client.GetAsync($"/sessions/{sid}");
+        Assert.Equal(System.Net.HttpStatusCode.OK, oneResp.StatusCode);
+        var oneBody = await oneResp.Content.ReadAsStringAsync();
+        using var oneDoc = System.Text.Json.JsonDocument.Parse(oneBody);
+        Assert.Equal(System.Text.Json.JsonValueKind.Object, oneDoc.RootElement.ValueKind);
+        Assert.Equal(sid, oneDoc.RootElement.GetProperty("sessionId").GetString());
+    }
+
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
         public List<byte[]> Packets { get; } = new();

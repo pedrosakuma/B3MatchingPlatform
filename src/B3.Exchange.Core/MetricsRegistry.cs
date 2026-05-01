@@ -43,19 +43,48 @@ public sealed class ChannelMetrics
 }
 
 /// <summary>
-/// Provider of per-session send-queue depth gauges. The host wires an
-/// implementation that snapshots the active <c>FixpSession</c>
-/// queues at scrape time. The "channel" label is currently fixed to
-/// <c>"all"</c> because a session's send queue is shared across every
-/// channel that may route ExecutionReports back to it; per-channel
-/// partitioning of session queues is not implemented today.
+/// Provider of per-session diagnostics for the operator surface
+/// (issue #70). The host wires an implementation that snapshots active
+/// <c>FixpSession</c>s at scrape time. Used by both the Prometheus
+/// renderer (per-session series) and the <c>GET /sessions</c> JSON
+/// endpoint.
 /// </summary>
 public interface ISessionMetricsProvider
 {
-    IEnumerable<SessionQueueSample> Sample();
+    /// <summary>Snapshot every currently-known session as a
+    /// <see cref="SessionDiagnostics"/>. Closed sessions are filtered
+    /// by the implementation.</summary>
+    IEnumerable<SessionDiagnostics> Sample();
 }
 
-public readonly record struct SessionQueueSample(string SessionId, long QueueDepth);
+/// <summary>
+/// Diagnostic snapshot of a single FIXP session. The numeric
+/// <paramref name="State"/> matches <c>FixpState</c>: 0=Idle,
+/// 1=Negotiated, 2=Established, 3=Suspended, 4=Terminated.
+/// <paramref name="AttachedTransportId"/> is <c>null</c> when the
+/// session is Suspended (no attached TCP transport).
+/// <paramref name="LastActivityAtMs"/> is Unix milliseconds; <c>0</c>
+/// before the first inbound frame.
+/// </summary>
+public readonly record struct SessionDiagnostics(
+    string SessionId,
+    string FirmId,
+    int State,
+    ulong SessionVerId,
+    uint OutboundSeq,
+    uint InboundExpectedSeq,
+    int RetxBufferDepth,
+    long SendQueueDepth,
+    string? AttachedTransportId,
+    long LastActivityAtMs);
+
+/// <summary>
+/// Static identity for a participant (corretora). Mirror of the
+/// <c>Firm</c> record in <c>B3.Exchange.Gateway</c>, exposed in
+/// <c>B3.Exchange.Core</c> so the operator HTTP surface (issue #70) can
+/// list firms without a Core→Gateway dependency.
+/// </summary>
+public readonly record struct FirmInfo(string Id, string Name, uint EnteringFirmCode);
 
 /// <summary>
 /// Process-wide counters for FIXP session lifecycle events. Exposed via
@@ -149,17 +178,40 @@ public sealed class MetricsRegistry
 
         sb.Append("# HELP exch_send_queue_depth Per-session ExecutionReport send-queue depth (channel=\"all\" because the session queue is shared).\n");
         sb.Append("# TYPE exch_send_queue_depth gauge\n");
-        if (sessions != null)
+        SessionDiagnostics[] sessionSnap = sessions != null
+            ? sessions.Sample().ToArray()
+            : Array.Empty<SessionDiagnostics>();
+        if (sessionSnap.Length > 0)
         {
-            foreach (var s in sessions.Sample())
+            foreach (var s in sessionSnap)
             {
                 sb.Append("exch_send_queue_depth{channel=\"all\",session=\"")
                   .Append(EscapeLabel(s.SessionId))
                   .Append("\"} ")
-                  .Append(s.QueueDepth.ToString(CultureInfo.InvariantCulture))
+                  .Append(s.SendQueueDepth.ToString(CultureInfo.InvariantCulture))
                   .Append('\n');
             }
         }
+
+        // Per-session diagnostics series (issue #70).
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_state",
+            "Current FIXP state (0=Idle, 1=Negotiated, 2=Established, 3=Suspended, 4=Terminated).",
+            withFirmLabel: true, s => s.State);
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_outbound_seq",
+            "Last allocated outbound MsgSeqNum on this session (peer's next-expected is this+1).",
+            withFirmLabel: false, s => (long)s.OutboundSeq);
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_inbound_expected_seq",
+            "Highest inbound MsgSeqNum accepted on this session (next-expected is this+1).",
+            withFirmLabel: false, s => (long)s.InboundExpectedSeq);
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_retx_buffer_depth",
+            "Number of business frames buffered for replay on this session.",
+            withFirmLabel: false, s => s.RetxBufferDepth);
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_attached_transports",
+            "1 if a TCP transport is currently attached, 0 if Suspended.",
+            withFirmLabel: false, s => s.AttachedTransportId is null ? 0 : 1);
+        EmitSessionGauge(sb, sessionSnap, "fixp_session_last_activity_unixms",
+            "Unix time (ms) of the most recent inbound frame on this session; 0 if nothing yet.",
+            withFirmLabel: false, s => s.LastActivityAtMs);
 
         EmitProcessCounter(sb, "exch_session_established_total",
             "Total FIXP sessions that have transitioned into Established (initial Establish + rebind via #69b).",
@@ -211,6 +263,20 @@ public sealed class MetricsRegistry
               .Append("\"} ")
               .Append(selector(c).ToString(CultureInfo.InvariantCulture))
               .Append('\n');
+        }
+    }
+
+    private static void EmitSessionGauge(StringBuilder sb, SessionDiagnostics[] sessions,
+        string name, string help, bool withFirmLabel, Func<SessionDiagnostics, long> selector)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" gauge\n");
+        foreach (var s in sessions)
+        {
+            sb.Append(name).Append("{session=\"").Append(EscapeLabel(s.SessionId)).Append('"');
+            if (withFirmLabel)
+                sb.Append(",firm=\"").Append(EscapeLabel(s.FirmId)).Append('"');
+            sb.Append("} ").Append(selector(s).ToString(CultureInfo.InvariantCulture)).Append('\n');
         }
     }
 

@@ -206,6 +206,38 @@ public sealed class FixpSession : IAsyncDisposable
     /// </summary>
     public int SendQueueDepth => _transport.SendQueueDepth;
 
+    /// <summary>Number of in-buffer business frames available to replay
+    /// in response to a <c>RetransmitRequest</c>. Diagnostic only.</summary>
+    public int RetxBufferDepth => _retxBuffer.Count;
+
+    /// <summary>Last allocated outbound MsgSeqNum (the value the next
+    /// emitted business frame's <c>NextMsgSeqNum()</c> call will return
+    /// is <c>OutboundSeq + 1</c>). Diagnostic only.</summary>
+    public uint OutboundSeq => (uint)Volatile.Read(ref _msgSeqNum);
+
+    /// <summary>Unix epoch time (ms) of the most recent inbound frame
+    /// (including session-layer Sequence/heartbeats). Zero if nothing has
+    /// been received yet. Distinct from <c>_lastInboundMs</c>, which is
+    /// monotonic ticks used by the watchdog. Diagnostic only.</summary>
+    public long LastActivityAtMs => Volatile.Read(ref _lastInboundUnixMs);
+    private long _lastInboundUnixMs;
+
+    /// <summary>True while the session is registered with the gateway —
+    /// covers Established AND Suspended states. Distinct from
+    /// <see cref="IsOpen"/>, which also requires a live transport and
+    /// therefore goes false during Suspended. Used by diagnostics
+    /// providers (e.g. <c>/sessions</c>) so suspended sessions remain
+    /// observable. Diagnostic only.</summary>
+    public bool IsRegistered => Volatile.Read(ref _isOpen) == 1;
+
+    /// <summary>Stable handle for the currently-attached TCP transport,
+    /// or <c>null</c> when the session is Suspended (no attached
+    /// transport). Format <c>"tx-&lt;hex(connectionId)&gt;"</c>.
+    /// Diagnostic only.</summary>
+    public string? AttachedTransportId => IsAttached
+        ? "tx-" + ConnectionId.ToString("x", System.Globalization.CultureInfo.InvariantCulture)
+        : null;
+
     public FixpSession(long connectionId, uint enteringFirm, uint sessionId,
         Stream stream, IInboundCommandSink sink, ILogger<FixpSession> logger,
         Func<ulong>? nowNanos = null,
@@ -244,6 +276,7 @@ public sealed class FixpSession : IAsyncDisposable
         // in Established state per spec §4.5 (issue #69).
         _transport = CreateBoundTransport(stream);
         Volatile.Write(ref _lastInboundMs, NowMs());
+        Volatile.Write(ref _lastInboundUnixMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
     /// <summary>
@@ -303,6 +336,7 @@ public sealed class FixpSession : IAsyncDisposable
                     // Any well-framed inbound frame counts as liveness, including
                     // session-layer Sequence (heartbeat) frames.
                     Volatile.Write(ref _lastInboundMs, NowMs());
+                    Volatile.Write(ref _lastInboundUnixMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                     Volatile.Write(ref _probeOutstanding, 0);
                     if (!await DispatchInboundAsync(info, bodyBuf, info.BodyLength).ConfigureAwait(false))
                     {
