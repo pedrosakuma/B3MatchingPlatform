@@ -101,9 +101,8 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             else
             {
-                var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort,
-                    _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, ch.Ttl);
+                sink = BuildUdpSink(ch.Transport, ch.IncrementalGroup, ch.IncrementalPort,
+                    ch.LocalInterface, ch.Ttl);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
             var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
@@ -145,9 +144,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 }
                 else
                 {
-                    var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-                    snapSink = new MulticastUdpPacketSink(IPAddress.Parse(snap.Group), snap.Port,
-                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, snap.Ttl ?? ch.Ttl);
+                    snapSink = BuildUdpSink(ch.Transport, snap.Group, snap.Port,
+                        ch.LocalInterface, snap.Ttl ?? ch.Ttl);
                 }
                 if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
 
@@ -178,11 +176,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 }
                 else
                 {
-                    var local = idCfg.LocalInterface != null
-                        ? IPAddress.Parse(idCfg.LocalInterface)
-                        : (ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null);
-                    idSink = new MulticastUdpPacketSink(IPAddress.Parse(idCfg.Group), idCfg.Port,
-                        _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, idCfg.Ttl);
+                    var localIface = idCfg.LocalInterface ?? ch.LocalInterface;
+                    idSink = BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl);
                 }
                 if (idSink is IDisposable idd) _ownedSinks.Add(idd);
                 byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
@@ -304,6 +299,26 @@ public sealed class ExchangeHost : IAsyncDisposable
                     LastActivityAtMs: s.LastActivityAtMs);
             }
         }
+    }
+
+    private IUmdfPacketSink BuildUdpSink(UmdfTransport transport, string host, int port,
+        string? localInterface, byte ttl)
+    {
+        if (transport == UmdfTransport.Unicast)
+        {
+            // Unicast mode is bridge-network friendly: `host` is treated as
+            // a DNS name (or IP literal) and resolved on construction. The
+            // multicast-only options (TTL, local interface) are ignored —
+            // log a warning if the operator set them so they don't expect
+            // multicast routing semantics.
+            if (localInterface is not null)
+                _logger.LogWarning("transport=unicast: ignoring localInterface='{Iface}' (multicast-only)", localInterface);
+            return new UnicastUdpPacketSink(host, port,
+                _loggerFactory.CreateLogger<UnicastUdpPacketSink>());
+        }
+        var local = localInterface != null ? IPAddress.Parse(localInterface) : null;
+        return new MulticastUdpPacketSink(IPAddress.Parse(host), port,
+            _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, ttl);
     }
 
     private FirmRegistry BuildFirmRegistry()

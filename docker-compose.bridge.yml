@@ -1,0 +1,52 @@
+# Bridge-network friendly compose for the matching platform.
+#
+# Unlike docker-compose.synthtrader.yml (host networking, multicast wire),
+# this file runs the simulator on the default docker bridge network and
+# uses unicast UDP for UMDF so that downstream consumers can reach it via
+# service-name DNS. Designed for the B3 family compose:
+#
+#   matching-platform → marketdata (unicast UDP) → trading-host (WS)
+#
+# Status: PREVIEW. The consumer side (B3MarketDataPlatform) needs to be
+# updated to listen on a unicast UDP port — see B3MarketDataPlatform#2.
+# Until then this file boots the exchange in unicast mode but UDP packets
+# go to the configured hostname; replace "marketdata" with a real consumer
+# (or remove the service for a smoke test).
+#
+# Usage:
+#   docker compose -f docker-compose.bridge.yml up --build
+#
+# Pre-built image alternative:
+#   docker pull ghcr.io/pedrosakuma/b3-matching:latest
+#   docker compose -f docker-compose.bridge.yml up
+services:
+  exchange:
+    image: ghcr.io/pedrosakuma/b3-matching:latest
+    # Local development: replace `image:` with `build:` to rebuild from src.
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    depends_on:
+      marketdata:
+        condition: service_started
+    ports:
+      - "9876:9876"   # EntryPoint TCP
+      - "8080:8080"   # /metrics, /health/*, /sessions, /firms
+    volumes:
+      - ./config:/app/config:ro
+    command: ["/app/config/exchange-simulator.bridge.json"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/live"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+
+  # Placeholder so the `marketdata` DNS name in exchange-simulator.bridge.json
+  # resolves at startup. Replace this service with the real
+  # B3MarketDataPlatform consumer (issue #88 part 2 / B3MarketDataPlatform#2)
+  # once it ships. Until then UDP packets are dropped silently — the
+  # exchange itself still boots and serves /metrics, /sessions, etc.
+  marketdata:
+    image: alpine:3.20
+    command: ["tail", "-f", "/dev/null"]

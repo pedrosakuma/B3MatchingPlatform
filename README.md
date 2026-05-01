@@ -39,10 +39,38 @@ dotnet run --project src/B3.Exchange.Host -- config/exchange-simulator.json
 
 ## Docker
 
+### Build locally
+
 ```bash
 docker build -t sbeb3exchange:latest .
 docker run --rm --network host -v $(pwd)/config:/app/config sbeb3exchange:latest
 ```
+
+### Pre-built images on GHCR
+
+Every push to `main` and every `v*` tag publishes:
+
+```bash
+docker pull ghcr.io/pedrosakuma/b3-matching:latest
+docker pull ghcr.io/pedrosakuma/b3-matching-synthtrader:latest
+```
+
+Tags available: `:latest`, `:sha-<short>`, `:<branch>`, `:vX.Y.Z`, `:X.Y`.
+
+### Bridge-network mode (issue #88, preview)
+
+The default mode publishes UMDF over UDP **multicast** and so requires
+host networking. For docker-compose family deployments where multicast is
+not routable across the bridge, set `transport: "unicast"` per channel
+and point the `*.group` fields at the consumer's service name. See
+`config/exchange-simulator.bridge.json` and `docker-compose.bridge.yml`:
+
+```bash
+docker compose -f docker-compose.bridge.yml up
+```
+
+This mode is **PREVIEW** until the consumer side ships in
+[B3MarketDataPlatform#2](https://github.com/pedrosakuma/B3MarketDataPlatform/issues/2).
 
 The host needs network access for both the multicast publish socket and the
 EntryPoint TCP listener (default port 9876).
