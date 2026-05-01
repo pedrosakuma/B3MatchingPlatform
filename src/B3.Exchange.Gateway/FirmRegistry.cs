@@ -17,6 +17,7 @@ public sealed class FirmRegistry
 {
     private readonly IReadOnlyDictionary<string, Firm> _firms;
     private readonly IReadOnlyDictionary<string, SessionCredential> _credentials;
+    private readonly IReadOnlyDictionary<uint, SessionCredential> _credentialsByWire;
 
     /// <summary>All firms keyed by <see cref="Firm.Id"/>.</summary>
     public IReadOnlyDictionary<string, Firm> Firms => _firms;
@@ -40,11 +41,23 @@ public sealed class FirmRegistry
         }
 
         var credMap = new Dictionary<string, SessionCredential>(StringComparer.Ordinal);
+        var wireMap = new Dictionary<uint, SessionCredential>();
         foreach (var s in sessions)
         {
             ArgumentNullException.ThrowIfNull(s);
             if (string.IsNullOrWhiteSpace(s.SessionId))
                 throw new InvalidOperationException("SessionCredential.SessionId must be non-empty");
+            // FIXP wire SessionID is uint32; require config sessionId to
+            // parse as a decimal uint32 so credential lookup at Negotiate
+            // time is unambiguous (see B3-ENTRYPOINT-ARCHITECTURE.md §4.2).
+            if (!uint.TryParse(s.SessionId, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var wireId))
+                throw new InvalidOperationException(
+                    $"SessionCredential.SessionId '{s.SessionId}' must parse as a decimal uint32 " +
+                    "(FIXP wire SessionID is uint32 per spec §4.5.2)");
+            if (wireId == 0)
+                throw new InvalidOperationException(
+                    $"SessionCredential.SessionId '{s.SessionId}' must be > 0 (zero is the FIXP null value)");
             if (!firmMap.ContainsKey(s.FirmId))
                 throw new InvalidOperationException(
                     $"session '{s.SessionId}' references unknown firm '{s.FirmId}' " +
@@ -52,10 +65,15 @@ public sealed class FirmRegistry
             s.Policy.Validate();
             if (!credMap.TryAdd(s.SessionId, s))
                 throw new InvalidOperationException($"duplicate session id: '{s.SessionId}'");
+            // wire index uniqueness is implied by string uniqueness + the
+            // canonical-decimal rule above (no leading zeros / signs allowed
+            // by NumberStyles.None, so the parse is bijective).
+            wireMap.Add(wireId, s);
         }
 
         _firms = firmMap;
         _credentials = credMap;
+        _credentialsByWire = wireMap;
     }
 
     /// <summary>
@@ -68,6 +86,14 @@ public sealed class FirmRegistry
         ArgumentNullException.ThrowIfNull(sessionId);
         return _credentials.TryGetValue(sessionId, out var c) ? c : null;
     }
+
+    /// <summary>
+    /// Resolves a <see cref="SessionCredential"/> by the wire-format
+    /// uint32 SessionID (the encoding used by FIXP <c>Negotiate</c>).
+    /// Returns <c>null</c> when unknown.
+    /// </summary>
+    public SessionCredential? FindSessionByWire(uint sessionId)
+        => _credentialsByWire.TryGetValue(sessionId, out var c) ? c : null;
 
     /// <summary>
     /// Resolves a <see cref="Firm"/> by FirmId. Returns <c>null</c> when

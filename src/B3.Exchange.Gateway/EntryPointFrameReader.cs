@@ -56,6 +56,8 @@ public static class EntryPointFrameReader
     public const ushort TidOrderCancelRequest = 105;
     /// <summary>Session: Sequence (FIXP, also used as heartbeat). Bidirectional.</summary>
     public const ushort TidSequence = 9;
+    /// <summary>Session: Negotiate (FIXP, inbound only). See spec §4.5.2.</summary>
+    public const ushort TidNegotiate = 1;
 
     /// <summary>Outbound: ExecutionReport_New (V2).</summary>
     public const ushort TidExecutionReportNew = 200;
@@ -75,6 +77,7 @@ public static class EntryPointFrameReader
         (TidSimpleModifyOrder, 2) => 98,         // SimpleModifyOrderV2.MESSAGE_SIZE
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
+        (TidNegotiate, 0) => 28,                 // NegotiateData.BLOCK_LENGTH (V6 schema, root version 0)
         _ => -1
     };
 

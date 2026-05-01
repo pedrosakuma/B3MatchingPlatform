@@ -27,15 +27,16 @@
     { "id": "FIRM02", "name": "Beta Corretora",  "enteringFirmCode": 200 }
   ],
   // Per-(firm, session) credentials. The Negotiate handshake (#42) will
-  // resolve a session by sessionId here and validate the peer's
-  // access_key against accessKey (when auth.devMode is false).
-  // Pre-#42 the host picks the lexicographically-first session as the
+  // resolve a session by the wire-format uint32 sessionID and validate the
+  // peer's access_key against accessKey (when auth.devMode is false).
+  // Pre-#42 the host picks the lowest sessionId as the
   // default tenant for every accept.
+  // sessionId MUST parse as a decimal uint32 (FIXP wire SessionID is uint32).
   "sessions": [
-    { "sessionId": "FIRM01-SESS-01", "firmId": "FIRM01", "accessKey": "dev-key-1" },
-    { "sessionId": "FIRM01-SESS-02", "firmId": "FIRM01", "accessKey": "dev-key-2" },
-    { "sessionId": "FIRM02-SESS-01", "firmId": "FIRM02", "accessKey": "dev-key-3" },
-    { "sessionId": "FIRM02-SESS-02", "firmId": "FIRM02", "accessKey": "dev-key-4" }
+    { "sessionId": "10101", "firmId": "FIRM01", "accessKey": "dev-key-1" },
+    { "sessionId": "10102", "firmId": "FIRM01", "accessKey": "dev-key-2" },
+    { "sessionId": "20201", "firmId": "FIRM02", "accessKey": "dev-key-3" },
+    { "sessionId": "20202", "firmId": "FIRM02", "accessKey": "dev-key-4" }
   ],
   // Optional Kestrel-hosted operability endpoint. Remove this block to
   // disable HTTP entirely. Exposes:

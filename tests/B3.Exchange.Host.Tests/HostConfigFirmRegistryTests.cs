@@ -25,8 +25,8 @@ public class HostConfigFirmRegistryTests
             { "id": "FIRM02", "name": "Beta Corretora", "enteringFirmCode": 200 }
           ],
           "sessions": [
-            { "sessionId": "SESS-A", "firmId": "FIRM01", "accessKey": "k1" },
-            { "sessionId": "SESS-B", "firmId": "FIRM02", "accessKey": "k2",
+            { "sessionId": "101", "firmId": "FIRM01", "accessKey": "k1" },
+            { "sessionId": "102", "firmId": "FIRM02", "accessKey": "k2",
               "policy": { "throttleMessagesPerSecond": 50, "keepAliveIntervalMs": 15000,
                           "idleTimeoutMs": 20000, "testRequestGraceMs": 3000,
                           "retransmitBufferSize": 5000 } }

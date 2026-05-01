@@ -24,6 +24,8 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
     private readonly FixpSessionOptions _sessionOptions;
     private readonly Action<FixpSession, string>? _onSessionClosed;
+    private readonly NegotiationValidator? _negotiationValidator;
+    private readonly SessionClaimRegistry? _sessionClaims;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -49,7 +51,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         ILoggerFactory loggerFactory,
         Func<EndPoint?, AcceptedConnection>? identityFactory = null,
         FixpSessionOptions? sessionOptions = null,
-        Action<FixpSession, string>? onSessionClosed = null)
+        Action<FixpSession, string>? onSessionClosed = null,
+        NegotiationValidator? negotiationValidator = null,
+        SessionClaimRegistry? sessionClaims = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         ArgumentNullException.ThrowIfNull(registry);
@@ -62,6 +66,13 @@ public sealed class EntryPointListener : IAsyncDisposable
         _sessionOptions = sessionOptions ?? FixpSessionOptions.Default;
         _sessionOptions.Validate();
         _onSessionClosed = onSessionClosed;
+        _negotiationValidator = negotiationValidator;
+        _sessionClaims = sessionClaims;
+        if ((_negotiationValidator is null) ^ (_sessionClaims is null))
+        {
+            throw new ArgumentException(
+                "negotiationValidator and sessionClaims must be supplied together (both null = legacy passthrough mode).");
+        }
     }
 
     // Convenience overload for callers (e.g., tests) that don't need an
@@ -119,7 +130,9 @@ public sealed class EntryPointListener : IAsyncDisposable
 
                 var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
                     stream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
-                    options: _sessionOptions, onClosed: onClosed);
+                    options: _sessionOptions, onClosed: onClosed,
+                    negotiationValidator: _negotiationValidator,
+                    sessionClaims: _sessionClaims);
                 _registry.Register(session);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
