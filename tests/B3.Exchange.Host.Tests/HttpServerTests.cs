@@ -103,8 +103,11 @@ public class HttpServerTests
     [Fact]
     public async Task LiveFlipsTo503_WithinThreshold_AfterDispatcherIsKilled()
     {
-        // Short threshold so the test stays well under 10 s.
-        var (cfg, sink) = BuildConfig(livenessStaleMs: 500);
+        // Threshold must be > the dispatcher's internal HeartbeatInterval
+        // (1 s) so a healthy dispatcher's normal "tick every 1 s" cadence
+        // doesn't itself trip the 503. 2500 ms keeps total test time well
+        // under the 10 s acceptance window while leaving headroom for CI.
+        var (cfg, sink) = BuildConfig(livenessStaleMs: 2500);
         await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
         await host.StartAsync();
         var http = host.HttpEndpoint!;

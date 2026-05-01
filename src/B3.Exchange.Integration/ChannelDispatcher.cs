@@ -105,12 +105,6 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     public void Start()
     {
         _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
-        // Seed an initial heartbeat synchronously before the loop task is
-        // scheduled so /health/live does not flap to 503 in the (potentially
-        // long) interval between Start() returning and the dispatcher thread
-        // actually getting CPU. Without this, a probe arriving during that
-        // gap sees LastTickUnixMs == 0 and reports DOWN.
-        RecordHeartbeat();
         _loopTask = Task.Factory.StartNew(() => RunLoopAsync(_cts.Token),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
     }

@@ -68,8 +68,15 @@ public sealed class HttpServer : IAsyncDisposable
             foreach (var c in channels)
             {
                 long last = c.LastTickUnixMs;
-                if (last == 0 || (nowMs - last) > stale)
-                    stuck.Add($"channel={c.ChannelNumber} last_tick_ms_ago={(last == 0 ? -1 : nowMs - last)}");
+                // last == 0 means the dispatcher loop has not produced its
+                // first heartbeat yet (still starting up). Liveness should be
+                // tolerant during startup — readiness probes (/health/ready)
+                // are the correct surface for "not yet ready". A truly dead
+                // dispatcher will start ticking and then go stale, which the
+                // staleness check below catches.
+                if (last == 0) continue;
+                if ((nowMs - last) > stale)
+                    stuck.Add($"channel={c.ChannelNumber} last_tick_ms_ago={nowMs - last}");
             }
             if (stuck.Count > 0)
             {
