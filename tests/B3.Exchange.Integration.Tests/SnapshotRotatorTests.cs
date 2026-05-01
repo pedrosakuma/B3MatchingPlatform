@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging.Abstractions;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 using Side = B3.Exchange.Matching.Side;
@@ -257,8 +258,8 @@ public class ChannelDispatcherSnapshotTests
         var snapSink = new CapturingSink();
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
-            engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s); return engine; },
-            packetSink: incSink, nowNanos: () => 1UL, tradeDate: 1);
+            engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
+            packetSink: incSink, logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);
@@ -281,8 +282,8 @@ public class ChannelDispatcherSnapshotTests
         var snapSink = new CapturingSink();
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
-            engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s); return engine; },
-            packetSink: incSink, nowNanos: () => 1UL, tradeDate: 1);
+            engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
+            packetSink: incSink, logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);

@@ -1,6 +1,7 @@
 namespace B3.Exchange.Matching.Tests;
 
 using B3.Exchange.Instruments;
+using Microsoft.Extensions.Logging.Abstractions;
 using static TestFactory;
 
 public class CancelReplaceTests
@@ -181,7 +182,7 @@ public class ReentrancyTests
     public void ReentrantCallFromSink_Throws()
     {
         var sink = new ReentrantSink();
-        var eng = new MatchingEngine(new[] { Petr4 }, sink);
+        var eng = new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance);
         sink.Engine = eng;
         eng.Submit(new NewOrderCommand("c1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 11, 1000));
         Assert.NotNull(sink.Captured);

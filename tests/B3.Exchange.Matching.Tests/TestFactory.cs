@@ -1,4 +1,5 @@
 using B3.Exchange.Instruments;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Matching.Tests;
 
@@ -22,7 +23,7 @@ internal static class TestFactory
     public static MatchingEngine NewEngine(out RecordingSink sink)
     {
         sink = new RecordingSink();
-        return new MatchingEngine(new[] { Petr4 }, sink);
+        return new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance);
     }
 
     public static long Px(decimal p) => (long)(p * 10_000m);

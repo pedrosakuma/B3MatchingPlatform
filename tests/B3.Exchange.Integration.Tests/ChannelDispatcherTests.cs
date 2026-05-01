@@ -4,6 +4,7 @@ using B3.Exchange.Instruments;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
 using B3.Umdf.WireEncoder;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Integration.Tests;
 
@@ -58,8 +59,9 @@ public class ChannelDispatcherTests
     {
         var pkt = new RecordingPacketSink();
         var disp = new ChannelDispatcher(channelNumber: 1,
-            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink),
+            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
             packetSink: pkt,
+            logger: NullLogger<ChannelDispatcher>.Instance,
             nowNanos: () => 1_000_000_000UL, tradeDate: 19_000);
         return (disp, pkt);
     }

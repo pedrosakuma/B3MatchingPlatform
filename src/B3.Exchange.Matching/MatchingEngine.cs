@@ -1,4 +1,5 @@
 using B3.Exchange.Instruments;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Matching;
 
@@ -14,6 +15,7 @@ public sealed class MatchingEngine
     private readonly Dictionary<long, InstrumentTradingRules> _rulesById;
     private readonly Dictionary<long, LimitOrderBook> _booksById;
     private readonly IMatchingEventSink _sink;
+    private readonly ILogger<MatchingEngine> _logger;
     private readonly SelfTradePrevention _stp;
 
     private long _nextOrderId = 1;
@@ -23,11 +25,14 @@ public sealed class MatchingEngine
     private bool _dispatching;
 
     public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink,
+        ILogger<MatchingEngine> logger,
         SelfTradePrevention selfTradePrevention = SelfTradePrevention.None)
     {
         ArgumentNullException.ThrowIfNull(instruments);
         ArgumentNullException.ThrowIfNull(sink);
+        ArgumentNullException.ThrowIfNull(logger);
         _sink = sink;
+        _logger = logger;
         _stp = selfTradePrevention;
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
@@ -37,6 +42,7 @@ public sealed class MatchingEngine
             _rulesById.Add(i.SecurityId, rules);
             _booksById.Add(i.SecurityId, new LimitOrderBook(i.SecurityId));
         }
+        _logger.LogInformation("matching engine initialized with {InstrumentCount} instruments", _rulesById.Count);
     }
 
     public uint CurrentRptSeq => _rptSeq;

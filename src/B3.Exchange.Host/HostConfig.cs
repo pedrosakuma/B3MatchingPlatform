@@ -18,6 +18,16 @@ public sealed class TcpConfig
 {
     [JsonPropertyName("listen")] public string Listen { get; set; } = "0.0.0.0:9876";
     [JsonPropertyName("enteringFirm")] public uint EnteringFirm { get; set; } = 1;
+    /// <summary>Server-side heartbeat (Sequence) interval in milliseconds.
+    /// A heartbeat is only emitted when no other outbound traffic has been
+    /// sent within this window. Default: 30 s.</summary>
+    [JsonPropertyName("heartbeatIntervalMs")] public int HeartbeatIntervalMs { get; set; } = 30_000;
+    /// <summary>Inbound silence in milliseconds before the server emits a
+    /// Sequence probe (FIXP TestRequest equivalent). Default: 30 s.</summary>
+    [JsonPropertyName("idleTimeoutMs")] public int IdleTimeoutMs { get; set; } = 30_000;
+    /// <summary>Additional grace window after the probe before the session is
+    /// closed for inactivity. Default: 5 s.</summary>
+    [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
 }
 
 public sealed class ChannelConfig

@@ -1,0 +1,26 @@
+# Multi-stage image producing the synthetic trader binary.
+#
+# The synth-trader is a TCP client of the exchange host (image built from the
+# top-level Dockerfile). It connects to the host on TCP/9876 by default; see
+# config/synthetic-trader.json for the wire endpoint.
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+WORKDIR /src
+
+COPY Directory.Build.props global.json SbeB3Exchange.slnx ./
+COPY schemas/ schemas/
+COPY src/ src/
+
+RUN dotnet restore src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.csproj
+RUN dotnet publish src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.csproj \
+    -c Release -o /app --no-restore
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+
+WORKDIR /app
+COPY --from=build /app .
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/app/B3.Exchange.SyntheticTrader"]
+CMD ["/app/config/synthetic-trader.json"]
