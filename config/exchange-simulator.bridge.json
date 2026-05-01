@@ -1,0 +1,58 @@
+{
+  // Bridge-network friendly variant of exchange-simulator.json.
+  //
+  // Use this when running the simulator inside a docker-compose project
+  // alongside a UMDF consumer (e.g. B3MarketDataPlatform) where multicast
+  // is not routable across the bridge network. The wire format is
+  // identical; only the L3 destination changes from a multicast group to
+  // a unicast hostname/port that resolves to the consumer service.
+  //
+  // To switch back to the production-shaped multicast wire, drop the
+  // "transport" field (or set it to "multicast") and put a real 224/4
+  // group in incrementalGroup / snapshot.group / instrumentDefinition.group.
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
+  },
+  "auth": {
+    "devMode": true
+  },
+  "firms": [
+    { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 }
+  ],
+  "sessions": [
+    { "sessionId": "10101", "firmId": "FIRM01", "accessKey": "dev-key-1" }
+  ],
+  "http": {
+    "listen": "0.0.0.0:8080",
+    "livenessStaleMs": 5000
+  },
+  "channels": [
+    {
+      "channelNumber": 84,
+      // transport=unicast: each "*.group" below is treated as a DNS name
+      // (or unicast IP) and resolved at startup. Replace "marketdata" with
+      // whatever service name your compose project uses for the consumer.
+      "transport": "unicast",
+      "incrementalGroup": "marketdata",
+      "incrementalPort": 30084,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-eqt.json",
+      "snapshot": {
+        "group": "marketdata",
+        "port": 30184,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "marketdata",
+        "port": 31084,
+        "cadenceMs": 5000
+      }
+    }
+  ]
+}

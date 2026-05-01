@@ -116,6 +116,20 @@ public sealed class ChannelConfig
     [JsonPropertyName("instruments")] public string InstrumentsFile { get; set; } = "";
 
     /// <summary>
+    /// UDP transport mode for the incremental, snapshot, and instrumentDef
+    /// publishers. <c>multicast</c> (default) preserves legacy behaviour and
+    /// expects <c>IncrementalGroup</c>/<c>Snapshot.Group</c>/
+    /// <c>InstrumentDefinition.Group</c> to be IPv4 multicast addresses.
+    /// <c>unicast</c> is the bridge-network-friendly mode introduced for
+    /// docker-compose setups where multicast is not routable: the
+    /// <c>*.Group</c> fields are then treated as DNS hostnames (e.g.
+    /// <c>"marketdata"</c>) or unicast IPs and resolved at startup.
+    /// </summary>
+    [JsonPropertyName("transport")]
+    [JsonConverter(typeof(UmdfTransportJsonConverter))]
+    public UmdfTransport Transport { get; set; } = UmdfTransport.Multicast;
+
+    /// <summary>
     /// Self-trade prevention policy applied by this channel's matching engine.
     /// Defaults to <c>none</c> (preserves legacy behaviour). Accepted values
     /// (case-insensitive): <c>none</c>, <c>cancel-aggressor</c>,
@@ -139,6 +153,39 @@ public sealed class ChannelConfig
     /// instrument definitions are published for this channel.
     /// </summary>
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
+}
+
+public enum UmdfTransport
+{
+    /// <summary>UDP multicast (legacy default; matches B3 production wire).</summary>
+    Multicast,
+    /// <summary>UDP unicast — destination is a DNS hostname or unicast IP.
+    /// Used for docker-compose bridge-network setups.</summary>
+    Unicast,
+}
+
+public sealed class UmdfTransportJsonConverter : JsonConverter<UmdfTransport>
+{
+    public override UmdfTransport Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var s = reader.GetString();
+        return s?.ToLowerInvariant() switch
+        {
+            null or "" or "multicast" => UmdfTransport.Multicast,
+            "unicast" => UmdfTransport.Unicast,
+            _ => throw new JsonException($"unknown transport value '{s}' (expected: multicast|unicast)"),
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, UmdfTransport value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value switch
+        {
+            UmdfTransport.Multicast => "multicast",
+            UmdfTransport.Unicast => "unicast",
+            _ => throw new JsonException($"unknown UmdfTransport value: {value}"),
+        });
+    }
 }
 
 public sealed class SelfTradePreventionJsonConverter : JsonConverter<B3.Exchange.Matching.SelfTradePrevention>
