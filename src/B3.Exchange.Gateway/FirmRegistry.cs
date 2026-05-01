@@ -58,6 +58,14 @@ public sealed class FirmRegistry
             if (wireId == 0)
                 throw new InvalidOperationException(
                     $"SessionCredential.SessionId '{s.SessionId}' must be > 0 (zero is the FIXP null value)");
+            // Reject leading zeros so the (string sessionId) → (uint32) map is
+            // truly bijective. NumberStyles.None blocks signs/whitespace but
+            // still accepts "001" → 1, which would let two distinct
+            // SessionCredential.SessionId values collide in wireMap.Add below.
+            if (s.SessionId.Length > 1 && s.SessionId[0] == '0')
+                throw new InvalidOperationException(
+                    $"SessionCredential.SessionId '{s.SessionId}' must not have leading zeros " +
+                    "(canonical decimal required so the wire-uint32 mapping is bijective)");
             if (!firmMap.ContainsKey(s.FirmId))
                 throw new InvalidOperationException(
                     $"session '{s.SessionId}' references unknown firm '{s.FirmId}' " +
