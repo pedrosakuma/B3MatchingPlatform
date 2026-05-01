@@ -1,8 +1,8 @@
 using System.Runtime.InteropServices;
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
 
-namespace B3.Exchange.EntryPoint.Tests;
+namespace B3.Exchange.Gateway.Tests;
 
 public class ExecutionReportEncoderTests
 {

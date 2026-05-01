@@ -1,6 +1,6 @@
 # B3 Binary EntryPoint — Compliance Audit
 
-Audit of how `src/B3.Exchange.EntryPoint` and friends compare to the official
+Audit of how `src/B3.Exchange.Gateway` and friends compare to the official
 B3 spec. This is the canonical "what's missing / what's wrong vs. the wire
 protocol" reference for the simulator — issues that track individual gaps
 should link back to a row in the table below by `#gap-NN`.

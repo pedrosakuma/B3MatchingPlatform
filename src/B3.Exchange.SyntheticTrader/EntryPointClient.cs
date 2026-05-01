@@ -2,7 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Threading.Channels;
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 
 namespace B3.Exchange.SyntheticTrader;
 
@@ -68,7 +68,7 @@ public sealed class EntryPointClient : IAsyncDisposable
     private const int MaxAcceptedBlockLength = 1024;
 
     // Per-template expected block lengths (mirroring ExecutionReportEncoder
-    // constants in B3.Exchange.EntryPoint, which is internal). Used as a
+    // constants in B3.Exchange.Gateway, which is internal). Used as a
     // tighter, schema-aware validation before allocating the body buffer.
     // Returns -1 for unknown template IDs (caller falls back to MaxAcceptedBlockLength).
     private static int ExpectedBlockLength(ushort templateId) => templateId switch

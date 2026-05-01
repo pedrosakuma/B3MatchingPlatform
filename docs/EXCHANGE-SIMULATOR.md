@@ -2,7 +2,7 @@
 
 Stateful B3-style exchange simulator built on top of the matching engine
 in `src/B3.Exchange.Matching` and the EntryPoint TCP server in
-`src/B3.Exchange.EntryPoint`. Publishes synthetic UMDF traffic on multicast
+`src/B3.Exchange.Gateway`. Publishes synthetic UMDF traffic on multicast
 and accepts SBE EntryPoint orders over TCP.
 
 This is **distinct from** the synthetic publisher in

@@ -1,4 +1,4 @@
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
 
 namespace B3.Exchange.SyntheticTrader.Tests;

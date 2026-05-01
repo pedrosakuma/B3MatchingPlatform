@@ -4,7 +4,7 @@ using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Stream-based per-connection session. Hosts:

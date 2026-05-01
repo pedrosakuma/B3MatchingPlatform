@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Byte-level encoder for the B3 EntryPoint <c>Terminate</c> message
