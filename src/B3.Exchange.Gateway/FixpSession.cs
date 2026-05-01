@@ -2,18 +2,18 @@ using System.Buffers;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
+using ContractsSessionId = B3.Exchange.Contracts.SessionId;
 
 namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Per-connection FIXP session: owns session identity (<see cref="SessionId"/>,
 /// <see cref="EnteringFirm"/>), the inbound decode loop, the FIXP-style
-/// liveness watchdog, and the implementation of
-/// <see cref="IGatewayResponseChannel"/> that encodes outbound
-/// ExecutionReports. Hands the actual byte-level send/receive of frames
-/// to a composed <see cref="TcpTransport"/>.
+/// liveness watchdog, and the encoders for outbound ExecutionReport
+/// frames. Hands the actual byte-level send/receive of frames to a
+/// composed <see cref="TcpTransport"/>.
 ///
-/// <para>The class is the destination for the
+/// <para>The session is the destination for the
 /// <see cref="IInboundCommandSink"/> dispatch — Core never holds a
 /// transport reference. Future Phase-2 work (FIXP state machine,
 /// authentication, retransmission) will plug into this same surface.</para>
@@ -22,7 +22,7 @@ namespace B3.Exchange.Gateway;
 /// in tests with <c>MemoryStream</c> or duplex pipes — see
 /// <see cref="EntryPointListener"/> for the production accept loop.</para>
 /// </summary>
-public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
+public sealed class FixpSession : IAsyncDisposable
 {
     private const int InboundHeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int DefaultSendQueueCapacity = 1024;
@@ -47,6 +47,12 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
     public long ConnectionId { get; }
     public uint EnteringFirm { get; }
     public uint SessionId { get; }
+    /// <summary>Stable, transport-neutral identity of this session as seen
+    /// by Core / Contracts. Routing key the Gateway uses to resolve
+    /// outbound ExecutionReports back to this <see cref="FixpSession"/>.
+    /// Derived from <see cref="ConnectionId"/> until Phase 2 introduces a
+    /// <c>SessionRegistry</c> backed by authentication.</summary>
+    public ContractsSessionId Identity { get; }
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
 
     /// <summary>
@@ -67,6 +73,7 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
+        Identity = new ContractsSessionId("conn-" + connectionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _sink = sink;
         _logger = logger;
         _nowNanos = nowNanos ?? DefaultNowNanos;
@@ -108,7 +115,7 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
                 await ReadExactlyAsync(stream, headerBuf, ct).ConfigureAwait(false);
                 if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var headerError, out var hdrMsg))
                 {
-                    _sink.OnDecodeError(this, hdrMsg ?? headerError.ToString());
+                    _sink.OnDecodeError(Identity, hdrMsg ?? headerError.ToString());
                     await TerminateAndCloseAsync(MapHeaderErrorToTerminationCode(headerError), $"decode-error:{headerError}").ConfigureAwait(false);
                     return;
                 }
@@ -198,7 +205,7 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
         if (!EntryPointVarData.TryValidate(varData, spec, out var varErr))
         {
-            _sink.OnDecodeError(this, varErr ?? "decode error: varData");
+            _sink.OnDecodeError(Identity, varErr ?? "decode error: varData");
             await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:varData").ConfigureAwait(false);
             return false;
         }
@@ -212,34 +219,34 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
-                    _sink.EnqueueNewOrder(no, this, noClOrd);
+                    _sink.EnqueueNewOrder(no, Identity, EnteringFirm, noClOrd);
                     return true;
                 }
-                _sink.OnDecodeError(this, noErr ?? "decode error: SimpleNewOrder");
+                _sink.OnDecodeError(Identity, noErr ?? "decode error: SimpleNewOrder");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleNewOrder").ConfigureAwait(false);
                 return false;
             case EntryPointFrameReader.TidSimpleModifyOrder:
                 if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
                 {
-                    _sink.EnqueueReplace(rp, this, rpClOrd, rpOrigClOrd);
+                    _sink.EnqueueReplace(rp, Identity, EnteringFirm, rpClOrd, rpOrigClOrd);
                     return true;
                 }
-                _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
+                _sink.OnDecodeError(Identity, rpErr ?? "decode error: SimpleModifyOrder");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleModifyOrder").ConfigureAwait(false);
                 return false;
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
                 {
-                    _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
+                    _sink.EnqueueCancel(cn, Identity, EnteringFirm, cnClOrd, cnOrigClOrd);
                     return true;
                 }
-                _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
+                _sink.OnDecodeError(Identity, cnErr ?? "decode error: OrderCancelRequest");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderCancelRequest").ConfigureAwait(false);
                 return false;
             default:
                 // Unreachable: TryParseInboundHeader has already screened out
                 // unknown templates and returned UnsupportedTemplate.
-                _sink.OnDecodeError(this, $"unsupported templateId={info.TemplateId}");
+                _sink.OnDecodeError(Identity, $"unsupported templateId={info.TemplateId}");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.UnrecognizedMessage, "decode-error:unsupported").ConfigureAwait(false);
                 return false;
         }
@@ -469,7 +476,7 @@ public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
         // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for
         // the lifetime of every resting order it placed → unbounded memory.
-        try { _sink.OnSessionClosed(this); } catch { }
+        try { _sink.OnSessionClosed(Identity); } catch { }
         try { _onClosed?.Invoke(this, reason); } catch { }
     }
 

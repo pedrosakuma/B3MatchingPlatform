@@ -15,31 +15,26 @@ public class HostRouterTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) => Calls.Add(channelNumber);
     }
 
-    private sealed class RecordingReply : IGatewayResponseChannel
+    private sealed class RecordingOutbound : ICoreOutbound
     {
-        public long ConnectionId => 1;
-        public uint EnteringFirm => 1;
-        public bool IsOpen => true;
         public List<RejectEvent> Rejects { get; } = new();
-        public bool WriteExecutionReportNew(in OrderAcceptedEvent e) => true;
-        public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
-        public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
-        public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) => true;
-        public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue) { Rejects.Add(e); return true; }
-        public bool WriteSessionReject(byte terminationCode) => true;
-        public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason, string? text = null) => true;
+        public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e) => true;
+        public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
+        public bool WriteExecutionReportCancel(B3.Exchange.Contracts.SessionId session, in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
+        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) => true;
+        public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue) { Rejects.Add(e); return true; }
     }
 
     [Fact]
     public void UnknownInstrument_RoutesToInlineRejectWithoutDispatcher()
     {
         var routing = new Dictionary<long, ChannelDispatcher>(); // empty
-        var router = new HostRouter(routing, NullLogger<HostRouter>.Instance, () => 1_000UL);
-        var reply = new RecordingReply();
+        var outbound = new RecordingOutbound();
+        var router = new HostRouter(routing, outbound, NullLogger<HostRouter>.Instance, () => 1_000UL);
         router.EnqueueNewOrder(
             new NewOrderCommand("1", SecurityId: 12345, Side.Buy, OrderType.Limit, TimeInForce.Day, 100, 100, 1, 0),
-            reply, clOrdIdValue: 1);
-        var rej = Assert.Single(reply.Rejects);
+            new B3.Exchange.Contracts.SessionId("s1"), enteringFirm: 1, clOrdIdValue: 1);
+        var rej = Assert.Single(outbound.Rejects);
         Assert.Equal(12345, rej.SecurityId);
         Assert.Equal(RejectReason.UnknownInstrument, rej.Reason);
     }
@@ -60,20 +55,21 @@ public class HostRouterTests
             SecurityType = "CS"
         };
         var pkt = new NoopPacketSink();
+        var outbound = new RecordingOutbound();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => new MatchingEngine(new[] { inst }, s, NullLogger<MatchingEngine>.Instance),
             packetSink: pkt,
+            outbound: outbound,
             logger: NullLogger<ChannelDispatcher>.Instance,
             nowNanos: () => 1_000UL);
         // Dispatcher loop not started; we read inbound queue directly.
-        var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp }, NullLogger<HostRouter>.Instance);
-        var reply = new RecordingReply();
+        var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp }, outbound, NullLogger<HostRouter>.Instance);
 
         router.EnqueueNewOrder(
             new NewOrderCommand("1", SecurityId: 42, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 1, 0),
-            reply, clOrdIdValue: 1);
+            new B3.Exchange.Contracts.SessionId("s1"), enteringFirm: 1, clOrdIdValue: 1);
 
-        Assert.Empty(reply.Rejects);
+        Assert.Empty(outbound.Rejects);
         // Drain the dispatcher queue + assert it actually processed an order
         var field = typeof(ChannelDispatcher).GetField("_inbound", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
         var inbound = field.GetValue(disp)!;

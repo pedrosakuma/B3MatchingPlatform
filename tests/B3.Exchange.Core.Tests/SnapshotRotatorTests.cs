@@ -259,7 +259,8 @@ public class ChannelDispatcherSnapshotTests
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
-            packetSink: incSink, logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
+            packetSink: incSink, outbound: new ChannelDispatcherTests_RecordingOutbound(),
+            logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);
@@ -283,20 +284,21 @@ public class ChannelDispatcherSnapshotTests
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
-            packetSink: incSink, logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
+            packetSink: incSink, outbound: new ChannelDispatcherTests_RecordingOutbound(),
+            logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);
         disp.AttachSnapshotRotator(rotator);
 
         // Submit a couple of resting orders so the snapshot has content.
-        var reply = new ChannelDispatcherTests_RecordingReply();
+        var session = new B3.Exchange.Contracts.SessionId("test");
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, 10_0000, 100, 7, 1UL),
-            reply, clOrdIdValue: 1UL);
+            session, enteringFirm: 7, clOrdIdValue: 1UL);
         disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, 9_0000, 200, 7, 2UL),
-            reply, clOrdIdValue: 2UL);
+            session, enteringFirm: 7, clOrdIdValue: 2UL);
         disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, 11_0000, 300, 7, 3UL),
-            reply, clOrdIdValue: 3UL);
+            session, enteringFirm: 7, clOrdIdValue: 3UL);
         Drain(disp);
         snapSink.Packets.Clear();
 
@@ -332,16 +334,11 @@ public class ChannelDispatcherSnapshotTests
     }
 }
 
-internal sealed class ChannelDispatcherTests_RecordingReply : B3.Exchange.Core.IGatewayResponseChannel
+internal sealed class ChannelDispatcherTests_RecordingOutbound : B3.Exchange.Core.ICoreOutbound
 {
-    public long ConnectionId => 1;
-    public uint EnteringFirm => 7;
-    public bool IsOpen => true;
-    public bool WriteExecutionReportNew(in OrderAcceptedEvent e) => true;
-    public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
-    public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) => true;
-    public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue) => true;
-    public bool WriteSessionReject(byte terminationCode) => true;
-    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason, string? text = null) => true;
+    public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e) => true;
+    public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
+    public bool WriteExecutionReportCancel(B3.Exchange.Contracts.SessionId session, in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
+    public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) => true;
+    public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue) => true;
 }

@@ -33,11 +33,11 @@ public class ChannelDispatcherTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) => Packets.Add(packet.ToArray());
     }
 
-    private sealed class RecordingReply : IGatewayResponseChannel
+    private sealed class FakeSession
     {
-        public long ConnectionId => 1;
-        public uint EnteringFirm => 7;
-        public bool IsOpen => true;
+        private static int _nextId;
+        public B3.Exchange.Contracts.SessionId Id { get; } = new("s" + System.Threading.Interlocked.Increment(ref _nextId));
+        public uint EnteringFirm { get; init; } = 7;
         public List<string> Calls { get; } = new();
         public List<OrderAcceptedEvent> News { get; } = new();
         public List<OrderCanceledEvent> Cancels { get; } = new();
@@ -45,35 +45,50 @@ public class ChannelDispatcherTests
         public List<TradeEvent> Trades { get; } = new();
         public bool CaptureCancelIds { get; set; }
         public List<(ulong ClOrdId, ulong OrigClOrdId)> CancelIds { get; } = new();
-        public bool WriteExecutionReportNew(in OrderAcceptedEvent e) { News.Add(e); Calls.Add("New"); return true; }
-        public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
-        { Trades.Add(e); Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); return true; }
-        public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue) { Cancels.Add(e); Calls.Add("Cancel"); if (CaptureCancelIds) CancelIds.Add((clOrdIdValue, origClOrdIdValue)); return true; }
-        public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq) { Calls.Add("Modify"); return true; }
-        public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue) { Rejects.Add(e); Calls.Add("Reject"); return true; }
-        public bool WriteSessionReject(byte terminationCode) { Calls.Add("SessionReject"); return true; }
-        public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason, string? text = null) { Calls.Add("BusinessReject"); return true; }
+
+        public FakeSession(RecordingOutbound outbound) { outbound.Register(this); }
     }
 
-    private static (ChannelDispatcher disp, RecordingPacketSink pkt) NewDispatcher()
+    private sealed class RecordingOutbound : ICoreOutbound
+    {
+        private readonly Dictionary<B3.Exchange.Contracts.SessionId, FakeSession> _sessions = new();
+        public void Register(FakeSession s) => _sessions[s.Id] = s;
+        private FakeSession? Find(B3.Exchange.Contracts.SessionId id)
+            => _sessions.TryGetValue(id, out var s) ? s : null;
+
+        public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e)
+        { if (Find(session) is { } s) { s.News.Add(e); s.Calls.Add("New"); } return true; }
+        public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
+        { if (Find(session) is { } s) { s.Trades.Add(e); s.Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); } return true; }
+        public bool WriteExecutionReportCancel(B3.Exchange.Contracts.SessionId session, in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
+        { if (Find(session) is { } s) { s.Cancels.Add(e); s.Calls.Add("Cancel"); if (s.CaptureCancelIds) s.CancelIds.Add((clOrdIdValue, origClOrdIdValue)); } return true; }
+        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq)
+        { if (Find(session) is { } s) { s.Calls.Add("Modify"); } return true; }
+        public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue)
+        { if (Find(session) is { } s) { s.Rejects.Add(e); s.Calls.Add("Reject"); } return true; }
+    }
+
+    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()
     {
         var pkt = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
             packetSink: pkt,
+            outbound: outbound,
             logger: NullLogger<ChannelDispatcher>.Instance,
             nowNanos: () => 1_000_000_000UL, tradeDate: 19_000);
-        return (disp, pkt);
+        return (disp, pkt, outbound);
     }
 
     [Fact]
     public void NewOrder_AcceptedRestingOrder_EmitsOrderAddedFrameAndExecReportNew()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
 
         // No background loop — drive synchronously by reading the inbound queue.
         DrainInbound(disp);
@@ -97,18 +112,18 @@ public class ChannelDispatcherTests
     [Fact]
     public void Crossing_AggressorAndResting_BothGetTradeReportsAndDeleteFrames()
     {
-        var (disp, pkt) = NewDispatcher();
-        var maker = new RecordingReply();
-        var taker = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            maker, clOrdIdValue: 1UL);
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
         Assert.Single(maker.News);
         pkt.Packets.Clear();
 
         disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
-            taker, clOrdIdValue: 2UL);
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 2UL);
         DrainInbound(disp);
 
         Assert.Single(maker.Trades);
@@ -125,16 +140,16 @@ public class ChannelDispatcherTests
     [Fact]
     public void Cancel_RestingOrder_EmitsDeleteFrameAndExecReportCancel()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
         long oid = reply.News[0].OrderId;
         pkt.Packets.Clear();
 
-        disp.EnqueueCancel(new CancelOrderCommand("1", Petr, oid, 2_000UL), reply, clOrdIdValue: 1UL, origClOrdIdValue: 0UL);
+        disp.EnqueueCancel(new CancelOrderCommand("1", Petr, oid, 2_000UL), reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL, origClOrdIdValue: 0UL);
         DrainInbound(disp);
 
         Assert.Single(reply.Cancels);
@@ -145,11 +160,11 @@ public class ChannelDispatcherTests
     [Fact]
     public void UnknownInstrument_EmitsRejectExecReport_NoUmdfPacket()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", SecurityId: 999, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
 
         Assert.Single(reply.Rejects);
@@ -159,18 +174,18 @@ public class ChannelDispatcherTests
     [Fact]
     public void Cancel_ByOrigClOrdId_ResolvesViaSessionMap()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply { CaptureCancelIds = true };
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound) { CaptureCancelIds = true };
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
         long oid = reply.News[0].OrderId;
         pkt.Packets.Clear();
 
         // Cancel without OrderID — only OrigClOrdID = 1.
         disp.EnqueueCancel(new CancelOrderCommand("99", Petr, OrderId: 0, 2_000UL),
-            reply, clOrdIdValue: 99UL, origClOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 99UL, origClOrdIdValue: 1UL);
         DrainInbound(disp);
 
         Assert.Single(reply.Cancels);
@@ -182,15 +197,15 @@ public class ChannelDispatcherTests
     [Fact]
     public void SequenceNumber_NearOverflow_BumpsSequenceVersion_AndResets()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         Assert.Equal((ushort)1, disp.SequenceVersion);
         disp.TestSetSequenceNumber(uint.MaxValue);
         Assert.Equal(uint.MaxValue, disp.SequenceNumber);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
 
         Assert.Single(pkt.Packets);
@@ -204,15 +219,15 @@ public class ChannelDispatcherTests
     [Fact]
     public void OnSessionClosed_ReleasesOrderOwnerEntries_LeavesOrdersOnBook()
     {
-        var (disp, _) = NewDispatcher();
-        var sessionA = new RecordingReply();
-        var sessionB = new RecordingReply();
+        var (disp, _, outbound) = NewDispatcher();
+        var sessionA = new FakeSession(outbound);
+        var sessionB = new FakeSession(outbound);
 
         // Two resting orders by sessionA, one by sessionB (different prices so
         // they don't cross).
-        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL), sessionA, 1UL);
-        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 7, 1_000UL), sessionA, 2UL);
-        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10.05m), 100, 8, 1_000UL), sessionB, 3UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL), sessionA.Id, sessionA.EnteringFirm, 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 7, 1_000UL), sessionA.Id, sessionA.EnteringFirm, 2UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10.05m), 100, 8, 1_000UL), sessionB.Id, sessionB.EnteringFirm, 3UL);
         DrainInbound(disp);
 
         Assert.Equal(3, OrderOwnerCount(disp));
@@ -220,15 +235,15 @@ public class ChannelDispatcherTests
         // Session A drops. After processing OnSessionClosed on the dispatcher
         // thread, only B's owner entry must remain. Orders themselves stay on
         // the book (the engine never sees a Cancel).
-        ((IInboundCommandSink)disp).OnSessionClosed(sessionA);
+        ((IInboundCommandSink)disp).OnSessionClosed(sessionA.Id);
         DrainInbound(disp);
 
         Assert.Equal(1, OrderOwnerCount(disp));
         // Cross sessionB's sell with a fresh aggressor: passive side has no
         // owner left for A's resting BUYs (correct), but a counter-cross from
         // sessionB itself exercises the still-live ownership for B.
-        var sessionC = new RecordingReply();
-        disp.EnqueueNewOrder(new NewOrderCommand("4", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 9, 2_000UL), sessionC, 4UL);
+        var sessionC = new FakeSession(outbound);
+        disp.EnqueueNewOrder(new NewOrderCommand("4", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 9, 2_000UL), sessionC.Id, sessionC.EnteringFirm, 4UL);
         DrainInbound(disp);
         // Aggressor (C) sees its trade ER. Passive owner (A) is gone → no ER
         // delivered to A — verifies the back-reference was actually dropped.
@@ -237,58 +252,26 @@ public class ChannelDispatcherTests
     }
 
     [Fact]
-    public void OnSessionClosed_AllowsSessionToBeGarbageCollected()
+    public void OnSessionClosed_RemovesSessionIdOwnerEntries()
     {
-        var (disp, _) = NewDispatcher();
-
-        // Place an order from a session that we will let drop. A helper method
-        // isolates the local rooted reference so the JIT cannot keep it
-        // alive after the helper returns.
-        var weak = PlaceAndForgetSession(disp);
-
-        // At this point the dispatcher's _orderOwners map still references the
-        // session, so it should NOT be collectable yet.
-        ForceGc();
-        Assert.True(weak.IsAlive, "session unexpectedly collected before OnSessionClosed");
-
-        // Notify and drain. After NotifyClosedAndForget returns, the
-        // temporary reference it pulled from WeakReference.Target lives in a
-        // popped stack frame and cannot be kept rooted by the caller.
-        NotifyClosedAndForget(disp, weak);
-
-        ForceGc();
-        Assert.False(weak.IsAlive, "session was not GC-eligible after OnSessionClosed; ownership map still roots it");
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static WeakReference PlaceAndForgetSession(ChannelDispatcher disp)
-    {
-        var session = new RecordingReply();
+        // With a value-only owner map (SessionId is a struct), there is no
+        // session reference to GC. The behavioral guarantee is simpler:
+        // OnSessionClosed must evict every entry whose owner SessionId equals
+        // the closed session.
+        var (disp, _, outbound) = NewDispatcher();
+        var session = new FakeSession(outbound);
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            session, 1UL);
+            session.Id, session.EnteringFirm, 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 7, 1_001UL),
+            session.Id, session.EnteringFirm, 2UL);
         DrainInbound(disp);
-        var weak = new WeakReference(session);
-        // session goes out of scope when this method returns.
-        return weak;
-    }
 
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void NotifyClosedAndForget(ChannelDispatcher disp, WeakReference weak)
-    {
-        var target = (IGatewayResponseChannel?)weak.Target;
-        if (target is null) return;
-        ((IInboundCommandSink)disp).OnSessionClosed(target);
-        target = null;
+        Assert.Equal(2, OrderOwnerCount(disp));
+
+        ((IInboundCommandSink)disp).OnSessionClosed(session.Id);
         DrainInbound(disp);
-    }
 
-    private static void ForceGc()
-    {
-        for (int i = 0; i < 3; i++)
-        {
-            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-            GC.WaitForPendingFinalizers();
-        }
+        Assert.Equal(0, OrderOwnerCount(disp));
     }
 
     private static int OrderOwnerCount(ChannelDispatcher disp)
@@ -303,11 +286,11 @@ public class ChannelDispatcherTests
     [Fact]
     public void Cancel_ByUnknownOrigClOrdId_EmitsRejectAndNoUmdfPacket()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         disp.EnqueueCancel(new CancelOrderCommand("42", Petr, OrderId: 0, 1_000UL),
-            reply, clOrdIdValue: 42UL, origClOrdIdValue: 12345UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 42UL, origClOrdIdValue: 12345UL);
         DrainInbound(disp);
 
         var rej = Assert.Single(reply.Rejects);
@@ -318,11 +301,11 @@ public class ChannelDispatcherTests
     [Fact]
     public void Replace_ByOrigClOrdId_LostPriority_ResolvesViaSessionMap()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
         long origOid = reply.News[0].OrderId;
         pkt.Packets.Clear();
@@ -330,7 +313,7 @@ public class ChannelDispatcherTests
         // Replace with NEW PRICE (loses priority): only OrigClOrdID provided.
         disp.EnqueueReplace(
             new ReplaceOrderCommand("2", Petr, OrderId: 0, NewPriceMantissa: Px(11m), NewQuantity: 100, EnteredAtNanos: 2_000UL),
-            reply, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
         DrainInbound(disp);
 
         // Engine emits OrderCanceled (lost priority) + OrderAccepted.
@@ -345,14 +328,14 @@ public class ChannelDispatcherTests
 
         // Subsequent cancel by the OLD ClOrdId must fail (evicted).
         disp.EnqueueCancel(new CancelOrderCommand("3", Petr, OrderId: 0, 3_000UL),
-            reply, clOrdIdValue: 3UL, origClOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3UL, origClOrdIdValue: 1UL);
         DrainInbound(disp);
         Assert.Single(reply.Rejects);
         Assert.Equal(RejectReason.UnknownOrderId, reply.Rejects[^1].Reason);
 
         // Cancel by NEW ClOrdId resolves to newOid.
         disp.EnqueueCancel(new CancelOrderCommand("4", Petr, OrderId: 0, 4_000UL),
-            reply, clOrdIdValue: 4UL, origClOrdIdValue: 2UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 4UL, origClOrdIdValue: 2UL);
         DrainInbound(disp);
         Assert.Equal(2, reply.Cancels.Count);
         Assert.Equal(newOid, reply.Cancels[^1].OrderId);
@@ -361,19 +344,19 @@ public class ChannelDispatcherTests
     [Fact]
     public void FullyFilledOrder_EvictsClOrdIdMap()
     {
-        var (disp, pkt) = NewDispatcher();
-        var maker = new RecordingReply();
-        var taker = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
 
         // Maker rests an order tagged with ClOrdId=10.
         disp.EnqueueNewOrder(new NewOrderCommand("10", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            maker, clOrdIdValue: 10UL);
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 10UL);
         DrainInbound(disp);
         Assert.Single(maker.News);
 
         // Taker fully consumes the maker's order.
         disp.EnqueueNewOrder(new NewOrderCommand("20", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
-            taker, clOrdIdValue: 20UL);
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 20UL);
         DrainInbound(disp);
 
         Assert.Single(maker.Trades);
@@ -381,7 +364,7 @@ public class ChannelDispatcherTests
         // The maker's ClOrdId must be evicted from the (firm, ClOrdId) → orderId map:
         // a Cancel by OrigClOrdID=10 must now reject with UnknownOrderId.
         disp.EnqueueCancel(new CancelOrderCommand("11", Petr, OrderId: 0, 3_000UL),
-            maker, clOrdIdValue: 11UL, origClOrdIdValue: 10UL);
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 11UL, origClOrdIdValue: 10UL);
         DrainInbound(disp);
 
         var rej = Assert.Single(maker.Rejects);
@@ -391,15 +374,15 @@ public class ChannelDispatcherTests
     [Fact]
     public void Cancel_OnSelf_ER_CarriesBothClOrdIdAndOrigClOrdId()
     {
-        var (disp, _) = NewDispatcher();
-        var reply = new RecordingReply { CaptureCancelIds = true };
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound) { CaptureCancelIds = true };
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
 
         disp.EnqueueCancel(new CancelOrderCommand("99", Petr, OrderId: 0, 2_000UL),
-            reply, clOrdIdValue: 99UL, origClOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 99UL, origClOrdIdValue: 1UL);
         DrainInbound(disp);
 
         Assert.Single(reply.CancelIds);
@@ -411,14 +394,14 @@ public class ChannelDispatcherTests
     [Fact]
     public void OperatorBumpVersion_ClearsBook_BumpsVersions_EmitsChannelResetPacket()
     {
-        var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
 
         // Seed two resting orders so the book has state to clear.
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
-            reply, clOrdIdValue: 1UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(11m), 200, 7, 1_001UL),
-            reply, clOrdIdValue: 2UL);
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
         DrainInbound(disp);
 
         ushort versionBefore = disp.SequenceVersion;
@@ -469,7 +452,7 @@ public class ChannelDispatcherTests
         // produces no incremental packets — verifies the dispatch path is
         // safe in the no-rotator case (the host wires the rotator only when
         // the channel has a snapshot config).
-        var (disp, pkt) = NewDispatcher();
+        var (disp, pkt, outbound) = NewDispatcher();
         Assert.True(disp.EnqueueOperatorSnapshotNow());
         DrainInbound(disp);
         Assert.Empty(pkt.Packets);
