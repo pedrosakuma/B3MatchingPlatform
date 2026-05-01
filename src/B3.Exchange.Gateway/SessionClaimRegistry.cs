@@ -84,6 +84,36 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Returns the live owner of <paramref name="sessionId"/>, if any,
+    /// along with the recorded last-seen sessionVerID. Used by the
+    /// rebind path (#69b-2): if the new transport's <c>Establish</c>
+    /// targets a sessionId currently claimed by a <see cref="FixpSession"/>
+    /// in <see cref="FixpState.Suspended"/> with matching sessionVerID,
+    /// the listener routes the new transport to that existing session
+    /// instead of constructing a fresh one.
+    ///
+    /// <para>Returns <c>false</c> if no claim is currently held. Returns
+    /// <c>true</c> with <paramref name="holder"/> set to the live owner
+    /// otherwise; the caller is responsible for downcasting to the
+    /// concrete session type.</para>
+    /// </summary>
+    public bool TryGetActiveClaim(uint sessionId, out object holder, out ulong sessionVerId)
+    {
+        lock (_lock)
+        {
+            if (_activeClaims.TryGetValue(sessionId, out var owner))
+            {
+                holder = owner;
+                sessionVerId = _lastSessionVerId.TryGetValue(sessionId, out var v) ? v : 0UL;
+                return true;
+            }
+        }
+        holder = null!;
+        sessionVerId = 0UL;
+        return false;
+    }
+
+    /// <summary>
     /// Releases the claim for <paramref name="sessionId"/> if (and only
     /// if) it is currently held by <paramref name="claimToken"/>. Safe to
     /// call from any thread; safe to call multiple times. Does not

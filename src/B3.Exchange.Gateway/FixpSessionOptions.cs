@@ -28,6 +28,17 @@ public sealed record FixpSessionOptions
     public int IdleTimeoutMs { get; init; } = 30_000;
     public int TestRequestGraceMs { get; init; } = 5_000;
     public int SuspendedTimeoutMs { get; init; } = 5 * 60_000;
+    /// <summary>
+    /// Per-connection budget (ms) for the listener's first-frame router
+    /// (issue #69b-2) to read the SOFH+SBE header + body of the first
+    /// FIXP message and decide whether to route the new transport into
+    /// an existing Suspended <see cref="FixpSession"/> (re-attach) or to
+    /// construct a fresh session. Slowloris connections that fail to
+    /// emit a complete first frame within this window are closed
+    /// without ever instantiating a <see cref="FixpSession"/>. Default
+    /// is 5 s; tests override to sub-second.
+    /// </summary>
+    public int FirstFrameTimeoutMs { get; init; } = 5_000;
 
     public static FixpSessionOptions Default { get; } = new();
 
@@ -37,5 +48,6 @@ public sealed record FixpSessionOptions
         if (IdleTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(IdleTimeoutMs));
         if (TestRequestGraceMs <= 0) throw new ArgumentOutOfRangeException(nameof(TestRequestGraceMs));
         if (SuspendedTimeoutMs < 0) throw new ArgumentOutOfRangeException(nameof(SuspendedTimeoutMs));
+        if (FirstFrameTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(FirstFrameTimeoutMs));
     }
 }
