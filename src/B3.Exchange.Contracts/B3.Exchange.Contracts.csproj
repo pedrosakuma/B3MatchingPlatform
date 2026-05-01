@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.Exchange.Contracts</RootNamespace>
+    <AssemblyName>B3.Exchange.Contracts</AssemblyName>
+  </PropertyGroup>
+
+</Project>
