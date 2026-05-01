@@ -92,11 +92,20 @@ public class ExchangeHostSnapshotE2ETests
         Assert.True(host.Dispatchers[0].EnqueueSnapshotTick());
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (snapSink.Packets.Count == 0 && DateTime.UtcNow < deadline)
-            await Task.Delay(20);
+        byte[]? pkt = null;
+        while (pkt is null && DateTime.UtcNow < deadline)
+        {
+            lock (snapSink.Packets)
+            {
+                if (snapSink.Packets.Count > 0)
+                    pkt = (byte[])snapSink.Packets[0].Clone();
+            }
 
-        Assert.True(snapSink.Packets.Count >= 1, "snapshot packet not received");
-        var pkt = snapSink.Packets[0];
+            if (pkt is null)
+                await Task.Delay(20);
+        }
+
+        Assert.True(pkt is not null, "snapshot packet not received");
 
         // PacketHeader sanity.
         ref readonly var hdr = ref MemoryMarshal.AsRef<B3.Umdf.Mbo.Sbe.V16.PacketHeader>(pkt.AsSpan(0, WireOffsets.PacketHeaderSize));
@@ -161,11 +170,20 @@ public class ExchangeHostSnapshotE2ETests
         Assert.True(host.Dispatchers[0].EnqueueSnapshotTick());
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (snapSink.Packets.Count == 0 && DateTime.UtcNow < deadline)
-            await Task.Delay(20);
+        byte[]? pkt = null;
+        while (pkt is null && DateTime.UtcNow < deadline)
+        {
+            lock (snapSink.Packets)
+            {
+                if (snapSink.Packets.Count > 0)
+                    pkt = (byte[])snapSink.Packets[0].Clone();
+            }
 
-        Assert.True(snapSink.Packets.Count >= 1);
-        var pkt = snapSink.Packets[0];
+            if (pkt is null)
+                await Task.Delay(20);
+        }
+
+        Assert.True(pkt is not null, "snapshot packet not received");
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
