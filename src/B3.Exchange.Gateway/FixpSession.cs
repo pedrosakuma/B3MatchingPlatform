@@ -416,6 +416,13 @@ public sealed class FixpSession : IAsyncDisposable
                     // DropSilently / Terminal / NotApplied — defensive: drop frame.
                     return true;
             }
+
+            // §4.6.3.1 / §4.10 (#GAP-10): businessHeader.sessionID must
+            // match the negotiated SessionId. Mismatch → BMR(33003); the
+            // session stays open (per spec the message is rejected, not
+            // the session).
+            if (!TryAcceptBusinessHeaderSessionId(info.TemplateId, fixedBlock))
+                return true;
         }
 
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
@@ -660,6 +667,48 @@ public sealed class FixpSession : IAsyncDisposable
         => templateId == EntryPointFrameReader.TidSimpleNewOrder
         || templateId == EntryPointFrameReader.TidSimpleModifyOrder
         || templateId == EntryPointFrameReader.TidOrderCancelRequest;
+
+    /// <summary>
+    /// Spec §4.6.3.1 / §4.10 (#GAP-10): validates that an inbound business
+    /// message's <c>InboundBusinessHeader.sessionID</c> matches this
+    /// session's negotiated SessionId. Returns <c>true</c> if the header
+    /// is OK and dispatch may proceed; returns <c>false</c> after
+    /// emitting <c>BusinessMessageReject(33003)</c> for the mismatched
+    /// frame. Called only in strict (validator-enabled) mode; legacy
+    /// passthrough mode skips this check to preserve pre-Phase-2 test
+    /// fixtures that mint sessionIds independently.
+    /// </summary>
+    /// internal — exposed for tests in B3.Exchange.Gateway.Tests
+    internal bool TryAcceptBusinessHeaderSessionId(ushort templateId, ReadOnlySpan<byte> fixedBlock)
+    {
+        // InboundBusinessHeader composite: sessionID(uint32 @0),
+        // msgSeqNum(uint32 @4), sendingTime(uint64 @8),
+        // eventIndicator(byte @16), marketSegmentID(byte @17). Header is
+        // the first 20 bytes of every business message body; the
+        // EntryPoint exact-frame validator guarantees the body has at
+        // least BlockLength bytes (>= 76 for the smallest template).
+        uint hdrSessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(0, 4));
+        if (hdrSessionId == SessionId) return true;
+
+        uint hdrMsgSeqNum = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4));
+        // ClOrdID lives at body offset 20 for all three currently-supported
+        // application templates. Forwarded as businessRejectRefId so the
+        // peer can correlate the reject back to the source order.
+        ulong refClOrdId = fixedBlock.Length >= 28
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+            : 0UL;
+
+        WriteBusinessMessageReject(
+            refMsgType: (byte)templateId,
+            refSeqNum: hdrMsgSeqNum,
+            businessRejectRefId: refClOrdId,
+            businessRejectReason: 33003,
+            text: "Wrong sessionID in businessHeader");
+        _logger.LogWarning(
+            "fixp session {ConnectionId} rejected business message: sessionID {Got} != negotiated {Expected} (template={Template})",
+            ConnectionId, hdrSessionId, SessionId, templateId);
+        return false;
+    }
 
     /// <summary>
     /// Outcome of synchronously processing an inbound Establish frame.
