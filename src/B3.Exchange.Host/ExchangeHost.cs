@@ -206,15 +206,19 @@ public sealed class ExchangeHost : IAsyncDisposable
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
         };
+        // Phase 2 (#42): real Negotiate handshake. The validator is pure
+        // (no IO); the claim ledger lives for the host process lifetime
+        // so duplicate-connection detection works across reconnects.
+        var sessionClaims = new SessionClaimRegistry();
+        var negotiationValidator = new NegotiationValidator(firmRegistry, sessionClaims, devMode: _config.Auth.DevMode);
         _listener = new EntryPointListener(listenEp, _router, sessionRegistry, _loggerFactory,
             identityFactory: remote =>
             {
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
-                // Pre-#42 (Negotiate): we do not yet know which session the
-                // peer will claim, so we stamp the default session's firm
-                // code on every accept. #42 will move firm/session
-                // resolution into the Negotiate handler and consult
-                // FirmRegistry by sessionID claimed by the peer.
+                // Pre-Negotiate placeholder: firm/session are stamped from
+                // a default and rewritten by FixpSession on a successful
+                // Negotiate. SessionId here is just a unique pre-handshake
+                // tag for log correlation.
                 var enteringFirm = defaultSession.firmCode;
                 return new EntryPointListener.AcceptedConnection(
                     ConnectionId: connectionId,
@@ -222,7 +226,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
             },
             sessionOptions: sessionOptions,
-            onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason));
+            onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason),
+            negotiationValidator: negotiationValidator,
+            sessionClaims: sessionClaims);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 

@@ -34,6 +34,15 @@ public sealed class FixpSession : IAsyncDisposable
     private readonly Func<ulong> _nowNanos;
     private readonly FixpSessionOptions _options;
     private readonly Action<FixpSession, string>? _onClosed;
+    private readonly NegotiationValidator? _validator;
+    private readonly SessionClaimRegistry? _claims;
+    /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
+    /// or 0 if no claim is held. Tracked so <see cref="Close"/> can
+    /// release the claim using the value from the moment the claim was
+    /// taken (the public <see cref="SessionId"/> may be re-stamped on a
+    /// subsequent rejected Negotiate that fails after we've already
+    /// claimed).</summary>
+    private uint _claimedSessionId;
     private long _msgSeqNum;
     private int _isOpen = 1;
     // Watchdog state (milliseconds since process start, monotonic).
@@ -45,8 +54,22 @@ public sealed class FixpSession : IAsyncDisposable
     private Task? _watchdogTask;
 
     public long ConnectionId { get; }
-    public uint EnteringFirm { get; }
-    public uint SessionId { get; }
+    /// <summary>
+    /// Numeric firm code (B3 EnteringFirm). Initially set from
+    /// <c>identityFactory</c> at accept time as a placeholder; rewritten
+    /// to the resolved <see cref="Firm.EnteringFirmCode"/> after a
+    /// successful FIXP <c>Negotiate</c> handshake (#42).
+    /// </summary>
+    public uint EnteringFirm { get; private set; }
+    /// <summary>
+    /// FIXP wire SessionID (uint32). Set from <c>identityFactory</c> at
+    /// accept time as a placeholder; rewritten to the value claimed by
+    /// the peer after a successful Negotiate.
+    /// </summary>
+    public uint SessionId { get; private set; }
+    /// <summary>FIXP <c>sessionVerID</c> recorded on the most recent
+    /// successful Negotiate. Zero before the handshake has completed.</summary>
+    public ulong SessionVerId { get; private set; }
     /// <summary>Stable, transport-neutral identity of this session as seen
     /// by Core / Contracts. Routing key the Gateway uses to resolve
     /// outbound ExecutionReports back to this <see cref="FixpSession"/>.
@@ -89,7 +112,9 @@ public sealed class FixpSession : IAsyncDisposable
         int sendQueueCapacity = DefaultSendQueueCapacity,
         FixpSessionOptions? options = null,
         Action<FixpSession, string>? onClosed = null,
-        ILogger<TcpTransport>? transportLogger = null)
+        ILogger<TcpTransport>? transportLogger = null,
+        NegotiationValidator? negotiationValidator = null,
+        SessionClaimRegistry? sessionClaims = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -102,6 +127,12 @@ public sealed class FixpSession : IAsyncDisposable
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
         _onClosed = onClosed;
+        _validator = negotiationValidator;
+        _claims = sessionClaims;
+        if (negotiationValidator is not null && sessionClaims is null)
+            throw new ArgumentException(
+                "sessionClaims is required when negotiationValidator is supplied",
+                nameof(sessionClaims));
         // The transport's onClose callback funnels back through our Close so
         // session-level book-keeping (sink notification, onClosed delegate)
         // runs even when teardown originates from a transport-side IO error.
@@ -238,6 +269,11 @@ public sealed class FixpSession : IAsyncDisposable
                 // Session-layer heartbeat / sequence sync. Liveness already
                 // recorded by the receive loop; nothing else to do.
                 return true;
+            case EntryPointFrameReader.TidNegotiate:
+                {
+                    var step = ProcessNegotiate(fixedBlock, varData);
+                    return await ExecuteNegotiateStepAsync(step).ConfigureAwait(false);
+                }
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
@@ -272,6 +308,168 @@ public sealed class FixpSession : IAsyncDisposable
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.UnrecognizedMessage, "decode-error:unsupported").ConfigureAwait(false);
                 return false;
         }
+    }
+
+    /// <summary>
+    /// Outcome of synchronously processing an inbound Negotiate frame.
+    /// Buffered byte arrays are produced inside <see cref="ProcessNegotiate"/>
+    /// so the async writer in <see cref="ExecuteNegotiateStepAsync"/> can
+    /// send them after spans have gone out of scope.
+    /// </summary>
+    private readonly struct NegotiateStep
+    {
+        public readonly bool IsAccepted;
+        public readonly bool DecodeError;
+        public readonly string? DecodeErrorMessage;
+        public readonly byte[]? ResponseFrame;
+        public readonly byte[]? RejectFrame;
+        public readonly string LogReason;
+
+        private NegotiateStep(bool accepted, bool decodeErr, string? decodeMsg,
+            byte[]? response, byte[]? reject, string logReason)
+        {
+            IsAccepted = accepted;
+            DecodeError = decodeErr;
+            DecodeErrorMessage = decodeMsg;
+            ResponseFrame = response;
+            RejectFrame = reject;
+            LogReason = logReason;
+        }
+
+        public static NegotiateStep Accepted(byte[] response, string reason)
+            => new(true, false, null, response, null, reason);
+        public static NegotiateStep Rejected(byte[] reject, string reason)
+            => new(false, false, null, null, reject, reason);
+        public static NegotiateStep Decode(string message)
+            => new(false, true, message, null, null, message);
+    }
+
+    /// <summary>
+    /// Synchronous Negotiate processing: SBE decode, JSON credentials
+    /// parse, validator dispatch, claim acquisition, state transition,
+    /// session-state mutation. Produces a <see cref="NegotiateStep"/>
+    /// describing what the async wrapper should send (and whether to
+    /// close the connection afterwards).
+    /// </summary>
+    private NegotiateStep ProcessNegotiate(ReadOnlySpan<byte> fixedBlock, ReadOnlySpan<byte> varData)
+    {
+        if (!NegotiateDecoder.TryDecode(fixedBlock, varData,
+                out var req, out var credentialsBytes, out var decodeErr))
+        {
+            return NegotiateStep.Decode(decodeErr ?? "decode error: Negotiate");
+        }
+
+        // No validator configured → legacy single-tenant mode: accept the
+        // peer's claim wholesale (Phase 1 behavior). Stamp identity
+        // fields so subsequent app messages carry the peer's values.
+        if (_validator is null || _claims is null)
+        {
+            _ = ApplyTransition(FixpEvent.Negotiate);
+            SessionId = req.SessionId;
+            EnteringFirm = req.EnteringFirm;
+            SessionVerId = req.SessionVerId;
+            var frame = new byte[NegotiateResponseEncoder.Total];
+            NegotiateResponseEncoder.Encode(frame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, req.EnteringFirm,
+                semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
+            return NegotiateStep.Accepted(frame, $"negotiate-accept (legacy, sid={req.SessionId})");
+        }
+
+        if (!NegotiateCredentials.TryParse(credentialsBytes, out var creds, out var jsonErr))
+        {
+            // Credentials parse failure is a Credentials reject per spec
+            // §4.5.2, NOT a decoding error (the SBE wire shape was fine).
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.CREDENTIALS,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                $"negotiate-reject (Credentials: {jsonErr})");
+        }
+
+        var outcome = _validator.Validate(in req, in creds, State);
+
+        if (!outcome.IsAccepted)
+        {
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                outcome.RejectCode,
+                outcome.CurrentSessionVerId == 0UL ? null : outcome.CurrentSessionVerId);
+            return NegotiateStep.Rejected(rejectFrame,
+                $"negotiate-reject ({outcome.RejectCode}: {outcome.RejectReason})");
+        }
+
+        // Atomic claim. If another live transport already holds this
+        // sessionID (or the version is stale by the time we commit), we
+        // must reject — spec §4.5.2.
+        var claim = _claims.TryClaim(req.SessionId, req.SessionVerId, this);
+        if (claim != SessionClaimRegistry.ClaimResult.Accepted)
+        {
+            var code = claim switch
+            {
+                SessionClaimRegistry.ClaimResult.DuplicateConnection
+                    => B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.DUPLICATE_SESSION_CONNECTION,
+                _ => B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.INVALID_SESSIONVERID,
+            };
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null, code,
+                claim == SessionClaimRegistry.ClaimResult.StaleVersion
+                    ? _claims.CurrentSessionVerId(req.SessionId) : null);
+            return NegotiateStep.Rejected(rejectFrame,
+                $"negotiate-reject ({code}: claim {claim})");
+        }
+
+        _claimedSessionId = req.SessionId;
+        _ = ApplyTransition(FixpEvent.Negotiate);
+        SessionId = req.SessionId;
+        EnteringFirm = outcome.Firm!.EnteringFirmCode;
+        SessionVerId = req.SessionVerId;
+
+        var responseFrame = new byte[NegotiateResponseEncoder.Total];
+        NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,
+            req.TimestampNanos, outcome.Firm.EnteringFirmCode,
+            semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
+        return NegotiateStep.Accepted(responseFrame,
+            $"negotiate-accept (sid={req.SessionId} firm={outcome.Firm.Id})");
+    }
+
+    private async Task<bool> ExecuteNegotiateStepAsync(NegotiateStep step)
+    {
+        if (step.DecodeError)
+        {
+            _sink.OnDecodeError(Identity, step.DecodeErrorMessage ?? "decode error: Negotiate");
+            await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError,
+                "decode-error:Negotiate").ConfigureAwait(false);
+            return false;
+        }
+        if (step.IsAccepted)
+        {
+            _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
+            if (!_transport.TryEnqueueFrame(step.ResponseFrame!))
+            {
+                _logger.LogWarning("session {ConnectionId} could not enqueue NegotiateResponse — closing",
+                    ConnectionId);
+                Close("send-queue-full:NegotiateResponse");
+                return false;
+            }
+            return true;
+        }
+        // Reject path: send NegotiateReject, then Terminate, then close.
+        _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
+        try
+        {
+            await _transport.SendDirectAsync(step.RejectFrame!).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "session {ConnectionId} failed to write NegotiateReject", ConnectionId);
+        }
+        await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.Unspecified,
+            step.LogReason).ConfigureAwait(false);
+        return false;
     }
 
     /// <summary>
@@ -494,6 +692,13 @@ public sealed class FixpSession : IAsyncDisposable
         // callback in IO-error paths). Either way, ensure it's down so the
         // send loop wakes up and exits.
         _transport.Close(reason);
+        // Release the FIXP session claim (if any) so the same sessionID
+        // can be re-negotiated by a future transport.
+        if (_claimedSessionId != 0 && _claims is not null)
+        {
+            try { _claims.Release(_claimedSessionId, this); } catch { }
+            _claimedSessionId = 0;
+        }
         // Notify the engine sink so it releases any cached references to this
         // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for

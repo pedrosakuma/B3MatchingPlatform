@@ -14,40 +14,40 @@ public class FirmRegistryTests
     {
         var r = new FirmRegistry(
             new[] { Firm("F1", 100), Firm("F2", 200) },
-            new[] { Cred("S1", "F1"), Cred("S2", "F2") });
+            new[] { Cred("1", "F1"), Cred("2", "F2") });
 
         Assert.Equal(2, r.Firms.Count);
         Assert.Equal(2, r.Credentials.Count);
         Assert.Equal(100u, r.FindFirm("F1")!.EnteringFirmCode);
-        Assert.Equal("F1", r.FindSession("S1")!.FirmId);
+        Assert.Equal("F1", r.FindSession("1")!.FirmId);
     }
 
     [Fact]
     public void FindSession_returns_null_when_unknown()
     {
-        var r = new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("S1", "F1") });
-        Assert.Null(r.FindSession("missing"));
+        var r = new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("1", "F1") });
+        Assert.Null(r.FindSession("99999"));
     }
 
     [Fact]
     public void FindFirm_returns_null_when_unknown()
     {
         var r = new FirmRegistry(new[] { Firm("F1") }, Array.Empty<SessionCredential>());
-        Assert.Null(r.FindFirm("missing"));
+        Assert.Null(r.FindFirm("99999"));
     }
 
     [Fact]
     public void FirmOf_resolves_firm_by_session_id()
     {
-        var r = new FirmRegistry(new[] { Firm("F1", 42) }, new[] { Cred("S1", "F1") });
-        Assert.Equal(42u, r.FirmOf("S1")!.EnteringFirmCode);
+        var r = new FirmRegistry(new[] { Firm("F1", 42) }, new[] { Cred("1", "F1") });
+        Assert.Equal(42u, r.FirmOf("1")!.EnteringFirmCode);
     }
 
     [Fact]
     public void FirmOf_returns_null_for_unknown_session()
     {
-        var r = new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("S1", "F1") });
-        Assert.Null(r.FirmOf("ghost"));
+        var r = new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("1", "F1") });
+        Assert.Null(r.FirmOf("99999"));
     }
 
     [Fact]
@@ -62,7 +62,7 @@ public class FirmRegistryTests
     public void Duplicate_session_id_throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("S1", "F1"), Cred("S1", "F1") }));
+            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("1", "F1"), Cred("1", "F1") }));
         Assert.Contains("duplicate session id", ex.Message);
     }
 
@@ -70,7 +70,7 @@ public class FirmRegistryTests
     public void Session_referencing_unknown_firm_throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("S1", "GHOST") }));
+            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("1", "GHOST") }));
         Assert.Contains("unknown firm 'GHOST'", ex.Message);
     }
 
@@ -89,9 +89,42 @@ public class FirmRegistryTests
     }
 
     [Fact]
+    public void Non_uint32_session_id_throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("FIRM01-SESS-01", "F1") }));
+        Assert.Contains("uint32", ex.Message);
+    }
+
+    [Fact]
+    public void Zero_session_id_throws()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("0", "F1") }));
+    }
+
+    [Fact]
+    public void FindSessionByWire_resolves_credential()
+    {
+        var r = new FirmRegistry(new[] { Firm("F1", 100) },
+            new[] { Cred("4242", "F1", "secret") });
+        var c = r.FindSessionByWire(4242u);
+        Assert.NotNull(c);
+        Assert.Equal("F1", c!.FirmId);
+        Assert.Equal("secret", c.AccessKey);
+    }
+
+    [Fact]
+    public void FindSessionByWire_returns_null_for_unknown()
+    {
+        var r = new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("1", "F1") });
+        Assert.Null(r.FindSessionByWire(999u));
+    }
+
+    [Fact]
     public void Invalid_policy_propagates_validation_error()
     {
-        var bad = new SessionCredential("S1", "F1", "", null,
+        var bad = new SessionCredential("1", "F1", "", null,
             new SessionPolicy(KeepAliveIntervalMs: 0));
         Assert.Throws<InvalidOperationException>(() =>
             new FirmRegistry(new[] { Firm("F1") }, new[] { bad }));
