@@ -1,12 +1,16 @@
 name: CodeQL
 
+# Strategy: don't gate PRs on CodeQL (16min/run × every push = high cost
+# for a small benefit on an active-dev repo). Run on every push to main
+# to catch what actually lands, and nightly to surface CWE rule updates
+# from GitHub's curated query pack without manual intervention. PRs get
+# fast feedback from `ci.yml` (build + test + format).
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
-    - cron: "23 4 * * 1"
+    - cron: "23 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
