@@ -147,8 +147,23 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     private void DispatchInbound(EntryPointFrameReader.FrameInfo info, ReadOnlySpan<byte> body)
     {
         ulong now = _nowNanos();
-        _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} length={Length}",
-            ConnectionId, info.TemplateId, info.BodyLength);
+        _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} blockLength={BlockLength} varDataLength={VarDataLength}",
+            ConnectionId, info.TemplateId, info.BlockLength, info.VarDataLength);
+
+        // Per spec §3.5, varData segments follow the fixed root block. We
+        // validate them here (length-prefixed, declared per-template caps
+        // from §4.10) before handing the fixed block to the typed
+        // decoders. A failure here is a decoding error — see #41 for the
+        // session-vs-business reject mapping.
+        var fixedBlock = body.Slice(0, info.BlockLength);
+        var varData = body.Slice(info.BlockLength);
+        var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
+        if (!EntryPointVarData.TryValidate(varData, spec, out var varErr))
+        {
+            _sink.OnDecodeError(this, varErr ?? "decode error: varData");
+            return;
+        }
+
         switch (info.TemplateId)
         {
             case EntryPointFrameReader.TidSequence:
@@ -156,17 +171,17 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                 // recorded by the receive loop; nothing else to do.
                 return;
             case EntryPointFrameReader.TidSimpleNewOrder:
-                if (InboundMessageDecoder.TryDecodeNewOrder(body, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
+                if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                     _sink.EnqueueNewOrder(no, this, noClOrd);
                 else _sink.OnDecodeError(this, noErr ?? "decode error: SimpleNewOrder");
                 break;
             case EntryPointFrameReader.TidSimpleModifyOrder:
-                if (InboundMessageDecoder.TryDecodeReplace(body, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
+                if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
                     _sink.EnqueueReplace(rp, this, rpClOrd, rpOrigClOrd);
                 else _sink.OnDecodeError(this, rpErr ?? "decode error: SimpleModifyOrder");
                 break;
             case EntryPointFrameReader.TidOrderCancelRequest:
-                if (InboundMessageDecoder.TryDecodeCancel(body, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
+                if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
                     _sink.EnqueueCancel(cn, this, cnClOrd, cnOrigClOrd);
                 else _sink.OnDecodeError(this, cnErr ?? "decode error: OrderCancelRequest");
                 break;
