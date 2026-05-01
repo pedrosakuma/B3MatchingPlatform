@@ -15,7 +15,7 @@ public class HostRouterTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) => Calls.Add(channelNumber);
     }
 
-    private sealed class RecordingReply : IEntryPointResponseChannel
+    private sealed class RecordingReply : IGatewayResponseChannel
     {
         public long ConnectionId => 1;
         public uint EnteringFirm => 1;

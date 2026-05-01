@@ -33,7 +33,7 @@ public class ChannelDispatcherTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) => Packets.Add(packet.ToArray());
     }
 
-    private sealed class RecordingReply : IEntryPointResponseChannel
+    private sealed class RecordingReply : IGatewayResponseChannel
     {
         public long ConnectionId => 1;
         public uint EnteringFirm => 7;
@@ -220,7 +220,7 @@ public class ChannelDispatcherTests
         // Session A drops. After processing OnSessionClosed on the dispatcher
         // thread, only B's owner entry must remain. Orders themselves stay on
         // the book (the engine never sees a Cancel).
-        ((IEntryPointEngineSink)disp).OnSessionClosed(sessionA);
+        ((IInboundCommandSink)disp).OnSessionClosed(sessionA);
         DrainInbound(disp);
 
         Assert.Equal(1, OrderOwnerCount(disp));
@@ -275,9 +275,9 @@ public class ChannelDispatcherTests
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static void NotifyClosedAndForget(ChannelDispatcher disp, WeakReference weak)
     {
-        var target = (IEntryPointResponseChannel?)weak.Target;
+        var target = (IGatewayResponseChannel?)weak.Target;
         if (target is null) return;
-        ((IEntryPointEngineSink)disp).OnSessionClosed(target);
+        ((IInboundCommandSink)disp).OnSessionClosed(target);
         target = null;
         DrainInbound(disp);
     }
