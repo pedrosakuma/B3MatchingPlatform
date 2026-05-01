@@ -3,6 +3,7 @@
     <Project Path="src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj" />
     <Project Path="src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj" />
     <Project Path="src/B3.Umdf.WireEncoder/B3.Umdf.WireEncoder.csproj" />
+    <Project Path="src/B3.Exchange.Contracts/B3.Exchange.Contracts.csproj" />
     <Project Path="src/B3.Exchange.Instruments/B3.Exchange.Instruments.csproj" />
     <Project Path="src/B3.Exchange.Matching/B3.Exchange.Matching.csproj" />
     <Project Path="src/B3.Exchange.EntryPoint/B3.Exchange.EntryPoint.csproj" />
