@@ -50,6 +50,14 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     public uint SessionId { get; }
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1;
 
+    /// <summary>
+    /// Approximate number of pre-encoded ExecutionReport frames sitting in
+    /// the outbound queue, for /metrics scraping. Reads
+    /// <see cref="System.Threading.Channels.ChannelReader{T}.Count"/>,
+    /// which is O(1) on a bounded channel.
+    /// </summary>
+    public int SendQueueDepth => _sendQueue.Reader.Count;
+
     public EntryPointSession(long connectionId, uint enteringFirm, uint sessionId,
         Stream stream, IEntryPointEngineSink sink, ILogger<EntryPointSession> logger,
         Func<ulong>? nowNanos = null,

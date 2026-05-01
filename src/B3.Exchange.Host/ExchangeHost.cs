@@ -31,8 +31,13 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
     private readonly List<Timer> _snapshotTimers = new();
+    private readonly MetricsRegistry _metrics = new();
+    private readonly StartupReadinessProbe _startupProbe = new("startup");
+    private readonly List<IReadinessProbe> _probes = new();
+    private readonly object _probesLock = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
+    private HttpServer? _http;
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
@@ -45,16 +50,33 @@ public sealed class ExchangeHost : IAsyncDisposable
         _packetSinkFactory = packetSinkFactory;
         _snapshotSinkFactory = snapshotSinkFactory;
         _instrumentDefSinkFactory = instrumentDefSinkFactory;
+        _probes.Add(_startupProbe);
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
-
+    public IPEndPoint? HttpEndpoint => _http?.LocalEndpoint;
+    public MetricsRegistry Metrics => _metrics;
     public IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
 
     /// <summary>Snapshot of the InstrumentDef publishers, primarily for tests.</summary>
     public IReadOnlyList<InstrumentDefinitionPublisher> InstrumentDefinitionPublishers => _instrumentDefPublishers;
 
-    public Task StartAsync()
+    /// <summary>
+    /// Register an additional readiness probe. Intended for the snapshot
+    /// rotator (#1) and instrument-definition publisher (#2) once they
+    /// land — each subsystem registers its own probe so /health/ready
+    /// only flips green when every dependency is satisfied.
+    /// Must be called before <see cref="StartAsync"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown if called after <see cref="StartAsync"/>.</exception>
+    public void RegisterReadinessProbe(IReadinessProbe probe)
+    {
+        if (_http != null)
+            throw new InvalidOperationException("Cannot register readiness probes after StartAsync has been called; probes are snapshotted at startup.");
+        lock (_probesLock) _probes.Add(probe);
+    }
+
+    public async Task StartAsync()
     {
         _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
         var routing = new Dictionary<long, ChannelDispatcher>();
@@ -74,6 +96,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
             var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
+            var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
 
             // Capture the engine via a side-channel so we can build a snapshot
             // source that reads through the live book on the dispatcher thread.
@@ -87,7 +110,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                     return e;
                 },
                 packetSink: sink,
-                logger: _loggerFactory.CreateLogger<ChannelDispatcher>());
+                logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
+                metrics: channelMetrics);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -183,7 +207,35 @@ public sealed class ExchangeHost : IAsyncDisposable
             onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason));
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
-        return Task.CompletedTask;
+
+        _metrics.SetSessionProvider(new ListenerSessionProvider(_listener));
+
+        if (_config.Http != null)
+        {
+            IReadOnlyList<IReadinessProbe> probeSnapshot;
+            lock (_probesLock) probeSnapshot = _probes.ToList();
+            _http = new HttpServer(_config.Http, _metrics, probeSnapshot,
+                msg => _logger.LogInformation("{Message}", msg));
+            await _http.StartAsync().ConfigureAwait(false);
+        }
+
+        _startupProbe.MarkReady();
+    }
+
+    private sealed class ListenerSessionProvider : ISessionMetricsProvider
+    {
+        private readonly EntryPointListener _listener;
+        public ListenerSessionProvider(EntryPointListener listener) { _listener = listener; }
+        public IEnumerable<SessionQueueSample> Sample()
+        {
+            foreach (var s in _listener.ActiveSessions)
+            {
+                if (!s.IsOpen) continue;
+                yield return new SessionQueueSample(
+                    SessionId: "conn-" + s.ConnectionId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    QueueDepth: s.SendQueueDepth);
+            }
+        }
     }
 
     private static IPEndPoint ParseEndpoint(string s)
@@ -198,6 +250,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _logger.LogInformation("exchange host shutting down");
+        if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);

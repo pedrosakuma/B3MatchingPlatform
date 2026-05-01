@@ -27,6 +27,14 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     private const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
 
+    /// <summary>
+    /// Maximum time the dispatch loop will block waiting for new work before
+    /// emitting a liveness heartbeat. Kept short (1s) so the
+    /// <c>/health/live</c> default threshold (5s) is comfortably exceeded
+    /// only when the loop thread is actually wedged.
+    /// </summary>
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
+
     public byte ChannelNumber { get; }
     public ushort SequenceVersion { get; private set; }
     public uint SequenceNumber { get; private set; }
@@ -37,6 +45,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     private readonly ILogger<ChannelDispatcher> _logger;
     private readonly Func<ulong> _nowNanos;
     private readonly ushort _tradeDate;
+    private readonly ChannelMetrics? _metrics;
 
     private readonly Dictionary<long, OrderOwnership> _orderOwners = new();
     /// <summary>
@@ -68,7 +77,8 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
         ILogger<ChannelDispatcher> logger,
-        Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity)
+        Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
+        ChannelMetrics? metrics = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ChannelNumber = channelNumber;
@@ -76,6 +86,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         _logger = logger;
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _tradeDate = tradeDate;
+        _metrics = metrics;
         SequenceVersion = 1;
         SequenceNumber = 0;
         _inbound = System.Threading.Channels.Channel.CreateBounded<WorkItem>(
@@ -100,11 +111,36 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
+        // Heartbeat is recorded on every loop wakeup (whether triggered by
+        // new work or by the periodic timeout) so a stuck/dead dispatch
+        // thread is detected by /health/live within HeartbeatInterval +
+        // probe threshold.
         try
         {
-            await foreach (var item in _inbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            var reader = _inbound.Reader;
+            while (!ct.IsCancellationRequested)
             {
-                ProcessOne(item);
+                RecordHeartbeat();
+                Task<bool> waitTask = reader.WaitToReadAsync(ct).AsTask();
+                bool more;
+                try
+                {
+                    more = await waitTask.WaitAsync(HeartbeatInterval, ct)
+                        .ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    // Timeout: loop and re-record the heartbeat on next iteration.
+                    continue;
+                }
+                catch (OperationCanceledException) { return; }
+
+                if (!more) return; // channel completed
+                while (reader.TryRead(out var item))
+                {
+                    ProcessOne(item);
+                    RecordHeartbeat();
+                }
             }
         }
         catch (OperationCanceledException) { }
@@ -113,6 +149,9 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
     }
+
+    private void RecordHeartbeat()
+        => _metrics?.RecordTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
     internal void ProcessOne(in WorkItem item)
     {
@@ -133,9 +172,10 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         {
             switch (item.Kind)
             {
-                case WorkKind.New: _engine.Submit(item.NewOrder!); break;
+                case WorkKind.New: _metrics?.IncOrdersIn(); _engine.Submit(item.NewOrder!); break;
                 case WorkKind.Cancel:
                     {
+                        _metrics?.IncOrdersIn();
                         var cancel = item.Cancel!;
                         if (cancel.OrderId == 0)
                         {
@@ -151,6 +191,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
                     }
                 case WorkKind.Replace:
                     {
+                        _metrics?.IncOrdersIn();
                         var replace = item.Replace!;
                         if (replace.OrderId == 0)
                         {
@@ -232,6 +273,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), SequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
         LogPacketFlushed(ChannelNumber, SequenceNumber, _packetWritten);
+        _metrics?.IncPacketsOut();
         _packetWritten = 0;
     }
 
@@ -462,6 +504,18 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     }
 
     // ====== shutdown ======
+
+    /// <summary>
+    /// Test hook: simulate a wedged dispatcher by cancelling the loop
+    /// without disposing. Subsequent enqueues remain accepted by the
+    /// channel but will never be processed, so liveness probes can verify
+    /// that <c>/health/live</c> flips to 503 within the configured stale
+    /// threshold.
+    /// </summary>
+    internal void KillForTesting()
+    {
+        try { _cts.Cancel(); } catch { }
+    }
 
     public async ValueTask DisposeAsync()
     {
