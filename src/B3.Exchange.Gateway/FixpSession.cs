@@ -56,6 +56,28 @@ public sealed class FixpSession : IAsyncDisposable
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
 
     /// <summary>
+    /// Current FIXP lifecycle state. Mutated only via <see cref="ApplyTransition"/>,
+    /// which routes through <see cref="FixpStateMachine.Apply"/>. Starts at
+    /// <see cref="FixpState.Idle"/> immediately after the TCP transport is
+    /// accepted (before any FIXP <c>Negotiate</c>).
+    /// </summary>
+    public FixpState State { get; private set; } = FixpState.Idle;
+
+    /// <summary>
+    /// Single entry point for state transitions. Looks up the next state and
+    /// recommended action via <see cref="FixpStateMachine.Apply"/>, applies
+    /// the new state, and returns the action so the dispatch loop can act
+    /// on it (write a response frame, terminate, etc.). Idempotent against
+    /// <see cref="FixpState.Terminated"/>.
+    /// </summary>
+    internal FixpAction ApplyTransition(FixpEvent ev)
+    {
+        var t = FixpStateMachine.Apply(State, ev);
+        State = t.NewState;
+        return t.Action;
+    }
+
+    /// <summary>
     /// Approximate number of pre-encoded ExecutionReport frames sitting
     /// in the outbound queue, for /metrics scraping.
     /// </summary>
