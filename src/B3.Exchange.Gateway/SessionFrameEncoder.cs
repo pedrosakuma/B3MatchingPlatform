@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Byte-level encoders for FIXP session-layer frames (currently just

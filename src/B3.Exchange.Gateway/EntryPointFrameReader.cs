@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Wire-format constants and parsers for the B3 EntryPoint protocol.

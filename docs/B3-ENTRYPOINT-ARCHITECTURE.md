@@ -135,7 +135,7 @@ src/
     ICoreInbound.cs                  ← Gateway → Core
     IGatewayInbound.cs               ← Core → Gateway
 
-  B3.Exchange.Gateway/               ← NEW (replaces B3.Exchange.EntryPoint)
+  B3.Exchange.Gateway/               ← NEW (replaces B3.Exchange.Gateway)
     TcpListener.cs
     TcpTransport.cs                  ← owns Socket + send queue
     FixpSession.cs                   ← single-thread actor
@@ -566,7 +566,7 @@ testing of later phases.
 
 ### Phase 1 — Component split (the big one)
 - Create `B3.Exchange.Contracts` with DTOs and interfaces (§3.2).
-- Create `B3.Exchange.Gateway`; move all of `B3.Exchange.EntryPoint`
+- Create `B3.Exchange.Gateway`; move all of `B3.Exchange.Gateway`
   into it; rename old `EntryPointSession` to `LegacyTcpSession` and
   carve out `TcpTransport` + `FixpSession` skeletons.
 - Rename `B3.Exchange.Core` → `B3.Exchange.Core`. Strip all

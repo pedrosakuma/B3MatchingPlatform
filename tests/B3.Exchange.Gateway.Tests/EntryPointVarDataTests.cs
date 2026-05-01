@@ -1,6 +1,6 @@
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 
-namespace B3.Exchange.EntryPoint.Tests;
+namespace B3.Exchange.Gateway.Tests;
 
 public class EntryPointVarDataTests
 {

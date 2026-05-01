@@ -13,7 +13,7 @@ a 24/7 simulated venue against any UMDF consumer.
   Limit/Market × Day/IOC/FOK, replace (priority preservation rules), cancel,
   FOK pre-check, market-no-liquidity, tick/lot/band validation.
 - **`B3.Exchange.Instruments`** — JSON instrument loader.
-- **`B3.Exchange.EntryPoint`** — TCP listener, framed SBE inbound decoder,
+- **`B3.Exchange.Gateway`** — TCP listener, framed SBE inbound decoder,
   ExecutionReport encoder.
 - **`B3.Exchange.Core`** — per-channel `ChannelDispatcher`: bounded
   inbound queue, single dispatch thread, packs MBO/Trade frames into 1400-byte

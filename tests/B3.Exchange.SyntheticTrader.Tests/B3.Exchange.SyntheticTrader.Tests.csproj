@@ -15,7 +15,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.SyntheticTrader\B3.Exchange.SyntheticTrader.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Host\B3.Exchange.Host.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Core\B3.Exchange.Core.csproj" />
-    <ProjectReference Include="..\..\src\B3.Exchange.EntryPoint\B3.Exchange.EntryPoint.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Gateway\B3.Exchange.Gateway.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
   </ItemGroup>
 

@@ -1,4 +1,4 @@
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Session-level timing knobs for heartbeats and idle-timeout teardown.

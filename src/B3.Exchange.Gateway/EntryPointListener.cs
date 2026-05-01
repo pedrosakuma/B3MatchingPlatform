@@ -3,7 +3,7 @@ using System.Net.Sockets;
 using B3.Exchange.Core;
 using Microsoft.Extensions.Logging;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// TCP accept loop. Each accepted socket is wrapped in a

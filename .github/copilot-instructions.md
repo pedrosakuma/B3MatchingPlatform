@@ -78,7 +78,7 @@ Layered projects under `src/` (build order roughly bottom-up):
    `MatchingEngine` owns one `LimitOrderBook` per `SecurityId`, monotonic
    order/trade-id allocators, and an `RptSeq` incremented on every emitted
    event. **Not thread-safe by design.**
-5. `B3.Exchange.EntryPoint` — TCP listener, framed SBE inbound decoder,
+5. `B3.Exchange.Gateway` — TCP listener, framed SBE inbound decoder,
    ExecutionReport encoder. Each TCP session implements
    `IEntryPointResponseChannel`.
 6. `B3.Exchange.Core` — `ChannelDispatcher`: bounded inbound queue +

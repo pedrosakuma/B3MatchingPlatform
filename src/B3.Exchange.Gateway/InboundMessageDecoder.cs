@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using B3.Exchange.Matching;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Decodes inbound EntryPoint message bodies (no SBE header — the

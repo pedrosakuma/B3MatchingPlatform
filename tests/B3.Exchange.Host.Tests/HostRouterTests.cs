@@ -1,4 +1,4 @@
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 using B3.Exchange.Host;
 using B3.Exchange.Core;
 using B3.Exchange.Instruments;

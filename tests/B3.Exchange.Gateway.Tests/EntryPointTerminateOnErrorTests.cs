@@ -2,11 +2,11 @@ using B3.Exchange.Core;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using B3.Exchange.EntryPoint;
+using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace B3.Exchange.EntryPoint.Tests;
+namespace B3.Exchange.Gateway.Tests;
 
 /// <summary>
 /// GAP-03 (#41): the gateway must send a FIXP <c>Terminate</c> with the
