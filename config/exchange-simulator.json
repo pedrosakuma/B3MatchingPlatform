@@ -5,11 +5,38 @@
   //   UMDF channel. instruments file partitions instruments across channels.
   "tcp": {
     "listen": "0.0.0.0:9876",
+    // DEPRECATED — pre-#67 single-tenant fallback. Used only when
+    // firms[]/sessions[] are empty. New deployments should declare
+    // firms[] and sessions[] explicitly (see below).
     "enteringFirm": 1,
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000
   },
+  // Authentication. devMode=true bypasses access-key validation during
+  // FIXP Negotiate (#42) — useful for local dev / tests. Production
+  // deployments should set this to false and provide non-empty
+  // accessKey values per session.
+  "auth": {
+    "devMode": true
+  },
+  // Participants (corretoras). One entry per firm; enteringFirmCode is
+  // stamped on outbound SBE headers as EnteringFirm.
+  "firms": [
+    { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 },
+    { "id": "FIRM02", "name": "Beta Corretora",  "enteringFirmCode": 200 }
+  ],
+  // Per-(firm, session) credentials. The Negotiate handshake (#42) will
+  // resolve a session by sessionId here and validate the peer's
+  // access_key against accessKey (when auth.devMode is false).
+  // Pre-#42 the host picks the lexicographically-first session as the
+  // default tenant for every accept.
+  "sessions": [
+    { "sessionId": "FIRM01-SESS-01", "firmId": "FIRM01", "accessKey": "dev-key-1" },
+    { "sessionId": "FIRM01-SESS-02", "firmId": "FIRM01", "accessKey": "dev-key-2" },
+    { "sessionId": "FIRM02-SESS-01", "firmId": "FIRM02", "accessKey": "dev-key-3" },
+    { "sessionId": "FIRM02-SESS-02", "firmId": "FIRM02", "accessKey": "dev-key-4" }
+  ],
   // Optional Kestrel-hosted operability endpoint. Remove this block to
   // disable HTTP entirely. Exposes:
   //   GET /health/live   liveness (dispatcher heartbeats fresher than livenessStaleMs)
