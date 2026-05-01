@@ -423,6 +423,15 @@ public sealed class FixpSession : IAsyncDisposable
             // the session).
             if (!TryAcceptBusinessHeaderSessionId(info.TemplateId, fixedBlock))
                 return true;
+
+            // §4.5.5 / §4.6.2 (#GAP-07): inbound MsgSeqNum gap detection.
+            // On gap (received > expected) emit NotApplied(fromSeqNo=expected,
+            // count=received-expected) AND advance expected past the gap
+            // (the new message is still applied — flow is idempotent).
+            // Duplicates (received <= expected) are dropped silently
+            // because the spec defines the inbound stream as idempotent.
+            if (!TryAcceptBusinessHeaderMsgSeqNum(fixedBlock))
+                return true;
         }
 
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
@@ -708,6 +717,84 @@ public sealed class FixpSession : IAsyncDisposable
             "fixp session {ConnectionId} rejected business message: sessionID {Got} != negotiated {Expected} (template={Template})",
             ConnectionId, hdrSessionId, SessionId, templateId);
         return false;
+    }
+
+    /// <summary>
+    /// Spec §4.5.5 / §4.6.2 (#GAP-07): inbound MsgSeqNum gap detection.
+    /// Reads <c>InboundBusinessHeader.msgSeqNum</c> at body[4..8] and
+    /// compares to the next-expected counter
+    /// (<c>LastIncomingSeqNo + 1</c>):
+    ///
+    /// <list type="bullet">
+    ///   <item><description>received == expected → advance and accept (return true).</description></item>
+    ///   <item><description>received &gt; expected → emit one
+    ///     <c>NotApplied(fromSeqNo=expected, count=received-expected)</c>,
+    ///     advance past the gap (received), and accept the new message
+    ///     (return true). The flow is idempotent — the gap window is
+    ///     recoverable by the client at its discretion.</description></item>
+    ///   <item><description>received &lt;= LastIncomingSeqNo → duplicate
+    ///     (e.g. PossResend on a client retransmit). Drop silently;
+    ///     return false so the dispatch loop skips engine enqueue.
+    ///     Idempotence per spec means the gateway never applies the
+    ///     same MsgSeqNum twice.</description></item>
+    /// </list>
+    ///
+    /// Called only in strict mode.
+    /// </summary>
+    internal bool TryAcceptBusinessHeaderMsgSeqNum(ReadOnlySpan<byte> fixedBlock)
+    {
+        uint hdrMsgSeqNum = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4));
+
+        // Duplicate / replay: drop silently. Includes hdrMsgSeqNum == 0
+        // (a peer that hasn't started numbering yet — defensive: don't
+        // advance to 0).
+        if (hdrMsgSeqNum == 0 || hdrMsgSeqNum <= LastIncomingSeqNo)
+        {
+            _logger.LogDebug(
+                "fixp session {ConnectionId} dropping duplicate inbound msgSeqNum={SeqNum} (last accepted={Last})",
+                ConnectionId, hdrMsgSeqNum, LastIncomingSeqNo);
+            return false;
+        }
+
+        uint expected = LastIncomingSeqNo + 1;
+        if (hdrMsgSeqNum > expected)
+        {
+            uint gap = hdrMsgSeqNum - expected;
+            // NotApplied is a session-level frame: does NOT take an
+            // outbound MsgSeqNum, so it goes straight to the transport
+            // (no AppendAndEnqueueLocked / RetransmitBuffer involvement).
+            // Holding _outboundLock keeps NotApplied from interleaving
+            // inside an in-progress replay block (issue #46) or between
+            // an ER and its trailing Sequence.
+            var frame = new byte[SessionFrameEncoder.NotAppliedTotal];
+            SessionFrameEncoder.EncodeNotApplied(frame, fromSeqNo: expected, count: gap);
+            bool enqueued;
+            lock (_outboundLock)
+            {
+                enqueued = _transport.TryEnqueueFrame(frame);
+            }
+            if (!enqueued)
+            {
+                // Send queue full / transport closing: do NOT advance and
+                // do NOT accept. The transport will tear down the session;
+                // dropping this message preserves the "NotApplied + apply"
+                // coupling under failure (we never apply a gapped message
+                // without successfully signaling the gap).
+                _logger.LogWarning(
+                    "fixp session {ConnectionId} could not enqueue NotApplied (transport closing or queue full); dropping inbound msgSeqNum={SeqNum}",
+                    ConnectionId, hdrMsgSeqNum);
+                return false;
+            }
+            _logger.LogWarning(
+                "fixp session {ConnectionId} inbound gap detected: expected={Expected} received={Got} gap={Gap}; sent NotApplied",
+                ConnectionId, expected, hdrMsgSeqNum, gap);
+        }
+
+        // Always advance to the new high-water mark on acceptance,
+        // even when there was a gap (idempotent: the new message is
+        // applied regardless of any missing predecessors).
+        LastIncomingSeqNo = hdrMsgSeqNum;
+        return true;
     }
 
     /// <summary>
