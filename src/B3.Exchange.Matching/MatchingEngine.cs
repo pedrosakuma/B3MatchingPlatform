@@ -18,6 +18,22 @@ public sealed class MatchingEngine
     private readonly ILogger<MatchingEngine> _logger;
     private readonly SelfTradePrevention _stp;
 
+    // === Long-running stability audit (issue #4) ===
+    //   _nextOrderId : long. ~9.22e18 max. At 1e9 orders/sec → 292 years.
+    //                 Effectively non-overflowing for 24/7 operation.
+    //   _nextTradeId : uint. ~4.29e9 max. At 100k trades/sec → ~12 hours.
+    //                 The B3 UMDF wire schema's TradeID field is uint, so we
+    //                 cannot widen here without a wire-format change. Wraps
+    //                 to 0 silently; downstream consumers correlate trades
+    //                 via (TradeID, TradeDate) so a wrap in the same trading
+    //                 day would create ambiguity. Acceptable for the
+    //                 simulator (sessions reset trade-day boundaries); flag
+    //                 for re-evaluation if we ever target sustained
+    //                 production-grade rates inside one trading day.
+    //   _rptSeq      : uint. Same limits as _nextTradeId. Per-channel,
+    //                 per-(SequenceVersion). The integration layer's
+    //                 SequenceVersion bump on packet-seq overflow does NOT
+    //                 reset _rptSeq — they are independent counters.
     private long _nextOrderId = 1;
     private uint _nextTradeId = 1;
     private uint _rptSeq;

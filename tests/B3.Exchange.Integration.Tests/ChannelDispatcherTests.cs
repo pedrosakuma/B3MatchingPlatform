@@ -180,6 +180,127 @@ public class ChannelDispatcherTests
     }
 
     [Fact]
+    public void SequenceNumber_NearOverflow_BumpsSequenceVersion_AndResets()
+    {
+        var (disp, pkt) = NewDispatcher();
+        var reply = new RecordingReply();
+
+        Assert.Equal((ushort)1, disp.SequenceVersion);
+        disp.TestSetSequenceNumber(uint.MaxValue);
+        Assert.Equal(uint.MaxValue, disp.SequenceNumber);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Single(pkt.Packets);
+        Assert.Equal((ushort)2, disp.SequenceVersion);
+        Assert.Equal((uint)1, disp.SequenceNumber);
+        var packet = pkt.Packets[0];
+        Assert.Equal((ushort)2, MemoryMarshal.Read<ushort>(packet.AsSpan(2, 2)));
+        Assert.Equal((uint)1, MemoryMarshal.Read<uint>(packet.AsSpan(4, 4)));
+    }
+
+    [Fact]
+    public void OnSessionClosed_ReleasesOrderOwnerEntries_LeavesOrdersOnBook()
+    {
+        var (disp, _) = NewDispatcher();
+        var sessionA = new RecordingReply();
+        var sessionB = new RecordingReply();
+
+        // Two resting orders by sessionA, one by sessionB (different prices so
+        // they don't cross).
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL), sessionA, 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 7, 1_000UL), sessionA, 2UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10.05m), 100, 8, 1_000UL), sessionB, 3UL);
+        DrainInbound(disp);
+
+        Assert.Equal(3, OrderOwnerCount(disp));
+
+        // Session A drops. After processing OnSessionClosed on the dispatcher
+        // thread, only B's owner entry must remain. Orders themselves stay on
+        // the book (the engine never sees a Cancel).
+        ((IEntryPointEngineSink)disp).OnSessionClosed(sessionA);
+        DrainInbound(disp);
+
+        Assert.Equal(1, OrderOwnerCount(disp));
+        // Cross sessionB's sell with a fresh aggressor: passive side has no
+        // owner left for A's resting BUYs (correct), but a counter-cross from
+        // sessionB itself exercises the still-live ownership for B.
+        var sessionC = new RecordingReply();
+        disp.EnqueueNewOrder(new NewOrderCommand("4", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 9, 2_000UL), sessionC, 4UL);
+        DrainInbound(disp);
+        // Aggressor (C) sees its trade ER. Passive owner (A) is gone → no ER
+        // delivered to A — verifies the back-reference was actually dropped.
+        Assert.Single(sessionC.Trades);
+        Assert.Empty(sessionA.Trades);
+    }
+
+    [Fact]
+    public void OnSessionClosed_AllowsSessionToBeGarbageCollected()
+    {
+        var (disp, _) = NewDispatcher();
+
+        // Place an order from a session that we will let drop. A helper method
+        // isolates the local rooted reference so the JIT cannot keep it
+        // alive after the helper returns.
+        var weak = PlaceAndForgetSession(disp);
+
+        // At this point the dispatcher's _orderOwners map still references the
+        // session, so it should NOT be collectable yet.
+        ForceGc();
+        Assert.True(weak.IsAlive, "session unexpectedly collected before OnSessionClosed");
+
+        // Notify and drain. After NotifyClosedAndForget returns, the
+        // temporary reference it pulled from WeakReference.Target lives in a
+        // popped stack frame and cannot be kept rooted by the caller.
+        NotifyClosedAndForget(disp, weak);
+
+        ForceGc();
+        Assert.False(weak.IsAlive, "session was not GC-eligible after OnSessionClosed; ownership map still roots it");
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference PlaceAndForgetSession(ChannelDispatcher disp)
+    {
+        var session = new RecordingReply();
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            session, 1UL);
+        DrainInbound(disp);
+        var weak = new WeakReference(session);
+        // session goes out of scope when this method returns.
+        return weak;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void NotifyClosedAndForget(ChannelDispatcher disp, WeakReference weak)
+    {
+        var target = (IEntryPointResponseChannel?)weak.Target;
+        if (target is null) return;
+        ((IEntryPointEngineSink)disp).OnSessionClosed(target);
+        target = null;
+        DrainInbound(disp);
+    }
+
+    private static void ForceGc()
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+        }
+    }
+
+    private static int OrderOwnerCount(ChannelDispatcher disp)
+    {
+        var f = typeof(ChannelDispatcher).GetField("_orderOwners",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var dict = (System.Collections.IDictionary)f.GetValue(disp)!;
+        return dict.Count;
+    }
+
+
+    [Fact]
     public void Cancel_ByUnknownOrigClOrdId_EmitsRejectAndNoUmdfPacket()
     {
         var (disp, pkt) = NewDispatcher();
