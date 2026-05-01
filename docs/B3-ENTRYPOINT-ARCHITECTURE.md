@@ -590,21 +590,21 @@ become cleanly localized** to the Gateway.
 - `Terminate` flow + `TerminationCode` enum — extends Phase 0.
 
 ### Phase 3 — Reliable delivery (in-memory)
-- `RetransmitBuffer` (bounded ring per session) — #46 (GAP-08).
+- `RetransmitBuffer` (bounded ring per session) — #43 (GAP-08).
 - `Sequence` keep-alive heartbeats both directions — #44 (GAP-06).
-- `NotApplied` on inbound gap — #45 (GAP-07).
+- `NotApplied` on inbound gap — #42 (GAP-07).
 - `RetransmitRequest` handling: replay from retx buffer, set `PossResend`
-  flag — #46 (GAP-08), #GAP-13.
+  flag — #43 (GAP-08), GAP-13.
 - Suspended ↔ Established re-attach via re-`Establish`.
 
 ### Phase 4 — Operational hardening
-- Cancel-on-Disconnect timer — #47 (GAP-09).
+- Cancel-on-Disconnect timer — #50 (GAP-18).
 - Daily reset (in-memory): drain → bump `SessionVerId` → reset seqs →
-  resume — #51 (GAP-15).
-- Throttle enforcement — #52 (GAP-16).
+  resume — #44 (GAP-09).
+- Throttle enforcement — #52 (GAP-20).
 - `BusinessMessageReject` for malformed application messages — #50
   (GAP-14).
-- Improve `OrdRejReason` mapping — #54 (GAP-18 / fixes the all-zeros
+- Improve `OrdRejReason` mapping — #49 (GAP-17 / fixes the all-zeros
   stub).
 - Operator HTTP endpoints (§9).
 
@@ -614,9 +614,9 @@ become cleanly localized** to the Gateway.
 | --- | --- |
 | 0 | #39, #40, #41 |
 | 1 | (none directly; enables) |
-| 2 | #8, #42, #43, #16 (supersede), #57 (sessionVerId in-mem) |
-| 3 | #44, #45, #46 |
-| 4 | #47, #50, #51, #52, #54 + #11 (supersede), #9 (supersede) |
+| 2 | #8, #42, #43, #16 (supersede) |
+| 3 | #42, #43, #44 |
+| 4 | #49, #50, #51, #52 + #11 (supersede), #9 (supersede) |
 
 Issues not in any phase are tracked separately (e.g. STP / cross-prevention
 in #14 → matching-side, scheduled independently).
