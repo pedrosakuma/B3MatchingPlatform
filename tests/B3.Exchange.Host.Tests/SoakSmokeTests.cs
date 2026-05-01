@@ -81,6 +81,7 @@ public class SoakSmokeTests
         var sink = new MonotonicSink();
         var hostCfg = new HostConfig
         {
+            Auth = new AuthConfig { RequireFixpHandshake = false },
             Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 1 },
             Channels =
             {

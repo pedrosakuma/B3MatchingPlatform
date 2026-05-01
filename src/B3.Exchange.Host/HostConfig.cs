@@ -49,6 +49,17 @@ public sealed class TcpConfig
 public sealed class AuthConfig
 {
     [JsonPropertyName("devMode")] public bool DevMode { get; set; }
+
+    /// <summary>
+    /// When true (default), the host wires the FIXP <c>Negotiate</c> and
+    /// <c>Establish</c> validators so application messages received on a
+    /// session before the handshake completes are rejected per spec
+    /// §4.5.3.1 (<c>Terminate(Unnegotiated)</c> /
+    /// <c>Terminate(NotEstablished)</c>). Set to <c>false</c> to run in
+    /// legacy permissive mode used by integration tests / synthetic
+    /// trader flows that do not yet implement the handshake.
+    /// </summary>
+    [JsonPropertyName("requireFixpHandshake")] public bool RequireFixpHandshake { get; set; } = true;
 }
 
 /// <summary>One firm (corretora). See architecture §4.1.</summary>

@@ -211,6 +211,14 @@ public sealed class ExchangeHost : IAsyncDisposable
         // so duplicate-connection detection works across reconnects.
         var sessionClaims = new SessionClaimRegistry();
         var negotiationValidator = new NegotiationValidator(firmRegistry, sessionClaims, devMode: _config.Auth.DevMode);
+        // Phase 2 (#43): Establish handshake validator. Pure (no IO);
+        // tolerates ±5 minutes of clock skew on Establish.timestamp.
+        var establishValidator = new EstablishValidator();
+        // Legacy passthrough mode (RequireFixpHandshake=false) leaves both
+        // session-layer validators unwired so app messages flow without a
+        // prior Negotiate/Establish — used by the synthetic trader and
+        // pre-#42 integration tests until they learn the handshake.
+        bool requireHandshake = _config.Auth.RequireFixpHandshake;
         _listener = new EntryPointListener(listenEp, _router, sessionRegistry, _loggerFactory,
             identityFactory: remote =>
             {
@@ -227,8 +235,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             },
             sessionOptions: sessionOptions,
             onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason),
-            negotiationValidator: negotiationValidator,
-            sessionClaims: sessionClaims);
+            negotiationValidator: requireHandshake ? negotiationValidator : null,
+            sessionClaims: requireHandshake ? sessionClaims : null,
+            establishValidator: requireHandshake ? establishValidator : null);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 

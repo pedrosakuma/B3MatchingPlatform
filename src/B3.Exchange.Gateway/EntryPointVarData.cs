@@ -18,10 +18,18 @@ public static class EntryPointVarData
 
     private static readonly Field Memo = new("memo", 40);
     private static readonly Field DeskID = new("deskID", 20);
+    private static readonly Field NegotiateCredentials = new("credentials", 128);
+    private static readonly Field NegotiateClientIp = new("clientIP", 30);
+    private static readonly Field NegotiateClientAppName = new("clientAppName", 30);
+    private static readonly Field NegotiateClientAppVersion = new("clientAppVersion", 30);
+    private static readonly Field EstablishCredentials = new("credentials", 128);
 
     private static readonly Field[] SimpleNewOrderFields = [Memo];
     private static readonly Field[] SimpleModifyOrderFields = [Memo];
     private static readonly Field[] OrderCancelFields = [DeskID, Memo];
+    private static readonly Field[] NegotiateFields =
+        [NegotiateCredentials, NegotiateClientIp, NegotiateClientAppName, NegotiateClientAppVersion];
+    private static readonly Field[] EstablishFields = [EstablishCredentials];
     private static readonly Field[] None = [];
 
     /// <summary>
@@ -35,6 +43,8 @@ public static class EntryPointVarData
         (EntryPointFrameReader.TidSimpleNewOrder, 2) => SimpleNewOrderFields,
         (EntryPointFrameReader.TidSimpleModifyOrder, 2) => SimpleModifyOrderFields,
         (EntryPointFrameReader.TidOrderCancelRequest, 0) => OrderCancelFields,
+        (EntryPointFrameReader.TidNegotiate, 0) => NegotiateFields,
+        (EntryPointFrameReader.TidEstablish, 0) => EstablishFields,
         _ => None,
     };
 

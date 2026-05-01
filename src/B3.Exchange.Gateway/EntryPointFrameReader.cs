@@ -58,6 +58,16 @@ public static class EntryPointFrameReader
     public const ushort TidSequence = 9;
     /// <summary>Session: Negotiate (FIXP, inbound only). See spec §4.5.2.</summary>
     public const ushort TidNegotiate = 1;
+    /// <summary>Session: Establish (FIXP, inbound only). See spec §4.5.3.</summary>
+    public const ushort TidEstablish = 4;
+    /// <summary>Outbound only: NegotiateResponse (template id 2).</summary>
+    public const ushort TidNegotiateResponse = 2;
+    /// <summary>Outbound only: NegotiateReject (template id 3).</summary>
+    public const ushort TidNegotiateReject = 3;
+    /// <summary>Outbound only: EstablishAck (template id 5).</summary>
+    public const ushort TidEstablishAck = 5;
+    /// <summary>Outbound only: EstablishReject (template id 6).</summary>
+    public const ushort TidEstablishReject = 6;
 
     /// <summary>Outbound: ExecutionReport_New (V2).</summary>
     public const ushort TidExecutionReportNew = 200;
@@ -78,6 +88,7 @@ public static class EntryPointFrameReader
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
         (TidNegotiate, 0) => 28,                 // NegotiateData.BLOCK_LENGTH (V6 schema, root version 0)
+        (TidEstablish, 0) => 42,                 // EstablishData.BLOCK_LENGTH
         _ => -1
     };
 

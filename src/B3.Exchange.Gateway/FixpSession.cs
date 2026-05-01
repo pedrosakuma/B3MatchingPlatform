@@ -35,6 +35,7 @@ public sealed class FixpSession : IAsyncDisposable
     private readonly FixpSessionOptions _options;
     private readonly Action<FixpSession, string>? _onClosed;
     private readonly NegotiationValidator? _validator;
+    private readonly EstablishValidator? _establishValidator;
     private readonly SessionClaimRegistry? _claims;
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
     /// or 0 if no claim is held. Tracked so <see cref="Close"/> can
@@ -70,6 +71,17 @@ public sealed class FixpSession : IAsyncDisposable
     /// <summary>FIXP <c>sessionVerID</c> recorded on the most recent
     /// successful Negotiate. Zero before the handshake has completed.</summary>
     public ulong SessionVerId { get; private set; }
+
+    /// <summary>Negotiated <c>keepAliveInterval</c> (ms) committed by the
+    /// most recent successful Establish. Zero before Establish completes.
+    /// Set inside the dispatch thread; read by the watchdog.</summary>
+    public long KeepAliveIntervalMs { get; private set; }
+
+    /// <summary>Highest inbound application <c>MsgSeqNum</c> accepted on
+    /// this session. Zero until the first inbound application message is
+    /// processed. Used to populate <c>EstablishAck.lastIncomingSeqNo</c>
+    /// and to compute <c>EstablishReject.lastIncomingSeqNo</c>.</summary>
+    public uint LastIncomingSeqNo { get; private set; }
     /// <summary>Stable, transport-neutral identity of this session as seen
     /// by Core / Contracts. Routing key the Gateway uses to resolve
     /// outbound ExecutionReports back to this <see cref="FixpSession"/>.
@@ -114,7 +126,8 @@ public sealed class FixpSession : IAsyncDisposable
         Action<FixpSession, string>? onClosed = null,
         ILogger<TcpTransport>? transportLogger = null,
         NegotiationValidator? negotiationValidator = null,
-        SessionClaimRegistry? sessionClaims = null)
+        SessionClaimRegistry? sessionClaims = null,
+        EstablishValidator? establishValidator = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -128,6 +141,7 @@ public sealed class FixpSession : IAsyncDisposable
         _options.Validate();
         _onClosed = onClosed;
         _validator = negotiationValidator;
+        _establishValidator = establishValidator;
         _claims = sessionClaims;
         if (negotiationValidator is not null && sessionClaims is null)
             throw new ArgumentException(
@@ -255,6 +269,39 @@ public sealed class FixpSession : IAsyncDisposable
         var fullBody = new ReadOnlyMemory<byte>(bodyBuf, 0, bodyLength);
         var fixedBlock = fullBody.Slice(0, info.BlockLength).Span;
         var varData = fullBody.Slice(info.BlockLength).Span;
+
+        // Strict gating (issue #43, spec §4.5.3.1): when the validator is
+        // wired (i.e. we're running in "real" multi-tenant mode), an
+        // application-template message that arrives before Establish has
+        // completed MUST be rejected with Terminate(Unnegotiated) or
+        // Terminate(NotEstablished) BEFORE we even attempt to decode the
+        // payload. We deliberately skip varData validation in that case
+        // so the peer learns the gating reason rather than a misleading
+        // DECODING_ERROR. Legacy mode (no validator) keeps the previous
+        // permissive behavior — covered by Phase 0/1 tests.
+        if (_validator is not null && IsApplicationTemplate(info.TemplateId))
+        {
+            var gate = ApplyTransition(FixpEvent.ApplicationMessage);
+            switch (gate)
+            {
+                case FixpAction.RejectAndTerminateUnnegotiated:
+                    await TerminateAndCloseAsync(
+                        SessionRejectEncoder.TerminationCode.Unnegotiated,
+                        "app-message-before-negotiate").ConfigureAwait(false);
+                    return false;
+                case FixpAction.RejectAndTerminateUnestablished:
+                    await TerminateAndCloseAsync(
+                        SessionRejectEncoder.TerminationCode.NotEstablished,
+                        "app-message-before-establish").ConfigureAwait(false);
+                    return false;
+                case FixpAction.Accept:
+                    break;
+                default:
+                    // DropSilently / Terminal / NotApplied — defensive: drop frame.
+                    return true;
+            }
+        }
+
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
         if (!EntryPointVarData.TryValidate(varData, spec, out var varErr))
         {
@@ -273,6 +320,11 @@ public sealed class FixpSession : IAsyncDisposable
                 {
                     var step = ProcessNegotiate(fixedBlock, varData);
                     return await ExecuteNegotiateStepAsync(step).ConfigureAwait(false);
+                }
+            case EntryPointFrameReader.TidEstablish:
+                {
+                    var step = ProcessEstablish(fixedBlock);
+                    return await ExecuteEstablishStepAsync(step).ConfigureAwait(false);
                 }
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
@@ -485,6 +537,161 @@ public sealed class FixpSession : IAsyncDisposable
         return false;
     }
 
+    private static bool IsApplicationTemplate(ushort templateId)
+        => templateId == EntryPointFrameReader.TidSimpleNewOrder
+        || templateId == EntryPointFrameReader.TidSimpleModifyOrder
+        || templateId == EntryPointFrameReader.TidOrderCancelRequest;
+
+    /// <summary>
+    /// Outcome of synchronously processing an inbound Establish frame.
+    /// Mirrors <see cref="NegotiateStep"/> so the async writer in
+    /// <see cref="ExecuteEstablishStepAsync"/> can post the buffered
+    /// EstablishAck / EstablishReject without holding spans across an
+    /// <c>await</c>.
+    /// </summary>
+    private readonly struct EstablishStep
+    {
+        public readonly bool IsAccepted;
+        public readonly bool DecodeError;
+        public readonly string? DecodeErrorMessage;
+        public readonly byte[]? AckFrame;
+        public readonly byte[]? RejectFrame;
+        public readonly string LogReason;
+
+        private EstablishStep(bool accepted, bool decodeErr, string? decodeMsg,
+            byte[]? ack, byte[]? reject, string logReason)
+        {
+            IsAccepted = accepted;
+            DecodeError = decodeErr;
+            DecodeErrorMessage = decodeMsg;
+            AckFrame = ack;
+            RejectFrame = reject;
+            LogReason = logReason;
+        }
+
+        public static EstablishStep Accepted(byte[] ack, string reason)
+            => new(true, false, null, ack, null, reason);
+        public static EstablishStep Rejected(byte[] reject, string reason)
+            => new(false, false, null, null, reject, reason);
+        public static EstablishStep Decode(string message)
+            => new(false, true, message, null, null, message);
+    }
+
+    /// <summary>
+    /// Synchronous Establish processing: SBE decode, validator dispatch,
+    /// state transition, session-state mutation. Produces an
+    /// <see cref="EstablishStep"/> describing what the async wrapper should
+    /// send (and whether to close the connection afterwards). On accept
+    /// the negotiated <c>keepAliveInterval</c> is committed to
+    /// <see cref="KeepAliveIntervalMs"/> so the watchdog can react.
+    /// </summary>
+    private EstablishStep ProcessEstablish(ReadOnlySpan<byte> fixedBlock)
+    {
+        if (!EstablishDecoder.TryDecode(fixedBlock, out var req, out var decodeErr))
+            return EstablishStep.Decode(decodeErr ?? "decode error: Establish");
+
+        // Legacy / no-validator mode mirrors Negotiate: accept whatever
+        // the peer asked for, transition to Established, echo an Ack with
+        // the requested keepAliveInterval. Existing Phase-1 tests rely on
+        // this pass-through.
+        if (_establishValidator is null)
+        {
+            var action = ApplyTransition(FixpEvent.Establish);
+            if (action != FixpAction.Accept)
+            {
+                var rejectFrame = new byte[EstablishRejectEncoder.Total];
+                EstablishRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                    req.TimestampNanos,
+                    B3.Entrypoint.Fixp.Sbe.V6.EstablishRejectCode.UNSPECIFIED,
+                    lastIncomingSeqNo: LastIncomingSeqNo == 0 ? null : LastIncomingSeqNo);
+                return EstablishStep.Rejected(rejectFrame,
+                    $"establish-reject (legacy, action={action})");
+            }
+            KeepAliveIntervalMs = (long)req.KeepAliveIntervalMillis;
+            var ackFrame = new byte[EstablishAckEncoder.Total];
+            EstablishAckEncoder.Encode(ackFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, req.KeepAliveIntervalMillis,
+                nextSeqNo: PeekNextMsgSeqNum(), lastIncomingSeqNo: LastIncomingSeqNo,
+                semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
+            return EstablishStep.Accepted(ackFrame, $"establish-accept (legacy, sid={req.SessionId})");
+        }
+
+        // Strict mode: validate against current state + negotiated identity
+        // before any transition. The validator is pure and never mutates.
+        var outcome = _establishValidator.Validate(in req, State,
+            negotiatedSessionId: SessionId,
+            negotiatedSessionVerId: SessionVerId,
+            lastIncomingSeqNo: LastIncomingSeqNo);
+        if (!outcome.IsAccepted)
+        {
+            var rejectFrame = new byte[EstablishRejectEncoder.Total];
+            EstablishRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, outcome.RejectCode,
+                lastIncomingSeqNo: outcome.LastIncomingSeqNo);
+            return EstablishStep.Rejected(rejectFrame,
+                $"establish-reject ({outcome.RejectCode}: {outcome.RejectReason})");
+        }
+
+        // Defensive: validator already screened state, but fold the
+        // result through the state machine so the canonical transition
+        // log records the event.
+        var act = ApplyTransition(FixpEvent.Establish);
+        if (act != FixpAction.Accept)
+        {
+            var rejectFrame = new byte[EstablishRejectEncoder.Total];
+            EstablishRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos,
+                B3.Entrypoint.Fixp.Sbe.V6.EstablishRejectCode.UNSPECIFIED,
+                lastIncomingSeqNo: LastIncomingSeqNo == 0 ? null : LastIncomingSeqNo);
+            return EstablishStep.Rejected(rejectFrame,
+                $"establish-reject (state-machine action={act})");
+        }
+
+        KeepAliveIntervalMs = (long)req.KeepAliveIntervalMillis;
+        var ack = new byte[EstablishAckEncoder.Total];
+        EstablishAckEncoder.Encode(ack, req.SessionId, req.SessionVerId,
+            req.TimestampNanos, req.KeepAliveIntervalMillis,
+            nextSeqNo: PeekNextMsgSeqNum(), lastIncomingSeqNo: LastIncomingSeqNo,
+            semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
+        return EstablishStep.Accepted(ack, $"establish-accept (sid={req.SessionId})");
+    }
+
+    private async Task<bool> ExecuteEstablishStepAsync(EstablishStep step)
+    {
+        if (step.DecodeError)
+        {
+            _sink.OnDecodeError(Identity, step.DecodeErrorMessage ?? "decode error: Establish");
+            await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError,
+                "decode-error:Establish").ConfigureAwait(false);
+            return false;
+        }
+        if (step.IsAccepted)
+        {
+            _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
+            if (!_transport.TryEnqueueFrame(step.AckFrame!))
+            {
+                _logger.LogWarning("session {ConnectionId} could not enqueue EstablishAck — closing",
+                    ConnectionId);
+                Close("send-queue-full:EstablishAck");
+                return false;
+            }
+            return true;
+        }
+        // Reject path: send EstablishReject, then Terminate, then close.
+        _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
+        try
+        {
+            await _transport.SendDirectAsync(step.RejectFrame!).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "session {ConnectionId} failed to write EstablishReject", ConnectionId);
+        }
+        await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.Unspecified,
+            step.LogReason).ConfigureAwait(false);
+        return false;
+    }
+
     /// <summary>
     /// Periodic watchdog that drives the FIXP-style heartbeat + idle-timeout
     /// policy. Runs on its own task; never touches the socket directly —
@@ -555,7 +762,12 @@ public sealed class FixpSession : IAsyncDisposable
     {
         if (!IsOpen) return;
         var frame = new byte[SessionFrameEncoder.SequenceTotal];
-        SessionFrameEncoder.EncodeSequence(frame, NextMsgSeqNum());
+        // FIXP §4.5.5: the Sequence message announces the *next* MsgSeqNum
+        // we intend to send. It does not consume a sequence number itself,
+        // so we must peek instead of incrementing — otherwise the Establish
+        // handshake would observe a phantom gap (e.g. an idle heartbeat
+        // before Establish would push EstablishAck.nextSeqNo off by one).
+        SessionFrameEncoder.EncodeSequence(frame, PeekNextMsgSeqNum());
         _transport.TryEnqueueFrame(frame);
     }
 
@@ -574,6 +786,11 @@ public sealed class FixpSession : IAsyncDisposable
     }
 
     private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
+
+    /// <summary>Peek the value <see cref="NextMsgSeqNum"/> would return on
+    /// its next call without consuming a sequence number. Used by FIXP
+    /// <c>Sequence</c> frames, which announce but do not consume.</summary>
+    private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e)
     {
