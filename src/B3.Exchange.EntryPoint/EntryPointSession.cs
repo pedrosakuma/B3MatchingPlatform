@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Threading.Channels;
+using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 
@@ -8,7 +9,7 @@ namespace B3.Exchange.EntryPoint;
 /// <summary>
 /// Stream-based per-connection session. Hosts:
 ///  - a receive loop that reads SBE-framed inbound messages and dispatches
-///    decoded commands to <see cref="IEntryPointEngineSink"/>;
+///    decoded commands to <see cref="IInboundCommandSink"/>;
 ///  - a send loop that drains a bounded <see cref="Channel{T}"/> of
 ///    pre-encoded outbound frames and writes them to the stream.
 ///
@@ -20,13 +21,13 @@ namespace B3.Exchange.EntryPoint;
 /// is closed (<c>FullMode = DropWrite</c> + explicit close). This drops the
 /// connection rather than ballooning memory under a stuck peer.
 /// </summary>
-public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDisposable
+public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposable
 {
     private const int InboundHeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int DefaultSendQueueCapacity = 1024;
 
     private readonly Stream _stream;
-    private readonly IEntryPointEngineSink _sink;
+    private readonly IInboundCommandSink _sink;
     private readonly ILogger<EntryPointSession> _logger;
     private readonly Channel<byte[]> _sendQueue;
     private readonly CancellationTokenSource _cts = new();
@@ -60,7 +61,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
     public int SendQueueDepth => _sendQueue.Reader.Count;
 
     public EntryPointSession(long connectionId, uint enteringFirm, uint sessionId,
-        Stream stream, IEntryPointEngineSink sink, ILogger<EntryPointSession> logger,
+        Stream stream, IInboundCommandSink sink, ILogger<EntryPointSession> logger,
         Func<ulong>? nowNanos = null,
         int sendQueueCapacity = DefaultSendQueueCapacity,
         EntryPointSessionOptions? options = null,
@@ -522,7 +523,7 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
         _sendQueue.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
         // Notify the engine sink so it releases any cached references to this
-        // session (see IEntryPointEngineSink.OnSessionClosed). Without this the
+        // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for
         // the lifetime of every resting order it placed → unbounded memory.
         try { _sink.OnSessionClosed(this); } catch { }

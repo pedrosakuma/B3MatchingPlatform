@@ -1,3 +1,4 @@
+using B3.Exchange.Core;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -14,13 +15,13 @@ namespace B3.Exchange.EntryPoint.Tests;
 /// </summary>
 public class EntryPointTerminateOnErrorTests
 {
-    private sealed class NoOpEngineSink : IEntryPointEngineSink
+    private sealed class NoOpEngineSink : IInboundCommandSink
     {
-        public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue) { }
-        public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
-        public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
-        public void OnDecodeError(IEntryPointResponseChannel reply, string error) { }
-        public void OnSessionClosed(IEntryPointResponseChannel reply) { }
+        public void EnqueueNewOrder(in NewOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue) { }
+        public void EnqueueCancel(in CancelOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
+        public void EnqueueReplace(in ReplaceOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
+        public void OnDecodeError(IGatewayResponseChannel reply, string error) { }
+        public void OnSessionClosed(IGatewayResponseChannel reply) { }
     }
 
     private static async Task<(EntryPointListener listener, TcpClient client)> ConnectAsync()

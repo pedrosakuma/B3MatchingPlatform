@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 namespace B3.Exchange.Host;
 
 /// <summary>
-/// <see cref="IEntryPointEngineSink"/> that fans inbound commands from one
+/// <see cref="IInboundCommandSink"/> that fans inbound commands from one
 /// TCP session out to the right <see cref="ChannelDispatcher"/> based on the
 /// command's <c>SecurityId</c>. A single session may submit orders for any
 /// instrument across any channel; the host owns the SecurityId → Channel
@@ -15,7 +15,7 @@ namespace B3.Exchange.Host;
 /// On unknown SecurityId the router synthesizes a reject ER directly to the
 /// session (no engine is involved).
 /// </summary>
-public sealed class HostRouter : IEntryPointEngineSink
+public sealed class HostRouter : IInboundCommandSink
 {
     private readonly IReadOnlyDictionary<long, ChannelDispatcher> _bySecId;
     private readonly IReadOnlyList<ChannelDispatcher> _allDispatchers;
@@ -34,7 +34,7 @@ public sealed class HostRouter : IEntryPointEngineSink
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
 
-    public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    public void EnqueueNewOrder(in NewOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
             disp.EnqueueNewOrder(cmd, reply, clOrdIdValue);
@@ -42,7 +42,7 @@ public sealed class HostRouter : IEntryPointEngineSink
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
+    public void EnqueueCancel(in CancelOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
             disp.EnqueueCancel(cmd, reply, clOrdIdValue, origClOrdIdValue);
@@ -50,7 +50,7 @@ public sealed class HostRouter : IEntryPointEngineSink
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
 
-    public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
+    public void EnqueueReplace(in ReplaceOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
             disp.EnqueueReplace(cmd, reply, clOrdIdValue, origClOrdIdValue);
@@ -58,7 +58,7 @@ public sealed class HostRouter : IEntryPointEngineSink
             RejectUnknownInstrument(cmd.SecurityId, reply, clOrdIdValue);
     }
 
-    public void OnDecodeError(IEntryPointResponseChannel reply, string error)
+    public void OnDecodeError(IGatewayResponseChannel reply, string error)
     {
         // Logging hook only. The EntryPointSession itself emits the
         // appropriate SessionReject (Terminate) or BusinessMessageReject
@@ -67,7 +67,7 @@ public sealed class HostRouter : IEntryPointEngineSink
         _logger.LogWarning("inbound decode error from connection {ConnectionId}: {Error}", reply.ConnectionId, error);
     }
 
-    public void OnSessionClosed(IEntryPointResponseChannel reply)
+    public void OnSessionClosed(IGatewayResponseChannel reply)
     {
         // A single session may have placed orders on any channel, so fan the
         // notification out to ALL dispatchers. Each one enqueues a release
@@ -78,7 +78,7 @@ public sealed class HostRouter : IEntryPointEngineSink
             disp.OnSessionClosed(reply);
     }
 
-    private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    private void RejectUnknownInstrument(long secId, IGatewayResponseChannel reply, ulong clOrdIdValue)
     {
         _logger.LogWarning("rejecting clOrdId={ClOrdId} from connection {ConnectionId}: unknown securityId={SecurityId}",
             clOrdIdValue, reply.ConnectionId, secId);

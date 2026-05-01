@@ -8,6 +8,7 @@
   <ItemGroup>
     <ProjectReference Include="..\B3.EntryPoint.Sbe\B3.EntryPoint.Sbe.csproj" />
     <ProjectReference Include="..\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
+    <ProjectReference Include="..\B3.Exchange.Core\B3.Exchange.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

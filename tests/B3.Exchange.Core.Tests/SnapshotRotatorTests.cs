@@ -332,7 +332,7 @@ public class ChannelDispatcherSnapshotTests
     }
 }
 
-internal sealed class ChannelDispatcherTests_RecordingReply : B3.Exchange.EntryPoint.IEntryPointResponseChannel
+internal sealed class ChannelDispatcherTests_RecordingReply : B3.Exchange.Core.IGatewayResponseChannel
 {
     public long ConnectionId => 1;
     public uint EnteringFirm => 7;

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using B3.Exchange.Core;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.EntryPoint;
@@ -16,7 +17,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     public readonly record struct AcceptedConnection(long ConnectionId, uint EnteringFirm, uint SessionId);
 
     private readonly IPEndPoint _endpoint;
-    private readonly IEntryPointEngineSink _sink;
+    private readonly IInboundCommandSink _sink;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<EntryPointListener> _logger;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
@@ -42,7 +43,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         get { lock (_lock) return _sessions.ToArray(); }
     }
 
-    public EntryPointListener(IPEndPoint endpoint, IEntryPointEngineSink sink,
+    public EntryPointListener(IPEndPoint endpoint, IInboundCommandSink sink,
         ILoggerFactory loggerFactory,
         Func<EndPoint?, AcceptedConnection>? identityFactory = null,
         EntryPointSessionOptions? sessionOptions = null,

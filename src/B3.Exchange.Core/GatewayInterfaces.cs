@@ -1,19 +1,20 @@
 using B3.Exchange.Matching;
 
-namespace B3.Exchange.EntryPoint;
+namespace B3.Exchange.Core;
 
 /// <summary>
-/// Per-connection writer of outbound ExecutionReports. The matching engine's
-/// integration layer is expected to call these from the engine dispatch thread;
-/// implementations (e.g. <see cref="EntryPointSession"/>) MUST be thread-safe
-/// for the write side and serialise sends through a dedicated send loop.
+/// Per-session writer of outbound ExecutionReports. Owned by the gateway
+/// (TCP/FIXP transport); Core obtains an instance via the session-id
+/// indirection and never holds a transport reference directly.
+/// Implementations MUST be thread-safe for the write side and serialise
+/// sends through a dedicated send loop.
 ///
 /// All <c>Write*</c> methods return <c>true</c> if the report was queued for
 /// sending or <c>false</c> if the channel is closed (peer disconnected) or
 /// backpressure forced a drop. A returned <c>false</c> is informational; the
 /// caller should not retry on the same channel.
 /// </summary>
-public interface IEntryPointResponseChannel
+public interface IGatewayResponseChannel
 {
     /// <summary>Stable per-connection identifier (for diagnostics + ownership maps).</summary>
     long ConnectionId { get; }
@@ -66,29 +67,29 @@ public interface IEntryPointResponseChannel
 
 /// <summary>
 /// Sink for inbound commands decoded from a TCP connection. The
-/// <see cref="EntryPointSession"/> calls these on the receive loop thread.
+/// <see cref="IGatewayResponseChannel"/> calls these on the receive loop thread.
 ///
 /// IMPORTANT: implementations MUST hand off to a per-channel dispatch queue
 /// (the matching engine is single-threaded per channel — invoking it inline
 /// from multiple sessions corrupts internal state). The integration layer
 /// (next milestone) owns this hand-off.
 /// </summary>
-public interface IEntryPointEngineSink
+public interface IInboundCommandSink
 {
-    void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue);
-    void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
-    void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
+    void EnqueueNewOrder(in NewOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue);
+    void EnqueueCancel(in CancelOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
+    void EnqueueReplace(in ReplaceOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>Called when a frame fails decoding (unsupported template,
     /// invalid block length, malformed body). The integration layer may close
     /// the connection or emit a generic reject.</summary>
-    void OnDecodeError(IEntryPointResponseChannel reply, string error);
+    void OnDecodeError(IGatewayResponseChannel reply, string error);
 
     /// <summary>
     /// Called once when a session's transport closes (peer disconnect, IO
     /// error, host shutdown). The integration layer MUST drop any cached
     /// references to <paramref name="reply"/> so the disconnected
-    /// <see cref="EntryPointSession"/> can be garbage-collected.
+    /// <see cref="IGatewayResponseChannel"/> can be garbage-collected.
     ///
     /// The session's resting orders stay on the book — they ARE the book —
     /// but any reply-channel back-references (e.g. orderId → reply maps used
@@ -96,5 +97,5 @@ public interface IEntryPointEngineSink
     /// integration layer treats further passive fills on those orders as
     /// "unowned" (no ER emitted) until / unless a fresh session takes over.
     /// </summary>
-    void OnSessionClosed(IEntryPointResponseChannel reply);
+    void OnSessionClosed(IGatewayResponseChannel reply);
 }

@@ -1,4 +1,3 @@
-using B3.Exchange.EntryPoint;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 
@@ -8,7 +7,7 @@ namespace B3.Exchange.Core;
 /// One per UMDF channel. Owns:
 ///  - A <see cref="MatchingEngine"/> (single-threaded by construction).
 ///  - A bounded inbound queue of decoded EntryPoint commands tagged with the
-///    originating <see cref="IEntryPointResponseChannel"/>.
+///    originating <see cref="IGatewayResponseChannel"/>.
 ///  - An order-id → reply-channel map so that PASSIVE-side execution reports
 ///    (e.g. a resting order is filled by a counterparty's aggressor) get
 ///    routed back to the correct TCP session.
@@ -17,12 +16,12 @@ namespace B3.Exchange.Core;
 ///    flushed as one packet (with a packet-header + monotonic
 ///    <c>SequenceNumber</c>) to the <see cref="IUmdfPacketSink"/>.
 ///
-/// Implements both <see cref="IEntryPointEngineSink"/> (commands in) and
+/// Implements both <see cref="IInboundCommandSink"/> (commands in) and
 /// <see cref="IMatchingEventSink"/> (engine events out). The dispatch loop
 /// guarantees that the engine and the event-sink callbacks always run on the
 /// dedicated dispatch thread — there is no cross-thread call into the engine.
 /// </summary>
-public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatchingEventSink, IAsyncDisposable
+public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEventSink, IAsyncDisposable
 {
     private const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
@@ -59,7 +58,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     private readonly Dictionary<(uint Firm, ulong ClOrdId), long> _clOrdIdIndex = new();
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
-    private IEntryPointResponseChannel? _currentReply;
+    private IGatewayResponseChannel? _currentReply;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
 
@@ -260,7 +259,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         }
     }
 
-    private bool TryResolveByClOrdId(IEntryPointResponseChannel reply, ulong origClOrdId, out long orderId)
+    private bool TryResolveByClOrdId(IGatewayResponseChannel reply, ulong origClOrdId, out long orderId)
     {
         if (origClOrdId != 0 && _clOrdIdIndex.TryGetValue((reply.EnteringFirm, origClOrdId), out orderId))
             return true;
@@ -320,7 +319,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     /// quiescent dispatcher".</summary>
     internal void TestSetSequenceNumber(uint value) => SequenceNumber = value;
 
-    private void ReleaseOwnerOnDispatchThread(IEntryPointResponseChannel reply)
+    private void ReleaseOwnerOnDispatchThread(IGatewayResponseChannel reply)
     {
         // Sweep the orderId → reply map and drop every entry whose reply is
         // the disconnected session. The orders themselves stay in the book
@@ -366,27 +365,27 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     private void Commit(int written) => _packetWritten += written;
 
-    // ====== IEntryPointEngineSink ======
+    // ====== IInboundCommandSink ======
 
-    public void EnqueueNewOrder(in NewOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue)
+    public void EnqueueNewOrder(in NewOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, reply, clOrdIdValue, 0, cmd, null, null)))
             LogQueueFull(ChannelNumber, WorkKind.New);
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
+    public void EnqueueCancel(in CancelOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, reply, clOrdIdValue, origClOrdIdValue, null, cmd, null)))
             LogQueueFull(ChannelNumber, WorkKind.Cancel);
     }
 
-    public void EnqueueReplace(in ReplaceOrderCommand cmd, IEntryPointResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
+    public void EnqueueReplace(in ReplaceOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, reply, clOrdIdValue, origClOrdIdValue, null, null, cmd)))
             LogQueueFull(ChannelNumber, WorkKind.Replace);
     }
 
-    public void OnDecodeError(IEntryPointResponseChannel reply, string error)
+    public void OnDecodeError(IGatewayResponseChannel reply, string error)
     {
         _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, reply, 0, 0, null, null, null)))
@@ -416,7 +415,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     public bool EnqueueSnapshotTick()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, null, 0, 0, null, null, null));
 
-    public void OnSessionClosed(IEntryPointResponseChannel reply)
+    public void OnSessionClosed(IGatewayResponseChannel reply)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.ReleaseOwner, reply, 0, 0, null, null, null));
 
     /// <summary>
@@ -589,11 +588,11 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
 
     internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
 
-    internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
+    internal readonly record struct OrderOwnership(IGatewayResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
 
     internal sealed record WorkItem(
         WorkKind Kind,
-        IEntryPointResponseChannel? Reply,
+        IGatewayResponseChannel? Reply,
         ulong ClOrdId,
         ulong OrigClOrdId,
         NewOrderCommand? NewOrder,
