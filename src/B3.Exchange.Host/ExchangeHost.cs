@@ -38,6 +38,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private EntryPointListener? _listener;
     private HostRouter? _router;
     private HttpServer? _http;
+    private DailyResetScheduler? _dailyReset;
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
@@ -57,6 +58,19 @@ public sealed class ExchangeHost : IAsyncDisposable
     public IPEndPoint? HttpEndpoint => _http?.LocalEndpoint;
     public MetricsRegistry Metrics => _metrics;
     public IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
+
+    /// <summary>
+    /// On-demand trigger for the daily-rollover routine (#GAP-09 /
+    /// issue #47). Returns the number of sessions that were terminated,
+    /// or -1 if the host has not finished <see cref="StartAsync"/>.
+    /// Safe to call from any thread.
+    /// </summary>
+    public int TriggerDailyReset(string reason = "operator-trigger")
+    {
+        var listener = _listener;
+        if (listener is null) return -1;
+        return listener.TerminateAllSessions(reason);
+    }
 
     /// <summary>Firm + session credentials parsed from <c>HostConfig</c>.
     /// Built lazily on first access (or on <see cref="StartAsync"/>); empty
@@ -257,8 +271,23 @@ public sealed class ExchangeHost : IAsyncDisposable
             _http = new HttpServer(_config.Http, _metrics, probeSnapshot, dispatchersByChannel,
                 msg => _logger.LogInformation("{Message}", msg),
                 sessionsProvider: sessionProvider.Sample,
-                firms: firmInfos);
+                firms: firmInfos,
+                dailyResetTrigger: () => TriggerDailyReset("http-trigger"));
             await _http.StartAsync().ConfigureAwait(false);
+        }
+
+        // #GAP-09 (#47): daily trading-day rollover. The listener exists
+        // by this point so it is safe to capture it for the timer
+        // callback. Always terminate via the public Trigger so the
+        // scheduler logs and re-arms even if the action throws.
+        if (_config.DailyReset is { Enabled: true } drCfg)
+        {
+            _dailyReset = new DailyResetScheduler(
+                drCfg.Schedule,
+                drCfg.Timezone,
+                action: () => _listener?.TerminateAllSessions("daily-reset"),
+                logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
+            _dailyReset.Start();
         }
 
         _startupProbe.MarkReady();
@@ -400,6 +429,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _logger.LogInformation("exchange host shutting down");
+        if (_dailyReset != null) await _dailyReset.DisposeAsync().ConfigureAwait(false);
         if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);

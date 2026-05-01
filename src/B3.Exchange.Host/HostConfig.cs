@@ -15,6 +15,7 @@ public sealed class HostConfig
     [JsonPropertyName("firms")] public List<FirmConfig> Firms { get; set; } = new();
     [JsonPropertyName("sessions")] public List<SessionConfig> Sessions { get; set; } = new();
     [JsonPropertyName("http")] public HttpConfig? Http { get; set; }
+    [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 }
 
@@ -104,6 +105,33 @@ public sealed class HttpConfig
     /// milliseconds. Default 5000 (5s).
     /// </summary>
     [JsonPropertyName("livenessStaleMs")] public int LivenessStaleMs { get; set; } = 5000;
+}
+
+/// <summary>
+/// Daily trading-day rollover (#GAP-09 / issue #47, spec §4.5.1). When
+/// <see cref="Enabled"/> is true the host schedules a once-per-day timer
+/// that fires at <see cref="Schedule"/> in <see cref="Timezone"/> and
+/// terminates every live session, forcing each client to reconnect with
+/// a fresh <c>Negotiate</c>+<c>Establish(nextSeqNo=1)</c>. Operators can
+/// also trigger the rollover on demand via <c>POST /admin/daily-reset</c>
+/// regardless of this flag.
+/// </summary>
+public sealed class DailyResetConfig
+{
+    /// <summary>When false (default) the scheduled timer is not armed —
+    /// the operator endpoint still works.</summary>
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+
+    /// <summary>Local-time-of-day "HH:mm" (24h) at which the rollover
+    /// fires. Defaults to <c>"18:00"</c>, the B3 cash-equity post-trading
+    /// boundary.</summary>
+    [JsonPropertyName("schedule")] public string Schedule { get; set; } = "18:00";
+
+    /// <summary>IANA time zone identifier in which <see cref="Schedule"/>
+    /// is interpreted. Defaults to <c>"America/Sao_Paulo"</c>; the
+    /// platform's <c>TimeZoneInfo</c> store must recognize the value
+    /// (Linux containers ship with the IANA database).</summary>
+    [JsonPropertyName("timezone")] public string Timezone { get; set; } = "America/Sao_Paulo";
 }
 
 public sealed class ChannelConfig
