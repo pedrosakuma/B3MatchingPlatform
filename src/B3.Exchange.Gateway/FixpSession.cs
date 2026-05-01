@@ -51,6 +51,36 @@ public sealed class FixpSession : IAsyncDisposable
     /// <see cref="TryReattach"/> bound to the new snapshot).
     /// </summary>
     private readonly object _attachLock = new();
+    /// <summary>
+    /// Serializes outbound business-frame production (sequence-number
+    /// allocation + retransmit-buffer append + send-queue enqueue) and
+    /// retransmission replay blocks. Held by every live business write
+    /// (<see cref="WriteExecutionReportNew"/> &amp;c.) for the entire
+    /// allocate-encode-buffer-enqueue triplet, and held by
+    /// <see cref="ProcessAndEnqueueRetransmitRequest"/> for the entire
+    /// header + N replay clones + trailing Sequence block. This
+    /// guarantees (a) no live frame interleaves the replay block on the
+    /// wire and (b) the trailing Sequence's <c>nextSeqNo</c> matches
+    /// the next live seq the peer will see (issue #46, gpt-5.5
+    /// critique).
+    /// </summary>
+    private readonly object _outboundLock = new();
+    /// <summary>
+    /// Per-session retransmission ring buffer (issue #46, spec §4.5.6).
+    /// Holds copies of the wire frames for ExecutionReport_* and
+    /// BusinessMessageReject — the buffered business templates that
+    /// carry an <c>OutboundBusinessHeader.MsgSeqNum</c>. Not preserved
+    /// across <see cref="Close"/>; preserved across
+    /// <see cref="Suspend"/> / <see cref="TryReattach"/> so a new
+    /// transport can recover via <c>RetransmitRequest</c>.
+    /// </summary>
+    private readonly RetransmitBuffer _retxBuffer;
+    /// <summary>0 / 1 — set via <see cref="Interlocked.CompareExchange"/>
+    /// for the duration of a single retransmission replay (per spec
+    /// §4.5.6: "one outstanding request at a time"). Cleared after the
+    /// last frame of the replay block is enqueued under
+    /// <see cref="_outboundLock"/>.</summary>
+    private int _retxInProgress;
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
     /// or 0 if no claim is held. Tracked so <see cref="Close"/> can
     /// release the claim using the value from the moment the claim was
@@ -184,6 +214,7 @@ public sealed class FixpSession : IAsyncDisposable
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
+        _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity);
         _onClosed = onClosed;
         _validator = negotiationValidator;
         _establishValidator = establishValidator;
@@ -396,6 +427,9 @@ public sealed class FixpSession : IAsyncDisposable
                     var step = ProcessEstablish(fixedBlock);
                     return await ExecuteEstablishStepAsync(step).ConfigureAwait(false);
                 }
+            case EntryPointFrameReader.TidRetransmitRequest:
+                ProcessAndEnqueueRetransmitRequest(fixedBlock);
+                return true;
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
@@ -848,8 +882,16 @@ public sealed class FixpSession : IAsyncDisposable
         // so we must peek instead of incrementing — otherwise the Establish
         // handshake would observe a phantom gap (e.g. an idle heartbeat
         // before Establish would push EstablishAck.nextSeqNo off by one).
-        SessionFrameEncoder.EncodeSequence(frame, PeekNextMsgSeqNum());
-        _transport.TryEnqueueFrame(frame);
+        //
+        // Outbound lock: serializes against the replay block in
+        // ProcessAndEnqueueRetransmitRequest so a watchdog-driven
+        // heartbeat cannot land inside the Retransmission/replay/Sequence
+        // sequence on the wire (gpt-5.5 review #1).
+        lock (_outboundLock)
+        {
+            SessionFrameEncoder.EncodeSequence(frame, PeekNextMsgSeqNum());
+            _transport.TryEnqueueFrame(frame);
+        }
     }
 
     private static async Task ReadExactlyAsync(Stream s, byte[] buf, CancellationToken ct)
@@ -873,94 +915,246 @@ public sealed class FixpSession : IAsyncDisposable
     /// <c>Sequence</c> frames, which announce but do not consume.</summary>
     private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
 
+    /// <summary>
+    /// Decodes and processes a FIXP <c>RetransmitRequest</c> (template
+    /// id 12), per spec §4.5.6 and issue #46. Runs on the dispatch
+    /// (recv-loop) thread.
+    ///
+    /// <para>State machine routing (already encoded in
+    /// <see cref="FixpStateMachine"/>): <c>Established → Replay</c>;
+    /// <c>Suspended → DeferredToReestablish</c> (silently drop); other
+    /// states → <c>DropSilently</c>. Validation order before replay:
+    /// <c>SessionID</c> match, timestamp non-zero, count bounds, in-flight
+    /// gate (CAS), then the buffer's window check (<c>OUT_OF_RANGE</c>
+    /// vs <c>INVALID_FROMSEQNO</c>).</para>
+    ///
+    /// <para>On accept: encodes a <c>Retransmission</c> header with
+    /// <c>nextSeqNo = request.fromSeqNo</c> and <c>count = actual</c>,
+    /// enqueues all replay clones (each carrying the
+    /// <c>PossResend</c> bit), and finally enqueues a <c>Sequence</c>
+    /// frame whose <c>nextSeqNo</c> is the next live business seq
+    /// (i.e. <see cref="PeekNextMsgSeqNum"/>). The entire block is
+    /// enqueued under <see cref="_outboundLock"/> so live business
+    /// writes cannot interleave it on the wire and so the trailing
+    /// Sequence's seq matches what the peer will see next.</para>
+    /// </summary>
+    private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
+    {
+        // Layout (BLOCK_LENGTH=20): SessionID(4) | Timestamp(8 ulong) |
+        // FromSeqNo(4 uint) | Count(4 uint).
+        if (fixedBlock.Length < 20) return; // header validator already enforced this; defensive
+        uint reqSessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(0, 4));
+        ulong reqTimestamp = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(4, 8));
+        uint fromSeq = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(12, 4));
+        uint count = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(16, 4));
+
+        var action = ApplyTransition(FixpEvent.RetransmitRequest);
+        if (action != FixpAction.Replay)
+        {
+            // DropSilently / DeferredToReestablish / Terminal: per spec,
+            // emit nothing. Suspended sessions have no live transport
+            // anyway; a request that arrives in any pre-Established state
+            // is simply ignored and the peer is expected to drive the
+            // handshake before requesting recovery.
+            _logger.LogDebug("session {ConnectionId} retransmit-request action={Action} state={State} dropped",
+                ConnectionId, action, State);
+            return;
+        }
+
+        // Spec validations BEFORE single-in-flight gate so a malformed
+        // request doesn't leave the gate held.
+        if (reqSessionId != SessionId)
+        {
+            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_SESSION);
+            return;
+        }
+        if (reqTimestamp == 0UL)
+        {
+            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_TIMESTAMP);
+            return;
+        }
+
+        // One-outstanding-request gate. Cleared in the finally below
+        // after the entire replay block is enqueued under _outboundLock,
+        // so a subsequent request can never see partial state.
+        if (Interlocked.CompareExchange(ref _retxInProgress, 1, 0) != 0)
+        {
+            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.RETRANSMIT_IN_PROGRESS);
+            return;
+        }
+        try
+        {
+            // Buffer combines count-bounds + window check under one lock
+            // (no TOCTOU between FirstAvailable read and clone copy).
+            var snap = _retxBuffer.TryGet(fromSeq, count);
+            if (snap.RejectCode is { } code)
+            {
+                EnqueueRetransmitReject(reqTimestamp, code);
+                return;
+            }
+
+            // Hold the outbound lock for the entire block so (a) no live
+            // business frame interleaves on the wire and (b) the
+            // trailing Sequence's nextSeqNo matches the next live seq
+            // the peer will see (gpt-5.5 critique #1, #2).
+            lock (_outboundLock)
+            {
+                // Backpressure: TcpTransport's bounded send queue can
+                // drop frames if it overflows mid-replay (gpt-5.5 review
+                // #2). Reserve capacity for the FULL block (header +
+                // clones + trailer) under the outbound lock; if the
+                // queue cannot accept the burst, reject with SYSTEM_BUSY
+                // rather than advertise an exact count we can't deliver.
+                int needed = 2 + snap.Frames.Length;
+                if (_transport.SendQueueDepth + needed > _sendQueueCapacity)
+                {
+                    EnqueueRetransmitReject(reqTimestamp,
+                        B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.SYSTEM_BUSY);
+                    return;
+                }
+
+                var headerFrame = new byte[RetransmissionEncoder.RetransmissionTotal];
+                RetransmissionEncoder.EncodeRetransmission(headerFrame,
+                    SessionId, reqTimestamp,
+                    firstRetransmittedSeqNo: snap.FirstSeq, count: snap.ActualCount);
+                _transport.TryEnqueueFrame(headerFrame);
+
+                for (int i = 0; i < snap.Frames.Length; i++)
+                    _transport.TryEnqueueFrame(snap.Frames[i]);
+
+                var trailer = new byte[SessionFrameEncoder.SequenceTotal];
+                SessionFrameEncoder.EncodeSequence(trailer, PeekNextMsgSeqNum());
+                _transport.TryEnqueueFrame(trailer);
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _retxInProgress, 0);
+        }
+    }
+
+    private void EnqueueRetransmitReject(ulong requestTimestampNanos,
+        B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode code)
+    {
+        var frame = new byte[RetransmissionEncoder.RetransmitRejectTotal];
+        RetransmissionEncoder.EncodeRetransmitReject(frame, SessionId, requestTimestampNanos, code);
+        _transport.TryEnqueueFrame(frame);
+        _logger.LogInformation("session {ConnectionId} retransmit-reject code={Code}",
+            ConnectionId, code);
+    }
+
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportNewTotal);
         ulong clOrd = ulong.TryParse(e.ClOrdId, out var v) ? v : 0;
-        int n = ExecutionReportEncoder.EncodeExecReportNew(frame.AsSpan(0, ExecutionReportEncoder.ExecReportNewTotal),
-            SessionId, NextMsgSeqNum(), e.InsertTimestampNanos,
-            e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
-            (ulong)e.RptSeq, e.InsertTimestampNanos,
-            OrderType.Limit, TimeInForce.Day,
-            e.RemainingQuantity, e.PriceMantissa);
-        return TryEnqueueExact(frame, n);
+        var exact = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        lock (_outboundLock)
+        {
+            ExecutionReportEncoder.EncodeExecReportNew(exact,
+                SessionId, NextMsgSeqNum(), e.InsertTimestampNanos,
+                e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
+                (ulong)e.RptSeq, e.InsertTimestampNanos,
+                OrderType.Limit, TimeInForce.Day,
+                e.RemainingQuantity, e.PriceMantissa);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportTradeTotal);
         var side = isAggressor ? e.AggressorSide : (e.AggressorSide == Side.Buy ? Side.Sell : Side.Buy);
-        int n = ExecutionReportEncoder.EncodeExecReportTrade(frame.AsSpan(0, ExecutionReportEncoder.ExecReportTradeTotal),
-            SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            side, clOrdIdValue, ownerOrderId, e.SecurityId, ownerOrderId,
-            e.Quantity, e.PriceMantissa,
-            (ulong)e.RptSeq, e.TransactTimeNanos, leavesQty, cumQty,
-            isAggressor, e.TradeId,
-            isAggressor ? e.RestingFirm : e.AggressorFirm,
-            tradeDate: 0,
-            orderQty: leavesQty + cumQty);
-        return TryEnqueueExact(frame, n);
+        var exact = new byte[ExecutionReportEncoder.ExecReportTradeTotal];
+        lock (_outboundLock)
+        {
+            ExecutionReportEncoder.EncodeExecReportTrade(exact,
+                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
+                side, clOrdIdValue, ownerOrderId, e.SecurityId, ownerOrderId,
+                e.Quantity, e.PriceMantissa,
+                (ulong)e.RptSeq, e.TransactTimeNanos, leavesQty, cumQty,
+                isAggressor, e.TradeId,
+                isAggressor ? e.RestingFirm : e.AggressorFirm,
+                tradeDate: 0,
+                orderQty: leavesQty + cumQty);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportCancelTotal);
-        int n = ExecutionReportEncoder.EncodeExecReportCancel(frame.AsSpan(0, ExecutionReportEncoder.ExecReportCancelTotal),
-            SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
-            e.SecurityId, e.OrderId,
-            (ulong)e.RptSeq, e.TransactTimeNanos,
-            cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);
-        return TryEnqueueExact(frame, n);
+        var exact = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        lock (_outboundLock)
+        {
+            ExecutionReportEncoder.EncodeExecReportCancel(exact,
+                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
+                e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
+                e.SecurityId, e.OrderId,
+                (ulong)e.RptSeq, e.TransactTimeNanos,
+                cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportModifyTotal);
-        int n = ExecutionReportEncoder.EncodeExecReportModify(frame.AsSpan(0, ExecutionReportEncoder.ExecReportModifyTotal),
-            SessionId, NextMsgSeqNum(), transactTimeNanos,
-            side, clOrdIdValue, origClOrdIdValue, orderId,
-            securityId, orderId, (ulong)rptSeq, transactTimeNanos,
-            leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa);
-        return TryEnqueueExact(frame, n);
+        var exact = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        lock (_outboundLock)
+        {
+            ExecutionReportEncoder.EncodeExecReportModify(exact,
+                SessionId, NextMsgSeqNum(), transactTimeNanos,
+                side, clOrdIdValue, origClOrdIdValue, orderId,
+                securityId, orderId, (ulong)rptSeq, transactTimeNanos,
+                leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
     public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(ExecutionReportEncoder.ExecReportRejectTotal);
         byte rej = MapRejectReason(e.Reason);
-        int n = ExecutionReportEncoder.EncodeExecReportReject(frame.AsSpan(0, ExecutionReportEncoder.ExecReportRejectTotal),
-            SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-            clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
-            rej, e.TransactTimeNanos);
-        return TryEnqueueExact(frame, n);
+        var exact = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
+        lock (_outboundLock)
+        {
+            ExecutionReportEncoder.EncodeExecReportReject(exact,
+                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
+                clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
+                rej, e.TransactTimeNanos);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
-    private bool TryEnqueueExact(byte[] frame, int written)
+    /// <summary>
+    /// Must be called with <see cref="_outboundLock"/> held. Reads the
+    /// already-allocated <c>MsgSeqNum</c> back out of the encoded
+    /// frame, appends to the retx buffer, then enqueues onto the
+    /// transport. Centralizes the two-step "buffer + enqueue" so every
+    /// business-frame write site has identical semantics.
+    /// </summary>
+    private bool AppendAndEnqueueLocked(byte[] exact)
     {
-        // Send loop writes the entire array, so we must hand it a tight buffer.
-        // The encoder buffer (`frame`) was rented from ArrayPool and may be
-        // larger than `written`. Copy out exactly `written` bytes into a fresh
-        // non-pool array and return the rented buffer to the pool.
-        var exact = new byte[written];
-        Buffer.BlockCopy(frame, 0, exact, 0, written);
-        ArrayPool<byte>.Shared.Return(frame);
+        // OutboundBusinessHeader.MsgSeqNum sits at body offset 4
+        // (SessionID(4) | MsgSeqNum(4) | …) → absolute offset
+        // WireHeaderSize + 4 = 16. Read it back so the buffer key
+        // exactly matches what's on the wire.
+        uint seq = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+            exact.AsSpan(EntryPointFrameReader.WireHeaderSize + 4, 4));
+        // Append BEFORE enqueue: per spec recovery semantics, any seq
+        // that has been allocated MUST be replayable, even if the local
+        // send queue rejects the frame (gpt-5.5 critique #9).
+        _retxBuffer.Append(seq, exact);
         return _transport.TryEnqueueFrame(exact);
     }
 
     public bool WriteSessionReject(byte terminationCode)
     {
         if (!IsOpen) return false;
-        var frame = ArrayPool<byte>.Shared.Rent(SessionRejectEncoder.TerminateTotal);
-        int n = SessionRejectEncoder.EncodeTerminate(frame.AsSpan(0, SessionRejectEncoder.TerminateTotal),
-            SessionId, 0, terminationCode);
-        bool result = TryEnqueueExact(frame, n);
+        var exact = new byte[SessionRejectEncoder.TerminateTotal];
+        SessionRejectEncoder.EncodeTerminate(exact, SessionId, 0, terminationCode);
+        bool result = _transport.TryEnqueueFrame(exact);
         Close();
         return result;
     }
@@ -970,12 +1164,15 @@ public sealed class FixpSession : IAsyncDisposable
     {
         if (!IsOpen) return false;
         int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
-        var frame = ArrayPool<byte>.Shared.Rent(BusinessMessageRejectEncoder.TotalSize(textLen));
-        int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
-            frame.AsSpan(0, BusinessMessageRejectEncoder.TotalSize(textLen)),
-            SessionId, NextMsgSeqNum(), _nowNanos(),
-            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
-        return TryEnqueueExact(frame, n);
+        int total = BusinessMessageRejectEncoder.TotalSize(textLen);
+        var exact = new byte[total];
+        lock (_outboundLock)
+        {
+            BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
+                exact, SessionId, NextMsgSeqNum(), _nowNanos(),
+                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+            return AppendAndEnqueueLocked(exact);
+        }
     }
 
     private static byte MapRejectReason(RejectReason r) => r switch

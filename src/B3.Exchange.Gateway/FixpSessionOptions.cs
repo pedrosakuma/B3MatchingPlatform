@@ -40,6 +40,17 @@ public sealed record FixpSessionOptions
     /// </summary>
     public int FirstFrameTimeoutMs { get; init; } = 5_000;
 
+    /// <summary>
+    /// Per-session capacity (in frames) of the outbound retransmission
+    /// ring buffer that backs FIXP <c>RetransmitRequest</c> recovery
+    /// (issue #46, spec §4.5.6). Buffered templates are
+    /// ExecutionReport_* and BusinessMessageReject (the templates that
+    /// carry an <c>OutboundBusinessHeader.MsgSeqNum</c>). Default 1024
+    /// satisfies the spec minimum (≥1000 messages per request) with one
+    /// extra slot of headroom.
+    /// </summary>
+    public int RetransmitBufferCapacity { get; init; } = 1024;
+
     public static FixpSessionOptions Default { get; } = new();
 
     internal void Validate()
@@ -49,5 +60,6 @@ public sealed record FixpSessionOptions
         if (TestRequestGraceMs <= 0) throw new ArgumentOutOfRangeException(nameof(TestRequestGraceMs));
         if (SuspendedTimeoutMs < 0) throw new ArgumentOutOfRangeException(nameof(SuspendedTimeoutMs));
         if (FirstFrameTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(FirstFrameTimeoutMs));
+        if (RetransmitBufferCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(RetransmitBufferCapacity));
     }
 }
