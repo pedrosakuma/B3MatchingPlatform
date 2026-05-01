@@ -73,6 +73,15 @@ Exposes:
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000
   },
+  "auth": { "devMode": true },
+  "firms": [
+    { "id": "FIRM01", "name": "Alpha", "enteringFirmCode": 100 },
+    { "id": "FIRM02", "name": "Beta",  "enteringFirmCode": 200 }
+  ],
+  "sessions": [
+    { "sessionId": "FIRM01-SESS-01", "firmId": "FIRM01", "accessKey": "dev-1" },
+    { "sessionId": "FIRM02-SESS-01", "firmId": "FIRM02", "accessKey": "dev-2" }
+  ],
   "http": { "listen": "0.0.0.0:8080", "livenessStaleMs": 5000 },
   "channels": [
     {
@@ -102,8 +111,22 @@ Exposes:
 ```
 
 * `tcp.listen` — bind address for the EntryPoint TCP server.
-* `tcp.enteringFirm` — uint stamped on every accepted order (single-firm
-  default; per-session firm assignment is not yet implemented).
+* `tcp.enteringFirm` — **DEPRECATED** (pre-#67 single-tenant fallback).
+  Used only when `firms[]`/`sessions[]` are empty. New configs should
+  declare firms and sessions explicitly (see below).
+* `auth.devMode` — when `true`, the FIXP `Negotiate` handler (#42) skips
+  `accessKey` validation. Useful for local dev / tests. Mixing
+  `devMode=true` with non-empty per-session `accessKey` values produces a
+  startup warning.
+* `firms[]` — one entry per participant (corretora). Each firm exposes
+  an `enteringFirmCode` (uint) that is stamped on outbound SBE headers.
+  See `docs/B3-ENTRYPOINT-ARCHITECTURE.md` §4.1.
+* `sessions[]` — per-`(firm, session)` credentials. The Negotiate
+  handshake (#42) resolves a session by `sessionId` and validates the
+  peer's `access_key` against `accessKey` (when `auth.devMode=false`).
+  Pre-#42 the host picks the lexicographically-first `sessionId` as the
+  default tenant for every accept. Optional `policy{}` block overrides
+  per-session throttling and keep-alive timings.
 * `tcp.heartbeatIntervalMs` — server emits a `Sequence` (templateId=9, used
   as heartbeat by B3) when no other outbound traffic has been sent within
   this window. Default `30000`.

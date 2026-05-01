@@ -58,6 +58,12 @@ public sealed class ExchangeHost : IAsyncDisposable
     public MetricsRegistry Metrics => _metrics;
     public IReadOnlyList<ChannelDispatcher> Dispatchers => _dispatchers;
 
+    /// <summary>Firm + session credentials parsed from <c>HostConfig</c>.
+    /// Built lazily on first access (or on <see cref="StartAsync"/>); empty
+    /// when <c>firms[]</c>/<c>sessions[]</c> are not configured.</summary>
+    public FirmRegistry FirmRegistry => _firmRegistry ??= BuildFirmRegistry();
+    private FirmRegistry? _firmRegistry;
+
     /// <summary>Snapshot of the InstrumentDef publishers, primarily for tests.</summary>
     public IReadOnlyList<InstrumentDefinitionPublisher> InstrumentDefinitionPublishers => _instrumentDefPublishers;
 
@@ -81,6 +87,9 @@ public sealed class ExchangeHost : IAsyncDisposable
         _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
         var sessionRegistry = new SessionRegistry();
         var gatewayRouter = new GatewayRouter(sessionRegistry, _loggerFactory.CreateLogger<GatewayRouter>());
+
+        var firmRegistry = FirmRegistry;
+        var defaultSession = ResolveDefaultSession(firmRegistry);
         var routing = new Dictionary<long, ChannelDispatcher>();
         foreach (var ch in _config.Channels)
         {
@@ -201,9 +210,15 @@ public sealed class ExchangeHost : IAsyncDisposable
             identityFactory: remote =>
             {
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
+                // Pre-#42 (Negotiate): we do not yet know which session the
+                // peer will claim, so we stamp the default session's firm
+                // code on every accept. #42 will move firm/session
+                // resolution into the Negotiate handler and consult
+                // FirmRegistry by sessionID claimed by the peer.
+                var enteringFirm = defaultSession.firmCode;
                 return new EntryPointListener.AcceptedConnection(
                     ConnectionId: connectionId,
-                    EnteringFirm: _config.Tcp.EnteringFirm,
+                    EnteringFirm: enteringFirm,
                     SessionId: (uint)(connectionId & 0xFFFFFFFFu));
             },
             sessionOptions: sessionOptions,
@@ -240,6 +255,73 @@ public sealed class ExchangeHost : IAsyncDisposable
                     QueueDepth: s.SendQueueDepth);
             }
         }
+    }
+
+    private FirmRegistry BuildFirmRegistry()
+    {
+        var firms = _config.Firms.Select(fc =>
+        {
+            if (string.IsNullOrWhiteSpace(fc.Id))
+                throw new InvalidOperationException("HostConfig.firms[].id must be non-empty");
+            if (fc.EnteringFirmCode == 0)
+                throw new InvalidOperationException(
+                    $"HostConfig.firms['{fc.Id}'].enteringFirmCode must be > 0");
+            return new Firm(fc.Id, string.IsNullOrWhiteSpace(fc.Name) ? fc.Id : fc.Name, fc.EnteringFirmCode);
+        });
+
+        var sessions = _config.Sessions.Select(sc =>
+        {
+            var policy = sc.Policy is null
+                ? SessionPolicy.Default
+                : new SessionPolicy(
+                    ThrottleMessagesPerSecond: sc.Policy.ThrottleMessagesPerSecond,
+                    KeepAliveIntervalMs: sc.Policy.KeepAliveIntervalMs,
+                    IdleTimeoutMs: sc.Policy.IdleTimeoutMs,
+                    TestRequestGraceMs: sc.Policy.TestRequestGraceMs,
+                    RetransmitBufferSize: sc.Policy.RetransmitBufferSize);
+            return new SessionCredential(
+                SessionId: sc.SessionId,
+                FirmId: sc.FirmId,
+                AccessKey: sc.AccessKey ?? "",
+                AllowedSourceCidrs: sc.AllowedSourceCidrs,
+                Policy: policy);
+        });
+
+        var registry = new FirmRegistry(firms, sessions);
+
+        if (_config.Auth.DevMode &&
+            registry.Credentials.Values.Any(c => !string.IsNullOrEmpty(c.AccessKey)))
+        {
+            _logger.LogWarning(
+                "auth.devMode=true but {Count} session(s) declare a non-empty accessKey; access keys will be ignored",
+                registry.Credentials.Values.Count(c => !string.IsNullOrEmpty(c.AccessKey)));
+        }
+
+        return registry;
+    }
+
+    private (string sessionId, uint firmCode) ResolveDefaultSession(FirmRegistry registry)
+    {
+        if (registry.Credentials.Count > 0)
+        {
+            // Stable: pick the lexicographically-first session id so the
+            // selection is deterministic regardless of YAML/JSON ordering
+            // quirks. #42 will replace this with peer-claimed sessionID.
+            var sid = registry.Credentials.Keys.OrderBy(k => k, StringComparer.Ordinal).First();
+            var firm = registry.FirmOf(sid)
+                ?? throw new InvalidOperationException($"BUG: session '{sid}' has no resolved firm");
+            _logger.LogInformation(
+                "pre-#42 default session: '{SessionId}' firm '{FirmId}' enteringFirmCode={EnteringFirmCode}",
+                sid, firm.Id, firm.EnteringFirmCode);
+            return (sid, firm.EnteringFirmCode);
+        }
+
+        // Backwards compatibility: pre-#67 single-tenant config.
+        _logger.LogWarning(
+            "HostConfig.firms[]/sessions[] is empty; falling back to deprecated tcp.enteringFirm={EnteringFirm}. " +
+            "Update your config to declare firms[] and sessions[] per docs/B3-ENTRYPOINT-ARCHITECTURE.md §8.",
+            _config.Tcp.EnteringFirm);
+        return ("legacy", _config.Tcp.EnteringFirm);
     }
 
     private static IPEndPoint ParseEndpoint(string s)

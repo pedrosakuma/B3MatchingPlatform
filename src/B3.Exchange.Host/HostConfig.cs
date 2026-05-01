@@ -11,6 +11,9 @@ namespace B3.Exchange.Host;
 public sealed class HostConfig
 {
     [JsonPropertyName("tcp")] public TcpConfig Tcp { get; set; } = new();
+    [JsonPropertyName("auth")] public AuthConfig Auth { get; set; } = new();
+    [JsonPropertyName("firms")] public List<FirmConfig> Firms { get; set; } = new();
+    [JsonPropertyName("sessions")] public List<SessionConfig> Sessions { get; set; } = new();
     [JsonPropertyName("http")] public HttpConfig? Http { get; set; }
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 }
@@ -18,6 +21,12 @@ public sealed class HostConfig
 public sealed class TcpConfig
 {
     [JsonPropertyName("listen")] public string Listen { get; set; } = "0.0.0.0:9876";
+    /// <summary>
+    /// DEPRECATED — pre-#67 single-tenant fallback. Used only when
+    /// <c>firms[]</c> / <c>sessions[]</c> are empty so existing configs
+    /// keep working. New configs should declare firms and sessions
+    /// explicitly per <c>docs/B3-ENTRYPOINT-ARCHITECTURE.md</c> §8.
+    /// </summary>
     [JsonPropertyName("enteringFirm")] public uint EnteringFirm { get; set; } = 1;
     /// <summary>Server-side heartbeat (Sequence) interval in milliseconds.
     /// A heartbeat is only emitted when no other outbound traffic has been
@@ -29,6 +38,44 @@ public sealed class TcpConfig
     /// <summary>Additional grace window after the probe before the session is
     /// closed for inactivity. Default: 5 s.</summary>
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
+}
+
+/// <summary>
+/// Authentication mode. <c>devMode=true</c> bypasses access-key validation
+/// during Negotiate (#42) — useful for local development / tests. Mixing
+/// devMode with non-empty <c>sessions[].accessKey</c> values produces a
+/// startup warning.
+/// </summary>
+public sealed class AuthConfig
+{
+    [JsonPropertyName("devMode")] public bool DevMode { get; set; }
+}
+
+/// <summary>One firm (corretora). See architecture §4.1.</summary>
+public sealed class FirmConfig
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("name")] public string Name { get; set; } = "";
+    [JsonPropertyName("enteringFirmCode")] public uint EnteringFirmCode { get; set; }
+}
+
+/// <summary>One session credential. See architecture §4.2.</summary>
+public sealed class SessionConfig
+{
+    [JsonPropertyName("sessionId")] public string SessionId { get; set; } = "";
+    [JsonPropertyName("firmId")] public string FirmId { get; set; } = "";
+    [JsonPropertyName("accessKey")] public string AccessKey { get; set; } = "";
+    [JsonPropertyName("allowedSourceCidrs")] public List<string>? AllowedSourceCidrs { get; set; }
+    [JsonPropertyName("policy")] public SessionPolicyConfig? Policy { get; set; }
+}
+
+public sealed class SessionPolicyConfig
+{
+    [JsonPropertyName("throttleMessagesPerSecond")] public int ThrottleMessagesPerSecond { get; set; }
+    [JsonPropertyName("keepAliveIntervalMs")] public int KeepAliveIntervalMs { get; set; } = 30_000;
+    [JsonPropertyName("idleTimeoutMs")] public int IdleTimeoutMs { get; set; } = 30_000;
+    [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
+    [JsonPropertyName("retransmitBufferSize")] public int RetransmitBufferSize { get; set; } = 10_000;
 }
 
 /// <summary>
