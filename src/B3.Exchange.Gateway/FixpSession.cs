@@ -46,6 +46,7 @@ public sealed class FixpSession : IAsyncDisposable
     private uint _claimedSessionId;
     private long _msgSeqNum;
     private int _isOpen = 1;
+    private int _isAttached = 1;
     // Watchdog state (milliseconds since process start, monotonic).
     private long _lastInboundMs;
     // Set true while we are waiting on the grace window after sending a probe;
@@ -89,6 +90,15 @@ public sealed class FixpSession : IAsyncDisposable
     /// <c>SessionRegistry</c> backed by authentication.</summary>
     public ContractsSessionId Identity { get; }
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
+
+    /// <summary>
+    /// True while the session has a live <see cref="TcpTransport"/> attached.
+    /// Set to false on transport-driven disconnect (issue #69). The session
+    /// itself remains in the registry — see <see cref="State"/>; only re-attach
+    /// (issue #69b) brings this back to true. Distinct from
+    /// <see cref="IsOpen"/>, which also goes false on terminal Close.
+    /// </summary>
+    public bool IsAttached => Volatile.Read(ref _isAttached) == 1;
 
     /// <summary>
     /// Current FIXP lifecycle state. Mutated only via <see cref="ApplyTransition"/>,
@@ -147,13 +157,14 @@ public sealed class FixpSession : IAsyncDisposable
             throw new ArgumentException(
                 "sessionClaims is required when negotiationValidator is supplied",
                 nameof(sessionClaims));
-        // The transport's onClose callback funnels back through our Close so
-        // session-level book-keeping (sink notification, onClosed delegate)
-        // runs even when teardown originates from a transport-side IO error.
+        // The transport's onClose callback funnels back through our
+        // OnTransportClosed handler so transport-driven teardown can be
+        // demoted to a Suspend (preserving the FIXP session) when we are
+        // in Established state per spec §4.5 (issue #69).
         _transport = new TcpTransport(connectionId, stream,
             transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance,
             sendQueueCapacity,
-            onClose: reason => Close(reason));
+            onClose: reason => OnTransportClosed(reason));
         Volatile.Write(ref _lastInboundMs, NowMs());
     }
 
@@ -214,7 +225,10 @@ public sealed class FixpSession : IAsyncDisposable
         }
         finally
         {
-            Close("recv-eof");
+            // Transport-side EOF: defer to the central handler so the
+            // Established → Suspended demotion (issue #69) is observed
+            // identically to a transport-callback-driven teardown.
+            OnTransportClosed("recv-eof");
         }
     }
 
@@ -908,6 +922,74 @@ public sealed class FixpSession : IAsyncDisposable
     public void Close() => Close("close");
 
     /// <summary>
+    /// Routes a transport-side teardown (network IO error, EOF, or
+    /// transport-initiated close) into either a session-preserving
+    /// <see cref="Suspend"/> (when we are <see cref="FixpState.Established"/>
+    /// per spec §4.5 / issue #69) or a full <see cref="Close"/>. Idempotent
+    /// — multiple callers (transport callback, receive-loop finally, watchdog)
+    /// converge here without repeating side effects.
+    /// </summary>
+    private void OnTransportClosed(string reason)
+    {
+        if (Volatile.Read(ref _isOpen) == 0) return;
+        // Re-entrancy guard: Suspend() itself calls _transport.Close(...),
+        // which will fire this callback a second time. Once we have detached
+        // (or are about to detach), defer to whichever branch already took
+        // ownership rather than escalating to a full Close.
+        if (Volatile.Read(ref _isAttached) == 0) return;
+        if (State == FixpState.Established)
+        {
+            Suspend(reason);
+            return;
+        }
+        Close(reason);
+    }
+
+    /// <summary>
+    /// Demote an <see cref="FixpState.Established"/> session to
+    /// <see cref="FixpState.Suspended"/> after the underlying TCP transport
+    /// has dropped (spec §4.5, issue #69). The session remains registered in
+    /// the <see cref="SessionRegistry"/> and retains its claim so that a
+    /// subsequent <c>Establish</c> on a brand-new transport (issue #69b) can
+    /// re-attach without re-Negotiate. The dispatch / watchdog loops are
+    /// stopped via <c>_cts.Cancel()</c>; a future re-attach will start fresh
+    /// loops bound to the new transport.
+    /// </summary>
+    public void Suspend(string reason)
+    {
+        // Atomically flip the attachment flag; second caller is a no-op.
+        if (Interlocked.Exchange(ref _isAttached, 0) == 0) return;
+        _logger.LogInformation("fixp session {ConnectionId} suspending (reason={Reason})",
+            ConnectionId, reason);
+        var action = ApplyTransition(FixpEvent.Detach);
+        if (action != FixpAction.Accept || State != FixpState.Suspended)
+        {
+            // State machine refused the demotion (e.g. we were already past
+            // Established when the transport died). Fall back to Close so we
+            // don't leave a half-broken session registered.
+            _logger.LogInformation(
+                "fixp session {ConnectionId} suspend declined (state={State} action={Action}); closing instead",
+                ConnectionId, State, action);
+            Close(reason);
+            return;
+        }
+        // Tear down the dead transport + cancel loops. Claim/registration are
+        // intentionally retained for re-attach. We do NOT call
+        // _sink.OnSessionClosed nor _onClosed because, from the engine's
+        // and the listener's perspective, the FIXP session is still alive.
+        try { _cts.Cancel(); } catch { }
+        try { _transport.Close(reason); } catch { }
+        // Dispose the dead NetworkStream/socket explicitly. Otherwise the
+        // suspended session keeps the underlying file descriptor open until
+        // re-attach (issue #69b) swaps in a new transport, or until GC
+        // finalizes the stream — under repeated client reconnects this would
+        // leak FDs. The stream owns its socket (NetworkStream(sock,
+        // ownsSocket:true) in EntryPointListener), so disposing it closes
+        // the socket too. Re-attach will install a fresh stream.
+        try { _transport.Stream.Dispose(); } catch { }
+    }
+
+    /// <summary>
     /// Closes the session with a diagnostic reason. The reason is forwarded to
     /// the optional <c>onClosed</c> callback supplied at construction so the
     /// listener (or tests) can log it. <see cref="Close()"/> is the
@@ -916,6 +998,7 @@ public sealed class FixpSession : IAsyncDisposable
     public void Close(string reason)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
+        Volatile.Write(ref _isAttached, 0);
         _logger.LogInformation("fixp session {ConnectionId} closing", ConnectionId);
         try { _cts.Cancel(); } catch { }
         // The transport may have already closed (it's the source of the
