@@ -51,6 +51,18 @@ public sealed record FixpSessionOptions
     /// </summary>
     public int RetransmitBufferCapacity { get; init; } = 1024;
 
+    /// <summary>
+    /// Optional process-wide session lifecycle counters. When non-null,
+    /// the session increments <see cref="SessionLifecycleMetrics.Established"/>
+    /// (and <see cref="SessionLifecycleMetrics.Rebound"/> for re-attach)
+    /// on transitions into <c>Established</c>, and
+    /// <see cref="SessionLifecycleMetrics.Suspended"/> on demotions into
+    /// <c>Suspended</c>. Reaped is incremented by the listener after a
+    /// successful reap. Optional so unit tests can construct sessions
+    /// without wiring <c>MetricsRegistry</c>.
+    /// </summary>
+    public B3.Exchange.Core.SessionLifecycleMetrics? LifecycleMetrics { get; init; }
+
     public static FixpSessionOptions Default { get; } = new();
 
     internal void Validate()

@@ -190,4 +190,46 @@ public class EntryPointListenerReaperTests
             await listener.DisposeAsync();
         }
     }
+
+    [Fact]
+    public async Task Reaper_increments_LifecycleMetrics_Reaped_counter()
+    {
+        var sink = new NoOpEngineSink();
+        var metrics = new SessionLifecycleMetrics();
+        var options = new FixpSessionOptions
+        {
+            HeartbeatIntervalMs = 60_000,
+            IdleTimeoutMs = 60_000,
+            TestRequestGraceMs = 60_000,
+            SuspendedTimeoutMs = 200,
+            LifecycleMetrics = metrics,
+        };
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            sink,
+            NullLoggerFactory.Instance,
+            sessionOptions: options);
+        listener.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var registered = await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.Count == 1, TimeSpan.FromSeconds(2));
+        Assert.True(registered);
+        var session = listener.ActiveSessions[0];
+        session.ApplyTransition(FixpEvent.Negotiate);
+        session.ApplyTransition(FixpEvent.Establish);
+        Assert.Equal(1, metrics.Established);
+        client.Close();
+        var suspended = await TestUtil.WaitUntilAsync(
+            () => session.State == FixpState.Suspended, TimeSpan.FromSeconds(2));
+        Assert.True(suspended);
+        Assert.Equal(1, metrics.Suspended);
+
+        var reaped = await TestUtil.WaitUntilAsync(
+            () => metrics.Reaped >= 1, TimeSpan.FromSeconds(2));
+        Assert.True(reaped, $"reaper did not increment Reaped within 2s (Reaped={metrics.Reaped})");
+        // Sanity: Rebound stays zero (we never re-attached).
+        Assert.Equal(0, metrics.Rebound);
+    }
 }

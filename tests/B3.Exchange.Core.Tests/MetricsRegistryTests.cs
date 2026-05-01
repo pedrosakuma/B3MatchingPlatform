@@ -58,6 +58,44 @@ public class MetricsRegistryTests
         Assert.Equal("startup", p.Name);
     }
 
+    [Fact]
+    public void SessionLifecycleCounters_AreRendered_AndExposeMonotonicCounts()
+    {
+        var reg = new MetricsRegistry();
+        reg.Sessions.IncEstablished();
+        reg.Sessions.IncEstablished();
+        reg.Sessions.IncSuspended();
+        reg.Sessions.IncRebound();
+        reg.Sessions.IncReaped();
+        reg.Sessions.IncReaped();
+        reg.Sessions.IncReaped();
+
+        Assert.Equal(2, reg.Sessions.Established);
+        Assert.Equal(1, reg.Sessions.Suspended);
+        Assert.Equal(1, reg.Sessions.Rebound);
+        Assert.Equal(3, reg.Sessions.Reaped);
+
+        var text = reg.RenderProm();
+        Assert.Contains("# TYPE exch_session_established_total counter\n", text);
+        Assert.Contains("exch_session_established_total 2\n", text);
+        Assert.Contains("exch_session_suspended_total 1\n", text);
+        Assert.Contains("exch_session_rebound_total 1\n", text);
+        Assert.Contains("exch_session_reaped_total 3\n", text);
+    }
+
+    [Fact]
+    public void SessionLifecycleCounters_AreZeroByDefault_AndStillRendered()
+    {
+        var reg = new MetricsRegistry();
+        var text = reg.RenderProm();
+        // Counters MUST be rendered even at zero so scrapers don't see them
+        // appear/disappear; this matches Prometheus best practices.
+        Assert.Contains("exch_session_established_total 0\n", text);
+        Assert.Contains("exch_session_suspended_total 0\n", text);
+        Assert.Contains("exch_session_rebound_total 0\n", text);
+        Assert.Contains("exch_session_reaped_total 0\n", text);
+    }
+
     private sealed class StubSessionProvider : ISessionMetricsProvider
     {
         private readonly SessionQueueSample[] _samples;

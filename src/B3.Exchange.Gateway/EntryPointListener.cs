@@ -165,6 +165,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             {
                 if (s.TryReapIfSuspended(thresholdMs))
                 {
+                    _sessionOptions.LifecycleMetrics?.IncReaped();
                     _logger.LogInformation(
                         "reaped suspended session {ConnectionId} sessionId={SessionId} (timeout={TimeoutMs}ms)",
                         s.ConnectionId, s.SessionId, timeoutMs);
