@@ -160,7 +160,7 @@ public class ChannelDispatcherTests
     public void Cancel_ByOrigClOrdId_ResolvesViaSessionMap()
     {
         var (disp, pkt) = NewDispatcher();
-        var reply = new RecordingReply();
+        var reply = new RecordingReply { CaptureCancelIds = true };
 
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
             reply, clOrdIdValue: 1UL);
@@ -406,6 +406,80 @@ public class ChannelDispatcherTests
         var (clOrd, origClOrd) = reply.CancelIds[0];
         Assert.Equal(99UL, clOrd);
         Assert.Equal(1UL, origClOrd);
+    }
+
+    [Fact]
+    public void OperatorBumpVersion_ClearsBook_BumpsVersions_EmitsChannelResetPacket()
+    {
+        var (disp, pkt) = NewDispatcher();
+        var reply = new RecordingReply();
+
+        // Seed two resting orders so the book has state to clear.
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply, clOrdIdValue: 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(11m), 200, 7, 1_001UL),
+            reply, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        ushort versionBefore = disp.SequenceVersion;
+        uint seqBefore = disp.SequenceNumber;
+        Assert.Equal(2, pkt.Packets.Count);
+        Assert.Equal(2, GetEngine(disp).OrderCount(Petr));
+        Assert.True(GetEngine(disp).CurrentRptSeq > 0);
+        pkt.Packets.Clear();
+
+        Assert.True(disp.EnqueueOperatorBumpVersion());
+        DrainInbound(disp);
+
+        // Book wiped, RptSeq reset.
+        Assert.Equal(0, GetEngine(disp).OrderCount(Petr));
+        Assert.Equal(0u, GetEngine(disp).CurrentRptSeq);
+
+        // SequenceVersion bumped on the dispatcher (incremental). Snapshot
+        // rotator is not attached in this test (no rotator wired) — the
+        // attach path is exercised in the host-level integration test.
+        Assert.Equal((ushort)(versionBefore + 1), disp.SequenceVersion);
+        // SequenceNumber rebased: starts at 0 then the ChannelReset flush
+        // increments it to 1.
+        Assert.Equal(1u, disp.SequenceNumber);
+        Assert.NotEqual(seqBefore, disp.SequenceNumber);
+
+        // Exactly one packet emitted: PacketHeader + framing + sbeHdr +
+        // ChannelReset_11 body (12).
+        Assert.Single(pkt.Packets);
+        var packet = pkt.Packets[0];
+        int expectedLen = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize + WireOffsets.ChannelResetBlockLength;
+        Assert.Equal(expectedLen, packet.Length);
+
+        // Packet header reflects the NEW SequenceVersion.
+        Assert.Equal((ushort)(versionBefore + 1), MemoryMarshal.Read<ushort>(packet.AsSpan(WireOffsets.PacketHeaderSequenceVersionOffset, 2)));
+        Assert.Equal(1u, MemoryMarshal.Read<uint>(packet.AsSpan(WireOffsets.PacketHeaderSequenceNumberOffset, 4)));
+
+        // SBE TemplateId == 11.
+        int sbeHdrStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize;
+        ushort templateId = MemoryMarshal.Read<ushort>(packet.AsSpan(sbeHdrStart + 2, 2));
+        Assert.Equal((ushort)11, templateId);
+    }
+
+    [Fact]
+    public void OperatorSnapshotNow_OnDispatcherWithoutRotator_IsNoOp()
+    {
+        // Without a snapshot rotator attached the work item is consumed but
+        // produces no incremental packets — verifies the dispatch path is
+        // safe in the no-rotator case (the host wires the rotator only when
+        // the channel has a snapshot config).
+        var (disp, pkt) = NewDispatcher();
+        Assert.True(disp.EnqueueOperatorSnapshotNow());
+        DrainInbound(disp);
+        Assert.Empty(pkt.Packets);
+    }
+
+    private static MatchingEngine GetEngine(ChannelDispatcher disp)
+    {
+        var f = typeof(ChannelDispatcher).GetField("_engine",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        return (MatchingEngine)f.GetValue(disp)!;
     }
 
     private static void DrainInbound(ChannelDispatcher disp)

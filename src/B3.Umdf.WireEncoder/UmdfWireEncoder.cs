@@ -328,6 +328,36 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// Writes <c>ChannelReset_11</c> (V16): framing header + SBE header + 12-byte body.
+    /// MatchEventIndicator is set to bit 5 (RecoveryMsg) | bit 7 (EndOfEvent),
+    /// per the schema's documented "bits applied to this message" annotation,
+    /// signalling consumers that this is a hard reset / end-of-event boundary.
+    /// Returns total bytes written.
+    /// </summary>
+    public static int WriteChannelResetFrame(
+        Span<byte> dst,
+        ulong mdEntryTimestampNanos)
+    {
+        const int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.ChannelResetBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.ChannelReset_11Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.ChannelResetBlockLength);
+        body.Clear();
+
+        // MatchEventIndicator: bit 5 (RecoveryMsg, value 0x20) | bit 7 (EndOfEvent, value 0x80) = 0xA0.
+        body[WireOffsets.ChannelResetBodyMatchEventIndicatorOffset] = 0xA0;
+        MemoryMarshal.Write(body.Slice(WireOffsets.ChannelResetBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

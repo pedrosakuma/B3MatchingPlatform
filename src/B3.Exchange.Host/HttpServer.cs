@@ -30,15 +30,19 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly HttpConfig _config;
     private readonly MetricsRegistry _metrics;
     private readonly IReadOnlyList<IReadinessProbe> _probes;
+    private readonly IReadOnlyDictionary<byte, ChannelDispatcher> _dispatchers;
     private readonly Action<string>? _log;
     private WebApplication? _app;
 
     public HttpServer(HttpConfig config, MetricsRegistry metrics,
-        IReadOnlyList<IReadinessProbe> probes, Action<string>? log = null)
+        IReadOnlyList<IReadinessProbe> probes,
+        IReadOnlyDictionary<byte, ChannelDispatcher> dispatchers,
+        Action<string>? log = null)
     {
         _config = config;
         _metrics = metrics;
         _probes = probes;
+        _dispatchers = dispatchers;
         _log = log;
     }
 
@@ -102,6 +106,19 @@ public sealed class HttpServer : IAsyncDisposable
         app.MapGet("/metrics", () =>
             Results.Text(_metrics.RenderProm(), "text/plain; version=0.0.4; charset=utf-8"));
 
+        // Operator endpoints (issue #6). All work is dispatched via the
+        // channel's inbound queue so the engine state mutation happens on
+        // the dispatch thread; the HTTP handler returns 202 Accepted as soon
+        // as the work item is enqueued. 404 for unknown channel; 503 if the
+        // dispatcher's bounded inbound queue is full (BoundedChannel
+        // FullMode is DropWrite, so TryWrite returns false rather than
+        // blocking the HTTP thread).
+        app.MapPost("/channel/{ch:int}/snapshot-now", (int ch, HttpContext ctx) =>
+            HandleOperatorEnqueue(ctx, ch, d => d.EnqueueOperatorSnapshotNow(), "snapshot-now"));
+
+        app.MapPost("/channel/{ch:int}/bump-version", (int ch, HttpContext ctx) =>
+            HandleOperatorEnqueue(ctx, ch, d => d.EnqueueOperatorBumpVersion(), "bump-version"));
+
         await app.StartAsync(ct).ConfigureAwait(false);
         _app = app;
 
@@ -115,6 +132,24 @@ public sealed class HttpServer : IAsyncDisposable
             LocalEndpoint = ep;
 
         _log?.Invoke($"http listening on {LocalEndpoint}");
+    }
+
+    private IResult HandleOperatorEnqueue(HttpContext ctx, int channelNumber,
+        Func<ChannelDispatcher, bool> enqueue, string opName)
+    {
+        if (channelNumber < 0 || channelNumber > 255 ||
+            !_dispatchers.TryGetValue((byte)channelNumber, out var disp))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"unknown channel {channelNumber}\n", "text/plain");
+        }
+        if (!enqueue(disp))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text($"channel {channelNumber} inbound queue full\n", "text/plain");
+        }
+        ctx.Response.StatusCode = StatusCodes.Status202Accepted;
+        return Results.Text($"accepted {opName} channel={channelNumber}\n", "text/plain");
     }
 
     private static IPEndPoint ParseEndpoint(string s)

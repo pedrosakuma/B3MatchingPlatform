@@ -73,6 +73,21 @@ internal sealed class LimitOrderBook
 
     public int OrderCount => _byOrderId.Count;
 
+    /// <summary>
+    /// Removes every resting order from this book without emitting any
+    /// per-order events. Intended for operator-initiated channel resets
+    /// (issue #6) where consumers receive a single <c>ChannelReset</c>
+    /// frame and drop their local state — per-order DeleteOrder frames
+    /// would be redundant and risk consumers seeing cancels for orders
+    /// they have already discarded.
+    /// </summary>
+    public void Clear()
+    {
+        _bids.Clear();
+        _asks.Clear();
+        _byOrderId.Clear();
+    }
+
     public bool TryGet(long orderId, out RestingOrder order) => _byOrderId.TryGetValue(orderId, out order!);
 
     private SortedDictionary<long, PriceLevel> SideMap(Side side) => side == Side.Buy ? _bids : _asks;
