@@ -44,7 +44,7 @@ public sealed class ChannelMetrics
 
 /// <summary>
 /// Provider of per-session send-queue depth gauges. The host wires an
-/// implementation that snapshots the active <c>EntryPointSession</c>
+/// implementation that snapshots the active <c>FixpSession</c>
 /// queues at scrape time. The "channel" label is currently fixed to
 /// <c>"all"</c> because a session's send queue is shared across every
 /// channel that may route ExecutionReports back to it; per-channel

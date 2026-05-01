@@ -329,7 +329,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // as normal, but no ER_Trade is sent (there is nobody listening).
         //
         // After this sweep, the dispatcher holds no strong reference to
-        // `reply`, so the EntryPointSession (and its NetworkStream / Socket)
+        // `reply`, so the FixpSession (and its NetworkStream / Socket)
         // becomes eligible for GC once the listener has also dropped it
         // from its live-sessions list.
         if (_orderOwners.Count == 0) return;

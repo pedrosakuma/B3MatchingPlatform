@@ -188,7 +188,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
         _router = new HostRouter(routing, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
-        var sessionOptions = new EntryPointSessionOptions
+        var sessionOptions = new FixpSessionOptions
         {
             HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,

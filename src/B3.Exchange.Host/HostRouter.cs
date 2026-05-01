@@ -60,7 +60,7 @@ public sealed class HostRouter : IInboundCommandSink
 
     public void OnDecodeError(IGatewayResponseChannel reply, string error)
     {
-        // Logging hook only. The EntryPointSession itself emits the
+        // Logging hook only. The FixpSession itself emits the
         // appropriate SessionReject (Terminate) or BusinessMessageReject
         // and decides whether to close the connection — the router has no
         // additional context to add here.

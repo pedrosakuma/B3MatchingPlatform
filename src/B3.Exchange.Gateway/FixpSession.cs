@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Threading.Channels;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -7,94 +6,89 @@ using Microsoft.Extensions.Logging;
 namespace B3.Exchange.Gateway;
 
 /// <summary>
-/// Stream-based per-connection session. Hosts:
-///  - a receive loop that reads SBE-framed inbound messages and dispatches
-///    decoded commands to <see cref="IInboundCommandSink"/>;
-///  - a send loop that drains a bounded <see cref="Channel{T}"/> of
-///    pre-encoded outbound frames and writes them to the stream.
+/// Per-connection FIXP session: owns session identity (<see cref="SessionId"/>,
+/// <see cref="EnteringFirm"/>), the inbound decode loop, the FIXP-style
+/// liveness watchdog, and the implementation of
+/// <see cref="IGatewayResponseChannel"/> that encodes outbound
+/// ExecutionReports. Hands the actual byte-level send/receive of frames
+/// to a composed <see cref="TcpTransport"/>.
 ///
-/// Stream-based (rather than Socket-bound) so it can be exercised in tests
-/// with <c>MemoryStream</c> or duplex pipes — see
-/// <see cref="EntryPointListener"/> for the production accept loop.
+/// <para>The class is the destination for the
+/// <see cref="IInboundCommandSink"/> dispatch — Core never holds a
+/// transport reference. Future Phase-2 work (FIXP state machine,
+/// authentication, retransmission) will plug into this same surface.</para>
 ///
-/// Send-side backpressure: the channel is bounded; on overflow the channel
-/// is closed (<c>FullMode = DropWrite</c> + explicit close). This drops the
-/// connection rather than ballooning memory under a stuck peer.
+/// <para>Stream-based (rather than Socket-bound) so it can be exercised
+/// in tests with <c>MemoryStream</c> or duplex pipes — see
+/// <see cref="EntryPointListener"/> for the production accept loop.</para>
 /// </summary>
-public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposable
+public sealed class FixpSession : IGatewayResponseChannel, IAsyncDisposable
 {
     private const int InboundHeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int DefaultSendQueueCapacity = 1024;
 
-    private readonly Stream _stream;
+    private readonly TcpTransport _transport;
     private readonly IInboundCommandSink _sink;
-    private readonly ILogger<EntryPointSession> _logger;
-    private readonly Channel<byte[]> _sendQueue;
+    private readonly ILogger<FixpSession> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<ulong> _nowNanos;
-    private readonly EntryPointSessionOptions _options;
-    private readonly Action<EntryPointSession, string>? _onClosed;
-    private readonly SemaphoreSlim _streamWriteLock = new(1, 1);
+    private readonly FixpSessionOptions _options;
+    private readonly Action<FixpSession, string>? _onClosed;
     private long _msgSeqNum;
     private int _isOpen = 1;
     // Watchdog state (milliseconds since process start, monotonic).
     private long _lastInboundMs;
-    private long _lastOutboundMs;
     // Set true while we are waiting on the grace window after sending a probe;
     // cleared as soon as any inbound frame arrives. Prevents flooding probes.
     private int _probeOutstanding;
     private Task? _recvTask;
-    private Task? _sendTask;
     private Task? _watchdogTask;
 
     public long ConnectionId { get; }
     public uint EnteringFirm { get; }
     public uint SessionId { get; }
-    public bool IsOpen => Volatile.Read(ref _isOpen) == 1;
+    public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
 
     /// <summary>
-    /// Approximate number of pre-encoded ExecutionReport frames sitting in
-    /// the outbound queue, for /metrics scraping. Reads
-    /// <see cref="System.Threading.Channels.ChannelReader{T}.Count"/>,
-    /// which is O(1) on a bounded channel.
+    /// Approximate number of pre-encoded ExecutionReport frames sitting
+    /// in the outbound queue, for /metrics scraping.
     /// </summary>
-    public int SendQueueDepth => _sendQueue.Reader.Count;
+    public int SendQueueDepth => _transport.SendQueueDepth;
 
-    public EntryPointSession(long connectionId, uint enteringFirm, uint sessionId,
-        Stream stream, IInboundCommandSink sink, ILogger<EntryPointSession> logger,
+    public FixpSession(long connectionId, uint enteringFirm, uint sessionId,
+        Stream stream, IInboundCommandSink sink, ILogger<FixpSession> logger,
         Func<ulong>? nowNanos = null,
         int sendQueueCapacity = DefaultSendQueueCapacity,
-        EntryPointSessionOptions? options = null,
-        Action<EntryPointSession, string>? onClosed = null)
+        FixpSessionOptions? options = null,
+        Action<FixpSession, string>? onClosed = null,
+        ILogger<TcpTransport>? transportLogger = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
-        _stream = stream;
         _sink = sink;
         _logger = logger;
         _nowNanos = nowNanos ?? DefaultNowNanos;
-        _options = options ?? EntryPointSessionOptions.Default;
+        _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
         _onClosed = onClosed;
-        _sendQueue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(sendQueueCapacity)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite,
-        });
-        long now = NowMs();
-        Volatile.Write(ref _lastInboundMs, now);
-        Volatile.Write(ref _lastOutboundMs, now);
+        // The transport's onClose callback funnels back through our Close so
+        // session-level book-keeping (sink notification, onClosed delegate)
+        // runs even when teardown originates from a transport-side IO error.
+        _transport = new TcpTransport(connectionId, stream,
+            transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance,
+            sendQueueCapacity,
+            onClose: reason => Close(reason));
+        Volatile.Write(ref _lastInboundMs, NowMs());
     }
 
     public void Start()
     {
-        _logger.LogInformation("entrypoint session opened: connectionId={ConnectionId} sessionId={SessionId} firm={EnteringFirm}",
+        _logger.LogInformation("fixp session opened: connectionId={ConnectionId} sessionId={SessionId} firm={EnteringFirm}",
             ConnectionId, SessionId, EnteringFirm);
+        _transport.StartSendLoop(_cts.Token);
         _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
-        _sendTask = Task.Run(() => RunSendLoopAsync(_cts.Token));
         _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
     }
 
@@ -105,12 +99,13 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
 
     private async Task RunReceiveLoopAsync(CancellationToken ct)
     {
+        var stream = _transport.Stream;
         var headerBuf = new byte[InboundHeaderSize];
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                await ReadExactlyAsync(_stream, headerBuf, ct).ConfigureAwait(false);
+                await ReadExactlyAsync(stream, headerBuf, ct).ConfigureAwait(false);
                 if (!EntryPointFrameReader.TryParseInboundHeader(headerBuf, out var info, out var headerError, out var hdrMsg))
                 {
                     _sink.OnDecodeError(this, hdrMsg ?? headerError.ToString());
@@ -120,12 +115,11 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
                 var bodyBuf = ArrayPool<byte>.Shared.Rent(info.BodyLength);
                 try
                 {
-                    await ReadExactlyAsync(_stream, bodyBuf.AsMemory(0, info.BodyLength), ct).ConfigureAwait(false);
+                    await ReadExactlyAsync(stream, bodyBuf.AsMemory(0, info.BodyLength), ct).ConfigureAwait(false);
                     // Any well-framed inbound frame counts as liveness, including
                     // session-layer Sequence (heartbeat) frames.
                     Volatile.Write(ref _lastInboundMs, NowMs());
                     Volatile.Write(ref _probeOutstanding, 0);
-                    var body = bodyBuf.AsSpan(0, info.BodyLength);
                     if (!await DispatchInboundAsync(info, bodyBuf, info.BodyLength).ConfigureAwait(false))
                     {
                         // DispatchInboundAsync already wrote Terminate + closed.
@@ -142,7 +136,7 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
         catch (EndOfStreamException) { }
         catch (IOException ex)
         {
-            _logger.LogWarning(ex, "entrypoint session {ConnectionId} receive IO error", ConnectionId);
+            _logger.LogWarning(ex, "fixp session {ConnectionId} receive IO error", ConnectionId);
         }
         finally
         {
@@ -169,10 +163,8 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
 
     /// <summary>
     /// Sends a Terminate frame with <paramref name="terminationCode"/>
-    /// directly to the underlying stream (bypassing the send queue, which
-    /// might be racing with an in-flight write or about to be cancelled),
-    /// and closes the session. Acquires <see cref="_streamWriteLock"/> so
-    /// it does not collide with the regular send loop.
+    /// directly to the underlying stream (bypassing the send queue), and
+    /// closes the session.
     /// </summary>
     private async Task TerminateAndCloseAsync(byte terminationCode, string reason)
     {
@@ -181,20 +173,11 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
         SessionRejectEncoder.EncodeTerminate(frame, SessionId, 0, terminationCode);
         try
         {
-            await _streamWriteLock.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                await _stream.WriteAsync(frame).ConfigureAwait(false);
-                Volatile.Write(ref _lastOutboundMs, NowMs());
-            }
-            finally
-            {
-                _streamWriteLock.Release();
-            }
+            await _transport.SendDirectAsync(frame).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "entrypoint session {ConnectionId} failed to write Terminate({Code})", ConnectionId, terminationCode);
+            _logger.LogWarning(ex, "fixp session {ConnectionId} failed to write Terminate({Code})", ConnectionId, terminationCode);
         }
         Close(reason);
     }
@@ -262,47 +245,11 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
         }
     }
 
-    private async Task RunSendLoopAsync(CancellationToken ct)
-    {
-        try
-        {
-            await foreach (var frame in _sendQueue.Reader.ReadAllAsync(ct).ConfigureAwait(false))
-            {
-                try
-                {
-                    await _streamWriteLock.WaitAsync(ct).ConfigureAwait(false);
-                    try
-                    {
-                        await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        _streamWriteLock.Release();
-                    }
-                    Volatile.Write(ref _lastOutboundMs, NowMs());
-                }
-                catch (IOException ex)
-                {
-                    _logger.LogWarning(ex, "entrypoint session {ConnectionId} send IO error; closing", ConnectionId);
-                    Close("send-io-error");
-                    return;
-                }
-                // Frames enqueued here are plain `new byte[]` (see TryEnqueueExact),
-                // never pool-owned, so we do not return them to ArrayPool.
-            }
-        }
-        catch (OperationCanceledException) { }
-        finally
-        {
-            Close("send-loop-exit");
-        }
-    }
-
     /// <summary>
     /// Periodic watchdog that drives the FIXP-style heartbeat + idle-timeout
     /// policy. Runs on its own task; never touches the socket directly —
-    /// instead it enqueues <c>Sequence</c> frames into the same bounded
-    /// channel the send loop drains, so all writes remain serialised.
+    /// instead it enqueues <c>Sequence</c> frames into the transport's
+    /// bounded channel, so all writes remain serialised.
     /// </summary>
     private async Task RunWatchdogLoopAsync(CancellationToken ct)
     {
@@ -319,12 +266,13 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
 
                 long now = NowMs();
                 long sinceIn = now - Volatile.Read(ref _lastInboundMs);
-                long sinceOut = now - Volatile.Read(ref _lastOutboundMs);
+                long sinceOut = now - _transport.LastOutboundTickMs;
 
                 // Idle teardown: if a probe is outstanding and grace elapsed
                 // without any inbound, close. The grace clock starts from the
-                // moment the probe was sent (i.e. _lastOutboundMs was bumped),
-                // so we measure the additional silence beyond idleTimeoutMs.
+                // moment the probe was sent (i.e. last outbound tick was
+                // bumped), so we measure the additional silence beyond
+                // idleTimeoutMs.
                 if (sinceIn >= (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs &&
                     Volatile.Read(ref _probeOutstanding) == 1)
                 {
@@ -368,7 +316,7 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
         if (!IsOpen) return;
         var frame = new byte[SessionFrameEncoder.SequenceTotal];
         SessionFrameEncoder.EncodeSequence(frame, NextMsgSeqNum());
-        TryEnqueue(frame);
+        _transport.TryEnqueueFrame(frame);
     }
 
     private static async Task ReadExactlyAsync(Stream s, byte[] buf, CancellationToken ct)
@@ -383,14 +331,6 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
             if (n == 0) throw new EndOfStreamException();
             total += n;
         }
-    }
-
-    private bool TryEnqueue(byte[] frame)
-    {
-        if (!IsOpen) return false;
-        if (_sendQueue.Writer.TryWrite(frame)) return true;
-        Close("send-queue-full");
-        return false;
     }
 
     private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
@@ -473,7 +413,7 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
         var exact = new byte[written];
         Buffer.BlockCopy(frame, 0, exact, 0, written);
         ArrayPool<byte>.Shared.Return(frame);
-        return TryEnqueue(exact);
+        return _transport.TryEnqueueFrame(exact);
     }
 
     public bool WriteSessionReject(byte terminationCode)
@@ -519,9 +459,12 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
     public void Close(string reason)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
-        _logger.LogInformation("entrypoint session {ConnectionId} closing", ConnectionId);
-        _sendQueue.Writer.TryComplete();
+        _logger.LogInformation("fixp session {ConnectionId} closing", ConnectionId);
         try { _cts.Cancel(); } catch { }
+        // The transport may have already closed (it's the source of the
+        // callback in IO-error paths). Either way, ensure it's down so the
+        // send loop wakes up and exits.
+        _transport.Close(reason);
         // Notify the engine sink so it releases any cached references to this
         // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for
@@ -534,8 +477,8 @@ public sealed class EntryPointSession : IGatewayResponseChannel, IAsyncDisposabl
     {
         Close("dispose");
         try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); } catch { }
-        try { if (_sendTask != null) await _sendTask.ConfigureAwait(false); } catch { }
         try { if (_watchdogTask != null) await _watchdogTask.ConfigureAwait(false); } catch { }
+        await _transport.DisposeAsync().ConfigureAwait(false);
         _cts.Dispose();
     }
 }

@@ -16,13 +16,13 @@ namespace B3.Exchange.Gateway;
 /// Defaults match the issue (#9) spec: 30 s heartbeat, 30 s idle, 5 s grace.
 /// Tests override with sub-second values to keep the suite fast.
 /// </summary>
-public sealed record EntryPointSessionOptions
+public sealed record FixpSessionOptions
 {
     public int HeartbeatIntervalMs { get; init; } = 30_000;
     public int IdleTimeoutMs { get; init; } = 30_000;
     public int TestRequestGraceMs { get; init; } = 5_000;
 
-    public static EntryPointSessionOptions Default { get; } = new();
+    public static FixpSessionOptions Default { get; } = new();
 
     internal void Validate()
     {

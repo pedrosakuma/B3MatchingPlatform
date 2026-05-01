@@ -38,7 +38,7 @@ public class EntryPointHeartbeatTests
     {
         var closures = new List<string>();
         var sem = new SemaphoreSlim(0, 1);
-        var options = new EntryPointSessionOptions
+        var options = new FixpSessionOptions
         {
             HeartbeatIntervalMs = 10_000, // not relevant for this test
             IdleTimeoutMs = 200,
@@ -91,7 +91,7 @@ public class EntryPointHeartbeatTests
     public async Task ActivelyHeartbeatingSession_StaysAlive()
     {
         var closures = new List<string>();
-        var options = new EntryPointSessionOptions
+        var options = new FixpSessionOptions
         {
             HeartbeatIntervalMs = 10_000, // ignore server-emitted heartbeats here
             IdleTimeoutMs = 200,
@@ -132,7 +132,7 @@ public class EntryPointHeartbeatTests
     [Fact]
     public async Task ServerEmitsHeartbeat_WhenOutboundIdle()
     {
-        var options = new EntryPointSessionOptions
+        var options = new FixpSessionOptions
         {
             HeartbeatIntervalMs = 150,
             IdleTimeoutMs = 10_000,        // disable idle teardown for this test
