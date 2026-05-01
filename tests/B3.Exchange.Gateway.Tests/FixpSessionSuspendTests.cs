@@ -73,9 +73,7 @@ public class FixpSessionSuspendTests
             client.Close();
 
             // Wait for the receive loop to observe EOF and run its finally.
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
-            while (session.IsAttached && DateTime.UtcNow < deadline)
-                await Task.Delay(20);
+            await TestUtil.WaitUntilAsync(() => !session.IsAttached, TimeSpan.FromSeconds(3));
 
             Assert.False(session.IsAttached);
             Assert.Equal(FixpState.Suspended, session.State);
@@ -114,14 +112,13 @@ public class FixpSessionSuspendTests
 
             client.Close();
 
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
             // Wait for IsOpen to flip false AND onClosed callback to fire.
             // IsOpen becomes false the instant Close() flips _isOpen, but
             // _onClosed is invoked a few statements later — poll on the
             // callback counter to avoid a benign race.
-            while ((session.IsOpen || Volatile.Read(ref onClosedCalls) == 0)
-                && DateTime.UtcNow < deadline)
-                await Task.Delay(20);
+            await TestUtil.WaitUntilAsync(
+                () => !session.IsOpen && Volatile.Read(ref onClosedCalls) > 0,
+                TimeSpan.FromSeconds(3));
 
             Assert.False(session.IsOpen);
             Assert.False(session.IsAttached);

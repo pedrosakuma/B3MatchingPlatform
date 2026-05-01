@@ -30,6 +30,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
+    private Task? _reaperTask;
     private long _nextConnectionId;
     private readonly List<FixpSession> _sessions = new();
     private readonly object _lock = new();
@@ -102,6 +103,75 @@ public sealed class EntryPointListener : IAsyncDisposable
         _listener.Start();
         _logger.LogInformation("entrypoint listener bound to {Endpoint}", _listener.LocalEndpoint);
         _acceptTask = Task.Run(() => RunAcceptLoopAsync(_cts.Token));
+        if (_sessionOptions.SuspendedTimeoutMs > 0)
+            _reaperTask = Task.Run(() => RunSuspendedReaperAsync(_cts.Token));
+    }
+
+    /// <summary>
+    /// Periodically scans <see cref="_sessions"/> for FIXP sessions that
+    /// have been in <see cref="FixpState.Suspended"/> longer than
+    /// <see cref="FixpSessionOptions.SuspendedTimeoutMs"/> and fully closes
+    /// them. Without this, every transport drop while Established (issue
+    /// #69a) leaves the session, its claim, and the engine's order-owner
+    /// reference rooted in memory until process exit. The full re-attach
+    /// machinery (#69b-2) will move long-lived suspended sessions back to
+    /// Established before the reaper fires.
+    /// </summary>
+    private async Task RunSuspendedReaperAsync(CancellationToken ct)
+    {
+        // Poll often enough to honor the timeout within ~10% latency, but
+        // never busy-loop and never sleep longer than 30 s in production
+        // configurations. Floor 50 ms keeps the test suite fast when
+        // tests set SuspendedTimeoutMs to e.g. 200 ms.
+        var timeoutMs = _sessionOptions.SuspendedTimeoutMs;
+        var pollMs = Math.Max(50, Math.Min(timeoutMs / 4, 30_000));
+        var poll = TimeSpan.FromMilliseconds(pollMs);
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try { await Task.Delay(poll, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                ReapSuspendedOnce(Environment.TickCount64);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "suspended-session reaper terminated unexpectedly");
+        }
+    }
+
+    /// <summary>
+    /// Single pass of the suspended-session reaper: fully closes any
+    /// session whose <see cref="FixpSession.SuspendedSinceMs"/> is older
+    /// than <see cref="FixpSessionOptions.SuspendedTimeoutMs"/>. Exposed
+    /// internally so tests can drive the reaper deterministically without
+    /// waiting for the Timer-based loop.
+    /// </summary>
+    internal void ReapSuspendedOnce(long nowMs)
+    {
+        var timeoutMs = _sessionOptions.SuspendedTimeoutMs;
+        if (timeoutMs <= 0) return;
+        FixpSession[] snapshot;
+        lock (_lock) snapshot = _sessions.ToArray();
+        foreach (var s in snapshot)
+        {
+            var since = s.SuspendedSinceMs;
+            if (since is null) continue;
+            // Defensive: only reap sessions that are still formally
+            // Suspended. A concurrent re-attach (#69b-2) will clear
+            // SuspendedSinceMs before we re-check.
+            if (s.State != FixpState.Suspended) continue;
+            if (nowMs - since.Value < timeoutMs) continue;
+            _logger.LogInformation(
+                "reaping suspended session {ConnectionId} sessionId={SessionId} (suspended for {AgeMs}ms, timeout={TimeoutMs}ms)",
+                s.ConnectionId, s.SessionId, nowMs - since.Value, timeoutMs);
+            try { s.Close("suspended-timeout"); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "reaper failed to close session {ConnectionId}", s.ConnectionId);
+            }
+        }
     }
 
     private async Task RunAcceptLoopAsync(CancellationToken ct)
@@ -155,6 +225,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         try { _cts.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
         if (_acceptTask != null) { try { await _acceptTask.ConfigureAwait(false); } catch { } }
+        if (_reaperTask != null) { try { await _reaperTask.ConfigureAwait(false); } catch { } }
         FixpSession[] toClose;
         lock (_lock) { toClose = _sessions.ToArray(); _sessions.Clear(); }
         foreach (var s in toClose) await s.DisposeAsync().ConfigureAwait(false);

@@ -92,6 +92,25 @@ public sealed class FixpSession : IAsyncDisposable
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
 
     /// <summary>
+    /// Wall-clock-ish (Environment.TickCount64) timestamp of the moment the
+    /// session entered <see cref="FixpState.Suspended"/>, or <c>null</c> if
+    /// the session is not currently Suspended. Read by the listener's
+    /// suspended-session reaper to decide whether the session has lingered
+    /// past <see cref="FixpSessionOptions.SuspendedTimeoutMs"/>.
+    /// Set on the dispatch thread inside <see cref="Suspend"/>; cleared
+    /// inside <see cref="Close"/>. Reads use <c>Volatile.Read</c>.
+    /// </summary>
+    public long? SuspendedSinceMs
+    {
+        get
+        {
+            var v = Volatile.Read(ref _suspendedSinceMs);
+            return v == 0 ? null : v;
+        }
+    }
+    private long _suspendedSinceMs;
+
+    /// <summary>
     /// True while the session has a live <see cref="TcpTransport"/> attached.
     /// Set to false on transport-driven disconnect (issue #69). The session
     /// itself remains in the registry — see <see cref="State"/>; only re-attach
@@ -987,6 +1006,9 @@ public sealed class FixpSession : IAsyncDisposable
         // ownsSocket:true) in EntryPointListener), so disposing it closes
         // the socket too. Re-attach will install a fresh stream.
         try { _transport.Stream.Dispose(); } catch { }
+        // Stamp the suspension timestamp last, so the reaper only observes
+        // Suspended sessions whose teardown is fully complete.
+        Volatile.Write(ref _suspendedSinceMs, NowMs());
     }
 
     /// <summary>
@@ -999,6 +1021,9 @@ public sealed class FixpSession : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
         Volatile.Write(ref _isAttached, 0);
+        // Clear the suspended-since timestamp so a concurrent reaper poll
+        // doesn't try to re-Close a session that's already terminal.
+        Volatile.Write(ref _suspendedSinceMs, 0);
         _logger.LogInformation("fixp session {ConnectionId} closing", ConnectionId);
         try { _cts.Cancel(); } catch { }
         // The transport may have already closed (it's the source of the
