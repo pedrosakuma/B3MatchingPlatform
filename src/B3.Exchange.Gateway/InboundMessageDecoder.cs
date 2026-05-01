@@ -5,7 +5,7 @@ namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// Decodes inbound EntryPoint message bodies (no SBE header — the
-/// <see cref="EntryPointSession"/> consumes that first) into matching engine
+/// <see cref="FixpSession"/> consumes that first) into matching engine
 /// command records. Field offsets are pinned to the V2 SBE layout; the
 /// frame-length validation guarantees the body is exactly the right size.
 /// </summary>

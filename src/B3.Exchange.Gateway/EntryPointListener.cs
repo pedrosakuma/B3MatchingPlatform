@@ -7,7 +7,7 @@ namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// TCP accept loop. Each accepted socket is wrapped in a
-/// <see cref="NetworkStream"/> + <see cref="EntryPointSession"/>. The caller
+/// <see cref="NetworkStream"/> + <see cref="FixpSession"/>. The caller
 /// supplies a factory to assign per-connection identity (ConnectionId,
 /// EnteringFirm, SessionId), so the listener doesn't need to know about
 /// authentication or firm-mapping policy.
@@ -21,13 +21,13 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<EntryPointListener> _logger;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
-    private readonly EntryPointSessionOptions _sessionOptions;
-    private readonly Action<EntryPointSession, string>? _onSessionClosed;
+    private readonly FixpSessionOptions _sessionOptions;
+    private readonly Action<FixpSession, string>? _onSessionClosed;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
     private long _nextConnectionId;
-    private readonly List<EntryPointSession> _sessions = new();
+    private readonly List<FixpSession> _sessions = new();
     private readonly object _lock = new();
 
     public IPEndPoint? LocalEndpoint => (IPEndPoint?)_listener?.LocalEndpoint;
@@ -35,10 +35,10 @@ public sealed class EntryPointListener : IAsyncDisposable
     /// <summary>
     /// Snapshot of currently active sessions for diagnostics / metrics.
     /// Closed sessions remain in the list until <see cref="DisposeAsync"/>
-    /// runs; callers should filter on <see cref="EntryPointSession.IsOpen"/>
+    /// runs; callers should filter on <see cref="FixpSession.IsOpen"/>
     /// if they only want live ones.
     /// </summary>
-    public IReadOnlyList<EntryPointSession> ActiveSessions
+    public IReadOnlyList<FixpSession> ActiveSessions
     {
         get { lock (_lock) return _sessions.ToArray(); }
     }
@@ -46,8 +46,8 @@ public sealed class EntryPointListener : IAsyncDisposable
     public EntryPointListener(IPEndPoint endpoint, IInboundCommandSink sink,
         ILoggerFactory loggerFactory,
         Func<EndPoint?, AcceptedConnection>? identityFactory = null,
-        EntryPointSessionOptions? sessionOptions = null,
-        Action<EntryPointSession, string>? onSessionClosed = null)
+        FixpSessionOptions? sessionOptions = null,
+        Action<FixpSession, string>? onSessionClosed = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _endpoint = endpoint;
@@ -55,7 +55,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<EntryPointListener>();
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
-        _sessionOptions = sessionOptions ?? EntryPointSessionOptions.Default;
+        _sessionOptions = sessionOptions ?? FixpSessionOptions.Default;
         _sessionOptions.Validate();
         _onSessionClosed = onSessionClosed;
     }
@@ -92,16 +92,16 @@ public sealed class EntryPointListener : IAsyncDisposable
                 var stream = new NetworkStream(sock, ownsSocket: true);
 
                 // Wrap onClosed to remove session from _sessions (so the
-                // disconnected EntryPointSession + its NetworkStream/Socket
+                // disconnected FixpSession + its NetworkStream/Socket
                 // become GC-eligible) before invoking the external callback.
-                Action<EntryPointSession, string> onClosed = (s, reason) =>
+                Action<FixpSession, string> onClosed = (s, reason) =>
                 {
                     lock (_lock) _sessions.Remove(s);
                     _onSessionClosed?.Invoke(s, reason);
                 };
 
-                var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
-                    stream, _sink, _loggerFactory.CreateLogger<EntryPointSession>(),
+                var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
+                    stream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
                     options: _sessionOptions, onClosed: onClosed);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
@@ -120,7 +120,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         try { _cts.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
         if (_acceptTask != null) { try { await _acceptTask.ConfigureAwait(false); } catch { } }
-        EntryPointSession[] toClose;
+        FixpSession[] toClose;
         lock (_lock) { toClose = _sessions.ToArray(); _sessions.Clear(); }
         foreach (var s in toClose) await s.DisposeAsync().ConfigureAwait(false);
         _cts.Dispose();
