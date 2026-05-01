@@ -381,7 +381,11 @@ public sealed class FixpSession : IAsyncDisposable
         // Per spec §3.5, varData segments follow the fixed root block. We
         // validate them here (length-prefixed, declared per-template caps
         // from §4.10) before handing the fixed block to the typed
-        // decoders. A varData failure is always DECODING_ERROR per §4.10.
+        // decoders. Classification (#GAP-14): structural failures
+        // (truncation/overrun/trailing) are DECODING_ERROR → Terminate;
+        // §4.10 business-rule failures (length-exceeded, CR/LF in
+        // single-line text fields) on application templates are
+        // BMR(33003) and the session stays open.
         var fullBody = new ReadOnlyMemory<byte>(bodyBuf, 0, bodyLength);
         var fixedBlock = fullBody.Slice(0, info.BlockLength).Span;
         var varData = fullBody.Slice(info.BlockLength).Span;
@@ -435,9 +439,37 @@ public sealed class FixpSession : IAsyncDisposable
         }
 
         var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
-        if (!EntryPointVarData.TryValidate(varData, spec, out var varErr))
+        var varResult = EntryPointVarData.ValidateDetailed(varData, spec);
+        if (!varResult.IsOk)
         {
-            _sink.OnDecodeError(Identity, varErr ?? "decode error: varData");
+            // §4.10 (#GAP-14): length-exceeded and CR/LF rejections on
+            // application messages are business-rule failures →
+            // BMR(33003) and drop the offending frame; the session
+            // stays open. Structural protocol errors (truncation,
+            // overrun, trailing bytes) are still DECODING_ERROR →
+            // terminate. Only applies in strict mode (Negotiated): in
+            // legacy passthrough there is no business-header context to
+            // reference, so retain the legacy terminate behaviour.
+            if (_validator is not null && varResult.IsBusinessReject && IsApplicationTemplate(info.TemplateId))
+            {
+                uint refSeqNum = fixedBlock.Length >= 8
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+                    : 0u;
+                ulong refClOrdId = fixedBlock.Length >= 28
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+                    : 0UL;
+                WriteBusinessMessageReject(
+                    refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(info.TemplateId),
+                    refSeqNum: refSeqNum,
+                    businessRejectRefId: refClOrdId,
+                    businessRejectReason: 33003,
+                    text: varResult.BmrText());
+                _logger.LogWarning(
+                    "fixp session {ConnectionId} business reject (varData) template={Template} field={Field} kind={Kind}: {Debug}",
+                    ConnectionId, info.TemplateId, varResult.FieldName, varResult.Kind, varResult.DebugMessage);
+                return true;
+            }
+            _sink.OnDecodeError(Identity, varResult.DebugMessage ?? "decode error: varData");
             await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:varData").ConfigureAwait(false);
             return false;
         }
@@ -708,7 +740,7 @@ public sealed class FixpSession : IAsyncDisposable
             : 0UL;
 
         WriteBusinessMessageReject(
-            refMsgType: (byte)templateId,
+            refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
             refSeqNum: hdrMsgSeqNum,
             businessRejectRefId: refClOrdId,
             businessRejectReason: 33003,

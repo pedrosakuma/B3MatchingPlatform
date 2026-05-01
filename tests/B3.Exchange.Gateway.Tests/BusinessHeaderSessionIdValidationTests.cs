@@ -137,16 +137,23 @@ public class BusinessHeaderSessionIdValidationTests
                 if (n <= 0) throw new EndOfStreamException();
                 read += n;
             }
-            // BusinessRejectReason is the first uint after refMsgType/refSeqNum/RefId.
-            // Its absolute body offset depends on the encoder layout — sanity
-            // check by scanning for the magic 33003 in the BMR payload area.
-            bool found33003 = false;
-            for (int i = 0; i + 4 <= bodyBuf.Length; i++)
-            {
-                if (BinaryPrimitives.ReadUInt32LittleEndian(bodyBuf.AsSpan(i, 4)) == 33003u)
-                { found33003 = true; break; }
-            }
-            Assert.True(found33003, "BMR did not carry businessRejectReason=33003");
+            // OutboundBusinessHeader: sessionID(@0,4) + msgSeqNum(@4,4) +
+            // sendingTime(@8,8) + eventIndicator(@16) + marketSegmentID(@17)
+            // BMR payload: refMsgType(byte @18) + padding(@19) +
+            // refSeqNum(uint32 @20) + businessRejectRefId(ulong @24) +
+            // businessRejectReason(uint32 @32).
+            byte refMsgType = bodyBuf[18];
+            uint refSeqNum = BinaryPrimitives.ReadUInt32LittleEndian(bodyBuf.AsSpan(20, 4));
+            ulong businessRejectRefId = BinaryPrimitives.ReadUInt64LittleEndian(bodyBuf.AsSpan(24, 8));
+            uint businessRejectReason = BinaryPrimitives.ReadUInt32LittleEndian(bodyBuf.AsSpan(32, 4));
+            // GAP-14 fix: refMsgType MUST be the schema MessageType enum
+            // byte (15 = SimpleNewOrder), NOT the raw templateId byte
+            // (102). Locking this in so a regression to (byte)templateId
+            // is caught.
+            Assert.Equal((byte)15, refMsgType);
+            Assert.Equal(13u, refSeqNum);
+            Assert.Equal(4242UL, businessRejectRefId);
+            Assert.Equal(33003u, businessRejectReason);
             session.Close("test");
         }
         finally
