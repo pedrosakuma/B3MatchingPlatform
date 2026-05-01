@@ -16,17 +16,21 @@ public class RejectEncoderTests
             terminationCode: SessionRejectEncoder.TerminationCode.DecodingError);
 
         Assert.Equal(SessionRejectEncoder.TerminateTotal, n);
-        Assert.Equal(21, n);
+        Assert.Equal(EntryPointFrameReader.WireHeaderSize + 13, n);
 
-        // SBE header
-        var hdr = buf.AsSpan(0, 8);
+        // SOFH (offset 0..4)
+        Assert.Equal((ushort)n, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)));
+        Assert.Equal(EntryPointFrameReader.SofhEncodingType, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(2, 2)));
+
+        // SBE header (offset SOFH+0 .. SOFH+8)
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
         Assert.Equal((ushort)SessionRejectEncoder.TerminateBlock, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(0, 2)));
         Assert.Equal(EntryPointFrameReader.TidTerminate, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(2, 2)));
         Assert.Equal((ushort)EntryPointFrameReader.SchemaId, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(4, 2)));
         Assert.Equal((ushort)0, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(6, 2)));
 
         // Body
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal(0xDEADBEEFu, BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(0, 4)));
         Assert.Equal(0x0102030405060708UL, BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(4, 8)));
         Assert.Equal((byte)SessionRejectEncoder.TerminationCode.DecodingError, body[12]);
@@ -46,15 +50,19 @@ public class RejectEncoderTests
 
         Assert.Equal(BusinessMessageRejectEncoder.TotalSize(12), n);
 
-        // Header: BlockLength=36, TemplateId=206, SchemaId=1, Version=0
-        var hdr = buf.AsSpan(0, 8);
+        // SOFH
+        Assert.Equal((ushort)n, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)));
+        Assert.Equal(EntryPointFrameReader.SofhEncodingType, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(2, 2)));
+
+        // SBE header: BlockLength=36, TemplateId=206, SchemaId=1, Version=0
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
         Assert.Equal((ushort)BusinessMessageRejectEncoder.BusinessRejectBlock, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(0, 2)));
         Assert.Equal(EntryPointFrameReader.TidBusinessMessageReject, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(2, 2)));
         Assert.Equal((ushort)EntryPointFrameReader.SchemaId, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(4, 2)));
         Assert.Equal((ushort)0, BinaryPrimitives.ReadUInt16LittleEndian(hdr.Slice(6, 2)));
 
         // OutboundBusinessHeader
-        var body = buf.AsSpan(8);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(0, 4)));
         Assert.Equal(99u, BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(4, 4)));
         Assert.Equal(1_700_000_000_000_000_000UL, BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(8, 8)));
@@ -69,7 +77,7 @@ public class RejectEncoderTests
             BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(32, 4)));                   // BusinessRejectReason
 
         // VarData: memo (length 0) then text ("invalid Side", 11 ASCII bytes)
-        var trailer = buf.AsSpan(8 + BusinessMessageRejectEncoder.BusinessRejectBlock);
+        var trailer = buf.AsSpan(EntryPointFrameReader.WireHeaderSize + BusinessMessageRejectEncoder.BusinessRejectBlock);
         Assert.Equal((byte)0, trailer[0]);          // memo length
         Assert.Equal((byte)12, trailer[1]);         // text length
         var text = System.Text.Encoding.ASCII.GetString(trailer.Slice(2, 12));
@@ -85,8 +93,8 @@ public class RejectEncoderTests
             refMsgType: 0, refSeqNum: 0u, businessRejectRefId: 0UL,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
             text: null);
-        Assert.Equal(8 + BusinessMessageRejectEncoder.BusinessRejectBlock + 2, n);
-        var trailer = buf.AsSpan(8 + BusinessMessageRejectEncoder.BusinessRejectBlock);
+        Assert.Equal(EntryPointFrameReader.WireHeaderSize + BusinessMessageRejectEncoder.BusinessRejectBlock + 2, n);
+        var trailer = buf.AsSpan(EntryPointFrameReader.WireHeaderSize + BusinessMessageRejectEncoder.BusinessRejectBlock);
         Assert.Equal((byte)0, trailer[0]);
         Assert.Equal((byte)0, trailer[1]);
     }
@@ -102,7 +110,7 @@ public class RejectEncoderTests
             businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
             text: longText);
         Assert.Equal(BusinessMessageRejectEncoder.TotalSize(BusinessMessageRejectEncoder.MaxTextLength), n);
-        var trailer = buf.AsSpan(8 + BusinessMessageRejectEncoder.BusinessRejectBlock);
+        var trailer = buf.AsSpan(EntryPointFrameReader.WireHeaderSize + BusinessMessageRejectEncoder.BusinessRejectBlock);
         Assert.Equal((byte)0, trailer[0]);
         Assert.Equal((byte)BusinessMessageRejectEncoder.MaxTextLength, trailer[1]);
     }

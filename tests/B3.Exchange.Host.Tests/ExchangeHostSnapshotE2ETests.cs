@@ -194,10 +194,11 @@ public class ExchangeHostSnapshotE2ETests
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,
         char tif, long qty, long priceMantissa)
     {
-        var frame = new byte[8 + 82];
-        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, 8),
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 82];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, EntryPointFrameReader.WireHeaderSize),
+            messageLength: (ushort)frame.Length,
             blockLength: 82, templateId: EntryPointFrameReader.TidSimpleNewOrder, version: 2);
-        var body = frame.AsSpan(8);
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
         body[56] = (byte)side;
@@ -214,12 +215,18 @@ public class ExchangeHostSnapshotE2ETests
     {
         if (timeout <= TimeSpan.Zero) timeout = TimeSpan.FromMilliseconds(1);
         using var cts = new CancellationTokenSource(timeout);
-        var headerBuf = new byte[8];
+        var headerBuf = new byte[EntryPointFrameReader.WireHeaderSize];
         await ReadExactAsync(stream, headerBuf, cts.Token);
-        ushort blockLength = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(0, 2));
-        ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(2, 2));
-        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(6, 2));
-        var body = new byte[blockLength];
+        ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(0, 2));
+        ushort encodingType = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(2, 2));
+        if (encodingType != EntryPointFrameReader.SofhEncodingType)
+            throw new InvalidOperationException($"unexpected SOFH encoding type 0x{encodingType:X4}");
+        var sbeHeader = headerBuf.AsSpan(EntryPointFrameReader.SofhSize);
+        ushort blockLength = BinaryPrimitives.ReadUInt16LittleEndian(sbeHeader.Slice(0, 2));
+        ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(sbeHeader.Slice(2, 2));
+        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(sbeHeader.Slice(6, 2));
+        int bodyLen = messageLength - EntryPointFrameReader.WireHeaderSize;
+        var body = new byte[bodyLen];
         await ReadExactAsync(stream, body, cts.Token);
         return new ReadFrame(templateId, version, body);
     }

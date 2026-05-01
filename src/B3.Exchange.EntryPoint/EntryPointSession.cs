@@ -22,7 +22,7 @@ namespace B3.Exchange.EntryPoint;
 /// </summary>
 public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDisposable
 {
-    private const int InboundHeaderSize = 8;
+    private const int InboundHeaderSize = EntryPointFrameReader.WireHeaderSize;
     private const int DefaultSendQueueCapacity = 1024;
 
     private readonly Stream _stream;

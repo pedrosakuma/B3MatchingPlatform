@@ -81,7 +81,7 @@ public sealed class EntryPointClient : IAsyncDisposable
         _ => -1,
     };
 
-    private const int HeaderSize = 8;
+    private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
 
     private readonly TcpClient _tcp;
     private readonly NetworkStream _stream;
@@ -172,6 +172,7 @@ public sealed class EntryPointClient : IAsyncDisposable
         if (frame.Length < HeaderSize + NewOrderBlockLen)
             throw new ArgumentException("buffer too small for SimpleNewOrderV2", nameof(frame));
         EntryPointFrameReader.WriteHeader(frame.Slice(0, HeaderSize),
+            messageLength: (ushort)(HeaderSize + NewOrderBlockLen),
             blockLength: NewOrderBlockLen,
             templateId: EntryPointFrameReader.TidSimpleNewOrder,
             version: 2);
@@ -202,6 +203,7 @@ public sealed class EntryPointClient : IAsyncDisposable
         if (frame.Length < HeaderSize + CancelBlockLen)
             throw new ArgumentException("buffer too small for OrderCancelRequest", nameof(frame));
         EntryPointFrameReader.WriteHeader(frame.Slice(0, HeaderSize),
+            messageLength: (ushort)(HeaderSize + CancelBlockLen),
             blockLength: CancelBlockLen,
             templateId: EntryPointFrameReader.TidOrderCancelRequest,
             version: 0);
@@ -312,10 +314,26 @@ public sealed class EntryPointClient : IAsyncDisposable
             while (!ct.IsCancellationRequested)
             {
                 await ReadExactAsync(_stream, headerBuf, ct).ConfigureAwait(false);
-                ushort blockLength = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(0, 2));
-                ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(2, 2));
-                ushort schemaId = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(4, 2));
-                ushort version = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(6, 2));
+                ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(0, 2));
+                ushort encodingType = BinaryPrimitives.ReadUInt16LittleEndian(headerBuf.AsSpan(2, 2));
+                if (encodingType != EntryPointFrameReader.SofhEncodingType)
+                {
+                    _logWarn?.Invoke($"unexpected SOFH encodingType=0x{encodingType:X4}, dropping connection");
+                    Close($"unexpected SOFH encodingType=0x{encodingType:X4}");
+                    return;
+                }
+                if (messageLength < EntryPointFrameReader.WireHeaderSize ||
+                    messageLength > EntryPointFrameReader.MaxInboundMessageLength)
+                {
+                    _logWarn?.Invoke($"unreasonable SOFH messageLength={messageLength}, dropping connection");
+                    Close($"unreasonable SOFH messageLength={messageLength}");
+                    return;
+                }
+                var sbe = headerBuf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
+                ushort blockLength = BinaryPrimitives.ReadUInt16LittleEndian(sbe.Slice(0, 2));
+                ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(sbe.Slice(2, 2));
+                ushort schemaId = BinaryPrimitives.ReadUInt16LittleEndian(sbe.Slice(4, 2));
+                ushort version = BinaryPrimitives.ReadUInt16LittleEndian(sbe.Slice(6, 2));
                 if (schemaId != EntryPointFrameReader.SchemaId)
                 {
                     _logWarn?.Invoke($"unexpected schemaId={schemaId}, dropping connection");
@@ -335,11 +353,20 @@ public sealed class EntryPointClient : IAsyncDisposable
                     Close($"unreasonable blockLength={blockLength}");
                     return;
                 }
+                int bodyLength = messageLength - EntryPointFrameReader.WireHeaderSize;
+                if (bodyLength < blockLength || bodyLength > MaxAcceptedBlockLength)
+                {
+                    _logWarn?.Invoke($"SOFH messageLength inconsistent with body (msgLen={messageLength}, block={blockLength}), dropping");
+                    Close($"messageLength inconsistent");
+                    return;
+                }
                 // Rent the body buffer to avoid per-frame heap allocations under load.
-                var body = ArrayPool<byte>.Shared.Rent(blockLength);
+                // Body may include trailing varData beyond BlockLength once GAP-02 lands;
+                // we read the full bodyLength here so the cursor stays aligned.
+                var body = ArrayPool<byte>.Shared.Rent(bodyLength);
                 try
                 {
-                    await ReadExactAsync(_stream, body.AsMemory(0, blockLength), ct).ConfigureAwait(false);
+                    await ReadExactAsync(_stream, body.AsMemory(0, bodyLength), ct).ConfigureAwait(false);
                     Dispatch(templateId, version, body, blockLength);
                 }
                 finally

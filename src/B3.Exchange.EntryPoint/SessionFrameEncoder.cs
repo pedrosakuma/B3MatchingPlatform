@@ -10,7 +10,7 @@ namespace B3.Exchange.EntryPoint;
 /// </summary>
 internal static class SessionFrameEncoder
 {
-    private const int HeaderSize = 8;
+    private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int SequenceBlock = 4;
     public const int SequenceTotal = HeaderSize + SequenceBlock;
 
@@ -24,7 +24,8 @@ internal static class SessionFrameEncoder
     {
         if (dst.Length < SequenceTotal)
             throw new ArgumentException("buffer too small for Sequence frame", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, blockLength: SequenceBlock,
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)SequenceTotal,
+            blockLength: SequenceBlock,
             templateId: EntryPointFrameReader.TidSequence, version: 0);
         MemoryMarshal.Write(dst.Slice(HeaderSize, 4), in nextSeqNo);
         return SequenceTotal;
