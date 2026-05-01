@@ -1,9 +1,20 @@
 # SbeB3Exchange
 
+[![CI](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/ci.yml/badge.svg)](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/ci.yml)
+[![Docker](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/docker.yml/badge.svg)](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/docker.yml)
+[![CodeQL](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/codeql.yml/badge.svg)](https://github.com/pedrosakuma/B3MatchingPlatform/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)](global.json)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-b3--matching-2496ED?logo=docker)](https://github.com/pedrosakuma/B3MatchingPlatform/pkgs/container/b3-matching)
+
 Stateful B3-spec exchange simulator. Speaks the **B3 EntryPoint** SBE protocol
 inbound (TCP) and the **B3 UMDF** market-data wire format outbound (UDP
-multicast). Companion to [`SbeB3UmdfConsumer`][consumer] — designed to run as
-a 24/7 simulated venue against any UMDF consumer.
+multicast or unicast). Companion to [`SbeB3UmdfConsumer`][consumer] — designed
+to run as a 24/7 simulated venue against any UMDF consumer.
+
+> **Status:** active development. The matching engine, EntryPoint TCP gateway,
+> and UMDF publisher are functional; FIXP session lifecycle and operator
+> endpoints are landing incrementally — see open issues for the roadmap.
 
 [consumer]: https://github.com/pedrosakuma/SbeB3UmdfConsumer
 
