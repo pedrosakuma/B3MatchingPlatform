@@ -79,6 +79,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     public async Task StartAsync()
     {
         _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
+        var sessionRegistry = new SessionRegistry();
+        var gatewayRouter = new GatewayRouter(sessionRegistry, _loggerFactory.CreateLogger<GatewayRouter>());
         var routing = new Dictionary<long, ChannelDispatcher>();
         foreach (var ch in _config.Channels)
         {
@@ -110,6 +112,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                     return e;
                 },
                 packetSink: sink,
+                outbound: gatewayRouter,
                 logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
                 metrics: channelMetrics);
             disp.Start();
@@ -186,7 +189,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
         }
 
-        _router = new HostRouter(routing, _loggerFactory.CreateLogger<HostRouter>());
+        _router = new HostRouter(routing, gatewayRouter, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions
         {
@@ -194,7 +197,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
         };
-        _listener = new EntryPointListener(listenEp, _router, _loggerFactory,
+        _listener = new EntryPointListener(listenEp, _router, sessionRegistry, _loggerFactory,
             identityFactory: remote =>
             {
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;

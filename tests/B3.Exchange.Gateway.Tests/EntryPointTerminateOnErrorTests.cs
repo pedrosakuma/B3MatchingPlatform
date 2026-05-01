@@ -17,11 +17,11 @@ public class EntryPointTerminateOnErrorTests
 {
     private sealed class NoOpEngineSink : IInboundCommandSink
     {
-        public void EnqueueNewOrder(in NewOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue) { }
-        public void EnqueueCancel(in CancelOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
-        public void EnqueueReplace(in ReplaceOrderCommand cmd, IGatewayResponseChannel reply, ulong clOrdIdValue, ulong origClOrdIdValue) { }
-        public void OnDecodeError(IGatewayResponseChannel reply, string error) { }
-        public void OnSessionClosed(IGatewayResponseChannel reply) { }
+        public void EnqueueNewOrder(in NewOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue) { }
+        public void EnqueueCancel(in CancelOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) { }
+        public void EnqueueReplace(in ReplaceOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) { }
+        public void OnDecodeError(B3.Exchange.Contracts.SessionId session, string error) { }
+        public void OnSessionClosed(B3.Exchange.Contracts.SessionId session) { }
     }
 
     private static async Task<(EntryPointListener listener, TcpClient client)> ConnectAsync()

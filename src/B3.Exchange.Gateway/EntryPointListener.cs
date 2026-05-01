@@ -18,6 +18,7 @@ public sealed class EntryPointListener : IAsyncDisposable
 
     private readonly IPEndPoint _endpoint;
     private readonly IInboundCommandSink _sink;
+    private readonly SessionRegistry _registry;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<EntryPointListener> _logger;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
@@ -44,20 +45,35 @@ public sealed class EntryPointListener : IAsyncDisposable
     }
 
     public EntryPointListener(IPEndPoint endpoint, IInboundCommandSink sink,
+        SessionRegistry registry,
         ILoggerFactory loggerFactory,
         Func<EndPoint?, AcceptedConnection>? identityFactory = null,
         FixpSessionOptions? sessionOptions = null,
         Action<FixpSession, string>? onSessionClosed = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
+        ArgumentNullException.ThrowIfNull(registry);
         _endpoint = endpoint;
         _sink = sink;
+        _registry = registry;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<EntryPointListener>();
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
         _sessionOptions = sessionOptions ?? FixpSessionOptions.Default;
         _sessionOptions.Validate();
         _onSessionClosed = onSessionClosed;
+    }
+
+    // Convenience overload for callers (e.g., tests) that don't need an
+    // out-of-process session registry. The listener still creates and owns a
+    // private registry instance; sessions register/deregister against it.
+    public EntryPointListener(IPEndPoint endpoint, IInboundCommandSink sink,
+        ILoggerFactory loggerFactory,
+        Func<EndPoint?, AcceptedConnection>? identityFactory = null,
+        FixpSessionOptions? sessionOptions = null,
+        Action<FixpSession, string>? onSessionClosed = null)
+        : this(endpoint, sink, new SessionRegistry(), loggerFactory, identityFactory, sessionOptions, onSessionClosed)
+    {
     }
 
     private AcceptedConnection DefaultIdentityFactory(EndPoint? remote)
@@ -96,6 +112,7 @@ public sealed class EntryPointListener : IAsyncDisposable
                 // become GC-eligible) before invoking the external callback.
                 Action<FixpSession, string> onClosed = (s, reason) =>
                 {
+                    _registry.Deregister(s);
                     lock (_lock) _sessions.Remove(s);
                     _onSessionClosed?.Invoke(s, reason);
                 };
@@ -103,6 +120,7 @@ public sealed class EntryPointListener : IAsyncDisposable
                 var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
                     stream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
                     options: _sessionOptions, onClosed: onClosed);
+                _registry.Register(session);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
             }
