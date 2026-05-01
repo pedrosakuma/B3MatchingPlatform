@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.EntryPoint;
 
@@ -16,7 +17,11 @@ public sealed class EntryPointListener : IAsyncDisposable
 
     private readonly IPEndPoint _endpoint;
     private readonly IEntryPointEngineSink _sink;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<EntryPointListener> _logger;
     private readonly Func<EndPoint?, AcceptedConnection> _identityFactory;
+    private readonly EntryPointSessionOptions _sessionOptions;
+    private readonly Action<EntryPointSession, string>? _onSessionClosed;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -27,11 +32,20 @@ public sealed class EntryPointListener : IAsyncDisposable
     public IPEndPoint? LocalEndpoint => (IPEndPoint?)_listener?.LocalEndpoint;
 
     public EntryPointListener(IPEndPoint endpoint, IEntryPointEngineSink sink,
-        Func<EndPoint?, AcceptedConnection>? identityFactory = null)
+        ILoggerFactory loggerFactory,
+        Func<EndPoint?, AcceptedConnection>? identityFactory = null,
+        EntryPointSessionOptions? sessionOptions = null,
+        Action<EntryPointSession, string>? onSessionClosed = null)
     {
+        ArgumentNullException.ThrowIfNull(loggerFactory);
         _endpoint = endpoint;
         _sink = sink;
+        _loggerFactory = loggerFactory;
+        _logger = loggerFactory.CreateLogger<EntryPointListener>();
         _identityFactory = identityFactory ?? DefaultIdentityFactory;
+        _sessionOptions = sessionOptions ?? EntryPointSessionOptions.Default;
+        _sessionOptions.Validate();
+        _onSessionClosed = onSessionClosed;
     }
 
     private AcceptedConnection DefaultIdentityFactory(EndPoint? remote)
@@ -44,6 +58,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     {
         _listener = new TcpListener(_endpoint);
         _listener.Start();
+        _logger.LogInformation("entrypoint listener bound to {Endpoint}", _listener.LocalEndpoint);
         _acceptTask = Task.Run(() => RunAcceptLoopAsync(_cts.Token));
     }
 
@@ -60,17 +75,36 @@ public sealed class EntryPointListener : IAsyncDisposable
 
                 sock.NoDelay = true;
                 var identity = _identityFactory(sock.RemoteEndPoint);
+                _logger.LogInformation("accepted connection {ConnectionId} from {Remote} sessionId={SessionId}",
+                    identity.ConnectionId, sock.RemoteEndPoint, identity.SessionId);
                 var stream = new NetworkStream(sock, ownsSocket: true);
-                var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId, stream, _sink);
+
+                // Wrap onClosed to remove session from _sessions (so the
+                // disconnected EntryPointSession + its NetworkStream/Socket
+                // become GC-eligible) before invoking the external callback.
+                Action<EntryPointSession, string> onClosed = (s, reason) =>
+                {
+                    lock (_lock) _sessions.Remove(s);
+                    _onSessionClosed?.Invoke(s, reason);
+                };
+
+                var session = new EntryPointSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
+                    stream, _sink, _loggerFactory.CreateLogger<EntryPointSession>(),
+                    options: _sessionOptions, onClosed: onClosed);
                 lock (_lock) _sessions.Add(session);
                 session.Start();
             }
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "entrypoint accept loop terminated unexpectedly");
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("entrypoint listener stopping");
         try { _cts.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
         if (_acceptTask != null) { try { await _acceptTask.ConfigureAwait(false); } catch { } }

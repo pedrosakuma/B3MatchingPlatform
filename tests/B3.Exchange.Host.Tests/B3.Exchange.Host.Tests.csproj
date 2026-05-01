@@ -18,6 +18,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.EntryPoint\B3.Exchange.EntryPoint.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Integration\B3.Exchange.Integration.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.SyntheticTrader\B3.Exchange.SyntheticTrader.csproj" />
   </ItemGroup>
 
   <ItemGroup>

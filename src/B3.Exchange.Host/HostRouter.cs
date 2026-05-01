@@ -1,6 +1,7 @@
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Integration;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Host;
 
@@ -17,11 +18,19 @@ namespace B3.Exchange.Host;
 public sealed class HostRouter : IEntryPointEngineSink
 {
     private readonly IReadOnlyDictionary<long, ChannelDispatcher> _bySecId;
+    private readonly IReadOnlyList<ChannelDispatcher> _allDispatchers;
+    private readonly ILogger<HostRouter> _logger;
     private readonly Func<ulong> _nowNanos;
 
-    public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, Func<ulong>? nowNanos = null)
+    public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, ILogger<HostRouter> logger,
+        Func<ulong>? nowNanos = null)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         _bySecId = routing;
+        // De-duplicate by reference: the routing map keys by SecurityId but
+        // many securities share one dispatcher.
+        _allDispatchers = routing.Values.Distinct().ToList();
+        _logger = logger;
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
 
@@ -51,16 +60,28 @@ public sealed class HostRouter : IEntryPointEngineSink
 
     public void OnDecodeError(IEntryPointResponseChannel reply, string error)
     {
-        // Best-effort: send a generic reject and rely on the session to close
-        // its own connection if the decode error was fatal.
-        reply.WriteExecutionReportReject(
-            new RejectEvent(ClOrdId: "0", SecurityId: 0, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
-            clOrdIdValue: 0);
+        // Logging hook only. The EntryPointSession itself emits the
+        // appropriate SessionReject (Terminate) or BusinessMessageReject
+        // and decides whether to close the connection — the router has no
+        // additional context to add here.
+        _logger.LogWarning("inbound decode error from connection {ConnectionId}: {Error}", reply.ConnectionId, error);
+    }
+
+    public void OnSessionClosed(IEntryPointResponseChannel reply)
+    {
+        // A single session may have placed orders on any channel, so fan the
+        // notification out to ALL dispatchers. Each one enqueues a release
+        // command on its own dispatch thread (see
+        // ChannelDispatcher.OnSessionClosed) so the engine's
+        // single-threaded contract is preserved.
+        foreach (var disp in _allDispatchers)
+            disp.OnSessionClosed(reply);
     }
 
     private void RejectUnknownInstrument(long secId, IEntryPointResponseChannel reply, ulong clOrdIdValue)
     {
+        _logger.LogWarning("rejecting clOrdId={ClOrdId} from connection {ConnectionId}: unknown securityId={SecurityId}",
+            clOrdIdValue, reply.ConnectionId, secId);
         reply.WriteExecutionReportReject(
             new RejectEvent(ClOrdId: clOrdIdValue.ToString(), SecurityId: secId, OrderIdOrZero: 0,
                 Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),

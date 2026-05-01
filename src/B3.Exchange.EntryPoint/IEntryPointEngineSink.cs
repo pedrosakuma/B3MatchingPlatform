@@ -42,6 +42,26 @@ public interface IEntryPointResponseChannel
 
     /// <summary>Inbound message rejected synchronously (validation, unknown order, etc.).</summary>
     bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue);
+
+    /// <summary>
+    /// Send a session-level reject (B3 <c>Terminate</c> with the given
+    /// <paramref name="terminationCode"/>) and gracefully close the
+    /// connection after the frame is flushed to the wire. Used when the
+    /// inbound stream is no longer recoverable (bad header, unknown
+    /// templateId, schema-version mismatch, body length mismatch, ...).
+    /// Returns <c>false</c> if the channel was already closed.
+    /// </summary>
+    bool WriteSessionReject(byte terminationCode);
+
+    /// <summary>
+    /// Send a business-level reject (B3 <c>BusinessMessageReject</c>) for a
+    /// well-framed inbound message that failed business validation. The
+    /// session is kept open; the client may retry with a corrected
+    /// message. <paramref name="refSeqNum"/> echoes the offending message's
+    /// inbound MsgSeqNum so the client can correlate.
+    /// </summary>
+    bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+        uint businessRejectReason, string? text = null);
 }
 
 /// <summary>
@@ -63,4 +83,18 @@ public interface IEntryPointEngineSink
     /// invalid block length, malformed body). The integration layer may close
     /// the connection or emit a generic reject.</summary>
     void OnDecodeError(IEntryPointResponseChannel reply, string error);
+
+    /// <summary>
+    /// Called once when a session's transport closes (peer disconnect, IO
+    /// error, host shutdown). The integration layer MUST drop any cached
+    /// references to <paramref name="reply"/> so the disconnected
+    /// <see cref="EntryPointSession"/> can be garbage-collected.
+    ///
+    /// The session's resting orders stay on the book — they ARE the book —
+    /// but any reply-channel back-references (e.g. orderId → reply maps used
+    /// to route passive-side fills) MUST be released. After this call the
+    /// integration layer treats further passive fills on those orders as
+    /// "unowned" (no ER emitted) until / unless a fresh session takes over.
+    /// </summary>
+    void OnSessionClosed(IEntryPointResponseChannel reply);
 }

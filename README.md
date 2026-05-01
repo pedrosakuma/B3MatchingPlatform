@@ -20,6 +20,10 @@ a 24/7 simulated venue against any UMDF consumer.
   UMDF packets, publishes via `IUmdfPacketSink`.
 - **`B3.Exchange.Host`** — JSON-configured single-binary host wiring
   EntryPoint listener + dispatchers + multicast UDP sinks.
+- **`B3.Exchange.SyntheticTrader`** — separate console client that connects
+  to the host over EntryPoint TCP and drives continuous order flow
+  (market-maker + noise-taker strategies, seeded RNG for repro). See
+  `config/synthetic-trader.json` and `docker-compose.synthtrader.yml`.
 - **`B3.Umdf.WireEncoder`** — stateless byte-level encoders for UMDF MBO,
   Trade, and Snapshot frames (V16 schema).
 - **`B3.Umdf.Sbe` / `B3.EntryPoint.Sbe`** — SBE bindings generated from the

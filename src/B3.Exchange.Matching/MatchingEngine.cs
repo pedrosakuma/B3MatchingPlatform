@@ -1,4 +1,5 @@
 using B3.Exchange.Instruments;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Matching;
 
@@ -14,8 +15,25 @@ public sealed class MatchingEngine
     private readonly Dictionary<long, InstrumentTradingRules> _rulesById;
     private readonly Dictionary<long, LimitOrderBook> _booksById;
     private readonly IMatchingEventSink _sink;
+    private readonly ILogger<MatchingEngine> _logger;
     private readonly SelfTradePrevention _stp;
 
+    // === Long-running stability audit (issue #4) ===
+    //   _nextOrderId : long. ~9.22e18 max. At 1e9 orders/sec → 292 years.
+    //                 Effectively non-overflowing for 24/7 operation.
+    //   _nextTradeId : uint. ~4.29e9 max. At 100k trades/sec → ~12 hours.
+    //                 The B3 UMDF wire schema's TradeID field is uint, so we
+    //                 cannot widen here without a wire-format change. Wraps
+    //                 to 0 silently; downstream consumers correlate trades
+    //                 via (TradeID, TradeDate) so a wrap in the same trading
+    //                 day would create ambiguity. Acceptable for the
+    //                 simulator (sessions reset trade-day boundaries); flag
+    //                 for re-evaluation if we ever target sustained
+    //                 production-grade rates inside one trading day.
+    //   _rptSeq      : uint. Same limits as _nextTradeId. Per-channel,
+    //                 per-(SequenceVersion). The integration layer's
+    //                 SequenceVersion bump on packet-seq overflow does NOT
+    //                 reset _rptSeq — they are independent counters.
     private long _nextOrderId = 1;
     private uint _nextTradeId = 1;
     private uint _rptSeq;
@@ -23,11 +41,14 @@ public sealed class MatchingEngine
     private bool _dispatching;
 
     public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink,
+        ILogger<MatchingEngine> logger,
         SelfTradePrevention selfTradePrevention = SelfTradePrevention.None)
     {
         ArgumentNullException.ThrowIfNull(instruments);
         ArgumentNullException.ThrowIfNull(sink);
+        ArgumentNullException.ThrowIfNull(logger);
         _sink = sink;
+        _logger = logger;
         _stp = selfTradePrevention;
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
@@ -37,6 +58,7 @@ public sealed class MatchingEngine
             _rulesById.Add(i.SecurityId, rules);
             _booksById.Add(i.SecurityId, new LimitOrderBook(i.SecurityId));
         }
+        _logger.LogInformation("matching engine initialized with {InstrumentCount} instruments", _rulesById.Count);
     }
 
     public uint CurrentRptSeq => _rptSeq;

@@ -91,10 +91,11 @@ public sealed class SnapshotRotator
 
     /// <summary>
     /// Publishes a complete snapshot for the next instrument in the rotation.
-    /// Returns the number of UDP packets emitted (always &gt;= 1, since even
-    /// an empty book emits the header packet). Caller MUST invoke from the
-    /// dispatcher thread so that <see cref="ISnapshotBookSource.EnumerateBook"/>
-    /// observes a stable book.
+    /// Returns the number of UDP packets emitted: 0 when
+    /// <see cref="ISnapshotBookSource.SecurityIds"/> is empty; otherwise at
+    /// least 1, since even an empty book emits the header packet. Caller MUST
+    /// invoke from the dispatcher thread so that
+    /// <see cref="ISnapshotBookSource.EnumerateBook"/> observes a stable book.
     /// </summary>
     public int PublishNext()
     {
@@ -112,7 +113,7 @@ public sealed class SnapshotRotator
     /// </summary>
     public int PublishFor(long securityId)
     {
-        // Materialise the book sides into pooled buffers. Snapshot ticks are
+        // Materialise the book sides into lists. Snapshot ticks are
         // low-frequency (typically every few seconds per instrument) so a
         // per-tick allocation is acceptable; the alternative — caching
         // per-symbol scratch lists — adds complexity for negligible benefit.
@@ -128,8 +129,11 @@ public sealed class SnapshotRotator
         // B3 §7.4 illiquid case: no incremental history → publish header with
         // LastRptSeq absent. Once any incremental event has been emitted we
         // always stamp the live RptSeq, even if the book is empty (e.g. all
-        // orders matched and no new ones have arrived).
-        uint? lastRptSeq = _source.CurrentRptSeq == 0 ? null : _source.CurrentRptSeq;
+        // orders matched and no new ones have arrived). A zero RptSeq is
+        // therefore treated as "illiquid" only when the book is also empty.
+        uint currentRptSeq = _source.CurrentRptSeq;
+        bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
+        uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
 
         ushort version = SequenceVersion;
         uint firstSeq = SequenceNumber + 1;

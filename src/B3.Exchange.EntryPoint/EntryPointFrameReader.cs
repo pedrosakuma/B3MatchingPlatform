@@ -13,12 +13,22 @@ public static class EntryPointFrameReader
 {
     public const ushort SchemaId = 1;
 
+    /// <summary>Outbound (session-level): Terminate (V0). Used as a
+    /// "SessionReject" — see <see cref="SessionRejectEncoder"/>.</summary>
+    public const ushort TidTerminate = 7;
+
+    /// <summary>Outbound (business-level): BusinessMessageReject (V0). See
+    /// <see cref="BusinessMessageRejectEncoder"/>.</summary>
+    public const ushort TidBusinessMessageReject = 206;
+
     /// <summary>Inbound: SimpleNewOrder (V2).</summary>
     public const ushort TidSimpleNewOrder = 100;
     /// <summary>Inbound: SimpleModifyOrder (V2).</summary>
     public const ushort TidSimpleModifyOrder = 101;
     /// <summary>Inbound: OrderCancelRequest (V6 base, no version variants).</summary>
     public const ushort TidOrderCancelRequest = 105;
+    /// <summary>Session: Sequence (FIXP, also used as heartbeat). Bidirectional.</summary>
+    public const ushort TidSequence = 9;
 
     /// <summary>Outbound: ExecutionReport_New (V2).</summary>
     public const ushort TidExecutionReportNew = 200;
@@ -37,6 +47,7 @@ public static class EntryPointFrameReader
         (TidSimpleNewOrder, 2) => 82,            // SimpleNewOrderV2.MESSAGE_SIZE
         (TidSimpleModifyOrder, 2) => 98,         // SimpleModifyOrderV2.MESSAGE_SIZE
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
+        (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
         _ => -1
     };
 
