@@ -123,40 +123,40 @@ public static class FixpStateMachine
     public static FixpTransition Apply(FixpState state, FixpEvent ev) => (state, ev) switch
     {
         // ── Idle ──────────────────────────────────────────────────────────
-        (FixpState.Idle, FixpEvent.Negotiate)          => new(FixpState.Negotiated, FixpAction.Accept),
-        (FixpState.Idle, FixpEvent.Establish)          => new(FixpState.Idle, FixpAction.NotApplied),
+        (FixpState.Idle, FixpEvent.Negotiate) => new(FixpState.Negotiated, FixpAction.Accept),
+        (FixpState.Idle, FixpEvent.Establish) => new(FixpState.Idle, FixpAction.NotApplied),
         (FixpState.Idle, FixpEvent.ApplicationMessage) => new(FixpState.Terminated, FixpAction.RejectAndTerminateUnnegotiated),
-        (FixpState.Idle, FixpEvent.Sequence)           => new(FixpState.Idle, FixpAction.DropSilently),
-        (FixpState.Idle, FixpEvent.Terminate)          => new(FixpState.Terminated, FixpAction.Accept),
-        (FixpState.Idle, FixpEvent.RetransmitRequest)  => new(FixpState.Idle, FixpAction.DropSilently),
-        (FixpState.Idle, FixpEvent.Detach)             => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Idle, FixpEvent.Sequence) => new(FixpState.Idle, FixpAction.DropSilently),
+        (FixpState.Idle, FixpEvent.Terminate) => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Idle, FixpEvent.RetransmitRequest) => new(FixpState.Idle, FixpAction.DropSilently),
+        (FixpState.Idle, FixpEvent.Detach) => new(FixpState.Terminated, FixpAction.Accept),
 
         // ── Negotiated ────────────────────────────────────────────────────
-        (FixpState.Negotiated, FixpEvent.Negotiate)          => new(FixpState.Negotiated, FixpAction.NegotiateRejectAlreadyNegotiated),
-        (FixpState.Negotiated, FixpEvent.Establish)          => new(FixpState.Established, FixpAction.Accept),
+        (FixpState.Negotiated, FixpEvent.Negotiate) => new(FixpState.Negotiated, FixpAction.NegotiateRejectAlreadyNegotiated),
+        (FixpState.Negotiated, FixpEvent.Establish) => new(FixpState.Established, FixpAction.Accept),
         (FixpState.Negotiated, FixpEvent.ApplicationMessage) => new(FixpState.Terminated, FixpAction.RejectAndTerminateUnestablished),
-        (FixpState.Negotiated, FixpEvent.Sequence)           => new(FixpState.Negotiated, FixpAction.NotApplied),
-        (FixpState.Negotiated, FixpEvent.Terminate)          => new(FixpState.Terminated, FixpAction.Accept),
-        (FixpState.Negotiated, FixpEvent.RetransmitRequest)  => new(FixpState.Negotiated, FixpAction.DropSilently),
-        (FixpState.Negotiated, FixpEvent.Detach)             => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Negotiated, FixpEvent.Sequence) => new(FixpState.Negotiated, FixpAction.NotApplied),
+        (FixpState.Negotiated, FixpEvent.Terminate) => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Negotiated, FixpEvent.RetransmitRequest) => new(FixpState.Negotiated, FixpAction.DropSilently),
+        (FixpState.Negotiated, FixpEvent.Detach) => new(FixpState.Terminated, FixpAction.Accept),
 
         // ── Established ───────────────────────────────────────────────────
-        (FixpState.Established, FixpEvent.Negotiate)          => new(FixpState.Established, FixpAction.NegotiateReject),
-        (FixpState.Established, FixpEvent.Establish)          => new(FixpState.Established, FixpAction.EstablishReject),
+        (FixpState.Established, FixpEvent.Negotiate) => new(FixpState.Established, FixpAction.NegotiateReject),
+        (FixpState.Established, FixpEvent.Establish) => new(FixpState.Established, FixpAction.EstablishReject),
         (FixpState.Established, FixpEvent.ApplicationMessage) => new(FixpState.Established, FixpAction.Accept),
-        (FixpState.Established, FixpEvent.Sequence)           => new(FixpState.Established, FixpAction.Accept),
-        (FixpState.Established, FixpEvent.Terminate)          => new(FixpState.Terminated, FixpAction.Accept),
-        (FixpState.Established, FixpEvent.RetransmitRequest)  => new(FixpState.Established, FixpAction.Replay),
-        (FixpState.Established, FixpEvent.Detach)             => new(FixpState.Suspended, FixpAction.Accept),
+        (FixpState.Established, FixpEvent.Sequence) => new(FixpState.Established, FixpAction.Accept),
+        (FixpState.Established, FixpEvent.Terminate) => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Established, FixpEvent.RetransmitRequest) => new(FixpState.Established, FixpAction.Replay),
+        (FixpState.Established, FixpEvent.Detach) => new(FixpState.Suspended, FixpAction.Accept),
 
         // ── Suspended (transport detached; session lifecycle alive) ───────
-        (FixpState.Suspended, FixpEvent.Negotiate)          => new(FixpState.Suspended, FixpAction.NegotiateRejectAlreadyNegotiated),
-        (FixpState.Suspended, FixpEvent.Establish)          => new(FixpState.Established, FixpAction.Accept), // re-attach
+        (FixpState.Suspended, FixpEvent.Negotiate) => new(FixpState.Suspended, FixpAction.NegotiateRejectAlreadyNegotiated),
+        (FixpState.Suspended, FixpEvent.Establish) => new(FixpState.Established, FixpAction.Accept), // re-attach
         (FixpState.Suspended, FixpEvent.ApplicationMessage) => new(FixpState.Suspended, FixpAction.DropSilently),
-        (FixpState.Suspended, FixpEvent.Sequence)           => new(FixpState.Suspended, FixpAction.DropSilently),
-        (FixpState.Suspended, FixpEvent.Terminate)          => new(FixpState.Terminated, FixpAction.Accept),
-        (FixpState.Suspended, FixpEvent.RetransmitRequest)  => new(FixpState.Suspended, FixpAction.DeferredToReestablish),
-        (FixpState.Suspended, FixpEvent.Detach)             => new(FixpState.Suspended, FixpAction.DropSilently),
+        (FixpState.Suspended, FixpEvent.Sequence) => new(FixpState.Suspended, FixpAction.DropSilently),
+        (FixpState.Suspended, FixpEvent.Terminate) => new(FixpState.Terminated, FixpAction.Accept),
+        (FixpState.Suspended, FixpEvent.RetransmitRequest) => new(FixpState.Suspended, FixpAction.DeferredToReestablish),
+        (FixpState.Suspended, FixpEvent.Detach) => new(FixpState.Suspended, FixpAction.DropSilently),
 
         // ── Terminated (terminal) ─────────────────────────────────────────
         (FixpState.Terminated, _) => new(FixpState.Terminated, FixpAction.Terminal),
