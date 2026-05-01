@@ -99,7 +99,14 @@ public static class EntryPointFrameReader
         ushort SchemaId,
         ushort Version,
         int BodyLength,
-        int MessageLength);
+        int MessageLength,
+        int BlockLength)
+    {
+        /// <summary>Bytes of trailing variable-length data after the SBE
+        /// fixed root block (= <see cref="BodyLength"/> -
+        /// <see cref="BlockLength"/>). Always ≥ 0.</summary>
+        public int VarDataLength => BodyLength - BlockLength;
+    }
 
     /// <summary>
     /// Parses the 12-byte composite header (SOFH + SBE) and validates schema /
@@ -167,20 +174,23 @@ public static class EntryPointFrameReader
             return false;
         }
 
-        // For templates without varData (current set), messageLength must be exactly
-        // SofhSize + SbeHeaderSize + BlockLength. GAP-02 will relax this once
-        // length-prefixed varData segments are honoured.
-        int expectedMessageLength = WireHeaderSize + blockLength;
-        if (messageLength != expectedMessageLength)
+        // Per spec §3.5, application messages may carry length-prefixed
+        // variable-length data segments after the SBE fixed root block.
+        // SOFH messageLength is the source of truth for the total frame
+        // size, so we accept anything ≥ WireHeaderSize + BlockLength and
+        // hand the trailing bytes to varData decoding (GAP-02).
+        int minMessageLength = WireHeaderSize + blockLength;
+        if (messageLength < minMessageLength)
         {
             error = HeaderError.MessageLengthMismatch;
-            message = $"SOFH messageLength={messageLength} != WireHeader({WireHeaderSize})+BlockLength({blockLength})={expectedMessageLength}";
+            message = $"SOFH messageLength={messageLength} < WireHeader({WireHeaderSize})+BlockLength({blockLength})={minMessageLength}";
             return false;
         }
 
         info = new FrameInfo(templateId, schemaId, version,
             BodyLength: messageLength - WireHeaderSize,
-            MessageLength: messageLength);
+            MessageLength: messageLength,
+            BlockLength: blockLength);
         return true;
     }
 

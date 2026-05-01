@@ -21,7 +21,24 @@ public class EntryPointFrameReaderTests
         Assert.True(ok, err);
         Assert.Equal(EntryPointFrameReader.TidSimpleNewOrder, info.TemplateId);
         Assert.Equal(82, info.BodyLength);
+        Assert.Equal(82, info.BlockLength);
+        Assert.Equal(0, info.VarDataLength);
         Assert.Equal(Wire + 82, info.MessageLength);
+    }
+
+    [Fact]
+    public void TryParse_AcceptsTrailingVarDataLength()
+    {
+        // GAP-02: messageLength may exceed WireHeader + BlockLength to carry varData.
+        Span<byte> buf = stackalloc byte[Wire];
+        EntryPointFrameReader.WriteHeader(buf,
+            messageLength: (ushort)(Wire + 82 + 5),
+            blockLength: 82, templateId: EntryPointFrameReader.TidSimpleNewOrder, version: 2);
+
+        Assert.True(EntryPointFrameReader.TryParseInboundHeader(buf, out var info, out _));
+        Assert.Equal(82, info.BlockLength);
+        Assert.Equal(82 + 5, info.BodyLength);
+        Assert.Equal(5, info.VarDataLength);
     }
 
     [Fact]
@@ -85,12 +102,12 @@ public class EntryPointFrameReaderTests
     }
 
     [Fact]
-    public void TryParse_RejectsMessageLengthInconsistentWithBlock()
+    public void TryParse_RejectsMessageLengthBelowMinimum()
     {
         Span<byte> buf = stackalloc byte[Wire];
-        // Claim one byte more than header+block.
+        // Claim one byte LESS than header+block (under GAP-02 we accept >=).
         EntryPointFrameReader.WriteHeader(buf,
-            messageLength: (ushort)(Wire + 82 + 1),
+            messageLength: (ushort)(Wire + 82 - 1),
             blockLength: 82, templateId: EntryPointFrameReader.TidSimpleNewOrder, version: 2);
 
         Assert.False(EntryPointFrameReader.TryParseInboundHeader(buf, out _, out var err, out _));
