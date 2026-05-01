@@ -1,10 +1,10 @@
 using System.Runtime.InteropServices;
 using B3.Exchange.Instruments;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 
-namespace B3.Exchange.Integration.Tests;
+namespace B3.Exchange.Core.Tests;
 
 /// <summary>
 /// Verifies that <see cref="InstrumentDefinitionPublisher"/> emits one

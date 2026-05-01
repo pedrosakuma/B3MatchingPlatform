@@ -1,7 +1,7 @@
 using B3.Exchange.Matching;
 using B3.Umdf.WireEncoder;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Per-UMDF-channel snapshot publisher. Each invocation of

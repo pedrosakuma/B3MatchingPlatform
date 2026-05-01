@@ -1,5 +1,5 @@
 using B3.Exchange.Host;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 
 namespace B3.Exchange.SyntheticTrader.Tests;
 

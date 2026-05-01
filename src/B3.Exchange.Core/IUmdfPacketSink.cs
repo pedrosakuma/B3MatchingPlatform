@@ -1,4 +1,4 @@
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Sink for fully-formed UMDF incremental packets ready for the wire.

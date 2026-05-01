@@ -1,4 +1,4 @@
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Single readiness signal. Composes additively: the host's overall

@@ -1,6 +1,6 @@
 using B3.Exchange.Matching;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Minimal read-only view that <see cref="SnapshotRotator"/> needs over a

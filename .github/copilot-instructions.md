@@ -81,7 +81,7 @@ Layered projects under `src/` (build order roughly bottom-up):
 5. `B3.Exchange.EntryPoint` — TCP listener, framed SBE inbound decoder,
    ExecutionReport encoder. Each TCP session implements
    `IEntryPointResponseChannel`.
-6. `B3.Exchange.Integration` — `ChannelDispatcher`: bounded inbound queue +
+6. `B3.Exchange.Core` — `ChannelDispatcher`: bounded inbound queue +
    single dispatch thread per channel. Pumps decoded commands into the engine,
    buffers emitted UMDF events for the duration of one command, then flushes
    them as a single packet (≤1400 bytes, `PacketHeader` + N inc messages) to

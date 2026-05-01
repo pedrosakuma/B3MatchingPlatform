@@ -153,7 +153,7 @@ src/
       CredentialValidator.cs         ← #43 (GAP-05)
     GatewayHost.cs                   ← wires listener → sessions → ICoreInbound
 
-  B3.Exchange.Core/                  ← RENAMED from B3.Exchange.Integration
+  B3.Exchange.Core/                  ← RENAMED from B3.Exchange.Core
     HostRouter.cs
     ChannelDispatcher.cs             ← no longer holds IEntryPointResponseChannel
     InstrumentDefinitionPublisher.cs
@@ -569,7 +569,7 @@ testing of later phases.
 - Create `B3.Exchange.Gateway`; move all of `B3.Exchange.EntryPoint`
   into it; rename old `EntryPointSession` to `LegacyTcpSession` and
   carve out `TcpTransport` + `FixpSession` skeletons.
-- Rename `B3.Exchange.Integration` → `B3.Exchange.Core`. Strip all
+- Rename `B3.Exchange.Core` → `B3.Exchange.Core`. Strip all
   references to `IEntryPointResponseChannel` from `ChannelDispatcher`;
   replace with `IGatewayInbound` from contracts.
 - Wire both via `B3.Exchange.Host` using in-process implementations of

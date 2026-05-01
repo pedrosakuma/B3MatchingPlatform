@@ -15,7 +15,7 @@ a 24/7 simulated venue against any UMDF consumer.
 - **`B3.Exchange.Instruments`** — JSON instrument loader.
 - **`B3.Exchange.EntryPoint`** — TCP listener, framed SBE inbound decoder,
   ExecutionReport encoder.
-- **`B3.Exchange.Integration`** — per-channel `ChannelDispatcher`: bounded
+- **`B3.Exchange.Core`** — per-channel `ChannelDispatcher`: bounded
   inbound queue, single dispatch thread, packs MBO/Trade frames into 1400-byte
   UMDF packets, publishes via `IUmdfPacketSink`.
 - **`B3.Exchange.Host`** — JSON-configured single-binary host wiring

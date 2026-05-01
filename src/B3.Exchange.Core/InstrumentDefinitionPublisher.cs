@@ -1,7 +1,7 @@
 using B3.Exchange.Instruments;
 using B3.Umdf.WireEncoder;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// Periodically emits <c>SecurityDefinition_12</c> ("SecurityDefinition_d"

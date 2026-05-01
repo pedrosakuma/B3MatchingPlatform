@@ -1,12 +1,12 @@
 using System.Runtime.InteropServices;
 using B3.Exchange.EntryPoint;
 using B3.Exchange.Instruments;
-using B3.Exchange.Integration;
+using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace B3.Exchange.Integration.Tests;
+namespace B3.Exchange.Core.Tests;
 
 public class ChannelDispatcherTests
 {

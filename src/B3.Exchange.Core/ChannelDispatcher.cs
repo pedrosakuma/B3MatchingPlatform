@@ -2,7 +2,7 @@ using B3.Exchange.EntryPoint;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 
-namespace B3.Exchange.Integration;
+namespace B3.Exchange.Core;
 
 /// <summary>
 /// One per UMDF channel. Owns:
