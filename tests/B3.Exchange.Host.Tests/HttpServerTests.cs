@@ -134,4 +134,67 @@ public class HttpServerTests
         }
         Assert.Equal(System.Net.HttpStatusCode.ServiceUnavailable, last);
     }
+
+    [Fact]
+    public async Task OperatorBumpVersion_Returns202_AndEmitsChannelResetOnIncrementalSink()
+    {
+        var (cfg, _) = BuildConfig();
+        var incSink = new RecordingPacketSink();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => incSink);
+        await host.StartAsync();
+        var http = host.HttpEndpoint!;
+
+        using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
+
+        var resp = await client.PostAsync("/channel/84/bump-version", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, resp.StatusCode);
+
+        // Wait for the dispatcher to drain the bump-version work item.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (incSink.Packets.Count == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+
+        Assert.True(incSink.Packets.Count >= 1, "expected ChannelReset packet on incremental sink");
+        var packet = incSink.Packets[0];
+
+        // SBE TemplateId == 11 (ChannelReset_11). PacketHeader=16, Framing=4,
+        // SBE MessageHeader: BlockLength(2) + TemplateId(2) ...
+        int sbeHdrStart = 16 + 4;
+        ushort templateId = System.Runtime.InteropServices.MemoryMarshal.Read<ushort>(
+            packet.AsSpan(sbeHdrStart + 2, 2));
+        Assert.Equal((ushort)11, templateId);
+
+        // SequenceVersion bumped from the default 1 to 2.
+        ushort version = System.Runtime.InteropServices.MemoryMarshal.Read<ushort>(packet.AsSpan(2, 2));
+        Assert.Equal((ushort)2, version);
+    }
+
+    [Fact]
+    public async Task OperatorSnapshotNow_Returns202_AndUnknownChannelReturns404()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var http = host.HttpEndpoint!;
+
+        using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
+
+        var ok = await client.PostAsync("/channel/84/snapshot-now", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, ok.StatusCode);
+
+        var unknown = await client.PostAsync("/channel/200/snapshot-now", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
+
+        var unknownBump = await client.PostAsync("/channel/200/bump-version", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknownBump.StatusCode);
+    }
+
+    private sealed class RecordingPacketSink : IUmdfPacketSink
+    {
+        public List<byte[]> Packets { get; } = new();
+        public void Publish(byte channelNumber, ReadOnlySpan<byte> packet)
+        {
+            lock (Packets) Packets.Add(packet.ToArray());
+        }
+    }
 }

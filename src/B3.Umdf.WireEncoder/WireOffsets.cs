@@ -80,6 +80,14 @@ public static class WireOffsets
     public const int SnapOrdersGroupSizeEncodingSize = 3;      // BlockLength(ushort) + NumInGroup(byte)
     public const int SnapOrdersEntrySize = 42;                 // per-entry (V16 layout)
 
+    // ---- ChannelReset_11 (V16) ----
+    // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
+    // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then
+    // MDEntryTimestamp @4 (8 bytes ulong nanos). Total 12 bytes.
+    public const int ChannelResetBlockLength = 12;
+    public const int ChannelResetBodyMatchEventIndicatorOffset = 0;
+    public const int ChannelResetBodyMdEntryTimestampOffset = 4;
+
     // ---- SecurityDefinition_12 (V16) ----
     public const int SecDefBlockLength = 230;
     public const int SecDefSecurityIdOffset = 0;

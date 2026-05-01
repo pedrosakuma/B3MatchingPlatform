@@ -153,14 +153,49 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     private void RecordHeartbeat()
         => _metrics?.RecordTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
+    private void ProcessBumpVersion()
+    {
+        // Atomic operator-initiated channel reset (issue #6). Order matters:
+        //   1. Wipe per-instrument books and reset RptSeq on the engine.
+        //   2. Bump incremental SequenceVersion + reset SequenceNumber.
+        //   3. Bump snapshot rotator's SequenceVersion (if attached).
+        //   4. Emit one ChannelReset_11 frame, flushed as a single-message
+        //      packet under the NEW SequenceVersion. Because we just reset
+        //      SequenceNumber to 0, FlushPacket() stamps SequenceNumber=1.
+        // Anything that races with this would violate the dispatch-thread
+        // invariant — ProcessOne is the sole caller and is invoked only
+        // from the dispatch loop.
+        _engine.ResetForChannelReset();
+        SequenceVersion = (ushort)(SequenceVersion + 1);
+        SequenceNumber = 0;
+        _snapshotRotator?.BumpSequenceVersion();
+
+        // Force-write the ChannelReset_11 frame using the standard
+        // ReserveOrFlush/Commit path so the packet header reflects the
+        // NEW SequenceVersion.
+        _packetWritten = 0;
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.ChannelResetBlockLength);
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteChannelResetFrame(dst, _nowNanos());
+        Commit(n);
+        FlushPacket();
+    }
+
     internal void ProcessOne(in WorkItem item)
     {
-        if (item.Kind == WorkKind.SnapshotRotation)
+        if (item.Kind == WorkKind.SnapshotRotation || item.Kind == WorkKind.OperatorSnapshotNow)
         {
             // Snapshot ticks bypass the per-command incremental packet buffer
             // entirely — they have their own sink + sequence space owned by
             // the rotator and emit one or more complete packets directly.
             _snapshotRotator?.PublishNext();
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorBumpVersion)
+        {
+            ProcessBumpVersion();
             return;
         }
 
@@ -384,6 +419,31 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
     public void OnSessionClosed(IEntryPointResponseChannel reply)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.ReleaseOwner, reply, 0, 0, null, null, null));
 
+    /// <summary>
+    /// Operator command (issue #6): forces an immediate snapshot publish on
+    /// the next available dispatcher cycle. Identical wire effect to a
+    /// <see cref="EnqueueSnapshotTick"/>; the distinct work-kind exists so
+    /// future operator commands can be metered/logged independently of the
+    /// scheduled cadence ticks. Returns <c>false</c> if the inbound queue
+    /// is full. Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorSnapshotNow()
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSnapshotNow, null!, 0, 0, null, null, null));
+
+    /// <summary>
+    /// Operator command (issue #6): atomically (a) bumps the incremental
+    /// channel's <see cref="SequenceVersion"/> + the attached snapshot
+    /// rotator's <c>SequenceVersion</c>, (b) clears every per-instrument
+    /// order book, (c) resets the engine's <c>RptSeq</c> counter to 0, and
+    /// (d) emits a single <c>ChannelReset_11</c> frame on the incremental
+    /// channel under the NEW <see cref="SequenceVersion"/>. The next
+    /// snapshot publish (whether scheduled or operator-forced) will reflect
+    /// the empty book stamped with the new versions. Returns <c>false</c>
+    /// if the inbound queue is full. Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorBumpVersion()
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBumpVersion, null!, 0, 0, null, null, null));
+
     // ====== IMatchingEventSink ======
 
     public void OnOrderAccepted(in OrderAcceptedEvent e)
@@ -527,7 +587,7 @@ public sealed partial class ChannelDispatcher : IEntryPointEngineSink, IMatching
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation, ReleaseOwner }
+    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
 
     internal readonly record struct OrderOwnership(IEntryPointResponseChannel Reply, ulong ClOrdId, uint EnteringFirm);
 
