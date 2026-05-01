@@ -66,6 +66,8 @@ public static class EntryPointFrameReader
     public const ushort TidRetransmission = 13;
     /// <summary>Session: RetransmitReject (FIXP, outbound). See spec §4.5.6.</summary>
     public const ushort TidRetransmitReject = 14;
+    /// <summary>Session: NotApplied (FIXP, outbound). See spec §4.5.5 / §4.6.2.</summary>
+    public const ushort TidNotApplied = 8;
     /// <summary>Outbound only: NegotiateResponse (template id 2).</summary>
     public const ushort TidNegotiateResponse = 2;
     /// <summary>Outbound only: NegotiateReject (template id 3).</summary>
