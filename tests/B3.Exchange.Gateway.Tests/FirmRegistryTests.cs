@@ -30,6 +30,14 @@ public class FirmRegistryTests
     }
 
     [Fact]
+    public void Leading_zero_session_id_throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new FirmRegistry(new[] { Firm("F1") }, new[] { Cred("01", "F1") }));
+        Assert.Contains("leading zero", ex.Message);
+    }
+
+    [Fact]
     public void FindFirm_returns_null_when_unknown()
     {
         var r = new FirmRegistry(new[] { Firm("F1") }, Array.Empty<SessionCredential>());

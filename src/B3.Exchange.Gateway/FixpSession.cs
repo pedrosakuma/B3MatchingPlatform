@@ -362,9 +362,22 @@ public sealed class FixpSession : IAsyncDisposable
         // No validator configured → legacy single-tenant mode: accept the
         // peer's claim wholesale (Phase 1 behavior). Stamp identity
         // fields so subsequent app messages carry the peer's values.
+        // We still consult the state machine: a second Negotiate on an
+        // already-negotiated connection MUST be rejected with
+        // ALREADY_NEGOTIATED per spec §4.5.3.1, even in legacy mode.
         if (_validator is null || _claims is null)
         {
-            _ = ApplyTransition(FixpEvent.Negotiate);
+            var action = ApplyTransition(FixpEvent.Negotiate);
+            if (action != FixpAction.Accept)
+            {
+                var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+                NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                    req.TimestampNanos, enteringFirm: null,
+                    B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.ALREADY_NEGOTIATED,
+                    currentSessionVerId: SessionVerId == 0UL ? null : SessionVerId);
+                return NegotiateStep.Rejected(rejectFrame,
+                    $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
+            }
             SessionId = req.SessionId;
             EnteringFirm = req.EnteringFirm;
             SessionVerId = req.SessionVerId;

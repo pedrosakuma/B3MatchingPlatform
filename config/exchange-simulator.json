@@ -26,11 +26,15 @@
     { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 },
     { "id": "FIRM02", "name": "Beta Corretora",  "enteringFirmCode": 200 }
   ],
-  // Per-(firm, session) credentials. The Negotiate handshake (#42) will
-  // resolve a session by the wire-format uint32 sessionID and validate the
-  // peer's access_key against accessKey (when auth.devMode is false).
-  // Pre-#42 the host picks the lowest sessionId as the
-  // default tenant for every accept.
+  // Per-(firm, session) credentials. The Negotiate handshake (#42) resolves
+  // a session by the wire-format uint32 sessionID and validates the peer's
+  // access_key against accessKey (when auth.devMode is false).
+  // The host also picks one session as a fallback "default tenant" used to
+  // stamp the EnteringFirm field on TCP accept (before Negotiate completes);
+  // the choice is the lexicographically-first sessionId string. With the
+  // numeric sessionIds enforced below this matches numeric order as long as
+  // every sessionId has the same digit count — keep them aligned to avoid
+  // surprises (e.g. "2" sorts before "10101" lexicographically).
   // sessionId MUST parse as a decimal uint32 (FIXP wire SessionID is uint32).
   "sessions": [
     { "sessionId": "10101", "firmId": "FIRM01", "accessKey": "dev-key-1" },
