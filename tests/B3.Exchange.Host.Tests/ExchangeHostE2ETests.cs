@@ -41,6 +41,7 @@ public class ExchangeHostE2ETests
         var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
         var cfg = new HostConfig
         {
+            Auth = new AuthConfig { RequireFixpHandshake = false },
             Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
             Channels =
             {

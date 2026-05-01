@@ -29,6 +29,12 @@ internal static class SessionRejectEncoder
     public static class TerminationCode
     {
         public const byte Unspecified = 0;
+        /// <summary>Peer sent an application message before completing
+        /// FIXP <c>Negotiate</c>. Spec §4.5 strict-gating rule.</summary>
+        public const byte Unnegotiated = 2;
+        /// <summary>Peer sent an application message after Negotiate but
+        /// before <c>Establish</c>. Spec §4.5 strict-gating rule.</summary>
+        public const byte NotEstablished = 3;
         public const byte UnrecognizedMessage = 15;
         public const byte InvalidSofh = 16;
         public const byte DecodingError = 17;
