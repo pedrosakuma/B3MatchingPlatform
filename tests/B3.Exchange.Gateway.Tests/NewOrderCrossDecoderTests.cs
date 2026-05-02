@@ -251,15 +251,17 @@ public class NewOrderCrossDecoderTests
     [Fact]
     public void DecodeError_VarDataTruncated()
     {
-        // Build a normal cross then truncate before the Memo length byte
-        // to exercise the "truncated before <field>" path.
-        var body = BuildCross();
-        // Body has root(84) + group(3+44) + deskLen(1) + memoLen(1) = 133.
-        // Truncate to 132 (drop memo length prefix).
-        var truncated = body.AsSpan(0, body.Length - 1).ToArray();
+        // Build a cross whose deskID declares 10 bytes of payload but
+        // truncate the buffer so the declared length overruns it. The
+        // shared validator (EntryPointVarData.ValidateDetailed) classifies
+        // an over-running length prefix as a structural protocol error
+        // (DECODING_ERROR), distinct from an over-length payload (which
+        // is a §4.10 BMR — see UnsupportedFeature_DeskIdTooLong).
+        var body = BuildCross(deskIdLen: 10);
+        var truncated = body.AsSpan(0, body.Length - 5).ToArray();
         var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
             truncated, SessionFirm, 1UL, out _, out _, out var msg);
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.DecodeError, outcome);
-        Assert.Contains("memo", msg);
+        Assert.Contains("deskID", msg);
     }
 }

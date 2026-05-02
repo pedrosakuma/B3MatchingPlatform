@@ -646,10 +646,18 @@ internal static class InboundMessageDecoder
         // 5. Walk varData (DeskID + Memo) so trailing garbage / oversize
         // segments are caught the same way as for other application
         // templates. We do not surface their contents to the engine.
-        int varCursor = sidesEnd;
-        if (!TryWalkCrossVarData(body, ref varCursor, out var varMessage))
+        // §4.10 (#GAP-21): over-length and CR/LF in deskID are
+        // BusinessMessageReject(33003) — not session-terminating.
+        var varSpan = body.Slice(sidesEnd);
+        var varResult = EntryPointVarData.ValidateDetailed(varSpan, EntryPointVarData.NewOrderCrossFields);
+        if (!varResult.IsOk)
         {
-            message = varMessage;
+            if (varResult.IsBusinessReject)
+            {
+                message = varResult.BmrText();
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+            message = varResult.DebugMessage;
             return InboundDecodeOutcome.DecodeError;
         }
 
@@ -682,51 +690,6 @@ internal static class InboundMessageDecoder
             EnteredAtNanos: enteredAtNanos);
         cross = new CrossOrderCommand(buy, sell, buyClOrd, sellClOrd, crossId);
         return InboundDecodeOutcome.Success;
-    }
-
-    /// <summary>
-    /// Validates the trailing DeskID + Memo varData for NewOrderCross
-    /// (length-prefixed bytes per spec §3.5). Mirrors the limits used
-    /// by <c>EntryPointVarData</c> for other application templates so
-    /// the simulator's behavior is uniform across templates that carry
-    /// these fields. Trailing bytes after the last expected segment are
-    /// rejected as a structural decode error.
-    /// </summary>
-    private static bool TryWalkCrossVarData(ReadOnlySpan<byte> body, ref int cursor, out string? message)
-    {
-        message = null;
-        // (Field name, max length in bytes). DeskID is 20, Memo is 40,
-        // matching EntryPointVarData's spec for the other application
-        // templates that carry these segments.
-        for (int i = 0; i < 2; i++)
-        {
-            string name = i == 0 ? "deskID" : "memo";
-            byte max = i == 0 ? (byte)20 : (byte)40;
-            if (cursor >= body.Length)
-            {
-                message = $"NewOrderCross varData truncated before {name} length prefix";
-                return false;
-            }
-            byte len = body[cursor];
-            cursor += 1;
-            if (len > max)
-            {
-                message = $"NewOrderCross varData {name} too long ({len} > {max})";
-                return false;
-            }
-            if (cursor + len > body.Length)
-            {
-                message = $"NewOrderCross varData {name} payload overruns frame";
-                return false;
-            }
-            cursor += len;
-        }
-        if (cursor != body.Length)
-        {
-            message = $"NewOrderCross has trailing bytes after varData ({body.Length - cursor})";
-            return false;
-        }
-        return true;
     }
 
     private static bool TryMapSide(byte b, out Side side)
