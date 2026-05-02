@@ -132,13 +132,14 @@ public sealed record CrossOrderCommand(
 
 /// <summary>
 /// Mass-cancel command (OrderMassActionRequest template 701, spec §4.8 /
-/// #GAP-19). The engine itself only ever sees a flat list of orderIds —
-/// the channel dispatcher resolves the (session, firm, optional Side,
-/// optional SecurityId) filter set against its <c>OrderOwnership</c> map
-/// before invoking <see cref="MatchingEngine.MassCancel"/>. A
+/// #GAP-19). Carries the wire-level filter as decoded from the inbound
+/// frame; the Gateway router resolves the
+/// (session, firm, optional Side, optional SecurityId) tuple against the
+/// <c>OrderOwnershipMap</c>, groups the resulting orderIds by channel, and
+/// forwards a flat list per channel via
+/// <c>ChannelDispatcher.EnqueueResolvedMassCancel</c>. A
 /// <c>SecurityId</c> of zero (the schema's null sentinel) means "any
-/// instrument in this dispatcher's books"; the host router fans the
-/// inbound command out to every channel when no security id is set.
+/// instrument".
 /// </summary>
 public sealed record MassCancelCommand(
     long SecurityId,

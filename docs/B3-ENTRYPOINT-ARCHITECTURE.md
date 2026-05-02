@@ -143,7 +143,7 @@ src/
     RetransmitBuffer.cs              ← in-RAM ring per session
     SessionRegistry.cs
     FirmRegistry.cs
-    OrderOwnershipMap.cs             ← OrderId → SessionId (per-channel)
+    OrderOwnershipMap.cs             ← OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId) (per process)
     Framing/
       SofhFrameReader.cs             ← #39 (GAP-01)
       SofhFrameWriter.cs
@@ -378,11 +378,36 @@ In-RAM map `FirmId → Firm` plus `(SessionId → SessionCredential)`. Loaded
 once from config at startup; immutable thereafter (for ephemeral). Future:
 hot-reload via admin endpoint.
 
-### 4.7 `OrderOwnershipMap` (per channel)
-`OrderId → SessionId`. Lives in the Gateway's per-channel state, populated
-on order acknowledgement, consulted on every inbound `ExecutionEvent` from
-Core. Bounded by the working order set; entries dropped on terminal events
-(Filled, Cancelled, Expired, Rejected).
+### 4.7 `OrderOwnershipMap` (per process)
+`OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId)`. Lives in the
+Gateway as a **single per-process** instance keyed by engine-assigned
+`OrderId`. Populated by `GatewayRouter` on every `ICoreOutbound.WriteExecutionReportNew`
+callback (i.e. as the engine accepts a new order); evicted on terminal
+events (`OnOrderCanceled`, full fill via `NotifyOrderTerminal`, and on
+session close via `EvictSession`).
+
+Used by:
+
+- **`GatewayRouter`** to resolve the resting-side owner of passive trade
+  reports (`WriteExecutionReportPassiveTrade`) and resting cancels
+  (`WriteExecutionReportPassiveCancel`) — Core never sees `SessionId` for
+  those events.
+- **`HostRouter`** to pre-resolve `OrigClOrdID → OrderId` on inbound
+  `Cancel`/`Replace` and to compute the explicit `OrderId` list for
+  `MassCancel` (filtering by `(Session, Firm, Side?, SecurityId?)`) before
+  enqueueing into the Core dispatcher.
+
+Threading: backed by `ConcurrentDictionary` for both forward
+(`OrderId → owner`) and reverse (`(Firm, ClOrdId) → OrderId`) indices.
+Writes happen on Core dispatch threads (one writer per `OrderId` because
+ID allocation is per-channel); reads happen on any FixpSession recv thread.
+
+Suspended-state ownership (open question 5): because the map is keyed by
+`SessionId` (the durable identity from the FIXP `Establish` claim) and not
+by the live `FixpSession` reference, entries survive a transport drop;
+when `SessionRegistry` re-binds a fresh `FixpSession` to that `SessionId`
+the existing resting orders' passive ER continue routing to the new
+transport.
 
 ---
 
@@ -676,10 +701,15 @@ into a corner.
    Proposal: Core reset and Gateway reset are independent events
    triggered on the same wall-clock; drain happens at each loop's own
    pace. Confirm in Phase 4.
-5. **Should `OrderOwnershipMap` survive `Suspended` state?** Yes —
-   otherwise ER for filled-while-disconnected orders would have nowhere
-   to go on re-attach. Just need to bound it (eviction on terminal
-   states already does this).
+5. **Should `OrderOwnershipMap` survive `Suspended` state?** **Resolved
+   (#66).** Yes — the Gateway map is keyed by the durable `SessionId`
+   (from the FIXP `Establish` claim), not by the live `FixpSession`
+   reference, so entries persist while a session is `Suspended` and
+   continue to route passive ER once a fresh transport re-binds the same
+   `SessionId` via `SessionRegistry`. Eviction on terminal events bounds
+   the map; explicit `EvictSession(SessionId)` runs only on transport
+   `OnSessionClosed`, releasing back-references without cancelling the
+   resting orders themselves.
 
 ---
 

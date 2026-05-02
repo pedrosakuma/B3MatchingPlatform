@@ -100,7 +100,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     {
         _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
         var sessionRegistry = new SessionRegistry();
-        var gatewayRouter = new GatewayRouter(sessionRegistry, _loggerFactory.CreateLogger<GatewayRouter>());
+        var ownershipMap = new OrderOwnershipMap();
+        var gatewayRouter = new GatewayRouter(sessionRegistry, ownershipMap, _loggerFactory.CreateLogger<GatewayRouter>());
 
         var firmRegistry = FirmRegistry;
         var defaultSession = ResolveDefaultSession(firmRegistry);
@@ -207,7 +208,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
         }
 
-        _router = new HostRouter(routing, gatewayRouter, _loggerFactory.CreateLogger<HostRouter>());
+        _router = new HostRouter(routing, gatewayRouter, ownershipMap, _loggerFactory.CreateLogger<HostRouter>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions
         {

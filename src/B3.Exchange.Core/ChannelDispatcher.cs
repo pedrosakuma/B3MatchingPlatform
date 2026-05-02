@@ -52,17 +52,6 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
 
-    private readonly Dictionary<long, OrderOwnership> _orderOwners = new();
-    /// <summary>
-    /// Per-channel reverse index from <c>(EnteringFirm, ClOrdID)</c> to engine-assigned
-    /// <c>orderId</c>. Populated when an order enters the book (<see cref="OnOrderAccepted"/>)
-    /// and evicted when it leaves (<see cref="OnOrderCanceled"/>, fully-filled
-    /// <see cref="OnOrderFilled"/>). Allows clients to send Cancel/Replace by their own
-    /// <c>OrigClOrdID</c> without tracking the engine-assigned id.
-    /// All access happens on the dispatch thread, so no synchronisation is required.
-    /// Key is a numeric <c>EnteringFirm</c> (FIXP wire field), not a transport reference.
-    /// </summary>
-    private readonly Dictionary<(uint Firm, ulong ClOrdId), long> _clOrdIdIndex = new();
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
     private SessionId _currentSession;
@@ -247,12 +236,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                         var cancel = item.Cancel!;
                         if (cancel.OrderId == 0)
                         {
-                            if (!_hasCurrentSession || !TryResolveByClOrdId(_currentFirm, item.OrigClOrdId, out var resolvedId))
-                            {
-                                EmitUnknownOrderIdReject(cancel.ClOrdId, cancel.SecurityId, cancel.EnteredAtNanos);
-                                break;
-                            }
-                            cancel = cancel with { OrderId = resolvedId };
+                            // HostRouter is expected to pre-resolve OrigClOrdID
+                            // → OrderId via the Gateway-side OrderOwnershipMap.
+                            // Defensive guard: surface a deterministic reject if
+                            // an unresolved command still reaches the engine.
+                            EmitUnknownOrderIdReject(cancel.ClOrdId, cancel.SecurityId, cancel.EnteredAtNanos);
+                            break;
                         }
                         _engine.Cancel(cancel);
                         break;
@@ -263,12 +252,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                         var replace = item.Replace!;
                         if (replace.OrderId == 0)
                         {
-                            if (!_hasCurrentSession || !TryResolveByClOrdId(_currentFirm, item.OrigClOrdId, out var resolvedId))
-                            {
-                                EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
-                                break;
-                            }
-                            replace = replace with { OrderId = resolvedId };
+                            EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
+                            break;
                         }
                         _engine.Replace(replace);
                         break;
@@ -294,28 +279,16 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                     }
                 case WorkKind.MassCancel:
                     {
-                        // Mass-cancel (#GAP-19, spec §4.8). Filter the
-                        // OrderOwnership map by (session, firm) plus the
-                        // per-command Side / SecurityId filters, then ask
-                        // the engine to cancel every matching orderId in
-                        // one dispatch turn so all DEL frames pack into a
-                        // single UMDF packet (atomic from the consumer's
-                        // POV) and one ER_Cancel per order is routed back
-                        // to the originating session via OnOrderCanceled.
+                        // OrderIds are pre-resolved by HostRouter against
+                        // the Gateway-side OrderOwnershipMap (filter is
+                        // session/firm/Side/SecurityId; spec §4.8 / #GAP-19).
+                        // Engine sees only a flat orderId list and emits one
+                        // ER_Cancel per matching order via OnOrderCanceled,
+                        // routed back to the originating session by the
+                        // Gateway router.
                         var mc = item.MassCancel!;
-                        if (!_hasCurrentSession) break;
-                        List<long>? matched = null;
-                        foreach (var kv in _orderOwners)
-                        {
-                            var owner = kv.Value;
-                            if (owner.Session != _currentSession) continue;
-                            if (owner.Firm != _currentFirm) continue;
-                            if (mc.SideFilter.HasValue && owner.Side != mc.SideFilter.Value) continue;
-                            if (mc.SecurityId != 0 && owner.SecurityId != mc.SecurityId) continue;
-                            (matched ??= new List<long>()).Add(kv.Key);
-                        }
-                        if (matched != null)
-                            _engine.MassCancel(matched, mc.EnteredAtNanos);
+                        if (mc.OrderIds.Count > 0)
+                            _engine.MassCancel(mc.OrderIds, mc.EnteredAtNanos);
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -325,9 +298,6 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                             new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
                             _currentClOrdId);
                     }
-                    break;
-                case WorkKind.ReleaseOwner:
-                    if (item.HasSession) ReleaseOwnerOnDispatchThread(item.Session);
                     break;
             }
             LogCommandProcessed(ChannelNumber, item.Kind, _currentClOrdId);
@@ -342,14 +312,6 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             _currentOrigClOrdId = 0;
             _currentReceivedTimeNanos = ulong.MaxValue;
         }
-    }
-
-    private bool TryResolveByClOrdId(uint firm, ulong origClOrdId, out long orderId)
-    {
-        if (origClOrdId != 0 && _clOrdIdIndex.TryGetValue((firm, origClOrdId), out orderId))
-            return true;
-        orderId = 0;
-        return false;
     }
 
     private void EmitUnknownOrderIdReject(string clOrdId, long securityId, ulong nowNanos)
@@ -407,31 +369,6 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// quiescent dispatcher".</summary>
     internal void TestSetSequenceNumber(uint value) => SequenceNumber = value;
 
-    private void ReleaseOwnerOnDispatchThread(SessionId session)
-    {
-        // Sweep the orderId → ownership map and drop every entry whose
-        // session matches the disconnected one. The orders themselves stay
-        // in the book (they ARE the book — passive liquidity for other
-        // sessions). We simply forget who to route the passive-side ER to:
-        // subsequent fills against those orders will publish the UMDF
-        // MBO/Trade frames as normal, but no ER_Trade is sent (there is
-        // nobody listening).
-        //
-        // After this sweep, the dispatcher holds no references to the
-        // session, so the FixpSession (and its NetworkStream / Socket)
-        // becomes eligible for GC once the listener has also dropped it
-        // from its live-sessions list.
-        if (_orderOwners.Count == 0) return;
-        List<long>? toRemove = null;
-        foreach (var (orderId, owner) in _orderOwners)
-        {
-            if (owner.Session == session)
-                (toRemove ??= new List<long>()).Add(orderId);
-        }
-        if (toRemove != null)
-            foreach (var oid in toRemove) _orderOwners.Remove(oid);
-    }
-
     private Span<byte> ReserveOrFlush(int frameSize)
     {
         if (_packetWritten == 0)
@@ -488,8 +425,33 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
     {
+        // OrderId resolution + filtering is the HostRouter's job (it owns
+        // access to the Gateway-side OrderOwnershipMap). Forwarding the
+        // pre-filter form here would require Core to track ownership again,
+        // which is exactly what #66 set out to remove. Surface the misuse
+        // instead of silently dropping.
+        throw new InvalidOperationException(
+            "Mass-cancel must be pre-resolved by the gateway router; call EnqueueResolvedMassCancel(orderIds) instead.");
+    }
+
+    /// <summary>
+    /// Channel-local mass-cancel entry point used by <c>HostRouter</c>
+    /// after it has resolved the spec §4.8 filter
+    /// (session/firm/Side/SecurityId) against the Gateway-side
+    /// <c>OrderOwnershipMap</c> and grouped the resulting orderIds by
+    /// channel. The dispatcher submits the list as a single
+    /// <c>MatchingEngine.MassCancel</c> call so all DEL frames pack into
+    /// one UMDF packet (atomic from the consumer's POV) and one
+    /// <c>ER_Cancel</c> per order is routed back to the originating session
+    /// via <c>OnOrderCanceled</c>.
+    /// </summary>
+    public void EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
+        ulong enteredAtNanos)
+    {
+        if (orderIds == null || orderIds.Count == 0) return;
+        var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
-            0, 0, null, null, null, null, cmd)))
+            0, 0, null, null, null, null, mc)))
             LogQueueFull(ChannelNumber, WorkKind.MassCancel);
     }
 
@@ -526,8 +488,13 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             0, 0, null, null, null, null));
 
     public void OnSessionClosed(SessionId session)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.ReleaseOwner, session, 0, true,
-            0, 0, null, null, null, null));
+    {
+        // Per-session order ownership lives in the Gateway-side
+        // OrderOwnershipMap; the dispatcher holds no per-session state to
+        // release. The Gateway listener invokes
+        // OrderOwnershipMap.EvictSession(session) directly on transport
+        // close, so this method is a no-op for the Core side.
+    }
 
     /// <summary>
     /// Operator command (issue #6): forces an immediate snapshot publish on
@@ -560,13 +527,6 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnOrderAccepted(in OrderAcceptedEvent e)
     {
-        if (_hasCurrentSession)
-        {
-            _orderOwners[e.OrderId] = new OrderOwnership(_currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
-            if (_currentClOrdId != 0)
-                _clOrdIdIndex[(_currentFirm, _currentClOrdId)] = e.OrderId;
-        }
-
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
@@ -578,7 +538,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         Commit(n);
 
         if (_hasCurrentSession)
-            _outbound.WriteExecutionReportNew(_currentSession, _currentClOrdId, e, _currentReceivedTimeNanos);
+            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos);
     }
 
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e)
@@ -612,14 +572,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             e.SecurityId, e.OrderId, entryType, e.RemainingQuantityAtCancel, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        if (_orderOwners.Remove(e.OrderId, out var owner))
-        {
-            if (owner.ClOrdId != 0)
-                _clOrdIdIndex.Remove((owner.Firm, owner.ClOrdId));
-            _outbound.WriteExecutionReportCancel(owner.Session, e,
-                _currentClOrdId != 0 ? _currentClOrdId : owner.ClOrdId, owner.ClOrdId,
-                _currentReceivedTimeNanos);
-        }
+        // Gateway resolves OrderId → owning session via OrderOwnershipMap
+        // and evicts the entry. Pass the active session's ClOrdId (if any)
+        // so the wire ER carries the requester's id while OrigClOrdID
+        // points to the owner's original ClOrdID.
+        _outbound.WriteExecutionReportPassiveCancel(e.OrderId, e, _currentClOrdId, _currentReceivedTimeNanos);
     }
 
     public void OnOrderFilled(in OrderFilledEvent e)
@@ -636,8 +593,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             e.SecurityId, e.OrderId, entryType, e.FinalFilledQuantity, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        if (_orderOwners.Remove(e.OrderId, out var owner) && owner.ClOrdId != 0)
-            _clOrdIdIndex.Remove((owner.Firm, owner.ClOrdId));
+        // Tell the Gateway to release the ownership entry — no wire ER here
+        // (the per-trade ER_Trade frames have already covered the fills).
+        _outbound.NotifyOrderTerminal(e.OrderId);
     }
 
     public void OnTrade(in TradeEvent e)
@@ -653,24 +611,18 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             buyerFirm: buyer, sellerFirm: seller);
         Commit(n);
 
-        // ER_Trade for both sides if their session is known.
-        // Aggressor: _currentSession (the command initiator).
-        // Resting: lookup orderOwners[e.RestingOrderId].
+        // ER_Trade for the aggressor side: routed to the active session by
+        // SessionId. We do not maintain per-aggressor cum/leaves tracking
+        // here; integration tests are scope-limited to single-fill scenarios.
         if (_hasCurrentSession)
         {
-            // We do not maintain per-aggressor cum/leaves tracking here; integration
-            // tests are scope-limited to single-fill scenarios. For passive side
-            // aggregation use OrderQuantityReducedEvent / OrderFilledEvent context.
             _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
                 ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
                 leavesQty: 0, cumQty: e.Quantity);
         }
-        if (_orderOwners.TryGetValue(e.RestingOrderId, out var resting))
-        {
-            _outbound.WriteExecutionReportTrade(resting.Session, e, isAggressor: false,
-                ownerOrderId: e.RestingOrderId, clOrdIdValue: resting.ClOrdId,
-                leavesQty: 0, cumQty: e.Quantity);
-        }
+        // ER_Trade for the resting side: Gateway resolves owner via the
+        // OrderOwnershipMap.
+        _outbound.WriteExecutionReportPassiveTrade(e.RestingOrderId, e, leavesQty: 0, cumQty: e.Quantity);
     }
 
     public void OnReject(in RejectEvent e)
@@ -703,15 +655,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
-
-    /// <summary>
-    /// Per-resting-order routing context. <see cref="Side"/> +
-    /// <see cref="SecurityId"/> are stamped at <see cref="OnOrderAccepted"/>
-    /// so the mass-cancel filter (#GAP-19, spec §4.8) can decide which
-    /// orders match without a round-trip into the engine.
-    /// </summary>
-    internal readonly record struct OrderOwnership(SessionId Session, ulong ClOrdId, uint Firm, Side Side, long SecurityId);
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion }
 
     internal sealed record WorkItem(
         WorkKind Kind,
@@ -724,7 +668,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         CancelOrderCommand? Cancel,
         ReplaceOrderCommand? Replace,
         CrossOrderCommand? Cross,
-        MassCancelCommand? MassCancel = null);
+        ResolvedMassCancel? MassCancel = null);
+
+    /// <summary>
+    /// Per-channel mass-cancel payload after gateway-side resolution: a
+    /// flat list of engine-assigned <c>OrderID</c>s plus the original
+    /// inbound timestamp.
+    /// </summary>
+    internal sealed record ResolvedMassCancel(IReadOnlyList<long> OrderIds, ulong EnteredAtNanos);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 
