@@ -646,10 +646,18 @@ internal static class InboundMessageDecoder
         // 5. Walk varData (DeskID + Memo) so trailing garbage / oversize
         // segments are caught the same way as for other application
         // templates. We do not surface their contents to the engine.
-        int varCursor = sidesEnd;
-        if (!TryWalkCrossVarData(body, ref varCursor, out var varMessage))
+        // §4.10 (#GAP-21): over-length and CR/LF in deskID are
+        // BusinessMessageReject(33003) — not session-terminating.
+        var varSpan = body.Slice(sidesEnd);
+        var varResult = EntryPointVarData.ValidateDetailed(varSpan, EntryPointVarData.NewOrderCrossFields);
+        if (!varResult.IsOk)
         {
-            message = varMessage;
+            if (varResult.IsBusinessReject)
+            {
+                message = varResult.BmrText();
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+            message = varResult.DebugMessage;
             return InboundDecodeOutcome.DecodeError;
         }
 
@@ -685,47 +693,123 @@ internal static class InboundMessageDecoder
     }
 
     /// <summary>
-    /// Validates the trailing DeskID + Memo varData for NewOrderCross
-    /// (length-prefixed bytes per spec §3.5). Mirrors the limits used
-    /// by <c>EntryPointVarData</c> for other application templates so
-    /// the simulator's behavior is uniform across templates that carry
-    /// these fields. Trailing bytes after the last expected segment are
-    /// rejected as a structural decode error.
+    /// Field offsets inside the OrderMassActionRequest (template 701)
+    /// SBE root block. Offsets are taken from the generated SBE struct.
     /// </summary>
-    private static bool TryWalkCrossVarData(ReadOnlySpan<byte> body, ref int cursor, out string? message)
+    private static class OrderMassActionRequestOffsets
     {
+        public const int MassActionType = 18;          // byte
+        public const int ClOrdID = 20;                 // ulong
+        public const int OrdTagID = 29;                // byte (0 == null)
+        public const int Side = 30;                    // char (0 == null)
+        public const int Asset = 32;                   // 6 bytes, all-zero == null
+        public const int SecurityID = 38;              // ulong (0 == null)
+        public const int InvestorID = 46;              // 6 bytes (V2 only); zeros == null (overlaps SecurityExchange in V1 base)
+    }
+
+    private const byte MassActionTypeCancelOrders = 3;
+
+    /// <summary>
+    /// Decodes an <c>OrderMassActionRequest</c> body (template 701, spec
+    /// §4.8 / #GAP-19) into a <see cref="MassCancelCommand"/>. Returns
+    /// <see cref="InboundDecodeOutcome.Success"/> when the request maps
+    /// onto the engine's supported subset (cancel-orders, optional Side
+    /// + SecurityID filters). Returns
+    /// <see cref="InboundDecodeOutcome.UnsupportedFeature"/> for
+    /// schema-valid but unimplemented variants. Returns
+    /// <see cref="InboundDecodeOutcome.DecodeError"/> for wire values
+    /// that violate the SBE schema.
+    /// </summary>
+    public static InboundDecodeOutcome TryDecodeOrderMassActionRequest(
+        ReadOnlySpan<byte> body, ulong enteredAtNanos,
+        out MassCancelCommand cmd, out ulong clOrdIdValue, out string? message)
+    {
+        cmd = null!;
+        clOrdIdValue = 0;
         message = null;
-        // (Field name, max length in bytes). DeskID is 20, Memo is 40,
-        // matching EntryPointVarData's spec for the other application
-        // templates that carry these segments.
-        for (int i = 0; i < 2; i++)
+
+        byte massActionType = body[OrderMassActionRequestOffsets.MassActionType];
+        byte sideByte = body[OrderMassActionRequestOffsets.Side];
+        byte ordTagId = body[OrderMassActionRequestOffsets.OrdTagID];
+        ulong securityIdRaw = MemoryMarshal.Read<ulong>(body.Slice(OrderMassActionRequestOffsets.SecurityID, 8));
+        clOrdIdValue = MemoryMarshal.Read<ulong>(body.Slice(OrderMassActionRequestOffsets.ClOrdID, 8));
+
+        if (massActionType != MassActionTypeCancelOrders)
         {
-            string name = i == 0 ? "deskID" : "memo";
-            byte max = i == 0 ? (byte)20 : (byte)40;
-            if (cursor >= body.Length)
+            if (massActionType == 2 || massActionType == 4)
             {
-                message = $"NewOrderCross varData truncated before {name} length prefix";
-                return false;
+                message = $"MassActionType={massActionType} not supported (only CANCEL_ORDERS=3)";
+                return InboundDecodeOutcome.UnsupportedFeature;
             }
-            byte len = body[cursor];
-            cursor += 1;
-            if (len > max)
-            {
-                message = $"NewOrderCross varData {name} too long ({len} > {max})";
-                return false;
-            }
-            if (cursor + len > body.Length)
-            {
-                message = $"NewOrderCross varData {name} payload overruns frame";
-                return false;
-            }
-            cursor += len;
+            message = $"invalid MassActionType={massActionType}";
+            return InboundDecodeOutcome.DecodeError;
         }
-        if (cursor != body.Length)
+
+        if (ordTagId != 0)
         {
-            message = $"NewOrderCross has trailing bytes after varData ({body.Length - cursor})";
-            return false;
+            message = "OrdTagID filter not supported (engine does not track ordTagID per order)";
+            return InboundDecodeOutcome.UnsupportedFeature;
         }
+
+        var assetSpan = body.Slice(OrderMassActionRequestOffsets.Asset, 6);
+        if (!IsAllZero(assetSpan))
+        {
+            message = "Asset filter not supported (engine does not track per-instrument asset)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+
+        var investorSpan = body.Slice(OrderMassActionRequestOffsets.InvestorID, 6);
+        if (!IsMassActionInvestorEmpty(investorSpan))
+        {
+            message = "InvestorID (mass cancel on behalf) not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+
+        Side? sideFilter = null;
+        if (sideByte != 0)
+        {
+            if (!TryMapSide(sideByte, out var side))
+            {
+                message = $"invalid Side={sideByte}";
+                return InboundDecodeOutcome.DecodeError;
+            }
+            sideFilter = side;
+        }
+
+        long securityId = securityIdRaw == 0 ? 0L : (long)securityIdRaw;
+
+        cmd = new MassCancelCommand(
+            SecurityId: securityId,
+            SideFilter: sideFilter,
+            EnteredAtNanos: enteredAtNanos);
+        return InboundDecodeOutcome.Success;
+    }
+
+    private static bool IsAllZero(ReadOnlySpan<byte> span)
+    {
+        for (int i = 0; i < span.Length; i++)
+            if (span[i] != 0) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// In the OrderMassActionRequest V1 base layout the bytes at offset
+    /// 46 hold the constant <c>SecurityExchange</c> = "BVMF" (4 chars,
+    /// padded to 6); in V2 the same offset holds <c>InvestorID</c>.
+    /// Treat the slot as "no InvestorID" when zeros, "BVMF" (with
+    /// trailing zeros/spaces), all-zero, or all-space.
+    /// </summary>
+    private static bool IsMassActionInvestorEmpty(ReadOnlySpan<byte> span)
+    {
+        if (IsAllZero(span)) return true;
+        if (span.Length >= 4 && span[0] == 'B' && span[1] == 'V' && span[2] == 'M' && span[3] == 'F')
+        {
+            for (int i = 4; i < span.Length; i++)
+                if (span[i] != 0 && span[i] != (byte)' ') return false;
+            return true;
+        }
+        for (int i = 0; i < span.Length; i++)
+            if (span[i] != (byte)' ') return false;
         return true;
     }
 

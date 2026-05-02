@@ -75,6 +75,26 @@ public sealed class HostRouter : IInboundCommandSink
             RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue);
     }
 
+    public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
+    {
+        // Spec §4.8 / #GAP-19 — when SecurityId is supplied we route to
+        // exactly one dispatcher (unknown SecurityId → no-op: the gateway
+        // has already emitted an OrderMassActionReport(ACCEPTED) for the
+        // request, and there is nothing to cancel). When SecurityId is
+        // null/zero the request can target ANY of the firm's resting
+        // orders, so we fan it out to every dispatcher; each one filters
+        // its OrderOwnership map and emits one ER_Cancel per matching
+        // resting order owned by this session.
+        if (cmd.SecurityId != 0)
+        {
+            if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
+                disp.EnqueueMassCancel(cmd, session, enteringFirm);
+            return;
+        }
+        foreach (var disp in _allDispatchers)
+            disp.EnqueueMassCancel(cmd, session, enteringFirm);
+    }
+
     public void OnDecodeError(SessionId session, string error)
     {
         // Logging hook only. The FixpSession itself emits the

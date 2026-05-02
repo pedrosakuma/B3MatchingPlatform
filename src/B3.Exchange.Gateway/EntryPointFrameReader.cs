@@ -60,6 +60,10 @@ public static class EntryPointFrameReader
     public const ushort TidOrderCancelReplaceRequest = 104;
     /// <summary>Inbound: OrderCancelRequest (V6 base, no version variants).</summary>
     public const ushort TidOrderCancelRequest = 105;
+    /// <summary>Inbound: OrderMassActionRequest (V6 base, spec §4.8 / #GAP-19).</summary>
+    public const ushort TidOrderMassActionRequest = 701;
+    /// <summary>Outbound: OrderMassActionReport (V6 base, spec §4.8 / #GAP-19).</summary>
+    public const ushort TidOrderMassActionReport = 702;
     /// <summary>Session: Sequence (FIXP, also used as heartbeat). Bidirectional.</summary>
     public const ushort TidSequence = 9;
     /// <summary>Session: Negotiate (FIXP, inbound only). See spec §4.5.2.</summary>
@@ -103,6 +107,7 @@ public static class EntryPointFrameReader
         (TidNewOrderCross, 6) => 84,             // NewOrderCross.MESSAGE_SIZE (root V6, group + varData follow)
         (TidOrderCancelReplaceRequest, 2) => 142, // OrderCancelReplaceRequestV2.MESSAGE_SIZE
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
+        (TidOrderMassActionRequest, 6) => 52,    // OrderMassActionRequestData.MESSAGE_SIZE (V6 base, no varData)
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
         (TidNegotiate, 0) => 28,                 // NegotiateData.BLOCK_LENGTH (V6 schema, root version 0)
         (TidEstablish, 0) => 42,                 // EstablishData.BLOCK_LENGTH

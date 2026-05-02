@@ -178,6 +178,45 @@ public sealed class MatchingEngine
         finally { ExitDispatch(); }
     }
 
+    /// <summary>
+    /// Mass-cancel the supplied resting orderIds (spec §4.8 / #GAP-19).
+    /// Each resolved order emits one <see cref="OrderCanceledEvent"/> with
+    /// <see cref="CancelReason.MassCancel"/>; orderIds that no longer
+    /// resolve (already filled / cancelled in the same dispatch turn)
+    /// are skipped silently. Returns the number of orders actually
+    /// cancelled. Caller (the channel dispatcher) is expected to have
+    /// already filtered by session / firm / side / asset using its
+    /// <c>OrderOwnership</c> map, so the engine sees only orderIds.
+    /// </summary>
+    public int MassCancel(IReadOnlyCollection<long> orderIds, ulong enteredAtNanos)
+    {
+        ArgumentNullException.ThrowIfNull(orderIds);
+        if (orderIds.Count == 0) return 0;
+        EnterDispatch();
+        try
+        {
+            int cancelled = 0;
+            foreach (var orderId in orderIds)
+            {
+                // Locate the book that owns this orderId. Mass-cancel runs
+                // in O(books × orderIds) which is acceptable since a typical
+                // mass-cancel touches a small number of resting orders
+                // within one channel.
+                foreach (var book in _booksById.Values)
+                {
+                    if (book.TryGet(orderId, out var resting))
+                    {
+                        EmitCanceled(book, resting, enteredAtNanos, CancelReason.MassCancel);
+                        cancelled++;
+                        break;
+                    }
+                }
+            }
+            return cancelled;
+        }
+        finally { ExitDispatch(); }
+    }
+
     public void Replace(ReplaceOrderCommand cmd)
     {
         EnterDispatch();
