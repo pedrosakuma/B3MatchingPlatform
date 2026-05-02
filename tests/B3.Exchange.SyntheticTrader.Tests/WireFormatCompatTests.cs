@@ -179,7 +179,7 @@ public class WireFormatCompatTests
         ExecutionReportEncoder.EncodeExecReportReject(frame,
             sessionId: 1, msgSeqNum: 2, sendingTimeNanos: 3,
             clOrdIdValue: clOrd, origClOrdIdValue: 0, securityId: secId, orderIdOrZero: 0,
-            rejectReason: 99, transactTimeNanos: 4);
+            rejectReason: 99u, transactTimeNanos: 4);
 
         var body = frame.Slice(SbeHeaderSize);
         var er = EntryPointClient.DecodeExecReportReject(body);

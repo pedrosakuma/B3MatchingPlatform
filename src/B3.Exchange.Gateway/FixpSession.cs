@@ -1397,7 +1397,7 @@ public sealed class FixpSession : IAsyncDisposable
     public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue)
     {
         if (!IsOpen) return false;
-        byte rej = MapRejectReason(e.Reason);
+        uint rej = MapRejectReason(e.Reason);
         var exact = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
         lock (_outboundLock)
         {
@@ -1457,12 +1457,36 @@ public sealed class FixpSession : IAsyncDisposable
         }
     }
 
-    private static byte MapRejectReason(RejectReason r) => r switch
+    /// <summary>
+    /// Maps engine <see cref="RejectReason"/> to the FIX OrdRejReason wire code
+    /// emitted on ExecutionReport_Reject (#GAP-17 / issue #53). Standard FIX 4.4
+    /// codes used:
+    ///   0  = Broker / exchange option (generic / no closer match)
+    ///   1  = Unknown symbol
+    ///   3  = Order exceeds limit (used here for price-band / tick / non-positive price)
+    ///   5  = Unknown order
+    ///   11 = Unsupported order characteristic (used for invalid quantity and
+    ///        Market/IOC-only constraints not satisfied by the inbound order)
+    /// Engine reasons that have no direct FIX peer (e.g. <see cref="RejectReason.MarketNoLiquidity"/>,
+    /// <see cref="RejectReason.FokUnfillable"/>, <see cref="RejectReason.SelfTradePrevention"/>)
+    /// fall through to 0 (Broker/exchange option) — context is conveyed via the
+    /// <c>Text</c> tag where applicable.
+    /// </summary>
+    internal static uint MapRejectReason(RejectReason r) => r switch
     {
-        // OrdRejReason wire codes: 0=BrokerExchangeOption (generic), 1=UnknownSymbol,
-        // 3=OrderExceedsLimit, 5=UnknownOrder, 6=DuplicateOrder, 11=UnsupportedOrderCharacteristic.
-        // Engine RejectReason values mapped to nearest wire code; unmapped => 0.
-        _ => 0,
+        RejectReason.UnknownInstrument => 1u,
+        RejectReason.UnknownOrderId => 5u,
+        RejectReason.PriceOutOfBand => 3u,
+        RejectReason.PriceNotOnTick => 3u,
+        RejectReason.PriceNonPositive => 3u,
+        RejectReason.QuantityNonPositive => 11u,
+        RejectReason.QuantityNotMultipleOfLot => 11u,
+        RejectReason.MarketNotImmediateOrCancel => 11u,
+        RejectReason.InvalidTimeInForceForMarket => 11u,
+        RejectReason.MarketNoLiquidity => 0u,
+        RejectReason.FokUnfillable => 0u,
+        RejectReason.SelfTradePrevention => 0u,
+        _ => 0u,
     };
 
     public void Close() => Close("close");
