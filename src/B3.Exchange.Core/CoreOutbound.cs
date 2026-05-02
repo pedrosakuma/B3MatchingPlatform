@@ -33,17 +33,20 @@ namespace B3.Exchange.Core;
 /// </summary>
 public interface ICoreOutbound
 {
-    bool WriteExecutionReportNew(SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e);
+    bool WriteExecutionReportNew(SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e,
+        ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor,
         long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty);
 
     bool WriteExecutionReportCancel(SessionId session, in OrderCanceledEvent e,
-        ulong clOrdIdValue, ulong origClOrdIdValue);
+        ulong clOrdIdValue, ulong origClOrdIdValue,
+        ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
-        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq);
+        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportReject(SessionId session, in RejectEvent e, ulong clOrdIdValue);
 }

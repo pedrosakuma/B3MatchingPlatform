@@ -89,7 +89,7 @@ public class ExchangeHostE2ETests
 
         var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
-        Assert.Equal(2, er1.Version);
+        Assert.Equal(3, er1.Version);
 
         // Second order on the SAME session: SELL PETR4 100 @ 12.34 → fully
         // crosses the resting BUY. Aggressor session sees ER_Trade (no New —
