@@ -107,13 +107,13 @@ public class ExecutionReportEncoderTests
         int n = ExecutionReportEncoder.EncodeExecReportReject(buf,
             sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
             clOrdIdValue: 7, origClOrdIdValue: 0, securityId: 333, orderIdOrZero: 0,
-            rejectReason: 5, transactTimeNanos: 0UL);
+            rejectReason: 5u, transactTimeNanos: 0UL);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportRejectTotal, n);
         var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal(7UL, MemoryMarshal.Read<ulong>(body.Slice(20, 8)));            // ClOrdID
         Assert.Equal(333L, MemoryMarshal.Read<long>(body.Slice(36, 8)));            // SecurityID
-        Assert.Equal((byte)5, body[44]);                                            // OrdRejReason
+        Assert.Equal(5u, MemoryMarshal.Read<uint>(body.Slice(44, 4)));              // OrdRejReason (uint32, overlaps SecExchange)
     }
 
     [Fact]

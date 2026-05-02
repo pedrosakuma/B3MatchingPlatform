@@ -216,7 +216,7 @@ internal static class ExecutionReportEncoder
     public static int EncodeExecReportReject(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         ulong clOrdIdValue, ulong origClOrdIdValue, long securityId, long orderIdOrZero,
-        byte rejectReason, ulong transactTimeNanos)
+        uint rejectReason, ulong transactTimeNanos)
     {
         if (dst.Length < ExecReportRejectTotal) throw new ArgumentException("buffer too small for ER_Reject", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportRejectTotal,
@@ -229,7 +229,11 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(20, 8), in clOrdIdValue);
         // SecondaryOrderID@28 = 0 (null)
         MemoryMarshal.Write(body.Slice(36, 8), in securityId);
-        body[44] = rejectReason;                                            // OrdRejReason (overlap SecExchange)
+        // OrdRejReason: schema type RejReason is uint32 (#GAP-17 / #53).
+        // Field overlaps SecurityExchange (offset 44) per the SBE schema;
+        // writing the full 4 LE bytes leaves SecurityExchange unset, which
+        // matches the engine's behaviour today (we never populate it).
+        MemoryMarshal.Write(body.Slice(44, 4), in rejectReason);            // OrdRejReason (overlap SecExchange)
         MemoryMarshal.Write(body.Slice(48, 8), in transactTimeNanos);
         ulong zeroExecId = 0;
         MemoryMarshal.Write(body.Slice(56, 8), in zeroExecId);              // ExecID 0
