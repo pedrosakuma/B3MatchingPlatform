@@ -472,40 +472,48 @@ public sealed class FixpSession : IAsyncDisposable
                 return true;
         }
 
-        var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
-        var varResult = EntryPointVarData.ValidateDetailed(varData, spec);
-        if (!varResult.IsOk)
+        // NewOrderCross (template 106) carries a NoSides repeating group
+        // BEFORE the varData segments, so the generic varData walker
+        // would mis-interpret the SBE group header as a length prefix.
+        // Bypass the generic validator here; the bespoke decoder below
+        // walks the group + varData with template-specific rules.
+        if (info.TemplateId != EntryPointFrameReader.TidNewOrderCross)
         {
-            // §4.10 (#GAP-14): length-exceeded and CR/LF rejections on
-            // application messages are business-rule failures →
-            // BMR(33003) and drop the offending frame; the session
-            // stays open. Structural protocol errors (truncation,
-            // overrun, trailing bytes) are still DECODING_ERROR →
-            // terminate. Only applies in strict mode (Negotiated): in
-            // legacy passthrough there is no business-header context to
-            // reference, so retain the legacy terminate behaviour.
-            if (_validator is not null && varResult.IsBusinessReject && IsApplicationTemplate(info.TemplateId))
+            var spec = EntryPointVarData.ExpectedFor(info.TemplateId, info.Version);
+            var varResult = EntryPointVarData.ValidateDetailed(varData, spec);
+            if (!varResult.IsOk)
             {
-                uint refSeqNum = fixedBlock.Length >= 8
-                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
-                    : 0u;
-                ulong refClOrdId = fixedBlock.Length >= 28
-                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
-                    : 0UL;
-                WriteBusinessMessageReject(
-                    refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(info.TemplateId),
-                    refSeqNum: refSeqNum,
-                    businessRejectRefId: refClOrdId,
-                    businessRejectReason: 33003,
-                    text: varResult.BmrText());
-                _logger.LogWarning(
-                    "fixp session {ConnectionId} business reject (varData) template={Template} field={Field} kind={Kind}: {Debug}",
-                    ConnectionId, info.TemplateId, varResult.FieldName, varResult.Kind, varResult.DebugMessage);
-                return true;
+                // §4.10 (#GAP-14): length-exceeded and CR/LF rejections on
+                // application messages are business-rule failures →
+                // BMR(33003) and drop the offending frame; the session
+                // stays open. Structural protocol errors (truncation,
+                // overrun, trailing bytes) are still DECODING_ERROR →
+                // terminate. Only applies in strict mode (Negotiated): in
+                // legacy passthrough there is no business-header context to
+                // reference, so retain the legacy terminate behaviour.
+                if (_validator is not null && varResult.IsBusinessReject && IsApplicationTemplate(info.TemplateId))
+                {
+                    uint refSeqNum = fixedBlock.Length >= 8
+                        ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+                        : 0u;
+                    ulong refClOrdId = fixedBlock.Length >= 28
+                        ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+                        : 0UL;
+                    WriteBusinessMessageReject(
+                        refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(info.TemplateId),
+                        refSeqNum: refSeqNum,
+                        businessRejectRefId: refClOrdId,
+                        businessRejectReason: 33003,
+                        text: varResult.BmrText());
+                    _logger.LogWarning(
+                        "fixp session {ConnectionId} business reject (varData) template={Template} field={Field} kind={Kind}: {Debug}",
+                        ConnectionId, info.TemplateId, varResult.FieldName, varResult.Kind, varResult.DebugMessage);
+                    return true;
+                }
+                _sink.OnDecodeError(Identity, varResult.DebugMessage ?? "decode error: varData");
+                await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:varData").ConfigureAwait(false);
+                return false;
             }
-            _sink.OnDecodeError(Identity, varResult.DebugMessage ?? "decode error: varData");
-            await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:varData").ConfigureAwait(false);
-            return false;
         }
 
         switch (info.TemplateId)
@@ -579,6 +587,30 @@ public sealed class FixpSession : IAsyncDisposable
                     }
                     _sink.OnDecodeError(Identity, ocrMsg ?? "decode error: OrderCancelReplaceRequest");
                     await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderCancelReplaceRequest").ConfigureAwait(false);
+                    return false;
+                }
+            case EntryPointFrameReader.TidNewOrderCross:
+                {
+                    // Body has root(84) + NoSides group + varData; we need
+                    // the full span (not just fixedBlock) so the bespoke
+                    // decoder can walk past the SBE group header.
+                    var fullBodySpan = fullBody.Span;
+                    var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
+                        fullBodySpan, EnteringFirm, now, out var cross, out var crossId, out var crossMsg);
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
+                    {
+                        _sink.EnqueueCross(cross, Identity, EnteringFirm);
+                        return true;
+                    }
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
+                    {
+                        // BusinessRejectRefID for NewOrderCross is CrossID,
+                        // not ClOrdID (offset 20 holds CrossID per schema).
+                        WriteApplicationBusinessReject(info.TemplateId, fixedBlock, crossId, crossMsg ?? "unsupported");
+                        return true;
+                    }
+                    _sink.OnDecodeError(Identity, crossMsg ?? "decode error: NewOrderCross");
+                    await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:NewOrderCross").ConfigureAwait(false);
                     return false;
                 }
             case EntryPointFrameReader.TidOrderCancelRequest:
@@ -779,7 +811,8 @@ public sealed class FixpSession : IAsyncDisposable
         || templateId == EntryPointFrameReader.TidSimpleModifyOrder
         || templateId == EntryPointFrameReader.TidNewOrderSingle
         || templateId == EntryPointFrameReader.TidOrderCancelReplaceRequest
-        || templateId == EntryPointFrameReader.TidOrderCancelRequest;
+        || templateId == EntryPointFrameReader.TidOrderCancelRequest
+        || templateId == EntryPointFrameReader.TidNewOrderCross;
 
     /// <summary>
     /// Emits a <c>BusinessMessageReject(33003)</c> for an application
