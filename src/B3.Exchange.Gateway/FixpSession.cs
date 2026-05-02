@@ -1325,7 +1325,7 @@ public sealed class FixpSession : IAsyncDisposable
             ConnectionId, code);
     }
 
-    public bool WriteExecutionReportNew(in OrderAcceptedEvent e)
+    public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!IsOpen) return false;
         ulong clOrd = ulong.TryParse(e.ClOrdId, out var v) ? v : 0;
@@ -1337,7 +1337,8 @@ public sealed class FixpSession : IAsyncDisposable
                 e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
                 (ulong)e.RptSeq, e.InsertTimestampNanos,
                 OrderType.Limit, TimeInForce.Day,
-                e.RemainingQuantity, e.PriceMantissa);
+                e.RemainingQuantity, e.PriceMantissa,
+                receivedTimeNanos);
             return AppendAndEnqueueLocked(exact);
         }
     }
@@ -1362,7 +1363,8 @@ public sealed class FixpSession : IAsyncDisposable
         }
     }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
+    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
+        ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!IsOpen) return false;
         var exact = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
@@ -1373,13 +1375,15 @@ public sealed class FixpSession : IAsyncDisposable
                 e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
                 e.SecurityId, e.OrderId,
                 (ulong)e.RptSeq, e.TransactTimeNanos,
-                cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa);
+                cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa,
+                receivedTimeNanos);
             return AppendAndEnqueueLocked(exact);
         }
     }
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
-        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq)
+        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!IsOpen) return false;
         var exact = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
@@ -1389,7 +1393,8 @@ public sealed class FixpSession : IAsyncDisposable
                 SessionId, NextMsgSeqNum(), transactTimeNanos,
                 side, clOrdIdValue, origClOrdIdValue, orderId,
                 securityId, orderId, (ulong)rptSeq, transactTimeNanos,
-                leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa);
+                leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
+                receivedTimeNanos: receivedTimeNanos);
             return AppendAndEnqueueLocked(exact);
         }
     }

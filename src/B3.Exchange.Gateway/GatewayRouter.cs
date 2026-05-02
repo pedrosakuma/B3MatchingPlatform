@@ -38,10 +38,11 @@ public sealed class GatewayRouter : ICoreOutbound
         _logger = logger;
     }
 
-    public bool WriteExecutionReportNew(ContractsSessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e)
+    public bool WriteExecutionReportNew(ContractsSessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e,
+        ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
-        return s.WriteExecutionReportNew(e);
+        return s.WriteExecutionReportNew(e, receivedTimeNanos);
     }
 
     public bool WriteExecutionReportTrade(ContractsSessionId session, in TradeEvent e, bool isAggressor,
@@ -52,19 +53,21 @@ public sealed class GatewayRouter : ICoreOutbound
     }
 
     public bool WriteExecutionReportCancel(ContractsSessionId session, in OrderCanceledEvent e,
-        ulong clOrdIdValue, ulong origClOrdIdValue)
+        ulong clOrdIdValue, ulong origClOrdIdValue,
+        ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportCancel"); return false; }
-        return s.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue);
+        return s.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos);
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
-        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq)
+        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        ulong receivedTimeNanos = ulong.MaxValue)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportModify"); return false; }
         return s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos);
     }
 
     public bool WriteExecutionReportReject(ContractsSessionId session, in RejectEvent e, ulong clOrdIdValue)

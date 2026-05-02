@@ -70,6 +70,17 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _hasCurrentSession;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
+    /// <summary>
+    /// Ingress timestamp of the inbound command currently being dispatched
+    /// (#GAP-11 / #49). Captured from the command's <c>EnteredAtNanos</c> at
+    /// the start of <see cref="ProcessOne"/> and reset to
+    /// <see cref="ulong.MaxValue"/> (the SBE null sentinel for
+    /// <c>UTCTimestampNanosOptional</c>) in the <c>finally</c> so engine-
+    /// originated events that fire outside command processing (iceberg
+    /// restate, stop triggers, etc.) emit ER frames with the
+    /// <c>receivedTime</c> field nulled.
+    /// </summary>
+    private ulong _currentReceivedTimeNanos = ulong.MaxValue;
 
     private SnapshotRotator? _snapshotRotator;
 
@@ -215,6 +226,13 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _hasCurrentSession = item.HasSession;
         _currentClOrdId = item.ClOrdId;
         _currentOrigClOrdId = item.OrigClOrdId;
+        _currentReceivedTimeNanos = item.Kind switch
+        {
+            WorkKind.New => item.NewOrder?.EnteredAtNanos ?? ulong.MaxValue,
+            WorkKind.Cancel => item.Cancel?.EnteredAtNanos ?? ulong.MaxValue,
+            WorkKind.Replace => item.Replace?.EnteredAtNanos ?? ulong.MaxValue,
+            _ => ulong.MaxValue,
+        };
         _packetWritten = 0;
         try
         {
@@ -275,6 +293,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             _hasCurrentSession = false;
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
+            _currentReceivedTimeNanos = ulong.MaxValue;
         }
     }
 
@@ -498,7 +517,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         Commit(n);
 
         if (_hasCurrentSession)
-            _outbound.WriteExecutionReportNew(_currentSession, _currentClOrdId, e);
+            _outbound.WriteExecutionReportNew(_currentSession, _currentClOrdId, e, _currentReceivedTimeNanos);
     }
 
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e)
@@ -537,7 +556,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             if (owner.ClOrdId != 0)
                 _clOrdIdIndex.Remove((owner.Firm, owner.ClOrdId));
             _outbound.WriteExecutionReportCancel(owner.Session, e,
-                _currentClOrdId != 0 ? _currentClOrdId : owner.ClOrdId, owner.ClOrdId);
+                _currentClOrdId != 0 ? _currentClOrdId : owner.ClOrdId, owner.ClOrdId,
+                _currentReceivedTimeNanos);
         }
     }
 

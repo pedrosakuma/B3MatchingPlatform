@@ -19,12 +19,12 @@ public class ExecutionReportEncoderTests
             orderQty: 10, priceMantissa: 12_3450L);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportNewTotal, n);
-        // SBE header at offset SOFH(4)..SOFH+8: BlockLength=144, TemplateId=200, SchemaId=1, Version=2
+        // SBE header at offset SOFH(4)..SOFH+8: BlockLength=172, TemplateId=200, SchemaId=1, Version=3 (#49 / #GAP-11)
         var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
         Assert.Equal((ushort)ExecutionReportEncoder.ExecReportNewBlock, MemoryMarshal.Read<ushort>(hdr.Slice(0, 2)));
         Assert.Equal((ushort)EntryPointFrameReader.TidExecutionReportNew, MemoryMarshal.Read<ushort>(hdr.Slice(2, 2)));
         Assert.Equal((ushort)1, MemoryMarshal.Read<ushort>(hdr.Slice(4, 2)));
-        Assert.Equal((ushort)2, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+        Assert.Equal((ushort)3, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
 
         var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((uint)42, MemoryMarshal.Read<uint>(body.Slice(0, 4)));        // SessionId
@@ -135,5 +135,92 @@ public class ExecutionReportEncoderTests
         Assert.Equal(21UL, MemoryMarshal.Read<ulong>(body.Slice(96, 8)));           // OrigClOrdID
         Assert.Equal(75L, MemoryMarshal.Read<long>(body.Slice(120, 8)));            // OrderQty
         Assert.Equal(99_0000L, MemoryMarshal.Read<long>(body.Slice(128, 8)));       // Price
+    }
+
+    // ====== #49 / #GAP-11: receivedTime (tag 35544) round-trip ======
+    //
+    // ER_New / ER_Modify / ER_Cancel were bumped to V3 to expose the optional
+    // `receivedTime` trailing field. Tests below lock both the populated and
+    // null sentinel paths and the V3 trailing optional null sentinels that
+    // body.Clear() alone cannot satisfy (they default to a non-zero "null"
+    // value per SBE schema).
+
+    [Fact]
+    public void EncodeNew_V3ReceivedTime_PopulatedAndNullSentinelsRoundTrip()
+    {
+        const ulong received = 1_700_000_000_123_456_789UL;
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        int n = ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, secondaryOrderId: 0,
+            securityId: 1, orderId: 1, execId: 0, transactTimeNanos: 0,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 100_0000L,
+            receivedTimeNanos: received);
+        Assert.Equal(ExecutionReportEncoder.ExecReportNewTotal, n);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(received, MemoryMarshal.Read<ulong>(body.Slice(144, 8)));    // ReceivedTime
+        Assert.Equal((byte)255, body[162]);                                       // CrossType null
+        Assert.Equal((byte)255, body[163]);                                       // CrossPrioritization null
+        Assert.Equal((byte)255, body[164]);                                       // MmProtectionReset null
+
+        var bufNull = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(bufNull,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, secondaryOrderId: 0,
+            securityId: 1, orderId: 1, execId: 0, transactTimeNanos: 0,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 100_0000L);
+        var bodyNull = bufNull.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(ulong.MaxValue, MemoryMarshal.Read<ulong>(bodyNull.Slice(144, 8))); // null sentinel
+    }
+
+    [Fact]
+    public void EncodeModify_V3ReceivedTime_PopulatedAndNullSentinelsRoundTrip()
+    {
+        const ulong received = 1_700_000_000_222_222_222UL;
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L,
+            receivedTimeNanos: received);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(received, MemoryMarshal.Read<ulong>(body.Slice(160, 8)));    // ReceivedTime
+        Assert.Equal((byte)255, body[178]);                                       // MmProtectionReset null
+
+        var bufNull = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(bufNull,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L);
+        var bodyNull = bufNull.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(ulong.MaxValue, MemoryMarshal.Read<ulong>(bodyNull.Slice(160, 8)));
+    }
+
+    [Fact]
+    public void EncodeCancel_V3ReceivedTime_PopulatedAndNullSentinelsRoundTrip()
+    {
+        const ulong received = 1_700_000_000_333_333_333UL;
+        var buf = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, origClOrdIdValue: 0, secondaryOrderId: 0,
+            securityId: 7, orderId: 1, execId: 0, transactTimeNanos: 0,
+            cumQty: 0, orderQty: 100, priceMantissa: 100_0000L,
+            receivedTimeNanos: received);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(received, MemoryMarshal.Read<ulong>(body.Slice(156, 8)));    // ReceivedTime
+
+        var bufNull = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(bufNull,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, origClOrdIdValue: 0, secondaryOrderId: 0,
+            securityId: 7, orderId: 1, execId: 0, transactTimeNanos: 0,
+            cumQty: 0, orderQty: 100, priceMantissa: 100_0000L);
+        var bodyNull = bufNull.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(ulong.MaxValue, MemoryMarshal.Read<ulong>(bodyNull.Slice(156, 8)));
     }
 }

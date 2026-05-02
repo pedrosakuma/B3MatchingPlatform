@@ -24,9 +24,18 @@ internal static class ExecutionReportEncoder
     private const ulong UTCTimestampNullValue = ulong.MaxValue;
     private const long PriceNullMantissa = long.MinValue;
 
-    public const int ExecReportNewBlock = 144;
-    public const int ExecReportModifyBlock = 160;
-    public const int ExecReportCancelBlock = 156;
+    // ER_New / ER_Modify / ER_Cancel are encoded against the **V3** schema so the
+    // optional `receivedTime` (tag 35544) field is wire-addressable (#GAP-11 / #49).
+    // Block lengths and trailing field offsets verified against the generated
+    // `B3.Entrypoint.Fixp.Sbe.V6.V3` structs:
+    //   ER_New    BLOCK_LENGTH = 172  receivedTime@144  + crossType@162 / crossPriori@163 / mmProtReset@164 nulls
+    //   ER_Modify BLOCK_LENGTH = 183  receivedTime@160  + mmProtReset@178 null
+    //   ER_Cancel BLOCK_LENGTH = 182  receivedTime@156  (no non-zero trailing nulls)
+    // ER_Trade and ER_Reject continue to ride the V2 schema; #49 explicitly
+    // scopes to ER_New/Modify/Cancel.
+    public const int ExecReportNewBlock = 172;
+    public const int ExecReportModifyBlock = 183;
+    public const int ExecReportCancelBlock = 182;
     public const int ExecReportTradeBlock = 154;
     public const int ExecReportRejectBlock = 138;
 
@@ -77,11 +86,11 @@ internal static class ExecutionReportEncoder
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId, long securityId, long orderId,
         ulong execId, ulong transactTimeNanos, Matching.OrderType ordType, Matching.TimeInForce tif,
-        long orderQty, long? priceMantissa)
+        long orderQty, long? priceMantissa, ulong receivedTimeNanos = UTCTimestampNullValue)
     {
         if (dst.Length < ExecReportNewTotal) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportNewTotal,
-            ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 2);
+            ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 3);
         var body = dst.Slice(HeaderSize, ExecReportNewBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -103,6 +112,12 @@ internal static class ExecutionReportEncoder
         long px = priceMantissa ?? PriceNullMantissa;
         MemoryMarshal.Write(body.Slice(104, 8), in px);
         MemoryMarshal.Write(body.Slice(112, 8), in nullPx);                 // StopPx
+        // V3 trailing fields: receivedTime + non-zero null sentinels.
+        MemoryMarshal.Write(body.Slice(144, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
+        // ordTagID@155 null=0 already, investorID@156 null=zeros already, strategyID@168 null=0 already.
+        body[162] = 255;                                                    // CrossType null
+        body[163] = 255;                                                    // CrossPrioritization null
+        body[164] = 255;                                                    // MmProtectionReset null
         return ExecReportNewTotal;
     }
 
@@ -110,11 +125,12 @@ internal static class ExecutionReportEncoder
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
-        long leavesQty, long cumQty, long orderQty, long priceMantissa)
+        long leavesQty, long cumQty, long orderQty, long priceMantissa,
+        ulong receivedTimeNanos = UTCTimestampNullValue)
     {
         if (dst.Length < ExecReportModifyTotal) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportModifyTotal,
-            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 2);
+            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 3);
         var body = dst.Slice(HeaderSize, ExecReportModifyBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -138,6 +154,10 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(120, 8), in orderQty);
         MemoryMarshal.Write(body.Slice(128, 8), in priceMantissa);
         MemoryMarshal.Write(body.Slice(136, 8), in nullPx);                 // StopPx
+        // V3 trailing fields: receivedTime@160 + mmProtectionReset@178 null sentinel.
+        MemoryMarshal.Write(body.Slice(160, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
+        // ordTagID@171 null=0 already, investorID@172 null=zeros already, strategyID@179 null=0 already.
+        body[178] = 255;                                                    // MmProtectionReset null
         return ExecReportModifyTotal;
     }
 
@@ -145,11 +165,12 @@ internal static class ExecutionReportEncoder
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
-        long cumQty, long orderQty, long? priceMantissa)
+        long cumQty, long orderQty, long? priceMantissa,
+        ulong receivedTimeNanos = UTCTimestampNullValue)
     {
         if (dst.Length < ExecReportCancelTotal) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportCancelTotal,
-            ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 2);
+            ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 3);
         var body = dst.Slice(HeaderSize, ExecReportCancelBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -173,6 +194,9 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(124, 8), in px);                     // Price
         long nullPx = PriceNullMantissa;
         MemoryMarshal.Write(body.Slice(132, 8), in nullPx);                 // StopPx
+        // V3 trailing fields: receivedTime@156 + ordTagID/investorID/strategyID/actionRequestedFromSessionID
+        // null sentinels are all zero (handled by body.Clear() above).
+        MemoryMarshal.Write(body.Slice(156, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
         return ExecReportCancelTotal;
     }
 

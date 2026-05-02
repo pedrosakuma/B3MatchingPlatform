@@ -70,12 +70,15 @@ public sealed class EntryPointClient : IAsyncDisposable
     // Per-template expected block lengths (mirroring ExecutionReportEncoder
     // constants in B3.Exchange.Gateway, which is internal). Used as a
     // tighter, schema-aware validation before allocating the body buffer.
+    // ER_New/Modify/Cancel were bumped to V3 in #49 (#GAP-11) to carry the
+    // optional `receivedTime` (tag 35544) trailing field; ER_Trade and
+    // ER_Reject continue to ride V2.
     // Returns -1 for unknown template IDs (caller falls back to MaxAcceptedBlockLength).
     private static int ExpectedBlockLength(ushort templateId) => templateId switch
     {
-        EntryPointFrameReader.TidExecutionReportNew => 144,
-        EntryPointFrameReader.TidExecutionReportModify => 160,
-        EntryPointFrameReader.TidExecutionReportCancel => 156,
+        EntryPointFrameReader.TidExecutionReportNew => 172,
+        EntryPointFrameReader.TidExecutionReportModify => 183,
+        EntryPointFrameReader.TidExecutionReportCancel => 182,
         EntryPointFrameReader.TidExecutionReportTrade => 154,
         EntryPointFrameReader.TidExecutionReportReject => 138,
         _ => -1,

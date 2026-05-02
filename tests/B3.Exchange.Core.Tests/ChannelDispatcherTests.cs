@@ -45,6 +45,7 @@ public class ChannelDispatcherTests
         public List<TradeEvent> Trades { get; } = new();
         public bool CaptureCancelIds { get; set; }
         public List<(ulong ClOrdId, ulong OrigClOrdId)> CancelIds { get; } = new();
+        public ulong LastReceivedTime { get; set; } = ulong.MaxValue;
 
         public FakeSession(RecordingOutbound outbound) { outbound.Register(this); }
     }
@@ -56,14 +57,14 @@ public class ChannelDispatcherTests
         private FakeSession? Find(B3.Exchange.Contracts.SessionId id)
             => _sessions.TryGetValue(id, out var s) ? s : null;
 
-        public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e)
-        { if (Find(session) is { } s) { s.News.Add(e); s.Calls.Add("New"); } return true; }
+        public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
+        { if (Find(session) is { } s) { s.News.Add(e); s.Calls.Add("New"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
         { if (Find(session) is { } s) { s.Trades.Add(e); s.Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); } return true; }
-        public bool WriteExecutionReportCancel(B3.Exchange.Contracts.SessionId session, in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue)
-        { if (Find(session) is { } s) { s.Cancels.Add(e); s.Calls.Add("Cancel"); if (s.CaptureCancelIds) s.CancelIds.Add((clOrdIdValue, origClOrdIdValue)); } return true; }
-        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq)
-        { if (Find(session) is { } s) { s.Calls.Add("Modify"); } return true; }
+        public bool WriteExecutionReportCancel(B3.Exchange.Contracts.SessionId session, in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue, ulong receivedTimeNanos = ulong.MaxValue)
+        { if (Find(session) is { } s) { s.Cancels.Add(e); s.Calls.Add("Cancel"); s.LastReceivedTime = receivedTimeNanos; if (s.CaptureCancelIds) s.CancelIds.Add((clOrdIdValue, origClOrdIdValue)); } return true; }
+        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue)
+        { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue)
         { if (Find(session) is { } s) { s.Rejects.Add(e); s.Calls.Add("Reject"); } return true; }
     }
@@ -155,6 +156,34 @@ public class ChannelDispatcherTests
         Assert.Single(reply.Cancels);
         Assert.Equal(oid, reply.Cancels[0].OrderId);
         Assert.Single(pkt.Packets);
+    }
+
+    [Fact]
+    public void ExecReports_PropagateInboundReceivedTime_FromCommandEnteredAt()
+    {
+        // #49 / #GAP-11: ER frames emitted while processing an inbound command
+        // must carry that command's ingress timestamp so clients can measure
+        // gateway latency. After processing returns, the dispatcher resets
+        // the per-command timestamp so engine-originated events emitted
+        // outside command context (e.g. iceberg restate) get the SBE null
+        // sentinel (ulong.MaxValue) and not a stale value.
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        const ulong newReceivedAt = 1_700_000_000_111_111_111UL;
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, newReceivedAt),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        Assert.Equal(newReceivedAt, reply.LastReceivedTime);
+
+        long oid = reply.News[0].OrderId;
+        const ulong cancelReceivedAt = 1_700_000_000_222_222_222UL;
+        disp.EnqueueCancel(
+            new CancelOrderCommand("1", Petr, oid, cancelReceivedAt),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL, origClOrdIdValue: 0UL);
+        DrainInbound(disp);
+        Assert.Equal(cancelReceivedAt, reply.LastReceivedTime);
     }
 
     [Fact]
