@@ -545,6 +545,42 @@ public sealed class FixpSession : IAsyncDisposable
                 _sink.OnDecodeError(Identity, rpErr ?? "decode error: SimpleModifyOrder");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleModifyOrder").ConfigureAwait(false);
                 return false;
+            case EntryPointFrameReader.TidNewOrderSingle:
+                {
+                    var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+                        fixedBlock, EnteringFirm, now, out var nos, out var nosClOrd, out var nosMsg);
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
+                    {
+                        _sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd);
+                        return true;
+                    }
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
+                    {
+                        WriteApplicationBusinessReject(info.TemplateId, fixedBlock, nosClOrd, nosMsg ?? "unsupported");
+                        return true;
+                    }
+                    _sink.OnDecodeError(Identity, nosMsg ?? "decode error: NewOrderSingle");
+                    await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:NewOrderSingle").ConfigureAwait(false);
+                    return false;
+                }
+            case EntryPointFrameReader.TidOrderCancelReplaceRequest:
+                {
+                    var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+                        fixedBlock, now, out var ocr, out var ocrClOrd, out var ocrOrigClOrd, out var ocrMsg);
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
+                    {
+                        _sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd);
+                        return true;
+                    }
+                    if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
+                    {
+                        WriteApplicationBusinessReject(info.TemplateId, fixedBlock, ocrClOrd, ocrMsg ?? "unsupported");
+                        return true;
+                    }
+                    _sink.OnDecodeError(Identity, ocrMsg ?? "decode error: OrderCancelReplaceRequest");
+                    await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderCancelReplaceRequest").ConfigureAwait(false);
+                    return false;
+                }
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
                 {
@@ -741,7 +777,36 @@ public sealed class FixpSession : IAsyncDisposable
     private static bool IsApplicationTemplate(ushort templateId)
         => templateId == EntryPointFrameReader.TidSimpleNewOrder
         || templateId == EntryPointFrameReader.TidSimpleModifyOrder
+        || templateId == EntryPointFrameReader.TidNewOrderSingle
+        || templateId == EntryPointFrameReader.TidOrderCancelReplaceRequest
         || templateId == EntryPointFrameReader.TidOrderCancelRequest;
+
+    /// <summary>
+    /// Emits a <c>BusinessMessageReject(33003)</c> for an application
+    /// frame whose wire body decoded but requested an unsupported
+    /// sub-feature (e.g. stop-order, iceberg, RLP, GTC). The session
+    /// stays open; spec §4.10 / #GAP-15. <paramref name="fixedBlock"/>
+    /// is the inbound body whose first 8 bytes are the
+    /// <c>InboundBusinessHeader</c>: <c>sessionID</c> (offset 0) and
+    /// <c>msgSeqNum</c> (offset 4). The supplied
+    /// <paramref name="clOrdId"/> is forwarded as
+    /// <c>businessRejectRefId</c> so the peer can correlate.
+    /// </summary>
+    private void WriteApplicationBusinessReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string text)
+    {
+        uint refSeqNum = fixedBlock.Length >= 8
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+            : 0u;
+        WriteBusinessMessageReject(
+            refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
+            refSeqNum: refSeqNum,
+            businessRejectRefId: clOrdId,
+            businessRejectReason: 33003,
+            text: text);
+        _logger.LogWarning(
+            "fixp session {ConnectionId} business reject (unsupported feature) template={Template} text={Text}",
+            ConnectionId, templateId, text);
+    }
 
     /// <summary>
     /// Spec §4.6.3.1 / §4.10 (#GAP-10): validates that an inbound business
