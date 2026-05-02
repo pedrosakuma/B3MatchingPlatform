@@ -70,6 +70,9 @@ public enum CancelReason : byte
     /// policy because an incoming aggressor from the same firm would have
     /// crossed against it.</summary>
     SelfTradePrevention,
+    /// <summary>Resting order cancelled by an OrderMassActionRequest
+    /// (template 701 → ER_Cancel; spec §4.8 / #GAP-19).</summary>
+    MassCancel,
 }
 
 /// <summary>
@@ -126,3 +129,18 @@ public sealed record CrossOrderCommand(
     ulong BuyClOrdIdValue,
     ulong SellClOrdIdValue,
     ulong CrossId);
+
+/// <summary>
+/// Mass-cancel command (OrderMassActionRequest template 701, spec §4.8 /
+/// #GAP-19). The engine itself only ever sees a flat list of orderIds —
+/// the channel dispatcher resolves the (session, firm, optional Side,
+/// optional SecurityId) filter set against its <c>OrderOwnership</c> map
+/// before invoking <see cref="MatchingEngine.MassCancel"/>. A
+/// <c>SecurityId</c> of zero (the schema's null sentinel) means "any
+/// instrument in this dispatcher's books"; the host router fans the
+/// inbound command out to every channel when no security id is set.
+/// </summary>
+public sealed record MassCancelCommand(
+    long SecurityId,
+    Side? SideFilter,
+    ulong EnteredAtNanos);

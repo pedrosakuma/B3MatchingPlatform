@@ -55,6 +55,7 @@ internal static class BusinessMessageRejectEncoder
         EntryPointFrameReader.TidOrderCancelReplaceRequest => 18, // MessageType.OrderCancelReplaceRequest
         EntryPointFrameReader.TidOrderCancelRequest => 19,// MessageType.OrderCancelRequest
         EntryPointFrameReader.TidNewOrderCross => 20,     // MessageType.NewOrderCross
+        EntryPointFrameReader.TidOrderMassActionRequest => 29, // MessageType.OrderMassActionRequest
         _ => 0,
     };
 
