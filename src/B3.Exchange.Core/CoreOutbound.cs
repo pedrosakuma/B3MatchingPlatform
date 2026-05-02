@@ -88,6 +88,23 @@ public interface IInboundCommandSink
     /// </summary>
     void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm);
 
+    /// <summary>
+    /// Enqueues a mass-cancel command (OrderMassActionRequest template 701,
+    /// spec §4.8 / #GAP-19). The dispatcher walks its
+    /// <c>OrderOwnership</c> map for every resting order owned by the
+    /// originating <paramref name="session"/> + <paramref name="enteringFirm"/>
+    /// that matches the optional Side / SecurityId filters and cancels
+    /// each (one <c>ExecutionReport_Cancel</c> per order back to the
+    /// originating session). The caller (gateway) is responsible for
+    /// emitting the matching <c>OrderMassActionReport</c> (template 702)
+    /// acknowledgement on the same wire.
+    ///
+    /// <para>A <c>SecurityId == 0</c> on the command means "any
+    /// instrument"; the host router fans the command out to every
+    /// dispatcher in that case.</para>
+    /// </summary>
+    void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm);
+
     /// <summary>Called when a frame fails decoding. Logging hook only — the
     /// Gateway-side <c>FixpSession</c> is responsible for the actual
     /// SessionReject (Terminate) / BusinessMessageReject + close-of-stream

@@ -652,6 +652,48 @@ public sealed class FixpSession : IAsyncDisposable
                 _sink.OnDecodeError(Identity, cnErr ?? "decode error: OrderCancelRequest");
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderCancelRequest").ConfigureAwait(false);
                 return false;
+            case EntryPointFrameReader.TidOrderMassActionRequest:
+                {
+                    var mcOutcome = InboundMessageDecoder.TryDecodeOrderMassActionRequest(
+                        fixedBlock, now, out var mcCmd, out var mcClOrd, out var mcMsg);
+                    if (mcOutcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
+                    {
+                        // Spec §4.8 — acknowledge synchronously with
+                        // OrderMassActionReport(ACCEPTED) ahead of the
+                        // per-order ER_Cancel frames the engine will emit
+                        // asynchronously when it processes EnqueueMassCancel.
+                        byte? sideByte = mcCmd.SideFilter switch
+                        {
+                            Matching.Side.Buy => (byte)'1',
+                            Matching.Side.Sell => (byte)'2',
+                            _ => null,
+                        };
+                        WriteOrderMassActionReport(mcClOrd,
+                            OrderMassActionReportEncoder.MassActionResponseAccepted,
+                            massActionRejectReason: null,
+                            side: sideByte, securityId: mcCmd.SecurityId,
+                            transactTimeNanos: now);
+                        _sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm);
+                        return true;
+                    }
+                    if (mcOutcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
+                    {
+                        // Template 702 IS the reject mechanism for 701 —
+                        // emit OrderMassActionReport(REJECTED) rather than
+                        // a generic BusinessMessageReject so the peer's
+                        // FIX-side state machine sees the expected ack
+                        // family (spec §4.8).
+                        WriteOrderMassActionReport(mcClOrd,
+                            OrderMassActionReportEncoder.MassActionResponseRejected,
+                            massActionRejectReason: OrderMassActionReportEncoder.RejectReasonMassActionNotSupported,
+                            side: null, securityId: 0, transactTimeNanos: now,
+                            text: mcMsg);
+                        return true;
+                    }
+                    _sink.OnDecodeError(Identity, mcMsg ?? "decode error: OrderMassActionRequest");
+                    await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:OrderMassActionRequest").ConfigureAwait(false);
+                    return false;
+                }
             default:
                 // Unreachable: TryParseInboundHeader has already screened out
                 // unknown templates and returned UnsupportedTemplate.
@@ -842,7 +884,8 @@ public sealed class FixpSession : IAsyncDisposable
         || templateId == EntryPointFrameReader.TidNewOrderSingle
         || templateId == EntryPointFrameReader.TidOrderCancelReplaceRequest
         || templateId == EntryPointFrameReader.TidOrderCancelRequest
-        || templateId == EntryPointFrameReader.TidNewOrderCross;
+        || templateId == EntryPointFrameReader.TidNewOrderCross
+        || templateId == EntryPointFrameReader.TidOrderMassActionRequest;
 
     /// <summary>
     /// Emits a <c>BusinessMessageReject(33003)</c> for an application
@@ -1458,6 +1501,40 @@ public sealed class FixpSession : IAsyncDisposable
                 securityId, orderId, (ulong)rptSeq, transactTimeNanos,
                 leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
                 receivedTimeNanos: receivedTimeNanos);
+            return AppendAndEnqueueLocked(exact);
+        }
+    }
+
+    /// <summary>
+    /// Per-session monotonic counter sourcing
+    /// <c>OrderMassActionReport.MassActionReportID</c> (template 702).
+    /// Spec requires an engine-assigned unique id; deriving it from a
+    /// per-session counter is sufficient because the (sessionId, id)
+    /// pair is globally unique.
+    /// </summary>
+    private long _massActionReportSeq;
+
+    /// <summary>
+    /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
+    /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
+    /// <c>OrderMassActionRequest</c>. The report is sent ahead of the
+    /// per-order <c>ExecutionReport_Cancel</c> messages that the engine
+    /// emits asynchronously for the matching resting orders.
+    /// </summary>
+    public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
+        byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,
+        string? text = null)
+    {
+        if (!IsOpen) return false;
+        ulong reportId = (ulong)Interlocked.Increment(ref _massActionReportSeq);
+        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text!.Length, OrderMassActionReportEncoder.MaxTextLength);
+        var exact = new byte[OrderMassActionReportEncoder.TotalSize(textLen)];
+        lock (_outboundLock)
+        {
+            OrderMassActionReportEncoder.EncodeOrderMassActionReportWithText(exact,
+                SessionId, NextMsgSeqNum(), transactTimeNanos,
+                clOrdIdValue, reportId, transactTimeNanos,
+                massActionResponse, massActionRejectReason, side, securityId, text);
             return AppendAndEnqueueLocked(exact);
         }
     }

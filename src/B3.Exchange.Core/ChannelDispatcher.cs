@@ -232,6 +232,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             WorkKind.Cancel => item.Cancel?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Replace => item.Replace?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Cross => item.Cross?.Buy.EnteredAtNanos ?? ulong.MaxValue,
+            WorkKind.MassCancel => item.MassCancel?.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
@@ -289,6 +290,32 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                         _metrics?.IncOrdersIn();
                         _currentClOrdId = cross.SellClOrdIdValue;
                         _engine.Submit(cross.Sell);
+                        break;
+                    }
+                case WorkKind.MassCancel:
+                    {
+                        // Mass-cancel (#GAP-19, spec §4.8). Filter the
+                        // OrderOwnership map by (session, firm) plus the
+                        // per-command Side / SecurityId filters, then ask
+                        // the engine to cancel every matching orderId in
+                        // one dispatch turn so all DEL frames pack into a
+                        // single UMDF packet (atomic from the consumer's
+                        // POV) and one ER_Cancel per order is routed back
+                        // to the originating session via OnOrderCanceled.
+                        var mc = item.MassCancel!;
+                        if (!_hasCurrentSession) break;
+                        List<long>? matched = null;
+                        foreach (var kv in _orderOwners)
+                        {
+                            var owner = kv.Value;
+                            if (owner.Session != _currentSession) continue;
+                            if (owner.Firm != _currentFirm) continue;
+                            if (mc.SideFilter.HasValue && owner.Side != mc.SideFilter.Value) continue;
+                            if (mc.SecurityId != 0 && owner.SecurityId != mc.SecurityId) continue;
+                            (matched ??= new List<long>()).Add(kv.Key);
+                        }
+                        if (matched != null)
+                            _engine.MassCancel(matched, mc.EnteredAtNanos);
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -459,6 +486,13 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             LogQueueFull(ChannelNumber, WorkKind.Cross);
     }
 
+    public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
+    {
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
+            0, 0, null, null, null, null, cmd)))
+            LogQueueFull(ChannelNumber, WorkKind.MassCancel);
+    }
+
     public void OnDecodeError(SessionId session, string error)
     {
         _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
@@ -528,7 +562,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_hasCurrentSession)
         {
-            _orderOwners[e.OrderId] = new OrderOwnership(_currentSession, _currentClOrdId, _currentFirm);
+            _orderOwners[e.OrderId] = new OrderOwnership(_currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
             if (_currentClOrdId != 0)
                 _clOrdIdIndex[(_currentFirm, _currentClOrdId)] = e.OrderId;
         }
@@ -669,9 +703,15 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
 
-    internal readonly record struct OrderOwnership(SessionId Session, ulong ClOrdId, uint Firm);
+    /// <summary>
+    /// Per-resting-order routing context. <see cref="Side"/> +
+    /// <see cref="SecurityId"/> are stamped at <see cref="OnOrderAccepted"/>
+    /// so the mass-cancel filter (#GAP-19, spec §4.8) can decide which
+    /// orders match without a round-trip into the engine.
+    /// </summary>
+    internal readonly record struct OrderOwnership(SessionId Session, ulong ClOrdId, uint Firm, Side Side, long SecurityId);
 
     internal sealed record WorkItem(
         WorkKind Kind,
@@ -683,7 +723,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         NewOrderCommand? NewOrder,
         CancelOrderCommand? Cancel,
         ReplaceOrderCommand? Replace,
-        CrossOrderCommand? Cross);
+        CrossOrderCommand? Cross,
+        MassCancelCommand? MassCancel = null);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

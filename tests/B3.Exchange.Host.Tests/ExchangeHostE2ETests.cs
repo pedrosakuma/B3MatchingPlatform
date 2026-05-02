@@ -336,6 +336,106 @@ public class ExchangeHostE2ETests
             $"missing symbols: {string.Join(",", expectedSymbols.Except(seenSymbols))}");
     }
 
+    [Fact]
+    public async Task OrderMassActionRequest_CancelsAllRestingOrdersForSession()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // Place two resting BUY orders.
+        await stream.WriteAsync(BuildSimpleNewOrder(clOrdId: 7001, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 100_000));
+        var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
+
+        await stream.WriteAsync(BuildSimpleNewOrder(clOrdId: 7002, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 200, priceMantissa: 99_000));
+        var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er2.TemplateId);
+
+        // Mass-cancel all orders on this security (no Side filter).
+        await stream.WriteAsync(BuildOrderMassActionRequest(clOrdId: 7100, secId: Petr));
+
+        // Expect: OrderMassActionReport(ACCEPTED) first, then 2 ER_Cancel
+        // frames (one per resting order) — order between the two cancels
+        // is FIFO-by-orderId and not part of the assertion.
+        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal((byte)'1', report.Body[44]); // MassActionResponse = ACCEPTED
+        ulong reportClOrd = BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8));
+        Assert.Equal(7100UL, reportClOrd);
+
+        var cancel1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel1.TemplateId);
+        var cancel2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel2.TemplateId);
+    }
+
+    [Fact]
+    public async Task OrderMassActionRequest_SideFilter_OnlyCancelsMatchingSide()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // One BUY @ 100 and one SELL @ 200 — they don't cross.
+        await stream.WriteAsync(BuildSimpleNewOrder(clOrdId: 8001, secId: Petr,
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 100_000));
+        var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
+
+        await stream.WriteAsync(BuildSimpleNewOrder(clOrdId: 8002, secId: Petr,
+            side: '2', ordType: '2', tif: '0', qty: 100, priceMantissa: 200_000));
+        var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er2.TemplateId);
+
+        // Mass-cancel only BUY side.
+        await stream.WriteAsync(BuildOrderMassActionRequest(clOrdId: 8100, secId: Petr, side: '1'));
+
+        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal((byte)'1', report.Body[48]); // Side filter echoed = Buy
+
+        var cancel = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel.TemplateId);
+        // Verify it cancelled the BUY (ER_Cancel.Side @ body[18] = '1')
+        Assert.Equal((byte)'1', cancel.Body[18]);
+    }
+
+    [Fact]
+    public async Task OrderMassActionRequest_OrdTagIdFilter_RejectedAsUnsupportedFeature()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // Build a request with OrdTagID set (unsupported feature).
+        var frame = BuildOrderMassActionRequest(clOrdId: 9100, secId: Petr);
+        frame[EntryPointFrameReader.WireHeaderSize + 29] = 7; // OrdTagID
+        await stream.WriteAsync(frame);
+
+        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal((byte)'0', report.Body[44]); // MassActionResponse = REJECTED
+        Assert.Equal((byte)0, report.Body[45]);   // RejectReason = MASS_ACTION_NOT_SUPPORTED
+    }
+
     private static byte[] BuildOrderCancelRequest(ulong clOrdId, long secId, ulong orderId, ulong origClOrdId, char side)
     {
         // 12-byte composite header (SOFH+SBE) + 76-byte OrderCancelRequest (V6) body.
@@ -438,6 +538,32 @@ public class ExchangeHostE2ETests
         body[58] = (byte)tif;
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(60, 8), qty);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
+        return frame;
+    }
+
+    private static byte[] BuildOrderMassActionRequest(ulong clOrdId, char? side = null, long? secId = null)
+    {
+        // 12-byte composite header (SOFH+SBE) + 52-byte OrderMassActionRequest (V6) body.
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 52];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, EntryPointFrameReader.WireHeaderSize),
+            messageLength: (ushort)frame.Length,
+            blockLength: 52, templateId: EntryPointFrameReader.TidOrderMassActionRequest, version: 6);
+
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        body[18] = 3;                  // MassActionType = CANCEL_ORDERS
+        body[19] = 255;                // MassActionScope null
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
+        body[28] = 255;                // ExecRestatementReason null
+        body[29] = 0;                  // OrdTagID null
+        body[30] = side.HasValue ? (byte)side.Value : (byte)0;
+        // body[31] padding; body[32..38] Asset null (zeros)
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(38, 8),
+            secId.HasValue ? (ulong)secId.Value : 0UL);
+        // body[46..52] InvestorID/SecurityExchange — leave as constant "BVMF"
+        body[46] = (byte)'B';
+        body[47] = (byte)'V';
+        body[48] = (byte)'M';
+        body[49] = (byte)'F';
         return frame;
     }
 
