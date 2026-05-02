@@ -24,6 +24,7 @@ public class FixpSessionThrottleTests
         public void EnqueueCancel(in CancelOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void EnqueueReplace(in ReplaceOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) { }
         public void EnqueueCross(in CrossOrderCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm) { }
+        public void EnqueueMassCancel(in MassCancelCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm) { }
         public void OnDecodeError(B3.Exchange.Contracts.SessionId session, string error) { }
         public void OnSessionClosed(B3.Exchange.Contracts.SessionId session) { }
     }
