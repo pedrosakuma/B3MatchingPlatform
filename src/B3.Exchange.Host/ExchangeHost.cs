@@ -215,6 +215,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
             LifecycleMetrics = _metrics.Sessions,
+            ThrottleTimeWindowMs = _config.Tcp.Throttle?.TimeWindowMs ?? 0,
+            ThrottleMaxMessages = _config.Tcp.Throttle?.MaxMessages ?? 0,
+            ThrottleMetrics = _config.Tcp.Throttle is not null ? _metrics.Throttle : null,
         };
         // Phase 2 (#42): real Negotiate handshake. The validator is pure
         // (no IO); the claim ledger lives for the host process lifetime

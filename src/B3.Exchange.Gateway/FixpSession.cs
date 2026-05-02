@@ -98,6 +98,14 @@ public sealed class FixpSession : IAsyncDisposable
     private int _probeOutstanding;
     private Task? _recvTask;
     private Task? _watchdogTask;
+    private readonly Func<long> _nowMs;
+    /// <summary>
+    /// Per-session inbound sliding-window throttle (issue #56 / GAP-20).
+    /// Null when both <see cref="FixpSessionOptions.ThrottleTimeWindowMs"/>
+    /// and <see cref="FixpSessionOptions.ThrottleMaxMessages"/> are 0
+    /// (throttling disabled). Mutated only on the receive thread.
+    /// </summary>
+    private readonly InboundThrottle? _throttle;
 
     public long ConnectionId { get; }
     /// <summary>
@@ -197,6 +205,15 @@ public sealed class FixpSession : IAsyncDisposable
                     break;
             }
         }
+        // Reset the inbound throttle window on every transition INTO
+        // Established (initial Establish + rebind via #69b) so a freshly
+        // (re-)established session starts with a clean budget. Counter
+        // totals on _throttle (lifetime accept/reject) are preserved.
+        if (t.Action == FixpAction.Accept && prev != t.NewState
+            && t.NewState == FixpState.Established)
+        {
+            _throttle?.Reset();
+        }
         return t.Action;
     }
 
@@ -247,7 +264,8 @@ public sealed class FixpSession : IAsyncDisposable
         ILogger<TcpTransport>? transportLogger = null,
         NegotiationValidator? negotiationValidator = null,
         SessionClaimRegistry? sessionClaims = null,
-        EstablishValidator? establishValidator = null)
+        EstablishValidator? establishValidator = null,
+        Func<long>? nowMs = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -259,9 +277,17 @@ public sealed class FixpSession : IAsyncDisposable
         _transportLogger = transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance;
         _sendQueueCapacity = sendQueueCapacity;
         _nowNanos = nowNanos ?? DefaultNowNanos;
+        _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
         _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity);
+        if (_options.ThrottleMaxMessages > 0 && _options.ThrottleTimeWindowMs > 0)
+        {
+            _throttle = new InboundThrottle(
+                _options.ThrottleMaxMessages,
+                _options.ThrottleTimeWindowMs,
+                _nowMs);
+        }
         _onClosed = onClosed;
         _validator = negotiationValidator;
         _establishValidator = establishValidator;
@@ -423,6 +449,18 @@ public sealed class FixpSession : IAsyncDisposable
         var fullBody = new ReadOnlyMemory<byte>(bodyBuf, 0, bodyLength);
         var fixedBlock = fullBody.Slice(0, info.BlockLength).Span;
         var varData = fullBody.Slice(info.BlockLength).Span;
+
+        // Per-session inbound sliding-window throttle (issue #56 / GAP-20,
+        // guidelines §4.9). Only application templates count toward the
+        // budget — FIXP session-layer messages (Negotiate, Establish,
+        // Sequence, RetransmitRequest) bypass it. On violation we emit
+        // BusinessMessageReject with text "Throttle limit exceeded" and
+        // KEEP the session open; the offending frame does not consume a
+        // slot (so a sustained burst keeps getting rejected, not slowly
+        // re-admitted). The decoded varData / strict-gating checks below
+        // are skipped on rejection.
+        if (!TryAcceptInboundThrottle(info.TemplateId, fixedBlock))
+            return true;
 
         // Strict gating (issue #43, spec §4.5.3.1): when the validator is
         // wired (i.e. we're running in "real" multi-tenant mode), an
@@ -886,6 +924,46 @@ public sealed class FixpSession : IAsyncDisposable
         || templateId == EntryPointFrameReader.TidOrderCancelRequest
         || templateId == EntryPointFrameReader.TidNewOrderCross
         || templateId == EntryPointFrameReader.TidOrderMassActionRequest;
+
+    /// <summary>
+    /// Per-session inbound sliding-window throttle gate (issue #56 /
+    /// GAP-20). Returns <c>true</c> if the inbound frame is admitted
+    /// (the slot is consumed), or <c>false</c> after emitting
+    /// <c>BusinessMessageReject(text="Throttle limit exceeded")</c> for
+    /// the rejected frame. Session-layer FIXP messages (anything that
+    /// is not an <see cref="IsApplicationTemplate"/> template) and
+    /// sessions configured without a throttle (<c>_throttle == null</c>)
+    /// always return <c>true</c>. Exposed as <c>internal</c> so tests can
+    /// drive the throttle directly without constructing a fully-decodable
+    /// SimpleNewOrder body.
+    /// </summary>
+    internal bool TryAcceptInboundThrottle(ushort templateId, ReadOnlySpan<byte> fixedBlock)
+    {
+        if (_throttle is null || !IsApplicationTemplate(templateId))
+            return true;
+        if (_throttle.TryAccept())
+        {
+            _options.ThrottleMetrics?.IncAccepted();
+            return true;
+        }
+        uint refSeqNum = fixedBlock.Length >= 8
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+            : 0u;
+        ulong refClOrdId = fixedBlock.Length >= 28
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+            : 0UL;
+        WriteBusinessMessageReject(
+            refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
+            refSeqNum: refSeqNum,
+            businessRejectRefId: refClOrdId,
+            businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
+            text: "Throttle limit exceeded");
+        _options.ThrottleMetrics?.IncRejected();
+        _logger.LogWarning(
+            "fixp session {ConnectionId} throttle reject template={Template} (max={Max}/{WindowMs}ms)",
+            ConnectionId, templateId, _throttle.MaxMessages, _throttle.TimeWindowMs);
+        return false;
+    }
 
     /// <summary>
     /// Emits a <c>BusinessMessageReject(33003)</c> for an application

@@ -39,6 +39,29 @@ public sealed class TcpConfig
     /// <summary>Additional grace window after the probe before the session is
     /// closed for inactivity. Default: 5 s.</summary>
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
+
+    /// <summary>
+    /// Per-session inbound sliding-window throttle (issue #56 / GAP-20,
+    /// guidelines §4.9). Omit (or set both fields to 0) to disable
+    /// throttling. Defaults to 100 application messages per 1000 ms when
+    /// the JSON object is present without explicit overrides.
+    /// </summary>
+    [JsonPropertyName("throttle")] public ThrottleConfig? Throttle { get; set; }
+}
+
+/// <summary>
+/// Configuration block for the per-session inbound sliding-window
+/// throttle (issue #56 / GAP-20, guidelines §4.9). On violation the
+/// session emits <c>BusinessMessageReject("Throttle limit exceeded")</c>
+/// and stays open. FIXP session-layer messages bypass the throttle.
+/// </summary>
+public sealed class ThrottleConfig
+{
+    /// <summary>Sliding window length in milliseconds. Default 1000 ms.</summary>
+    [JsonPropertyName("timeWindowMs")] public int TimeWindowMs { get; set; } = 1_000;
+
+    /// <summary>Maximum application messages accepted per window. Default 100.</summary>
+    [JsonPropertyName("maxMessages")] public int MaxMessages { get; set; } = 100;
 }
 
 /// <summary>
