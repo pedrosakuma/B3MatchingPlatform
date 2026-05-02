@@ -516,6 +516,36 @@ public sealed class FixpSession : IAsyncDisposable
             }
         }
 
+        // §4.10 (#GAP-21): CR/LF in fixed-block identifier slots
+        // (senderLocation / enteringTrader / executingTrader) on the four
+        // application templates that carry them must answer with
+        // BMR(33003 "Line breaks not supported in <field>"). Runs after
+        // the varData walker so a per-template empty slot table (Simple*
+        // templates have no identifier fields) is a cheap no-op.
+        if (_validator is not null && IsApplicationTemplate(info.TemplateId))
+        {
+            var idResult = EntryPointFixedIdentifiers.Validate(info.TemplateId, info.Version, fixedBlock);
+            if (!idResult.IsOk)
+            {
+                uint refSeqNum = fixedBlock.Length >= 8
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+                    : 0u;
+                ulong refRefId = fixedBlock.Length >= 28
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+                    : 0UL;
+                WriteBusinessMessageReject(
+                    refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(info.TemplateId),
+                    refSeqNum: refSeqNum,
+                    businessRejectRefId: refRefId,
+                    businessRejectReason: 33003,
+                    text: idResult.BmrText());
+                _logger.LogWarning(
+                    "fixp session {ConnectionId} business reject (identifier line-break) template={Template} field={Field}",
+                    ConnectionId, info.TemplateId, idResult.FieldName);
+                return true;
+            }
+        }
+
         switch (info.TemplateId)
         {
             case EntryPointFrameReader.TidSequence:

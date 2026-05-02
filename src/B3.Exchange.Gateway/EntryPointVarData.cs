@@ -32,6 +32,12 @@ public static class EntryPointVarData
     private static readonly Field[] NewOrderSingleFields = [DeskID, Memo];
     private static readonly Field[] OrderCancelReplaceFields = [DeskID, Memo];
     private static readonly Field[] OrderCancelFields = [DeskID, Memo];
+    /// <summary>NewOrderCross trailing varData fields (after the
+    /// NoSides repeating group). Schema order: DeskID, Memo. Same
+    /// length and line-break rules as the other application templates
+    /// (spec §4.10).</summary>
+    public static ReadOnlySpan<Field> NewOrderCrossFields => _newOrderCrossFields;
+    private static readonly Field[] _newOrderCrossFields = [DeskID, Memo];
     private static readonly Field[] NegotiateFields =
         [NegotiateCredentials, NegotiateClientIp, NegotiateClientAppName, NegotiateClientAppVersion];
     private static readonly Field[] EstablishFields = [EstablishCredentials];
