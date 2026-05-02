@@ -114,4 +114,20 @@ public class RejectEncoderTests
         Assert.Equal((byte)0, trailer[0]);
         Assert.Equal((byte)BusinessMessageRejectEncoder.MaxTextLength, trailer[1]);
     }
+
+    /// <summary>
+    /// #GAP-15 — locking in the schema MessageType enum bytes for the
+    /// templates the gateway maps to BMR(33003) refMsgType. A regression
+    /// to the raw templateId byte (e.g. 102/104) would silently break
+    /// compatibility with strict clients that decode refMsgType against
+    /// the schema enum.
+    /// </summary>
+    [Theory]
+    [InlineData(EntryPointFrameReader.TidSimpleNewOrder, (byte)15)]
+    [InlineData(EntryPointFrameReader.TidSimpleModifyOrder, (byte)16)]
+    [InlineData(EntryPointFrameReader.TidNewOrderSingle, (byte)17)]
+    [InlineData(EntryPointFrameReader.TidOrderCancelReplaceRequest, (byte)18)]
+    [InlineData(EntryPointFrameReader.TidOrderCancelRequest, (byte)19)]
+    public void MapRefMsgTypeFromTemplateId_MatchesSchemaMessageType(ushort tid, byte expected)
+        => Assert.Equal(expected, BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(tid));
 }

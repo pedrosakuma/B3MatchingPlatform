@@ -51,7 +51,75 @@ internal static class InboundMessageDecoder
         public const int Side = 52;           // byte
     }
 
+    /// <summary>
+    /// Body offsets for NewOrderSingleV2 (id=102, BlockLength=125). The
+    /// fixed root carries the supported subset (ClOrdID/SecurityID/Side/
+    /// OrdType/TimeInForce/OrderQty/Price) plus the sub-feature flags
+    /// (StopPx/MinQty/MaxFloor/RoutingInstruction/MmProtectionReset/
+    /// SelfTradePreventionInstruction/ExpireDate) that the engine does
+    /// not implement; presence of the latter triggers a
+    /// <c>BusinessMessageReject(33003)</c> rather than terminating the
+    /// session (#GAP-15).
+    /// </summary>
+    private static class NewOrderSingleOffsets
+    {
+        public const int MmProtectionReset = 19;  // bool byte (0=false)
+        public const int ClOrdID = 20;            // ulong
+        public const int Stp = 47;                // SelfTradePreventionInstruction (0=NONE)
+        public const int SecurityID = 48;         // ulong
+        public const int Side = 56;               // byte
+        public const int OrdType = 57;            // byte
+        public const int TimeInForce = 58;        // byte
+        public const int RoutingInstruction = 59; // byte (255 == null)
+        public const int OrderQty = 60;           // ulong
+        public const int PriceMantissa = 68;      // long (PriceOptional, MinValue == NULL)
+        public const int StopPxMantissa = 76;     // long (MinValue == NULL)
+        public const int MinQty = 84;             // ulong (0 == null)
+        public const int MaxFloor = 92;           // ulong (0 == null)
+        public const int ExpireDate = 105;        // ushort (0 == null)
+    }
+
+    /// <summary>
+    /// Body offsets for OrderCancelReplaceRequestV2 (id=104, BlockLength=142).
+    /// </summary>
+    private static class OrderCancelReplaceOffsets
+    {
+        public const int MmProtectionReset = 19;  // bool byte
+        public const int ClOrdID = 20;            // ulong
+        public const int Stp = 47;                // SelfTradePreventionInstruction
+        public const int SecurityID = 48;         // ulong
+        public const int Side = 56;               // byte
+        public const int OrdType = 57;            // byte
+        public const int TimeInForce = 58;        // byte (optional, '\0' == 0 == null)
+        public const int RoutingInstruction = 59; // byte (255 == null)
+        public const int OrderQty = 60;           // ulong
+        public const int PriceMantissa = 68;      // long
+        public const int OrderID = 76;            // ulong (0 == null)
+        public const int OrigClOrdID = 84;        // ulong (0 == null)
+        public const int StopPxMantissa = 92;     // long (MinValue == NULL)
+        public const int MinQty = 100;            // ulong (0 == null)
+        public const int MaxFloor = 108;          // ulong (0 == null)
+        public const int ExpireDate = 122;        // ushort (0 == null)
+    }
+
+    private const byte RoutingInstructionNull = 255;
+    private const byte TimeInForceOptionalNull = 0; // schema null = '\0'
+
     private const long PriceNull = long.MinValue;
+
+    /// <summary>
+    /// Three-valued outcome for the full NewOrderSingle (102) and
+    /// OrderCancelReplaceRequest (104) decoders. Distinguishes
+    /// session-terminating wire errors (<see cref="DecodeError"/>) from
+    /// recoverable business rejects (<see cref="UnsupportedFeature"/>)
+    /// per spec §4.10 / #GAP-15.
+    /// </summary>
+    public enum InboundDecodeOutcome
+    {
+        Success = 0,
+        DecodeError = 1,
+        UnsupportedFeature = 2,
+    }
 
     public static bool TryDecodeNewOrder(ReadOnlySpan<byte> body, uint enteringFirm, ulong enteredAtNanos,
         out NewOrderCommand cmd, out ulong clOrdIdValue, out string? error)
@@ -127,6 +195,254 @@ internal static class InboundMessageDecoder
         return true;
     }
 
+    /// <summary>
+    /// Decodes a NewOrderSingleV2 (id=102) body for #GAP-15. Returns
+    /// <see cref="InboundDecodeOutcome.Success"/> when the order maps
+    /// onto the engine's supported subset (Market/Limit, Day/IOC/FOK, no
+    /// stop / iceberg / minimum-fill / RLP). Returns
+    /// <see cref="InboundDecodeOutcome.UnsupportedFeature"/> with a
+    /// <c>BusinessMessageReject(33003)</c>-bound text when the wire fields
+    /// are individually valid but request a feature the engine does not
+    /// implement; the caller emits BMR and keeps the session open.
+    /// Returns <see cref="InboundDecodeOutcome.DecodeError"/> for wire
+    /// values that violate the SBE schema (unmapped Side / OrdType / TIF
+    /// bytes); the caller terminates with DECODING_ERROR.
+    /// </summary>
+    public static InboundDecodeOutcome TryDecodeNewOrderSingle(
+        ReadOnlySpan<byte> body, uint enteringFirm, ulong enteredAtNanos,
+        out NewOrderCommand cmd, out ulong clOrdIdValue, out string? message)
+    {
+        cmd = null!;
+        clOrdIdValue = 0;
+        message = null;
+
+        ulong clOrdId = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.ClOrdID, 8));
+        long secId = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.SecurityID, 8));
+        byte sideByte = body[NewOrderSingleOffsets.Side];
+        byte ordTypeByte = body[NewOrderSingleOffsets.OrdType];
+        byte tifByte = body[NewOrderSingleOffsets.TimeInForce];
+        byte routing = body[NewOrderSingleOffsets.RoutingInstruction];
+        long qty = (long)MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.OrderQty, 8));
+        long priceMantissa = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.PriceMantissa, 8));
+        long stopPx = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.StopPxMantissa, 8));
+        ulong minQty = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.MinQty, 8));
+        ulong maxFloor = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.MaxFloor, 8));
+        byte mmpReset = body[NewOrderSingleOffsets.MmProtectionReset];
+        byte stp = body[NewOrderSingleOffsets.Stp];
+        ushort expireDate = MemoryMarshal.Read<ushort>(body.Slice(NewOrderSingleOffsets.ExpireDate, 2));
+
+        clOrdIdValue = clOrdId;
+
+        if (!TryMapSide(sideByte, out var side))
+        {
+            message = $"invalid Side={sideByte}";
+            return InboundDecodeOutcome.DecodeError;
+        }
+        if (!TryClassifyOrdType(ordTypeByte, out var ordType, out var ordTypeUnsupported))
+        {
+            message = ordTypeUnsupported is not null
+                ? $"OrdType={ordTypeByte:X2} not supported (only Market, Limit)"
+                : $"invalid OrdType={ordTypeByte}";
+            return ordTypeUnsupported is not null
+                ? InboundDecodeOutcome.UnsupportedFeature
+                : InboundDecodeOutcome.DecodeError;
+        }
+        if (!TryClassifyTif(tifByte, out var tif, out var tifUnsupported))
+        {
+            message = tifUnsupported is not null
+                ? $"TimeInForce={(char)tifByte} not supported (only Day, IOC, FOK)"
+                : $"invalid TimeInForce={tifByte}";
+            return tifUnsupported is not null
+                ? InboundDecodeOutcome.UnsupportedFeature
+                : InboundDecodeOutcome.DecodeError;
+        }
+        if (stopPx != PriceNull)
+        {
+            message = "Stop orders not supported (StopPx must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (maxFloor != 0)
+        {
+            message = "Iceberg orders not supported (MaxFloor must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (minQty != 0)
+        {
+            message = "Minimum-fill orders not supported (MinQty must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (routing != RoutingInstructionNull)
+        {
+            message = $"RoutingInstruction={routing} not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (mmpReset != 0)
+        {
+            message = "MMProtectionReset not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (stp != 0)
+        {
+            message = "SelfTradePreventionInstruction not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (expireDate != 0)
+        {
+            message = "ExpireDate not supported (only Day/IOC/FOK)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+
+        long enginePrice = ordType == OrderType.Market ? 0L : (priceMantissa == PriceNull ? 0L : priceMantissa);
+
+        cmd = new NewOrderCommand(
+            ClOrdId: clOrdId.ToString(),
+            SecurityId: secId,
+            Side: side,
+            Type: ordType,
+            Tif: tif,
+            PriceMantissa: enginePrice,
+            Quantity: qty,
+            EnteringFirm: enteringFirm,
+            EnteredAtNanos: enteredAtNanos);
+        return InboundDecodeOutcome.Success;
+    }
+
+    /// <summary>
+    /// Decodes an OrderCancelReplaceRequestV2 (id=104) body for #GAP-15.
+    /// See <see cref="TryDecodeNewOrderSingle"/> for the outcome contract.
+    /// TimeInForce on this template is optional in the schema; absence is
+    /// accepted (replace inherits the original order's TIF).
+    /// </summary>
+    public static InboundDecodeOutcome TryDecodeOrderCancelReplace(
+        ReadOnlySpan<byte> body, ulong enteredAtNanos,
+        out ReplaceOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? message)
+    {
+        cmd = null!;
+        clOrdIdValue = 0;
+        origClOrdIdValue = 0;
+        message = null;
+
+        ulong clOrdId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.ClOrdID, 8));
+        long secId = MemoryMarshal.Read<long>(body.Slice(OrderCancelReplaceOffsets.SecurityID, 8));
+        byte sideByte = body[OrderCancelReplaceOffsets.Side];
+        byte ordTypeByte = body[OrderCancelReplaceOffsets.OrdType];
+        byte tifByte = body[OrderCancelReplaceOffsets.TimeInForce];
+        byte routing = body[OrderCancelReplaceOffsets.RoutingInstruction];
+        long qty = (long)MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrderQty, 8));
+        long priceMantissa = MemoryMarshal.Read<long>(body.Slice(OrderCancelReplaceOffsets.PriceMantissa, 8));
+        ulong orderId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrderID, 8));
+        ulong origClOrdId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrigClOrdID, 8));
+        long stopPx = MemoryMarshal.Read<long>(body.Slice(OrderCancelReplaceOffsets.StopPxMantissa, 8));
+        ulong minQty = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.MinQty, 8));
+        ulong maxFloor = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.MaxFloor, 8));
+        byte mmpReset = body[OrderCancelReplaceOffsets.MmProtectionReset];
+        byte stp = body[OrderCancelReplaceOffsets.Stp];
+        ushort expireDate = MemoryMarshal.Read<ushort>(body.Slice(OrderCancelReplaceOffsets.ExpireDate, 2));
+
+        clOrdIdValue = clOrdId;
+        origClOrdIdValue = origClOrdId;
+
+        if (!TryMapSide(sideByte, out _))
+        {
+            message = $"invalid Side={sideByte}";
+            return InboundDecodeOutcome.DecodeError;
+        }
+        if (!TryClassifyOrdType(ordTypeByte, out var ordType, out var ordTypeUnsupported))
+        {
+            message = ordTypeUnsupported is not null
+                ? $"OrdType={ordTypeByte:X2} not supported (only Limit on replace)"
+                : $"invalid OrdType={ordTypeByte}";
+            return ordTypeUnsupported is not null
+                ? InboundDecodeOutcome.UnsupportedFeature
+                : InboundDecodeOutcome.DecodeError;
+        }
+        // Replace path can only carry through Limit semantics — the
+        // engine's ReplaceOrderCommand has no Type field and reuses the
+        // resting order's existing type. Reject Market replace requests
+        // explicitly so we don't silently lie about what we did.
+        if (ordType != OrderType.Limit)
+        {
+            message = "Market replace not supported (only Limit replace)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        // TimeInForce on this template is optional in the schema (null =
+        // '\0'), meaning "do not change". Anything else than null or Day
+        // would request a TIF transition the engine cannot perform on
+        // a resting order, so reject with BMR rather than silently
+        // accepting and applying the wrong semantics.
+        if (tifByte != TimeInForceOptionalNull)
+        {
+            if (!TryClassifyTif(tifByte, out var tif, out var tifUnsupported))
+            {
+                message = tifUnsupported is not null
+                    ? $"TimeInForce={(char)tifByte} not supported on replace (omit or use Day)"
+                    : $"invalid TimeInForce={tifByte}";
+                return tifUnsupported is not null
+                    ? InboundDecodeOutcome.UnsupportedFeature
+                    : InboundDecodeOutcome.DecodeError;
+            }
+            if (tif != TimeInForce.Day)
+            {
+                message = "TIF change on replace not supported (omit or use Day)";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+        }
+        if (stopPx != PriceNull)
+        {
+            message = "Stop orders not supported (StopPx must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (maxFloor != 0)
+        {
+            message = "Iceberg orders not supported (MaxFloor must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (minQty != 0)
+        {
+            message = "Minimum-fill orders not supported (MinQty must be NULL)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (routing != RoutingInstructionNull)
+        {
+            message = $"RoutingInstruction={routing} not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (mmpReset != 0)
+        {
+            message = "MMProtectionReset not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (stp != 0)
+        {
+            message = "SelfTradePreventionInstruction not supported";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (expireDate != 0)
+        {
+            message = "ExpireDate not supported (only Day/IOC/FOK)";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (orderId == 0 && origClOrdId == 0)
+        {
+            message = "OrderCancelReplaceRequest requires either OrderID or OrigClOrdID";
+            return InboundDecodeOutcome.DecodeError;
+        }
+        if (priceMantissa == PriceNull)
+        {
+            message = "OrderCancelReplaceRequest requires Price (replace cannot remove price)";
+            return InboundDecodeOutcome.DecodeError;
+        }
+
+        cmd = new ReplaceOrderCommand(
+            ClOrdId: clOrdId.ToString(),
+            SecurityId: secId,
+            OrderId: (long)orderId,
+            NewPriceMantissa: priceMantissa,
+            NewQuantity: qty,
+            EnteredAtNanos: enteredAtNanos);
+        return InboundDecodeOutcome.Success;
+    }
+
     public static bool TryDecodeCancel(ReadOnlySpan<byte> body, ulong enteredAtNanos,
         out CancelOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? error)
     {
@@ -184,6 +500,70 @@ internal static class InboundMessageDecoder
             case (byte)'3': tif = TimeInForce.IOC; return true;
             case (byte)'4': tif = TimeInForce.FOK; return true;
             default: tif = default; return false;
+        }
+    }
+
+    /// <summary>
+    /// Three-way OrdType classification used by the
+    /// NewOrderSingle/OrderCancelReplaceRequest decoders. Returns
+    /// <c>true</c> for the supported subset (Market=1, Limit=2). Returns
+    /// <c>false</c> with <paramref name="unsupportedReason"/> set when the
+    /// byte is a schema-valid OrdType the engine does not implement
+    /// (Stop=3, StopLimit=4, MarketWithLeftover=K, RLP=W, Pegged=P —
+    /// schema enum values per <c>schemas/b3-entrypoint-messages-8.4.2.xml</c>).
+    /// Returns <c>false</c> with <paramref name="unsupportedReason"/>
+    /// <c>null</c> for bytes that are not part of the FIX OrdType
+    /// enumeration at all — caller terminates with DECODING_ERROR.
+    /// </summary>
+    private static bool TryClassifyOrdType(byte b, out OrderType type, out string? unsupportedReason)
+    {
+        unsupportedReason = null;
+        switch (b)
+        {
+            case (byte)'1': type = OrderType.Market; return true;
+            case (byte)'2': type = OrderType.Limit; return true;
+            case (byte)'3': // STOP_LOSS
+            case (byte)'4': // STOP_LIMIT
+            case (byte)'K': // MARKET_WITH_LEFTOVER_AS_LIMIT
+            case (byte)'W': // RLP
+            case (byte)'P': // PEGGED_MIDPOINT
+                type = default;
+                unsupportedReason = "unsupported OrdType";
+                return false;
+            default:
+                type = default;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Three-way TimeInForce classification. Returns <c>true</c> for the
+    /// supported subset (Day=0, IOC=3, FOK=4). For other schema-valid
+    /// values (GTC=1, GTD=6, AtTheClose=7, GoodForAuction='A') returns
+    /// <c>false</c> with <paramref name="unsupportedReason"/> populated.
+    /// For bytes not in the schema returns <c>false</c> with the reason
+    /// <c>null</c>. The schema-NULL byte ('\0') is always reported as a
+    /// wire decode error here; callers that accept optional TIF must
+    /// short-circuit before invoking this helper.
+    /// </summary>
+    private static bool TryClassifyTif(byte b, out TimeInForce tif, out string? unsupportedReason)
+    {
+        unsupportedReason = null;
+        switch (b)
+        {
+            case (byte)'0': tif = TimeInForce.Day; return true;
+            case (byte)'3': tif = TimeInForce.IOC; return true;
+            case (byte)'4': tif = TimeInForce.FOK; return true;
+            case (byte)'1': // GOOD_TILL_CANCEL
+            case (byte)'6': // GOOD_TILL_DATE
+            case (byte)'7': // AT_THE_CLOSE
+            case (byte)'A': // GOOD_FOR_AUCTION
+                tif = default;
+                unsupportedReason = "unsupported TimeInForce";
+                return false;
+            default:
+                tif = default;
+                return false;
         }
     }
 }
