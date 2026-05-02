@@ -111,6 +111,24 @@ public sealed class SessionLifecycleMetrics
 }
 
 /// <summary>
+/// Process-wide counters for the per-session inbound sliding-window
+/// throttle (issue #56 / GAP-20, guidelines §4.9). Increments are atomic
+/// so the FIXP recv thread can advance them while a metrics scrape runs
+/// concurrently on the HTTP thread.
+/// </summary>
+public sealed class ThrottleMetrics
+{
+    private long _accepted;
+    private long _rejected;
+
+    public long Accepted => Interlocked.Read(ref _accepted);
+    public long Rejected => Interlocked.Read(ref _rejected);
+
+    public void IncAccepted() => Interlocked.Increment(ref _accepted);
+    public void IncRejected() => Interlocked.Increment(ref _rejected);
+}
+
+/// <summary>
 /// Central registry of channel metrics + a Prometheus text-format
 /// renderer. Hand-rolled to avoid taking a dependency on
 /// <c>prometheus-net</c> (see issue #5 / project conventions).
@@ -121,8 +139,10 @@ public sealed class MetricsRegistry
     private readonly object _lock = new();
     private ISessionMetricsProvider? _sessions;
     private readonly SessionLifecycleMetrics _sessionLifecycle = new();
+    private readonly ThrottleMetrics _throttle = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
+    public ThrottleMetrics Throttle => _throttle;
 
     public ChannelMetrics RegisterChannel(byte channelNumber)
     {
@@ -225,6 +245,12 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_session_reaped_total",
             "Total Suspended FIXP sessions closed by the listener's CoD/suspended reaper after exceeding SuspendedTimeoutMs.",
             _sessionLifecycle.Reaped);
+        EmitProcessCounter(sb, "exch_throttle_accepted_total",
+            "Total inbound application messages accepted by the per-session sliding-window throttle (issue #56 / GAP-20).",
+            _throttle.Accepted);
+        EmitProcessCounter(sb, "exch_throttle_rejected_total",
+            "Total inbound application messages rejected with BusinessMessageReject(\"Throttle limit exceeded\") by the per-session sliding-window throttle (issue #56 / GAP-20).",
+            _throttle.Rejected);
 
         return sb.ToString();
     }

@@ -63,6 +63,31 @@ public sealed record FixpSessionOptions
     /// </summary>
     public B3.Exchange.Core.SessionLifecycleMetrics? LifecycleMetrics { get; init; }
 
+    /// <summary>
+    /// Per-session inbound rate cap (issue #56 / GAP-20, guidelines §4.9):
+    /// at most <see cref="ThrottleMaxMessages"/> application messages
+    /// per <see cref="ThrottleTimeWindowMs"/>-millisecond sliding window.
+    /// On violation the session emits
+    /// <c>BusinessMessageReject("Throttle limit exceeded")</c> and stays
+    /// open (the offending frame is dropped and does NOT consume budget).
+    /// FIXP session-layer messages (Negotiate / Establish / Sequence /
+    /// RetransmitRequest / Terminate) bypass the throttle. Set either
+    /// value to <c>0</c> to disable throttling on this session (default).
+    /// </summary>
+    public int ThrottleTimeWindowMs { get; init; }
+
+    /// <summary>See <see cref="ThrottleTimeWindowMs"/>.</summary>
+    public int ThrottleMaxMessages { get; init; }
+
+    /// <summary>
+    /// Optional process-wide throttle counters. When non-null the session
+    /// increments <see cref="B3.Exchange.Core.ThrottleMetrics.Accepted"/>
+    /// every time an application message is admitted by the throttle and
+    /// <see cref="B3.Exchange.Core.ThrottleMetrics.Rejected"/> on every
+    /// throttle-driven BusinessMessageReject.
+    /// </summary>
+    public B3.Exchange.Core.ThrottleMetrics? ThrottleMetrics { get; init; }
+
     public static FixpSessionOptions Default { get; } = new();
 
     internal void Validate()
@@ -73,5 +98,7 @@ public sealed record FixpSessionOptions
         if (SuspendedTimeoutMs < 0) throw new ArgumentOutOfRangeException(nameof(SuspendedTimeoutMs));
         if (FirstFrameTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(FirstFrameTimeoutMs));
         if (RetransmitBufferCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(RetransmitBufferCapacity));
+        if (ThrottleTimeWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleTimeWindowMs));
+        if (ThrottleMaxMessages < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleMaxMessages));
     }
 }
