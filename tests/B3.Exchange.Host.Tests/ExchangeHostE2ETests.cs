@@ -120,6 +120,54 @@ public class ExchangeHostE2ETests
     }
 
     [Fact]
+    public async Task NewOrderCross_DecodesAndProducesTradeForBothLegs()
+    {
+        // #GAP-16 (#52): NewOrderCross template 106 must decode into a
+        // single atomic dispatch that submits both legs against each
+        // other. With buy-first ordering the buy rests, then the sell
+        // crosses → two ER_Trade frames (one per side, both routed back
+        // to the same session) and a single UMDF Trade frame.
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        var crossFrame = BuildNewOrderCross(crossId: 7777, secId: Petr,
+            qty: 100, priceMantissa: 100_0000,
+            buyClOrdId: 5001, sellClOrdId: 5002);
+        await stream.WriteAsync(crossFrame);
+
+        // Both sides belong to the same session so the engine emits two
+        // ER_Trade frames back-to-back. Order may interleave with
+        // potential ER_New for the (briefly resting) buy leg if engine
+        // emits OnOrderAccepted before matching — but the matching
+        // engine emits trades as the sell aggressor sweeps the buy and
+        // does NOT emit OnOrderAccepted for fully-filled aggressors.
+        // We accept any frame mix as long as we receive at least 2
+        // ER_Trade frames within a few seconds.
+        int trades = 0;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (trades < 2 && DateTime.UtcNow < deadline)
+        {
+            var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(2));
+            if (er.TemplateId == EntryPointFrameReader.TidExecutionReportTrade) trades++;
+        }
+        Assert.Equal(2, trades);
+
+        // Single UMDF packet expected: both legs processed in one
+        // dispatch turn flush exactly once. Allow a brief race with the
+        // dispatcher thread.
+        var sinkDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (sink.Packets.Count < 1 && DateTime.UtcNow < sinkDeadline)
+            await Task.Delay(20);
+        Assert.True(sink.Packets.Count >= 1, $"expected >= 1 multicast packet, got {sink.Packets.Count}");
+    }
+
+    [Fact]
     public async Task UnknownInstrument_ProducesRejectExecutionReport()
     {
         var (cfg, sink) = BuildConfig();
@@ -322,6 +370,54 @@ public class ExchangeHostE2ETests
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(76, 8), orderId);
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(84, 8), origClOrdId);
+        return frame;
+    }
+
+    private static byte[] BuildNewOrderCross(ulong crossId, long secId, long qty, long priceMantissa,
+        ulong buyClOrdId, ulong sellClOrdId)
+    {
+        // 12-byte composite header + 84-byte root + 3-byte group header
+        // + 2 × 22-byte sides + 1-byte deskID len + 1-byte memo len
+        // (both empty) = 133 bytes total.
+        const int RootSize = 84;
+        const int GroupHeaderSize = 3;
+        const int SideEntrySize = 22;
+        int total = EntryPointFrameReader.WireHeaderSize + RootSize + GroupHeaderSize + 2 * SideEntrySize + 2;
+        var frame = new byte[total];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, EntryPointFrameReader.WireHeaderSize),
+            messageLength: (ushort)frame.Length,
+            blockLength: RootSize, templateId: EntryPointFrameReader.TidNewOrderCross, version: 6);
+
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        body[18] = 0; // OrdType null = implicit Limit
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), crossId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(56, 8), (ulong)qty);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(64, 8), priceMantissa);
+        BinaryPrimitives.WriteUInt16LittleEndian(body.Slice(72, 2), 65535);  // CrossedIndicator null
+        body[74] = 255;  // CrossType null
+        body[75] = 255;  // CrossPrioritization null
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(76, 8), 0UL); // MaxSweepQty null
+
+        // NoSides group header + 2 entries (buy first then sell).
+        int cursor = RootSize;
+        BinaryPrimitives.WriteUInt16LittleEndian(body.Slice(cursor, 2), SideEntrySize);
+        body[cursor + 2] = 2;
+        cursor += GroupHeaderSize;
+
+        body[cursor + 0] = (byte)'1'; // Side=Buy
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(cursor + 6, 4), 0xFFFFFFFFu); // FirmOptional null
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(cursor + 10, 8), buyClOrdId);
+        cursor += SideEntrySize;
+
+        body[cursor + 0] = (byte)'2'; // Side=Sell
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(cursor + 6, 4), 0xFFFFFFFFu);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(cursor + 10, 8), sellClOrdId);
+        cursor += SideEntrySize;
+
+        // Empty DeskID and Memo (length=0 each).
+        body[cursor++] = 0;
+        body[cursor++] = 0;
         return frame;
     }
 

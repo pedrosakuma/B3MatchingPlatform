@@ -231,6 +231,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             WorkKind.New => item.NewOrder?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Cancel => item.Cancel?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Replace => item.Replace?.EnteredAtNanos ?? ulong.MaxValue,
+            WorkKind.Cross => item.Cross?.Buy.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
@@ -269,6 +270,25 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                             replace = replace with { OrderId = resolvedId };
                         }
                         _engine.Replace(replace);
+                        break;
+                    }
+                case WorkKind.Cross:
+                    {
+                        // Atomic two-leg submission. Both legs share the
+                        // same _currentReceivedTimeNanos so receivedTime on
+                        // each ER frame matches the original cross frame's
+                        // ingress timestamp. _currentClOrdId is rebound
+                        // before each leg so ER routing uses the correct
+                        // per-leg ClOrdID. The packet buffer accumulates
+                        // both legs' UMDF events and flushes once at the
+                        // end of this dispatch turn.
+                        var cross = item.Cross!;
+                        _metrics?.IncOrdersIn();
+                        _currentClOrdId = cross.BuyClOrdIdValue;
+                        _engine.Submit(cross.Buy);
+                        _metrics?.IncOrdersIn();
+                        _currentClOrdId = cross.SellClOrdIdValue;
+                        _engine.Submit(cross.Sell);
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -412,7 +432,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     public void EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
-            clOrdIdValue, 0, cmd, null, null)))
+            clOrdIdValue, 0, cmd, null, null, null)))
             LogQueueFull(ChannelNumber, WorkKind.New);
     }
 
@@ -420,7 +440,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, cmd, null)))
+            clOrdIdValue, origClOrdIdValue, null, cmd, null, null)))
             LogQueueFull(ChannelNumber, WorkKind.Cancel);
     }
 
@@ -428,15 +448,22 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, null, cmd)))
+            clOrdIdValue, origClOrdIdValue, null, null, cmd, null)))
             LogQueueFull(ChannelNumber, WorkKind.Replace);
+    }
+
+    public void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
+    {
+        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
+            cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd)))
+            LogQueueFull(ChannelNumber, WorkKind.Cross);
     }
 
     public void OnDecodeError(SessionId session, string error)
     {
         _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, session, 0, true,
-            0, 0, null, null, null)))
+            0, 0, null, null, null, null)))
             LogQueueFull(ChannelNumber, WorkKind.DecodeError);
     }
 
@@ -462,11 +489,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool EnqueueSnapshotTick()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, default, 0, false,
-            0, 0, null, null, null));
+            0, 0, null, null, null, null));
 
     public void OnSessionClosed(SessionId session)
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.ReleaseOwner, session, 0, true,
-            0, 0, null, null, null));
+            0, 0, null, null, null, null));
 
     /// <summary>
     /// Operator command (issue #6): forces an immediate snapshot publish on
@@ -478,7 +505,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool EnqueueOperatorSnapshotNow()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSnapshotNow, default, 0, false,
-            0, 0, null, null, null));
+            0, 0, null, null, null, null));
 
     /// <summary>
     /// Operator command (issue #6): atomically (a) bumps the incremental
@@ -493,7 +520,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool EnqueueOperatorBumpVersion()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBumpVersion, default, 0, false,
-            0, 0, null, null, null));
+            0, 0, null, null, null, null));
 
     // ====== IMatchingEventSink ======
 
@@ -642,7 +669,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, DecodeError, SnapshotRotation, ReleaseOwner, OperatorSnapshotNow, OperatorBumpVersion }
 
     internal readonly record struct OrderOwnership(SessionId Session, ulong ClOrdId, uint Firm);
 
@@ -655,7 +682,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ulong OrigClOrdId,
         NewOrderCommand? NewOrder,
         CancelOrderCommand? Cancel,
-        ReplaceOrderCommand? Replace);
+        ReplaceOrderCommand? Replace,
+        CrossOrderCommand? Cross);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

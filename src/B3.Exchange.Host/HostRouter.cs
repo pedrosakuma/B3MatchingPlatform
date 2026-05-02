@@ -66,6 +66,15 @@ public sealed class HostRouter : IInboundCommandSink
             RejectUnknownInstrument(cmd.SecurityId, session, clOrdIdValue);
     }
 
+    public void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
+    {
+        // Both legs MUST belong to the same security (decoder enforces).
+        if (_bySecId.TryGetValue(cmd.Buy.SecurityId, out var disp))
+            disp.EnqueueCross(cmd, session, enteringFirm);
+        else
+            RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue);
+    }
+
     public void OnDecodeError(SessionId session, string error)
     {
         // Logging hook only. The FixpSession itself emits the

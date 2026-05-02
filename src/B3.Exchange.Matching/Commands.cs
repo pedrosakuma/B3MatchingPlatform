@@ -111,3 +111,18 @@ public sealed record ReplaceOrderCommand(
     long NewPriceMantissa,
     long NewQuantity,
     ulong EnteredAtNanos);
+
+/// <summary>
+/// Cross order command (NewOrderCross template 106 / spec §4.6.1 / §16.1.5).
+/// Submitted as a single inbound frame containing both legs at the same
+/// security/qty/price; the engine processes them as a single atomic dispatch
+/// turn so the cross cannot be split, dropped half-way, or interleaved with
+/// other producers (Self-Trading Prevention is tracked separately as #14;
+/// without STP both legs cross naturally on the book).
+/// </summary>
+public sealed record CrossOrderCommand(
+    NewOrderCommand Buy,
+    NewOrderCommand Sell,
+    ulong BuyClOrdIdValue,
+    ulong SellClOrdIdValue,
+    ulong CrossId);

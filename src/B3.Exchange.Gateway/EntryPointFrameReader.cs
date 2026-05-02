@@ -54,6 +54,8 @@ public static class EntryPointFrameReader
     public const ushort TidSimpleModifyOrder = 101;
     /// <summary>Inbound: NewOrderSingle (V2). Spec §4.6.4 / #GAP-15.</summary>
     public const ushort TidNewOrderSingle = 102;
+    /// <summary>Inbound: NewOrderCross (V6). Spec §4.6.1 / §16.1.5 / #GAP-16.</summary>
+    public const ushort TidNewOrderCross = 106;
     /// <summary>Inbound: OrderCancelReplaceRequest (V2). Spec §4.6.4 / #GAP-15.</summary>
     public const ushort TidOrderCancelReplaceRequest = 104;
     /// <summary>Inbound: OrderCancelRequest (V6 base, no version variants).</summary>
@@ -98,6 +100,7 @@ public static class EntryPointFrameReader
         (TidSimpleNewOrder, 2) => 82,            // SimpleNewOrderV2.MESSAGE_SIZE
         (TidSimpleModifyOrder, 2) => 98,         // SimpleModifyOrderV2.MESSAGE_SIZE
         (TidNewOrderSingle, 2) => 125,           // NewOrderSingleV2.MESSAGE_SIZE
+        (TidNewOrderCross, 6) => 84,             // NewOrderCross.MESSAGE_SIZE (root V6, group + varData follow)
         (TidOrderCancelReplaceRequest, 2) => 142, // OrderCancelReplaceRequestV2.MESSAGE_SIZE
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.

@@ -78,6 +78,16 @@ public interface IInboundCommandSink
     void EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue);
 
+    /// <summary>
+    /// Enqueues a NewOrderCross (template 106). Both legs MUST be processed
+    /// atomically on the dispatch thread: a half-applied cross would expose
+    /// one leg as live liquidity while the second is dropped or interleaved
+    /// with other producers. Implementations queue ONE work item carrying
+    /// both legs; <see cref="ChannelDispatcher"/> submits buy then sell in
+    /// a single dispatch turn under one packet flush.
+    /// </summary>
+    void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm);
+
     /// <summary>Called when a frame fails decoding. Logging hook only — the
     /// Gateway-side <c>FixpSession</c> is responsible for the actual
     /// SessionReject (Terminate) / BusinessMessageReject + close-of-stream
