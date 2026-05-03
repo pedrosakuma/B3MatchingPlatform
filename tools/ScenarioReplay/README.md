@@ -129,10 +129,43 @@ The `t` field is a unix-millisecond timestamp; mask it (or pipe through
 
 This MVP is intentionally narrow:
 
-- no "diff harness" subcommand (use plain `diff` / `jq` for now —
-  follow-up tracked in #116)
 - single TCP connection per session (no automatic reconnect on drop)
+- the `diff` subcommand compares JSON top-level fields only; UMDF
+  multicast records are matched on full hex-equality of the packet
+  bytes (semantic decoding of inner SBE messages is a follow-up).
 
 Follow-ups will live as separate issues.
+
+## Regression diffing
+
+```bash
+# 1. Capture a baseline tape from a known-good build:
+dotnet run --project tools/ScenarioReplay -- \
+    --script my_scenario.jsonl --out golden.jsonl
+
+# 2. On each PR, replay the same script and diff:
+dotnet run --project tools/ScenarioReplay -- \
+    --script my_scenario.jsonl --out run.jsonl
+
+dotnet run --project tools/ScenarioReplay -- diff \
+    --baseline golden.jsonl --candidate run.jsonl
+echo $?  # 0=equivalent, 1=diverged, 2=malformed/usage
+```
+
+Default ignored fields are `t` (wall-clock timestamp) and `sendingTime`
+(currently inside packet bytes; reserved for future structured-mcast
+diffs). Add more with `--ignore`:
+
+```bash
+# Tolerate engine-allocated orderId (not deterministic across runs):
+dotnet run --project tools/ScenarioReplay -- diff \
+    --baseline golden.jsonl --candidate run.jsonl \
+    --ignore orderId,leavesQty
+```
+
+The diff stops scanning at the first record-level divergence (printed
+side-by-side) but counts total `modified` / `onlyInBaseline` /
+`onlyInCandidate` across the whole pair so a CI summary line carries
+the impact at a glance.
 
 [issue-17]: https://github.com/pedrosakuma/B3MatchingPlatform/issues/17
