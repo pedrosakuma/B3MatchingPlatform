@@ -119,8 +119,13 @@ public class HttpServerTests
         using var live = await client.GetAsync("/health/live");
         Assert.Equal(System.Net.HttpStatusCode.OK, live.StatusCode);
 
-        // Wedge the dispatcher loop without disposing.
-        foreach (var d in host.Dispatchers) d.KillForTesting();
+        // Wedge the dispatcher loop without disposing. KillForTesting is an
+        // internal test seam; reach it via reflection so this test does not
+        // require Core/Gateway IVT to Host.Tests (issue #141).
+        var killForTesting = typeof(B3.Exchange.Core.ChannelDispatcher).GetMethod(
+            "KillForTesting",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        foreach (var d in host.Dispatchers) killForTesting.Invoke(d, null);
 
         // Poll until /health/live flips to 503. Bound wait at 8 s (issue
         // acceptance: <10 s).

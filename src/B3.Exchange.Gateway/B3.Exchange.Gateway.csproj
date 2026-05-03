@@ -16,7 +16,6 @@
   <ItemGroup>
     <InternalsVisibleTo Include="B3.Exchange.Gateway.Tests" />
     <InternalsVisibleTo Include="B3.Exchange.SyntheticTrader.Tests" />
-    <InternalsVisibleTo Include="B3.Exchange.Host.Tests" />
   </ItemGroup>
 
   <ItemGroup>
