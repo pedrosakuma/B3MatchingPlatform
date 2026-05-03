@@ -6,6 +6,37 @@ using B3.Exchange.Contracts;
 namespace B3.Exchange.Core;
 
 /// <summary>
+/// Inbound command kinds counted by <c>exch_inbound_messages_total</c>
+/// (issue #174). Bounded set; the label cardinality on the metric is
+/// fixed.
+/// </summary>
+public enum InboundMessageKind
+{
+    New = 0, Cancel = 1, Replace = 2, Cross = 3, MassCancel = 4, DecodeError = 5,
+}
+
+/// <summary>
+/// ExecutionReport kinds counted by <c>exch_execution_reports_total</c>
+/// (issue #174). Distinguishes active vs passive sides of trades and
+/// cancels because that's the breakdown SREs need to spot a runaway
+/// passive replay.
+/// </summary>
+public enum ExecutionReportKind
+{
+    New = 0, Trade = 1, TradePassive = 2, Cancel = 3, CancelPassive = 4, Replace = 5, Reject = 6,
+}
+
+/// <summary>
+/// UMDF feed kinds counted by <c>exch_umdf_packets_total</c> /
+/// <c>exch_umdf_bytes_total</c> (issue #174). Three values, one per
+/// physical multicast group the host publishes on.
+/// </summary>
+public enum UmdfFeedKind
+{
+    Incremental = 0, Snapshot = 1, InstrumentDef = 2,
+}
+
+/// <summary>
 /// Per-channel atomic counters and gauges. All mutating methods are
 /// designed to be called from the channel's single dispatch thread (no
 /// internal locking; lock-free <see cref="Interlocked"/> primitives are
@@ -36,6 +67,48 @@ public sealed class ChannelMetrics
     public LatencyHistogram EngineProcess { get; } = new();
     public LatencyHistogram OutboundEmit { get; } = new();
     public LatencyHistogram InboundDecode { get; } = new();
+
+    // Issue #174: throughput counters — per-channel, labelled by a small
+    // bounded set (msg_type / exec_type / feed). Indexed by the enum's
+    // numeric value so increments are a single Interlocked op.
+    private readonly long[] _inboundByKind = new long[InboundMessageKindNames.Length];
+    private readonly long[] _execReportsByKind = new long[ExecutionReportKindNames.Length];
+    private readonly long[] _packetsByFeed = new long[UmdfFeedKindNames.Length];
+    private readonly long[] _bytesByFeed = new long[UmdfFeedKindNames.Length];
+
+    internal static readonly string[] InboundMessageKindNames = new[]
+    {
+        "new", "cancel", "replace", "cross", "mass_cancel", "decode_error",
+    };
+
+    internal static readonly string[] ExecutionReportKindNames = new[]
+    {
+        "new", "trade", "trade_passive", "cancel", "cancel_passive", "replace", "reject",
+    };
+
+    internal static readonly string[] UmdfFeedKindNames = new[]
+    {
+        "incremental", "snapshot", "instrumentdef",
+    };
+
+    public void IncInboundMessage(InboundMessageKind kind)
+        => Interlocked.Increment(ref _inboundByKind[(int)kind]);
+    public void IncExecutionReport(ExecutionReportKind kind)
+        => Interlocked.Increment(ref _execReportsByKind[(int)kind]);
+    public void IncUmdfPacket(UmdfFeedKind feed, int bytes)
+    {
+        Interlocked.Increment(ref _packetsByFeed[(int)feed]);
+        Interlocked.Add(ref _bytesByFeed[(int)feed], bytes);
+    }
+
+    internal long ReadInboundMessages(InboundMessageKind kind)
+        => Interlocked.Read(ref _inboundByKind[(int)kind]);
+    internal long ReadExecutionReports(ExecutionReportKind kind)
+        => Interlocked.Read(ref _execReportsByKind[(int)kind]);
+    internal long ReadUmdfPackets(UmdfFeedKind feed)
+        => Interlocked.Read(ref _packetsByFeed[(int)feed]);
+    internal long ReadUmdfBytes(UmdfFeedKind feed)
+        => Interlocked.Read(ref _bytesByFeed[(int)feed]);
 
     public ChannelMetrics(byte channelNumber)
     {
@@ -304,6 +377,29 @@ public sealed class MetricsRegistry
             "Latency to flush the per-command UMDF packet to the outbound sink (engine exit → packet sink return), in seconds.",
             channels, c => c.OutboundEmit);
 
+        // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
+        // exec_type ≤ 7, feed = 3) — safe to ship per-channel.
+        EmitLabeledChannelCounter(sb, "exch_inbound_messages_total",
+            "Total inbound application commands received by the dispatcher, broken down by message kind.",
+            "msg_type", channels,
+            ChannelMetrics.InboundMessageKindNames,
+            (c, i) => c.ReadInboundMessages((InboundMessageKind)i));
+        EmitLabeledChannelCounter(sb, "exch_execution_reports_total",
+            "Total ExecutionReports emitted to client sessions, broken down by ER kind. Passive variants are reports for resting orders touched by another session's aggressor.",
+            "exec_type", channels,
+            ChannelMetrics.ExecutionReportKindNames,
+            (c, i) => c.ReadExecutionReports((ExecutionReportKind)i));
+        EmitLabeledChannelCounter(sb, "exch_umdf_packets_total",
+            "Total UMDF packets published per multicast feed.",
+            "feed", channels,
+            ChannelMetrics.UmdfFeedKindNames,
+            (c, i) => c.ReadUmdfPackets((UmdfFeedKind)i));
+        EmitLabeledChannelCounter(sb, "exch_umdf_bytes_total",
+            "Total bytes (UDP payload, including UMDF packet header) published per multicast feed.",
+            "feed", channels,
+            ChannelMetrics.UmdfFeedKindNames,
+            (c, i) => c.ReadUmdfBytes((UmdfFeedKind)i));
+
         EmitRuntimeMetrics(sb);
 
         return sb.ToString();
@@ -431,6 +527,26 @@ public sealed class MetricsRegistry
               .Append("\",").Append(label).Append("=\"").Append(labelValue).Append("\"} ")
               .Append(selector(c).ToString(CultureInfo.InvariantCulture))
               .Append('\n');
+        }
+    }
+
+    private static void EmitLabeledChannelCounter(StringBuilder sb, string name, string help,
+        string label, ChannelMetrics[] channels, string[] labelValues, Func<ChannelMetrics, int, long> selector)
+    {
+        // Emits {channel,<label>} pairs with a single HELP/TYPE header
+        // covering all label values. Cardinality = channels × labelValues.
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" counter\n");
+        foreach (var c in channels)
+        {
+            for (int i = 0; i < labelValues.Length; i++)
+            {
+                sb.Append(name).Append("{channel=\"")
+                  .Append(c.ChannelNumber.ToString(CultureInfo.InvariantCulture))
+                  .Append("\",").Append(label).Append("=\"").Append(labelValues[i]).Append("\"} ")
+                  .Append(selector(c, i).ToString(CultureInfo.InvariantCulture))
+                  .Append('\n');
+            }
         }
     }
 

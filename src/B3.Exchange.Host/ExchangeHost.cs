@@ -177,10 +177,10 @@ public sealed class ExchangeHost : IAsyncDisposable
                 }
                 else
                 {
-                    snapSink = WrapResilient(
+                    snapSink = WrapResilientCounting(
                         BuildUdpSink(ch.Transport, snap.Group, snap.Port,
                             ch.LocalInterface, snap.Ttl ?? ch.Ttl),
-                        channelMetrics);
+                        channelMetrics, UmdfFeedKind.Snapshot);
                 }
                 if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
 
@@ -212,9 +212,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 else
                 {
                     var localIface = idCfg.LocalInterface ?? ch.LocalInterface;
-                    idSink = WrapResilient(
+                    idSink = WrapResilientCounting(
                         BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl),
-                        channelMetrics);
+                        channelMetrics, UmdfFeedKind.InstrumentDef);
                 }
                 if (idSink is IDisposable idd) _ownedSinks.Add(idd);
                 byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
@@ -371,6 +371,15 @@ public sealed class ExchangeHost : IAsyncDisposable
             inner,
             _loggerFactory.CreateLogger<ResilientUdpPacketSinkDecorator>(),
             metrics);
+
+    /// <summary>
+    /// Issue #174: wraps an outbound packet sink with the resilient error
+    /// decorator and a counting decorator for the named feed. The
+    /// incremental feed is counted directly by <c>ChannelDispatcher</c>,
+    /// so this helper is only used for snapshot/instrument-def feeds.
+    /// </summary>
+    private IUmdfPacketSink WrapResilientCounting(IUmdfPacketSink inner, ChannelMetrics metrics, UmdfFeedKind feed)
+        => new CountingUdpPacketSinkDecorator(WrapResilient(inner, metrics), metrics, feed);
 
     private IUmdfPacketSink BuildUdpSink(UmdfTransport transport, string host, int port,
         string? localInterface, byte ttl)
