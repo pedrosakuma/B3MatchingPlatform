@@ -235,6 +235,31 @@ Tuning recipes:
   and a distinct EntryPoint `port` if you split the host. The sample
   uses `firm: 1` (the legacy single-tenant fallback).
 
+### 4.1 Deterministic replay (`tools/ScenarioReplay`)
+
+For reproducing bug reports and pinning regression tests, drive the host
+with a JSONL "script" instead of a randomised strategy:
+
+```bash
+# 1. Run the host with FIXP handshake disabled (single-tenant test mode):
+dotnet run -c Release --project src/B3.Exchange.Host -- config/exchange-simulator.json
+
+# 2. In another shell, replay a script and capture ER + multicast to disk:
+dotnet run -c Release --project tools/ScenarioReplay -- \
+    --host 127.0.0.1 --port 9876 \
+    --script tools/ScenarioReplay/example.jsonl \
+    --multicast 239.255.42.84:30184 \
+    --out tape.jsonl
+
+# 3. Inspect the tape:
+jq 'select(.src=="er") | {execType, clOrdId, lastQty, lastPxMantissa}' tape.jsonl
+```
+
+Format reference and per-field semantics live in
+[`tools/ScenarioReplay/README.md`](../tools/ScenarioReplay/README.md).
+Tape files are diff-friendly JSONL — pipe through `jq 'del(.t)'` to mask
+timestamps when comparing two runs.
+
 ---
 
 ## 5. Triggering recovery scenarios
