@@ -25,6 +25,9 @@ public sealed class ChannelMetrics
     private long _dispatchQueueFull;
     private long _decodeErrors;
     private long _dispatcherCrashes;
+    private long _publishErrors;
+    private long _publishErrorsHostUnreachable;
+    private long _publishErrorsMessageTooLarge;
 
     public ChannelMetrics(byte channelNumber)
     {
@@ -42,6 +45,9 @@ public sealed class ChannelMetrics
     public long DispatchQueueFull => Interlocked.Read(ref _dispatchQueueFull);
     public long DecodeErrors => Interlocked.Read(ref _decodeErrors);
     public long DispatcherCrashes => Interlocked.Read(ref _dispatcherCrashes);
+    public long PublishErrors => Interlocked.Read(ref _publishErrors);
+    public long PublishErrorsHostUnreachable => Interlocked.Read(ref _publishErrorsHostUnreachable);
+    public long PublishErrorsMessageTooLarge => Interlocked.Read(ref _publishErrorsMessageTooLarge);
 
     public void IncOrdersIn() => Interlocked.Increment(ref _ordersIn);
     public void IncPacketsOut() => Interlocked.Increment(ref _packetsOut);
@@ -53,6 +59,9 @@ public sealed class ChannelMetrics
     public void IncDispatchQueueFull() => Interlocked.Increment(ref _dispatchQueueFull);
     public void IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
     public void IncDispatcherCrashes() => Interlocked.Increment(ref _dispatcherCrashes);
+    public void IncPublishErrorSocketError() => Interlocked.Increment(ref _publishErrors);
+    public void IncPublishErrorHostUnreachable() => Interlocked.Increment(ref _publishErrorsHostUnreachable);
+    public void IncPublishErrorMessageTooLarge() => Interlocked.Increment(ref _publishErrorsMessageTooLarge);
 
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
@@ -193,6 +202,21 @@ public sealed class MetricsRegistry
             "Total work-items whose ProcessOne raised an unhandled exception (issue #170). The dispatcher loop catches and logs these, then continues draining; a non-zero value is a hard bug-report signal — every increment is a wedge that would have killed the channel before the containment fix.",
             channels, c => c.DispatcherCrashes);
 
+        // Issue #172: per-channel UDP publish errors broken down by kind.
+        // Multiple series (one per kind) under a single metric name with a
+        // 'kind' label so operators can alert on socket_error specifically
+        // (likely transient route loss) vs message_too_large (a hard bug —
+        // engine is producing an oversized UMDF packet).
+        sb.Append("# HELP exch_umdf_publish_errors_total ")
+          .Append("Total UMDF packet publish failures per channel and error kind (issue #172). The decorator catches the SocketException, increments this counter, and continues — the dispatcher loop is never poisoned by a publish failure. kind=host_unreachable usually means a transient route/multicast issue; kind=message_too_large is a packetizer bug; kind=socket_error covers everything else.\n");
+        sb.Append("# TYPE exch_umdf_publish_errors_total counter\n");
+        EmitLabeledCounter(sb, "exch_umdf_publish_errors_total", "kind", "socket_error",
+            channels, c => c.PublishErrors);
+        EmitLabeledCounter(sb, "exch_umdf_publish_errors_total", "kind", "host_unreachable",
+            channels, c => c.PublishErrorsHostUnreachable);
+        EmitLabeledCounter(sb, "exch_umdf_publish_errors_total", "kind", "message_too_large",
+            channels, c => c.PublishErrorsMessageTooLarge);
+
         sb.Append("# HELP exch_send_queue_depth Per-session ExecutionReport send-queue depth (channel=\"all\" because the session queue is shared).\n");
         sb.Append("# TYPE exch_send_queue_depth gauge\n");
         SessionDiagnostics[] sessionSnap = sessions != null
@@ -275,6 +299,22 @@ public sealed class MetricsRegistry
             sb.Append(name).Append("{channel=\"")
               .Append(c.ChannelNumber.ToString(CultureInfo.InvariantCulture))
               .Append("\"} ")
+              .Append(selector(c).ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+    }
+
+    private static void EmitLabeledCounter(StringBuilder sb, string name, string label, string labelValue,
+        ChannelMetrics[] channels, Func<ChannelMetrics, long> selector)
+    {
+        // Emits {channel,label} pairs reusing an already-emitted HELP/TYPE
+        // header. Caller is responsible for emitting the header exactly once
+        // before the first call for a given metric name.
+        foreach (var c in channels)
+        {
+            sb.Append(name).Append("{channel=\"")
+              .Append(c.ChannelNumber.ToString(CultureInfo.InvariantCulture))
+              .Append("\",").Append(label).Append("=\"").Append(labelValue).Append("\"} ")
               .Append(selector(c).ToString(CultureInfo.InvariantCulture))
               .Append('\n');
         }

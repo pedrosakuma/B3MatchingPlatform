@@ -109,6 +109,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         foreach (var ch in _config.Channels)
         {
             var instruments = InstrumentLoader.LoadFromFile(ch.InstrumentsFile);
+            var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
             IUmdfPacketSink sink;
             if (_packetSinkFactory != null)
             {
@@ -116,12 +117,13 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             else
             {
-                sink = BuildUdpSink(ch.Transport, ch.IncrementalGroup, ch.IncrementalPort,
-                    ch.LocalInterface, ch.Ttl);
+                sink = WrapResilient(
+                    BuildUdpSink(ch.Transport, ch.IncrementalGroup, ch.IncrementalPort,
+                        ch.LocalInterface, ch.Ttl),
+                    channelMetrics);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
             var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
-            var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
 
             // Wrap with chaos decorator if configured (issue #119). Off by
             // default; only activates when the operator opts in via config.
@@ -175,8 +177,10 @@ public sealed class ExchangeHost : IAsyncDisposable
                 }
                 else
                 {
-                    snapSink = BuildUdpSink(ch.Transport, snap.Group, snap.Port,
-                        ch.LocalInterface, snap.Ttl ?? ch.Ttl);
+                    snapSink = WrapResilient(
+                        BuildUdpSink(ch.Transport, snap.Group, snap.Port,
+                            ch.LocalInterface, snap.Ttl ?? ch.Ttl),
+                        channelMetrics);
                 }
                 if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
 
@@ -208,7 +212,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 else
                 {
                     var localIface = idCfg.LocalInterface ?? ch.LocalInterface;
-                    idSink = BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl);
+                    idSink = WrapResilient(
+                        BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl),
+                        channelMetrics);
                 }
                 if (idSink is IDisposable idd) _ownedSinks.Add(idd);
                 byte idChan = idCfg.ChannelNumber == 0 ? ch.ChannelNumber : idCfg.ChannelNumber;
@@ -350,6 +356,21 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Issue #172 — wrap any UDP-backed sink with the resilient decorator
+    /// so transient publish failures (NIC down, route lost, MTU mismatch)
+    /// are caught + counted via <c>exch_umdf_publish_errors_total</c>
+    /// instead of propagating into the dispatcher loop and aborting the
+    /// channel. Test paths injecting their own sink via
+    /// <c>packetSinkFactory</c> are deliberately not wrapped — tests may
+    /// want raw access to assert wire-level behaviour.
+    /// </summary>
+    private IUmdfPacketSink WrapResilient(IUmdfPacketSink inner, ChannelMetrics metrics)
+        => new ResilientUdpPacketSinkDecorator(
+            inner,
+            _loggerFactory.CreateLogger<ResilientUdpPacketSinkDecorator>(),
+            metrics);
 
     private IUmdfPacketSink BuildUdpSink(UmdfTransport transport, string host, int port,
         string? localInterface, byte ttl)
