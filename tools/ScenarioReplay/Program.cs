@@ -9,6 +9,11 @@ if (args.Length == 1 && (args[0] == "-h" || args[0] == "--help"))
     return 0;
 }
 
+if (args.Length >= 1 && args[0] == "diff")
+{
+    return RunDiff(args.AsSpan(1).ToArray());
+}
+
 var opts = CliOptions.Parse(args, out var error);
 if (opts == null)
 {
@@ -155,7 +160,79 @@ static void PrintUsage()
                                       the last script event (default 1000)
 
         Exit codes: 0 ok, 1 aborted, 2 usage, 3 script-parse, 4 connect.
+
+        diff subcommand:
+          ScenarioReplay diff --baseline <path> --candidate <path>
+                              [--ignore <field,field,...>] [--out <path>]
+
+          Compares two replay tapes (JSONL) for regression testing.
+          Default ignored fields: t, sendingTime. --ignore is additive
+          (e.g. --ignore orderId tolerates engine-allocated IDs).
+          Diff exit codes: 0 equivalent, 1 diverged, 2 malformed.
         """);
+}
+
+static int RunDiff(string[] args)
+{
+    string? baseline = null, candidate = null, outPath = null;
+    var ignore = new HashSet<string>(StringComparer.Ordinal) { "t", "sendingTime" };
+    for (int i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--baseline": baseline = NeedArg(args, ref i); break;
+            case "--candidate": candidate = NeedArg(args, ref i); break;
+            case "--out": outPath = NeedArg(args, ref i); break;
+            case "--ignore":
+                {
+                    var v = NeedArg(args, ref i);
+                    foreach (var f in v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        ignore.Add(f);
+                    break;
+                }
+            case "-h":
+            case "--help":
+                Console.Error.WriteLine("usage: ScenarioReplay diff --baseline <path> --candidate <path> [--ignore f1,f2] [--out path]");
+                return 2;
+            default:
+                Console.Error.WriteLine($"diff: unknown argument '{args[i]}'");
+                return 2;
+        }
+    }
+    if (string.IsNullOrEmpty(baseline) || string.IsNullOrEmpty(candidate))
+    {
+        Console.Error.WriteLine("diff: --baseline and --candidate are required");
+        return 2;
+    }
+    if (!File.Exists(baseline)) { Console.Error.WriteLine($"diff: baseline not found: {baseline}"); return 2; }
+    if (!File.Exists(candidate)) { Console.Error.WriteLine($"diff: candidate not found: {candidate}"); return 2; }
+
+    List<TapeDiff.NormalisedRecord> b, c;
+    try
+    {
+        b = TapeDiff.Load(baseline, ignore);
+        c = TapeDiff.Load(candidate, ignore);
+    }
+    catch (FormatException fx)
+    {
+        Console.Error.WriteLine($"diff: malformed tape ({fx.Message})");
+        return 2;
+    }
+
+    var result = TapeDiff.Compare(b, c);
+    using TextWriter sink = outPath == null
+        ? Console.Out
+        : new StreamWriter(outPath) { NewLine = "\n" };
+    TapeDiff.WriteReport(sink, result, baseline, candidate, ignore);
+    sink.Flush();
+    return result.IsEquivalent ? 0 : 1;
+
+    static string NeedArg(string[] args, ref int i)
+    {
+        if (i + 1 >= args.Length) throw new ArgumentException($"missing value after '{args[i]}'");
+        i++;
+        return args[i];
+    }
 }
 
 internal sealed class SessionSpec
