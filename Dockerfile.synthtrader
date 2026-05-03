@@ -7,7 +7,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 
 WORKDIR /src
 
-COPY Directory.Build.props global.json SbeB3Exchange.slnx ./
+COPY Directory.Build.props Directory.Packages.props global.json SbeB3Exchange.slnx ./
 COPY schemas/ schemas/
 COPY src/ src/
 

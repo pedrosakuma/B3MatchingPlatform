@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="SbeSourceGenerator" Version="1.6.1" />
+    <PackageReference Include="SbeSourceGenerator" />
   </ItemGroup>
 
   <ItemGroup>
