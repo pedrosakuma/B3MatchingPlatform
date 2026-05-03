@@ -175,6 +175,73 @@ public class MetricsRegistryTests
         Assert.Contains("# TYPE dotnet_threadpool_completed_items_total counter\n", text);
     }
 
+    [Fact]
+    public void Render_EmitsLatencyHistograms_Issue173()
+    {
+        var reg = new MetricsRegistry();
+        var ch = reg.RegisterChannel(7);
+
+        // Inject samples directly into each histogram so the test is not
+        // coupled to dispatcher timing. Buckets (s):
+        //   50us, 100us, 250us, 500us, 1ms, 2.5ms, 5ms, 10ms,
+        //   25ms, 50ms, 100ms, 250ms, 1s, +Inf
+        ch.InboundDecode.Observe(0.00003);    // → 50us bucket
+        ch.DispatchWait.Observe(0.0007);      // → 1ms bucket (le=0.001)
+        ch.DispatchWait.Observe(0.003);       // → 5ms bucket (le=0.005)
+        ch.EngineProcess.Observe(0.0001);     // → 100us bucket
+        ch.OutboundEmit.Observe(2.0);         // → +Inf overflow
+        ch.OutboundEmit.Observe(0.04);        // → 50ms bucket (le=0.05)
+
+        var text = reg.RenderProm();
+
+        foreach (var name in new[]
+        {
+            "exch_inbound_decode_seconds",
+            "exch_dispatch_wait_seconds",
+            "exch_engine_process_seconds",
+            "exch_outbound_emit_seconds",
+        })
+        {
+            Assert.Contains($"# TYPE {name} histogram\n", text);
+            Assert.Contains($"{name}_bucket{{channel=\"7\",le=\"0.00005\"}} ", text);
+            Assert.Contains($"{name}_bucket{{channel=\"7\",le=\"+Inf\"}} ", text);
+            Assert.Contains($"{name}_sum{{channel=\"7\"}} ", text);
+            Assert.Contains($"{name}_count{{channel=\"7\"}} ", text);
+        }
+
+        // Cumulative bucket invariants (Prometheus histograms are
+        // cumulative: each le-bucket count includes all lower buckets).
+        Assert.Contains("exch_inbound_decode_seconds_bucket{channel=\"7\",le=\"0.00005\"} 1\n", text);
+        Assert.Contains("exch_inbound_decode_seconds_count{channel=\"7\"} 1\n", text);
+
+        // dispatch_wait: 0.0007 → le=0.001 bucket, 0.003 → le=0.005.
+        // Cumulative: le=0.001 covers 1; le=0.005 covers both = 2.
+        Assert.Contains("exch_dispatch_wait_seconds_bucket{channel=\"7\",le=\"0.001\"} 1\n", text);
+        Assert.Contains("exch_dispatch_wait_seconds_bucket{channel=\"7\",le=\"0.005\"} 2\n", text);
+        Assert.Contains("exch_dispatch_wait_seconds_bucket{channel=\"7\",le=\"+Inf\"} 2\n", text);
+        Assert.Contains("exch_dispatch_wait_seconds_count{channel=\"7\"} 2\n", text);
+
+        // outbound_emit: 0.04 → le=0.05; 2.0 → overflow only counted at +Inf.
+        Assert.Contains("exch_outbound_emit_seconds_bucket{channel=\"7\",le=\"0.05\"} 1\n", text);
+        Assert.Contains("exch_outbound_emit_seconds_bucket{channel=\"7\",le=\"1\"} 1\n", text);
+        Assert.Contains("exch_outbound_emit_seconds_bucket{channel=\"7\",le=\"+Inf\"} 2\n", text);
+        Assert.Contains("exch_outbound_emit_seconds_count{channel=\"7\"} 2\n", text);
+    }
+
+    [Fact]
+    public void LatencyHistogram_Observe_RejectsNaNAndNegative()
+    {
+        var h = new LatencyHistogram();
+        h.Observe(double.NaN);
+        h.Observe(-1.0);
+        h.ObserveTicks(-100);
+
+        var snap = h.SnapshotCounts();
+        Assert.Equal(0, snap.OverflowCount);
+        Assert.All(snap.BucketCounts, c => Assert.Equal(0, c));
+        Assert.Equal(0.0, snap.SumSeconds);
+    }
+
     private sealed class StubSessionProvider : ISessionMetricsProvider
     {
         private readonly SessionDiagnostics[] _samples;
