@@ -98,16 +98,19 @@ public sealed class SessionLifecycleMetrics
     private long _suspended;
     private long _rebound;
     private long _reaped;
+    private long _cancelOnDisconnectFired;
 
     public long Established => Interlocked.Read(ref _established);
     public long Suspended => Interlocked.Read(ref _suspended);
     public long Rebound => Interlocked.Read(ref _rebound);
     public long Reaped => Interlocked.Read(ref _reaped);
+    public long CancelOnDisconnectFired => Interlocked.Read(ref _cancelOnDisconnectFired);
 
     public void IncEstablished() => Interlocked.Increment(ref _established);
     public void IncSuspended() => Interlocked.Increment(ref _suspended);
     public void IncRebound() => Interlocked.Increment(ref _rebound);
     public void IncReaped() => Interlocked.Increment(ref _reaped);
+    public void IncCancelOnDisconnectFired() => Interlocked.Increment(ref _cancelOnDisconnectFired);
 }
 
 /// <summary>
@@ -245,6 +248,9 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_session_reaped_total",
             "Total Suspended FIXP sessions closed by the listener's CoD/suspended reaper after exceeding SuspendedTimeoutMs.",
             _sessionLifecycle.Reaped);
+        EmitProcessCounter(sb, "exch_session_cancel_on_disconnect_fired_total",
+            "Total times the cancel-on-disconnect timer fired for a Suspended FIXP session (issue #54 / GAP-18) and the gateway issued a session-scoped mass cancel.",
+            _sessionLifecycle.CancelOnDisconnectFired);
         EmitProcessCounter(sb, "exch_throttle_accepted_total",
             "Total inbound application messages accepted by the per-session sliding-window throttle (issue #56 / GAP-20).",
             _throttle.Accepted);
