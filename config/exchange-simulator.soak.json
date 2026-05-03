@@ -1,9 +1,8 @@
 {
-  // Soak-test exchange config (#120). Deliberately omits firms[]/sessions[]
-  // so the deprecated single-tenant fallback kicks in — this lets the
-  // SyntheticTrader (which does not implement FIXP Negotiate) connect and
-  // sustain load for the soak duration. Do NOT use as a template for new
-  // deployments; production configs should declare firms/sessions explicitly.
+  // Soak-test exchange config (#120 + #133). Now exercises the production
+  // FIXP handshake path via the synthetic trader's FixpClient. Declares one
+  // firm + one session so the soak runner authenticates exactly like a real
+  // OMS would in prod. devMode=true keeps access keys optional.
   "tcp": {
     "listen": "0.0.0.0:9876",
     "enteringFirm": 1,
@@ -11,7 +10,13 @@
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000
   },
-  "auth": { "devMode": true, "requireFixpHandshake": false },
+  "auth": { "devMode": true, "requireFixpHandshake": true },
+  "firms": [
+    { "id": "soakFirm", "name": "Soak Firm", "enteringFirmCode": 1 }
+  ],
+  "sessions": [
+    { "sessionId": "100", "firmId": "soakFirm" }
+  ],
   "http": {
     "listen": "0.0.0.0:8080",
     "livenessStaleMs": 5000

@@ -20,6 +20,31 @@ public sealed class SyntheticTraderConfig
     [JsonPropertyName("tickIntervalMs")] public int TickIntervalMs { get; set; } = 100;
 
     [JsonPropertyName("instruments")] public List<InstrumentConfig> Instruments { get; set; } = new();
+
+    /// <summary>
+    /// Optional FIXP block. When present the trader performs a full
+    /// Negotiate+Establish handshake on connect and runs the session
+    /// layer (sequence numbers, heartbeat, Terminate on dispose). When
+    /// omitted the trader stays in legacy "raw business frames" mode for
+    /// back-compat with hosts that have <c>auth.requireFixpHandshake=false</c>.
+    /// </summary>
+    [JsonPropertyName("fixp")] public FixpConfig? Fixp { get; set; }
+}
+
+/// <summary>
+/// FIXP session layer configuration. The <c>sessionId</c> must match a
+/// <c>sessions[].sessionId</c> entry in the host config and obey the
+/// gateway's decimal-uint32 rule (no leading zeros, &gt; 0).
+/// </summary>
+public sealed class FixpConfig
+{
+    [JsonPropertyName("sessionId")] public string SessionId { get; set; } = "";
+    [JsonPropertyName("accessKey")] public string AccessKey { get; set; } = "";
+    [JsonPropertyName("keepAliveIntervalMs")] public uint KeepAliveIntervalMs { get; set; } = 5000;
+    [JsonPropertyName("cancelOnDisconnect")] public bool CancelOnDisconnect { get; set; }
+    [JsonPropertyName("retransmitOnGap")] public bool RetransmitOnGap { get; set; } = true;
+    [JsonPropertyName("clientAppName")] public string ClientAppName { get; set; } = "synth";
+    [JsonPropertyName("clientAppVersion")] public string ClientAppVersion { get; set; } = "1.0";
 }
 
 public sealed class HostEndpointConfig

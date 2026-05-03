@@ -243,6 +243,41 @@ Tuning recipes:
   and a distinct EntryPoint `port` if you split the host. The sample
   uses `firm: 1` (the legacy single-tenant fallback).
 
+#### 4.0.1 FIXP handshake (production-shaped login)
+
+When the host has `auth.requireFixpHandshake=true` the synthetic trader
+must perform a full FIXP `Negotiate`+`Establish` before sending business
+frames. Add a `fixp` block to the trader config:
+
+```json
+"fixp": {
+  "sessionId": "100",
+  "accessKey": "",
+  "keepAliveIntervalMs": 5000,
+  "cancelOnDisconnect": false,
+  "retransmitOnGap": true
+}
+```
+
+The `sessionId` MUST be a decimal `uint32` string (no leading zeros, > 0)
+that matches a `sessions[].sessionId` declared in the host config. The
+companion firm entry's `enteringFirmCode` MUST equal the trader's
+`firm` field. With `auth.devMode=true` the `accessKey` is ignored; in
+prod-shaped configs set it to the value registered for the session.
+
+When the block is **omitted** the trader falls back to legacy "raw
+business frames, no handshake" mode for back-compat with hosts running
+`auth.requireFixpHandshake=false`.
+
+The `EntryPointClient` then automatically:
+* sends `Negotiate` + `Establish` on connect (throws on reject);
+* embeds a monotonic `msgSeqNum` in every outbound business frame;
+* emits a `Sequence` heartbeat after `keepAliveIntervalMs/2` of outbound
+  silence and disconnects if the gateway is silent for >1.5×keepAlive;
+* sends a `Terminate(FINISHED)` on graceful shutdown;
+* on detected inbound gaps, fires `RetransmitRequest` when
+  `retransmitOnGap=true`.
+
 ### 4.1 Deterministic replay (`tools/ScenarioReplay`)
 
 For reproducing bug reports and pinning regression tests, drive the host

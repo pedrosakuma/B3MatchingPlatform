@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using B3.Exchange.Gateway;
+using B3.Exchange.SyntheticTrader.Fixp;
 
 namespace B3.Exchange.SyntheticTrader;
 
@@ -92,8 +93,10 @@ public sealed class EntryPointClient : IAsyncDisposable
     private readonly CancellationTokenSource _cts;
     private readonly Action<string>? _logDebug;
     private readonly Action<string>? _logWarn;
+    private readonly FixpClient? _fixp;
     private Task? _recvTask;
     private Task? _sendTask;
+    private Task? _heartbeatTask;
     private long _isOpen = 1;
 
     public event Action<ExecReportNew>? OnNew;
@@ -104,12 +107,22 @@ public sealed class EntryPointClient : IAsyncDisposable
 
     public bool IsOpen => Interlocked.Read(ref _isOpen) == 1;
 
-    private EntryPointClient(TcpClient tcp, NetworkStream stream, Action<string>? logDebug, Action<string>? logWarn, CancellationToken externalCt)
+    /// <summary>
+    /// Exposes the FIXP session layer when this client was constructed
+    /// with <see cref="FixpClientOptions"/>; <c>null</c> in legacy
+    /// (no-handshake) mode. Read-only — callers should drive sends via
+    /// <see cref="SendNewOrder"/>/<see cref="SendCancel"/>.
+    /// </summary>
+    public FixpClient? Fixp => _fixp;
+
+    private EntryPointClient(TcpClient tcp, NetworkStream stream, Action<string>? logDebug, Action<string>? logWarn,
+        CancellationToken externalCt, FixpClient? fixp = null)
     {
         _tcp = tcp;
         _stream = stream;
         _logDebug = logDebug;
         _logWarn = logWarn;
+        _fixp = fixp;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCt);
         _sendQueue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(1024)
         {
@@ -138,10 +151,54 @@ public sealed class EntryPointClient : IAsyncDisposable
         return client;
     }
 
+    /// <summary>
+    /// Connects and performs a full FIXP handshake (Negotiate +
+    /// Establish) before returning. After this call returns the client
+    /// is in <see cref="FixpClientState.Established"/>; subsequent
+    /// business sends will carry the assigned <c>msgSeqNum</c>, the
+    /// client emits <c>Sequence</c> heartbeats, and a <c>Terminate</c>
+    /// is sent on dispose. Throws <see cref="FixpHandshakeRejectedException"/>
+    /// if the gateway rejects either handshake leg.
+    /// </summary>
+    public static async Task<EntryPointClient> ConnectAsync(string host, int port,
+        FixpClientOptions fixpOptions,
+        Action<string>? logDebug = null, Action<string>? logWarn = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(fixpOptions);
+        var tcp = new TcpClient { NoDelay = true };
+        try
+        {
+            await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            tcp.Dispose();
+            throw;
+        }
+        var stream = tcp.GetStream();
+        var fixp = new FixpClient(stream, fixpOptions, logDebug, logWarn);
+        var client = new EntryPointClient(tcp, stream, logDebug, logWarn, ct, fixp);
+        client.Start();
+        try
+        {
+            await fixp.NegotiateAndEstablishAsync(client._cts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+        return client;
+    }
+
     private void Start()
     {
         _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
         _sendTask = Task.Run(() => RunSendLoopAsync(_cts.Token));
+        if (_fixp != null)
+        {
+            _heartbeatTask = Task.Run(() => RunHeartbeatLoopAsync(_cts.Token));
+        }
     }
 
     public bool SendNewOrder(ulong clOrdId, long securityId, OrderSide side,
@@ -150,6 +207,10 @@ public sealed class EntryPointClient : IAsyncDisposable
         if (!IsOpen) return false;
         var frame = new byte[HeaderSize + NewOrderBlockLen];
         EncodeNewOrder(frame, clOrdId, securityId, side, type, tif, qty, priceMantissa);
+        if (_fixp != null)
+        {
+            _fixp.AssignOutboundBusinessHeader(frame.AsSpan(HeaderSize, NewOrderBlockLen));
+        }
         _logDebug?.Invoke($"send NEW clord={clOrdId} sec={securityId} side={side} qty={qty} px={priceMantissa} tif={tif}");
         return Enqueue(frame);
     }
@@ -159,6 +220,10 @@ public sealed class EntryPointClient : IAsyncDisposable
         if (!IsOpen) return false;
         var frame = new byte[HeaderSize + CancelBlockLen];
         EncodeCancel(frame, clOrdId, securityId, orderId, origClOrdId, side);
+        if (_fixp != null)
+        {
+            _fixp.AssignOutboundBusinessHeader(frame.AsSpan(HeaderSize, CancelBlockLen));
+        }
         _logDebug?.Invoke($"send CXL clord={clOrdId} sec={securityId} orderId={orderId}");
         return Enqueue(frame);
     }
@@ -288,7 +353,14 @@ public sealed class EntryPointClient : IAsyncDisposable
             {
                 try
                 {
-                    await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                    if (_fixp != null)
+                    {
+                        await _fixp.WriteAsync(frame, ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                    }
                 }
                 catch (IOException ex)
                 {
@@ -307,6 +379,31 @@ public sealed class EntryPointClient : IAsyncDisposable
         {
             Close("send loop exit");
         }
+    }
+
+    private async Task RunHeartbeatLoopAsync(CancellationToken ct)
+    {
+        if (_fixp == null) return;
+        var period = TimeSpan.FromMilliseconds(Math.Max(50, _fixp.KeepAlive.TotalMilliseconds / 2));
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(period, ct).ConfigureAwait(false);
+                try { await _fixp.TickHeartbeatAsync(ct).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logWarn?.Invoke($"fixp heartbeat error: {ex.Message}");
+                }
+                if (_fixp.IsPeerStale())
+                {
+                    _logWarn?.Invoke("fixp watchdog: peer stale, closing");
+                    Close("fixp watchdog: peer stale");
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     private async Task RunReceiveLoopAsync(CancellationToken ct)
@@ -370,6 +467,33 @@ public sealed class EntryPointClient : IAsyncDisposable
                 try
                 {
                     await ReadExactAsync(_stream, body.AsMemory(0, bodyLength), ct).ConfigureAwait(false);
+                    if (_fixp != null)
+                    {
+                        var disp = _fixp.HandleInboundFrame(templateId, body.AsSpan(0, bodyLength));
+                        if (disp == InboundDisposition.HandledControl)
+                            continue;
+                        if (disp == InboundDisposition.PeerTerminated)
+                        {
+                            Close("peer Terminate");
+                            return;
+                        }
+                        if (disp == InboundDisposition.ProtocolError)
+                        {
+                            Close("fixp protocol error");
+                            return;
+                        }
+                        // PassThrough: track inbound business msgSeqNum
+                        // (InboundBusinessHeader is 18 bytes; msgSeqNum at body[4..8]).
+                        if (bodyLength >= 8)
+                        {
+                            uint msgSeq = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4, 4));
+                            if (!_fixp.TrackInboundBusinessSeq(msgSeq))
+                            {
+                                // Duplicate; drop without dispatching to ER callbacks.
+                                continue;
+                            }
+                        }
+                    }
                     Dispatch(templateId, version, body, blockLength);
                 }
                 finally
@@ -476,9 +600,16 @@ public sealed class EntryPointClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Send Terminate first when in FIXP mode so the gateway sees a
+        // graceful close rather than a half-open TCP. Best-effort.
+        if (_fixp != null)
+        {
+            try { await _fixp.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
         Close("dispose");
         try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); } catch { }
         try { if (_sendTask != null) await _sendTask.ConfigureAwait(false); } catch { }
+        try { if (_heartbeatTask != null) await _heartbeatTask.ConfigureAwait(false); } catch { }
         _cts.Dispose();
     }
 }
