@@ -25,6 +25,6 @@
     <Project Path="tests/B3.Exchange.Core.Tests/B3.Exchange.Core.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Host.Tests/B3.Exchange.Host.Tests.csproj" />
     <Project Path="tests/B3.Exchange.SyntheticTrader.Tests/B3.Exchange.SyntheticTrader.Tests.csproj" />
-    <Project Path="tests/ScenarioReplay.Tests/ScenarioReplay.Tests.csproj" />
+    <Project Path="tests/B3.Exchange.ScenarioReplay.Tests/B3.Exchange.ScenarioReplay.Tests.csproj" />
   </Folder>
 </Solution>
