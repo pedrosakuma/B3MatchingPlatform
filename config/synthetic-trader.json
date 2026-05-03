@@ -28,6 +28,29 @@
           "maxLotMultiple": 3,
           "crossTicks": 2
         }
+        // Additional taker strategies are available — uncomment to enable:
+        // ,{
+        //   "kind": "meanReverting",
+        //   "name": "meanrev-petr4",
+        //   "alpha": 0.1,                // EWMA smoothing factor (0,1]
+        //   "entryThresholdTicks": 5,    // ticks of mid deviation before firing
+        //   "crossTicks": 2,             // marketable offset on entry
+        //   "lotsPerOrder": 2            // size = lotsPerOrder * lotSize
+        // },
+        // {
+        //   "kind": "momentum",
+        //   "name": "momo-petr4",
+        //   "triggerTicks": 3,           // per-tick mid-step before firing
+        //   "crossTicks": 1,
+        //   "lotsPerOrder": 1
+        // },
+        // {
+        //   "kind": "sweeper",
+        //   "name": "sweep-petr4",
+        //   "triggerProbability": 0.02,  // per-tick fire probability [0,1]
+        //   "sweepLots": 25,             // size = sweepLots * lotSize
+        //   "crossTicks": 5              // ≥ levels-to-clear * mm.quoteSpacingTicks
+        // }
       ]
     }
   ]
