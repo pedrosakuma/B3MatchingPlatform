@@ -76,12 +76,7 @@ public sealed class FixpSession : IAsyncDisposable
     /// </summary>
     private readonly RetransmitBuffer _retxBuffer;
     private readonly FixpOutboundEncoder _outboundEncoder;
-    /// <summary>0 / 1 — set via <see cref="Interlocked.CompareExchange"/>
-    /// for the duration of a single retransmission replay (per spec
-    /// §4.5.6: "one outstanding request at a time"). Cleared after the
-    /// last frame of the replay block is enqueued under
-    /// <see cref="_outboundLock"/>.</summary>
-    private int _retxInProgress;
+    private readonly FixpRetransmitController _retransmitController;
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
     /// or 0 if no claim is held. Tracked so <see cref="Close"/> can
     /// release the claim using the value from the moment the claim was
@@ -338,6 +333,18 @@ public sealed class FixpSession : IAsyncDisposable
             nowNanos: () => _nowNanos(),
             isOpen: () => IsOpen,
             close: Close);
+        _retransmitController = new FixpRetransmitController(
+            sessionId: () => SessionId,
+            transport: () => _transport!,
+            retxBuffer: _retxBuffer,
+            outboundLock: _outboundLock,
+            sendQueueCapacity: _sendQueueCapacity,
+            isOpen: () => IsOpen,
+            peekNextMsgSeqNum: PeekNextMsgSeqNum,
+            applyTransition: ApplyTransition,
+            getState: () => State,
+            logger: _logger,
+            connectionId: ConnectionId);
         if (_options.ThrottleMaxMessages > 0 && _options.ThrottleTimeWindowMs > 0)
         {
             _throttle = new InboundThrottle(
@@ -1398,26 +1405,7 @@ public sealed class FixpSession : IAsyncDisposable
         }
     }
 
-    private void EnqueueSequence()
-    {
-        if (!IsOpen) return;
-        var frame = new byte[SessionFrameEncoder.SequenceTotal];
-        // FIXP §4.5.5: the Sequence message announces the *next* MsgSeqNum
-        // we intend to send. It does not consume a sequence number itself,
-        // so we must peek instead of incrementing — otherwise the Establish
-        // handshake would observe a phantom gap (e.g. an idle heartbeat
-        // before Establish would push EstablishAck.nextSeqNo off by one).
-        //
-        // Outbound lock: serializes against the replay block in
-        // ProcessAndEnqueueRetransmitRequest so a watchdog-driven
-        // heartbeat cannot land inside the Retransmission/replay/Sequence
-        // sequence on the wire (gpt-5.5 review #1).
-        lock (_outboundLock)
-        {
-            SessionFrameEncoder.EncodeSequence(frame, PeekNextMsgSeqNum());
-            _transport.TryEnqueueFrame(frame);
-        }
-    }
+    private void EnqueueSequence() => _retransmitController.EnqueueSequence();
 
     private static async Task ReadExactlyAsync(Stream s, byte[] buf, CancellationToken ct)
         => await ReadExactlyAsync(s, buf.AsMemory(), ct).ConfigureAwait(false);
@@ -1464,109 +1452,7 @@ public sealed class FixpSession : IAsyncDisposable
     /// Sequence's seq matches what the peer will see next.</para>
     /// </summary>
     private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
-    {
-        // Layout (BLOCK_LENGTH=20): SessionID(4) | Timestamp(8 ulong) |
-        // FromSeqNo(4 uint) | Count(4 uint).
-        if (fixedBlock.Length < 20) return; // header validator already enforced this; defensive
-        uint reqSessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(0, 4));
-        ulong reqTimestamp = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(4, 8));
-        uint fromSeq = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(12, 4));
-        uint count = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(16, 4));
-
-        var action = ApplyTransition(FixpEvent.RetransmitRequest);
-        if (action != FixpAction.Replay)
-        {
-            // DropSilently / DeferredToReestablish / Terminal: per spec,
-            // emit nothing. Suspended sessions have no live transport
-            // anyway; a request that arrives in any pre-Established state
-            // is simply ignored and the peer is expected to drive the
-            // handshake before requesting recovery.
-            _logger.LogDebug("session {ConnectionId} retransmit-request action={Action} state={State} dropped",
-                ConnectionId, action, State);
-            return;
-        }
-
-        // Spec validations BEFORE single-in-flight gate so a malformed
-        // request doesn't leave the gate held.
-        if (reqSessionId != SessionId)
-        {
-            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_SESSION);
-            return;
-        }
-        if (reqTimestamp == 0UL)
-        {
-            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_TIMESTAMP);
-            return;
-        }
-
-        // One-outstanding-request gate. Cleared in the finally below
-        // after the entire replay block is enqueued under _outboundLock,
-        // so a subsequent request can never see partial state.
-        if (Interlocked.CompareExchange(ref _retxInProgress, 1, 0) != 0)
-        {
-            EnqueueRetransmitReject(reqTimestamp, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.RETRANSMIT_IN_PROGRESS);
-            return;
-        }
-        try
-        {
-            // Buffer combines count-bounds + window check under one lock
-            // (no TOCTOU between FirstAvailable read and clone copy).
-            var snap = _retxBuffer.TryGet(fromSeq, count);
-            if (snap.RejectCode is { } code)
-            {
-                EnqueueRetransmitReject(reqTimestamp, code);
-                return;
-            }
-
-            // Hold the outbound lock for the entire block so (a) no live
-            // business frame interleaves on the wire and (b) the
-            // trailing Sequence's nextSeqNo matches the next live seq
-            // the peer will see (gpt-5.5 critique #1, #2).
-            lock (_outboundLock)
-            {
-                // Backpressure: TcpTransport's bounded send queue can
-                // drop frames if it overflows mid-replay (gpt-5.5 review
-                // #2). Reserve capacity for the FULL block (header +
-                // clones + trailer) under the outbound lock; if the
-                // queue cannot accept the burst, reject with SYSTEM_BUSY
-                // rather than advertise an exact count we can't deliver.
-                int needed = 2 + snap.Frames.Length;
-                if (_transport.SendQueueDepth + needed > _sendQueueCapacity)
-                {
-                    EnqueueRetransmitReject(reqTimestamp,
-                        B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.SYSTEM_BUSY);
-                    return;
-                }
-
-                var headerFrame = new byte[RetransmissionEncoder.RetransmissionTotal];
-                RetransmissionEncoder.EncodeRetransmission(headerFrame,
-                    SessionId, reqTimestamp,
-                    firstRetransmittedSeqNo: snap.FirstSeq, count: snap.ActualCount);
-                _transport.TryEnqueueFrame(headerFrame);
-
-                for (int i = 0; i < snap.Frames.Length; i++)
-                    _transport.TryEnqueueFrame(snap.Frames[i]);
-
-                var trailer = new byte[SessionFrameEncoder.SequenceTotal];
-                SessionFrameEncoder.EncodeSequence(trailer, PeekNextMsgSeqNum());
-                _transport.TryEnqueueFrame(trailer);
-            }
-        }
-        finally
-        {
-            Volatile.Write(ref _retxInProgress, 0);
-        }
-    }
-
-    private void EnqueueRetransmitReject(ulong requestTimestampNanos,
-        B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode code)
-    {
-        var frame = new byte[RetransmissionEncoder.RetransmitRejectTotal];
-        RetransmissionEncoder.EncodeRetransmitReject(frame, SessionId, requestTimestampNanos, code);
-        _transport.TryEnqueueFrame(frame);
-        _logger.LogInformation("session {ConnectionId} retransmit-reject code={Code}",
-            ConnectionId, code);
-    }
+        => _retransmitController.ProcessAndEnqueueRetransmitRequest(fixedBlock);
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
         => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos);
