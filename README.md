@@ -9,14 +9,40 @@
 
 Stateful B3-spec exchange simulator. Speaks the **B3 EntryPoint** SBE protocol
 inbound (TCP) and the **B3 UMDF** market-data wire format outbound (UDP
-multicast or unicast). Companion to [`SbeB3UmdfConsumer`][consumer] — designed
-to run as a 24/7 simulated venue against any UMDF consumer.
+multicast or unicast). Designed to run as a 24/7 simulated venue against any
+UMDF consumer or EntryPoint client.
 
 > **Status:** active development. The matching engine, EntryPoint TCP gateway,
 > and UMDF publisher are functional; FIXP session lifecycle and operator
 > endpoints are landing incrementally — see open issues for the roadmap.
 
-[consumer]: https://github.com/pedrosakuma/SbeB3UmdfConsumer
+## Family of repositories
+
+`B3MatchingPlatform` plays the role of **the exchange itself** — the matching
+engine, UMDF publisher, and EntryPoint listener that the rest of the family
+talks to. The companion repos play the roles of the consumers and
+participants that surround a real exchange:
+
+| Repo | Role | Wire IN | Wire OUT | Frontend? |
+| --- | --- | --- | --- | --- |
+| **[`B3MatchingPlatform`](https://github.com/pedrosakuma/B3MatchingPlatform)** *(this repo)* | The "exchange" (matching engine + UMDF publisher + EntryPoint listener) | EntryPoint orders | UMDF MD + EntryPoint ER | Operator-only |
+| [`B3MarketDataPlatform`](https://github.com/pedrosakuma/B3MarketDataPlatform) | Market-data subscriber (UMDF consumer + WebSocket distribution + frontend) | UMDF | — | Yes |
+| [`B3TradingPlatform`](https://github.com/pedrosakuma/B3TradingPlatform) | Participant / OMS-like backend (own orders, positions, end-clients) | EntryPoint ER | EntryPoint orders | Yes |
+| [`B3EntryPointClient`](https://github.com/pedrosakuma/B3EntryPointClient) | Wire-pure EntryPoint client lib + conformance suite | EntryPoint ER | EntryPoint orders | — |
+
+```
+                   orders ─────────────────────────────────►
+   ┌──────────────────────┐                ┌──────────────────────────────┐
+   │  B3TradingPlatform   │ ── EntryPoint ►│      B3MatchingPlatform      │
+   │  B3EntryPointClient  │ ◄── ER ─────── │   (this repo — "exchange")   │
+   └──────────────────────┘                └──────────────┬───────────────┘
+                                                          │ UMDF
+                                                          ▼
+                                            ┌──────────────────────────┐
+                                            │   B3MarketDataPlatform   │
+                                            └──────────────────────────┘
+                   ◄──────────────────────────────── market data
+```
 
 ## What's inside
 
