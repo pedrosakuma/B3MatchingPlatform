@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>B3.Exchange.ScenarioReplay</RootNamespace>
+    <AssemblyName>B3.Exchange.ScenarioReplay</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.SyntheticTrader\B3.Exchange.SyntheticTrader.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Exchange.ScenarioReplay.Tests" />
+  </ItemGroup>
+
+</Project>

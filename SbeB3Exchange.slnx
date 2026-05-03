@@ -11,6 +11,9 @@
     <Project Path="src/B3.Exchange.Host/B3.Exchange.Host.csproj" />
     <Project Path="src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/ScenarioReplay/ScenarioReplay.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.Umdf.WireEncoder.Tests/B3.Umdf.WireEncoder.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Instruments.Tests/B3.Exchange.Instruments.Tests.csproj" />
@@ -19,5 +22,6 @@
     <Project Path="tests/B3.Exchange.Core.Tests/B3.Exchange.Core.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Host.Tests/B3.Exchange.Host.Tests.csproj" />
     <Project Path="tests/B3.Exchange.SyntheticTrader.Tests/B3.Exchange.SyntheticTrader.Tests.csproj" />
+    <Project Path="tests/ScenarioReplay.Tests/ScenarioReplay.Tests.csproj" />
   </Folder>
 </Solution>
