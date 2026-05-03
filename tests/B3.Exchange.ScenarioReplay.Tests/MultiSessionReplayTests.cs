@@ -34,7 +34,7 @@ public class MultiSessionReplayTests
         throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
     }
 
-    [Fact(Skip = "Flaky pre-existing on main; tracked by #146. Aggressor session sometimes never receives its ER_Trade callback. Re-enable once #146 lands.")]
+    [Fact]
     public async Task TwoSessions_CrossingScript_LandsErTradesOnBothSides()
     {
         var sink = new CountingSink();
@@ -102,13 +102,17 @@ public class MultiSessionReplayTests
 
         await runner.RunAsync(script, cts.Token);
 
-        // Wait for ER_Trade on both sessions.
-        var deadline = DateTime.UtcNow.AddSeconds(5);
+        // Wait for ER_Trade on BOTH sessions. Poll until both sides have
+        // observed their own trade ER, not just any trade ER (the previous
+        // condition broke as soon as the first side's trade landed, which
+        // races the aggressor's recv loop — see #146).
+        var deadline = DateTime.UtcNow.AddSeconds(10);
         while (DateTime.UtcNow < deadline)
         {
-            var snap = sw.ToString();
-            if (snap.Contains("\"session\":\"firmA\"") && snap.Contains("\"session\":\"firmB\"")
-                && snap.Contains("\"execType\":\"trade\""))
+            var snapLines = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            bool aTrade = snapLines.Any(l => l.Contains("\"src\":\"er\"") && l.Contains("\"session\":\"firmA\"") && l.Contains("\"execType\":\"trade\""));
+            bool bTrade = snapLines.Any(l => l.Contains("\"src\":\"er\"") && l.Contains("\"session\":\"firmB\"") && l.Contains("\"execType\":\"trade\""));
+            if (aTrade && bTrade)
                 break;
             await Task.Delay(50, cts.Token);
         }
