@@ -81,6 +81,15 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// <see cref="SequenceVersion"/>. Safe to read from any thread.</summary>
     public uint SequenceNumber => Volatile.Read(ref _sequenceNumber);
 
+    /// <summary>
+    /// Pending work-items in the bounded inbound channel. Snapshot value;
+    /// safe to read from any thread (the underlying <see cref="System.Threading.Channels.Channel{T}"/>
+    /// reader supports counting). Used by the host's graceful-shutdown
+    /// drain loop (issue #171) to wait until in-flight commands have been
+    /// observed by the engine before broadcasting Terminate.
+    /// </summary>
+    public int InboundQueueDepth => _inbound.Reader.Count;
+
     private readonly System.Threading.Channels.Channel<WorkItem> _inbound;
     private readonly MatchingEngine _engine;
     private readonly IUmdfPacketSink _packetSink;

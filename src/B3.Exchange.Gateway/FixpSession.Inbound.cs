@@ -101,6 +101,16 @@ public sealed partial class FixpSession
     /// closes the session.
     /// </summary>
     private async Task TerminateAndCloseAsync(byte terminationCode, string reason)
+        => await SendTerminateAndCloseAsync(terminationCode, reason).ConfigureAwait(false);
+
+    /// <summary>
+    /// Public wrapper around <see cref="TerminateAndCloseAsync"/> so the
+    /// graceful-shutdown coordinator (issue #171) can broadcast
+    /// <c>Terminate(Finished)</c> to every live session before the host
+    /// tears the listener down. Idempotent: a session already closed
+    /// returns immediately without attempting any IO.
+    /// </summary>
+    public async Task SendTerminateAndCloseAsync(byte terminationCode, string reason)
     {
         if (!IsOpen) { Close(reason); return; }
         var frame = new byte[SessionRejectEncoder.TerminateTotal];

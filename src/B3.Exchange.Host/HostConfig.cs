@@ -16,7 +16,27 @@ public sealed class HostConfig
     [JsonPropertyName("sessions")] public List<SessionConfig> Sessions { get; set; } = new();
     [JsonPropertyName("http")] public HttpConfig? Http { get; set; }
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
+    [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
+}
+
+/// <summary>
+/// Graceful-shutdown tunables (issue #171 / A7). On SIGTERM the host
+/// flips its readiness probe NOT_READY, stops accepting connections,
+/// then waits up to <see cref="DrainGraceMs"/> for the per-channel
+/// dispatcher inbound queues to drain (polled every
+/// <see cref="DrainPollMs"/>) before broadcasting <c>Terminate(Finished)</c>
+/// to every live FIXP session and tearing the listener down.
+/// </summary>
+public sealed class ShutdownConfig
+{
+    /// <summary>Maximum wall-clock time to wait for inbound queues to
+    /// drain before forcing the Terminate broadcast. Default 5 s.</summary>
+    [JsonPropertyName("drainGraceMs")] public int DrainGraceMs { get; set; } = 5_000;
+
+    /// <summary>How often the drain loop polls per-channel queue depth.
+    /// Default 50 ms. Smaller = more responsive shutdown, more CPU.</summary>
+    [JsonPropertyName("drainPollMs")] public int DrainPollMs { get; set; } = 50;
 }
 
 public sealed class TcpConfig

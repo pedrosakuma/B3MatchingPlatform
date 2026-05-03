@@ -234,6 +234,63 @@ public sealed class EntryPointListener : IAsyncDisposable
         return closed;
     }
 
+    /// <summary>
+    /// Graceful-shutdown phase 1 (issue #171 / A7): stop accepting new TCP
+    /// connections without closing the existing sessions or unbinding the
+    /// listening socket. The accept loop and the suspended-session reaper
+    /// are cancelled and awaited; existing sessions keep flowing inbound +
+    /// outbound traffic so the host can continue to drain in-flight work
+    /// before the subsequent <see cref="TerminateAllSessionsAsync"/> step.
+    ///
+    /// <para>Idempotent: safe to call multiple times. Subsequent calls
+    /// short-circuit because <see cref="_acceptTask"/> is already torn
+    /// down. After this returns, <see cref="DisposeAsync"/> is still
+    /// required to release sockets and dispose remaining sessions.</para>
+    /// </summary>
+    public async Task StopAcceptingAsync()
+    {
+        try { _cts.Cancel(); } catch { }
+        try { _listener?.Stop(); } catch { }
+        if (_acceptTask != null) { try { await _acceptTask.ConfigureAwait(false); } catch { } _acceptTask = null; }
+        if (_reaperTask != null) { try { await _reaperTask.ConfigureAwait(false); } catch { } _reaperTask = null; }
+        _logger.LogInformation("entrypoint listener stopped accepting new connections");
+    }
+
+    /// <summary>
+    /// Graceful-shutdown phase 2 (issue #171 / A7): broadcast
+    /// <c>Terminate(<paramref name="terminationCode"/>)</c> to every live
+    /// FIXP session, then close them. Awaits each direct-send to give the
+    /// peer a chance to read the frame before TCP RST/FIN; failures are
+    /// logged and swallowed so one stuck session can't block the rest.
+    /// Returns the number of sessions that were live at snapshot time.
+    /// </summary>
+    public async Task<int> TerminateAllSessionsAsync(byte terminationCode, string reason)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(reason);
+        FixpSession[] snapshot;
+        lock (_lock) snapshot = _sessions.ToArray();
+        int closed = 0;
+        foreach (var s in snapshot)
+        {
+            if (!s.IsOpen) continue;
+            try
+            {
+                await s.SendTerminateAndCloseAsync(terminationCode, reason).ConfigureAwait(false);
+                closed++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "graceful terminate failed for session {ConnectionId}",
+                    s.ConnectionId);
+            }
+        }
+        _logger.LogInformation(
+            "broadcast Terminate({Code}) to {Count} session(s) (reason={Reason})",
+            terminationCode, closed, reason);
+        return closed;
+    }
+
     private async Task RunAcceptLoopAsync(CancellationToken ct)
     {
         try
@@ -427,10 +484,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _logger.LogInformation("entrypoint listener stopping");
-        try { _cts.Cancel(); } catch { }
-        try { _listener?.Stop(); } catch { }
-        if (_acceptTask != null) { try { await _acceptTask.ConfigureAwait(false); } catch { } }
-        if (_reaperTask != null) { try { await _reaperTask.ConfigureAwait(false); } catch { } }
+        await StopAcceptingAsync().ConfigureAwait(false);
         FixpSession[] toClose;
         lock (_lock) { toClose = _sessions.ToArray(); _sessions.Clear(); }
         foreach (var s in toClose) await s.DisposeAsync().ConfigureAwait(false);
