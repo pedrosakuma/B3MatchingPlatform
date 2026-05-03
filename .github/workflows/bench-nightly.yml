@@ -1,0 +1,71 @@
+name: Bench (nightly)
+
+on:
+  schedule:
+    # 02:00 UTC daily — off-peak, low risk of clashing with feature work.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'BenchmarkDotNet --filter pattern (default: all)'
+        required: false
+        default: '*'
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: BenchmarkDotNet
+    runs-on: ubuntu-latest
+    # Full suite is ~minutes today but allow head-room for future additions.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK (pinned by global.json)
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.slnx', 'Directory.Build.props', 'Directory.Packages.props', 'global.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore bench/B3.Exchange.Bench/B3.Exchange.Bench.csproj
+
+      - name: Build (Release)
+        run: dotnet build bench/B3.Exchange.Bench/B3.Exchange.Bench.csproj --no-restore -c Release
+
+      - name: Run benchmarks
+        env:
+          # GitHub-hosted runners are noisy; loosen tolerances slightly so a
+          # single noisy iteration does not turn the whole job red. We are
+          # tracking trends, not enforcing hard thresholds (yet).
+          DOTNET_TieredPGO: '1'
+        run: >
+          dotnet run --no-build -c Release
+          --project bench/B3.Exchange.Bench
+          --
+          --filter '${{ github.event.inputs.filter || ''*'' }}'
+          --exporters github
+
+      - name: Upload BenchmarkDotNet artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ github.run_number }}
+          path: BenchmarkDotNet.Artifacts/**/*
+          if-no-files-found: warn
+          retention-days: 90
