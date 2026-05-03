@@ -73,9 +73,9 @@ jobs:
           # Run the published DLL directly (not `dotnet run --project`) so
           # the working directory stays at the repo root and the relative
           # `instruments` path inside the JSON resolves correctly.
-          # The soak config omits firms[]/sessions[] to use the legacy
-          # single-tenant fallback so SyntheticTrader (no FIXP Negotiate)
-          # can connect and drive sustained load.
+          # The soak config sets `auth.requireFixpHandshake=false` so the
+          # SyntheticTrader (which speaks the SBE business protocol but not
+          # FIXP Negotiate/Establish) can sustain a connection.
           nohup dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
             config/exchange-simulator.soak.json \
             > artifacts/soak/host.log 2>&1 &
@@ -96,18 +96,11 @@ jobs:
           tail -200 artifacts/soak/host.log >&2 || true
           exit 1
 
-      - name: Start synthetic traders (best-effort)
-        # KNOWN LIMITATION: SyntheticTrader does not yet implement the FIXP
-        # Negotiate/Establish handshake required by the modern Gateway.
-        # Each connection is rejected with `app-message-before-negotiate`
-        # within milliseconds and the trader process exits without retry.
-        # Tracked as a follow-up to #120; for now this step provides only a
-        # brief burst of TCP-accept activity at start-of-soak. The host's
-        # snapshot rotator + instrument-definition publisher continue to
-        # generate steady UDP multicast traffic for the full soak duration,
-        # which exercises the publishers, timers, and HTTP server even with
-        # zero sustained client load.
-        continue-on-error: true
+      - name: Start synthetic traders
+        # The soak host config sets `auth.requireFixpHandshake = false` so
+        # SyntheticTrader can drive sustained load over its existing SBE
+        # send loop without implementing the FIXP Negotiate/Establish
+        # handshake. Production hosts leave the flag at its default (true).
         run: |
           set -euo pipefail
           mkdir -p artifacts/soak/traders
