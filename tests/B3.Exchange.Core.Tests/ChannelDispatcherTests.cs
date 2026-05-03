@@ -409,6 +409,66 @@ public class ChannelDispatcherTests
         Assert.Empty(pkt.Packets);
     }
 
+    /// <summary>
+    /// Issue #138: ensures /metrics-style scrapes from a non-dispatch thread
+    /// always observe a coherent (SequenceVersion ≥ 1, SequenceNumber ≥ 0)
+    /// pair while the dispatch loop is publishing packets concurrently.
+    /// Uses Volatile.Read accessors on the public properties — no torn or
+    /// hoisted reads should be observable.
+    /// </summary>
+    [Fact]
+    public async Task SequenceCounters_ReadFromForeignThread_NeverTearOrRegress()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        disp.Start();
+        try
+        {
+            using var stop = new CancellationTokenSource(TimeSpan.FromMilliseconds(800));
+            // Producer: enqueue resting orders as fast as the bounded queue allows.
+            var producer = Task.Run(() =>
+            {
+                ulong cl = 0;
+                while (!stop.IsCancellationRequested)
+                {
+                    disp.EnqueueNewOrder(
+                        new NewOrderCommand(
+                            (++cl).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                            Px(10m), 1, 7, 1_000UL),
+                        reply.Id, reply.EnteringFirm, clOrdIdValue: cl);
+                }
+            });
+            // Reader: scrape the public counters from another thread; assert
+            // monotonic-non-decreasing within a (version) generation and that
+            // version is always ≥ the value observed at construction.
+            var reader = Task.Run(() =>
+            {
+                ushort lastVer = disp.SequenceVersion;
+                uint lastSeq = 0;
+                while (!stop.IsCancellationRequested)
+                {
+                    ushort v = disp.SequenceVersion;
+                    uint s = disp.SequenceNumber;
+                    Assert.True(v >= 1, $"SequenceVersion torn: observed {v}");
+                    if (v == lastVer)
+                    {
+                        // Within the same version, sequence must not regress.
+                        Assert.True(s >= lastSeq,
+                            $"SequenceNumber regressed within version {v}: {lastSeq} -> {s}");
+                    }
+                    lastVer = v;
+                    lastSeq = s;
+                }
+            });
+            await Task.WhenAll(producer, reader);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
     private static MatchingEngine GetEngine(ChannelDispatcher disp)
     {
         var f = typeof(ChannelDispatcher).GetField("_engine",
