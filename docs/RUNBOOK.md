@@ -438,6 +438,58 @@ Notes:
   later packet so it appears later in the wire stream. Held packets are
   flushed on host shutdown.
 
+### 5.8 Long-haul soak (≥1h) — `.github/workflows/soak.yml`
+
+Detects slow leaks (RSS slope, FD growth, thread growth) that would not
+surface in the few-minute smoke soak from issue #4. Issue #120.
+
+Runs nightly at 03:00 UTC with `duration_minutes=60`; can also be
+dispatched manually with a custom `duration_minutes` (1–360) and
+`synth_clients` count.
+
+Tooling:
+
+- `tools/soak/sample.sh` — bash sampler that appends one CSV row every
+  `SAMPLE_INTERVAL_SECONDS` (default 30), capturing process RSS, VmSize,
+  thread count, FD count, and a few `/metrics` counters.
+- `tools/soak/analyze.py` — computes RSS slope (MB/h, OLS) and asserts
+  three thresholds (override via env):
+  - `RSS_SLOPE_MAX_MB_PER_H` (default 50)
+  - `FD_GROWTH_MAX` (default 100, last vs first)
+  - `THREAD_GROWTH_MAX` (default 20, last vs first)
+- Final summary is mirrored into `$GITHUB_STEP_SUMMARY`; the full sample
+  CSV + host/trader logs are uploaded as `soak-<run_number>` artifact
+  (30-day retention).
+
+Manual run:
+
+```bash
+gh workflow run soak.yml -f duration_minutes=15 -f synth_clients=2
+```
+
+Local equivalent (uses the published Release DLL so the relative
+`instruments` path resolves from the repo root):
+
+```bash
+dotnet build -c Release SbeB3Exchange.slnx
+dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
+  config/exchange-simulator.soak.json &
+HOST_PID=$!
+HOST_PID=$HOST_PID OUTPUT_CSV=/tmp/samples.csv DURATION_SECONDS=900 \
+  METRICS_URL=http://127.0.0.1:8080/metrics \
+  bash tools/soak/sample.sh
+python3 tools/soak/analyze.py /tmp/samples.csv
+```
+
+**Known limitation:** `SyntheticTrader` does not yet implement the FIXP
+Negotiate/Establish handshake required by the modern Gateway, so its
+connections are rejected within milliseconds of accept. The host's
+snapshot rotator + instrument-definition publisher continue to drive
+steady UDP multicast traffic for the full soak duration, exercising the
+publishers, timers, and HTTP surface; full client-side load coverage is
+gated on adding FIXP support to the synth trader (tracked as a #120
+follow-up).
+
 ---
 
 ## 6. Common tuning + debugging

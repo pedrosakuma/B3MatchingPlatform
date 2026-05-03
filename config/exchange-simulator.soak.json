@@ -1,0 +1,43 @@
+{
+  // Soak-test exchange config (#120). Deliberately omits firms[]/sessions[]
+  // so the deprecated single-tenant fallback kicks in — this lets the
+  // SyntheticTrader (which does not implement FIXP Negotiate) connect and
+  // sustain load for the soak duration. Do NOT use as a template for new
+  // deployments; production configs should declare firms/sessions explicitly.
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
+  },
+  "auth": { "devMode": true },
+  "http": {
+    "listen": "0.0.0.0:8080",
+    "livenessStaleMs": 5000
+  },
+  "channels": [
+    {
+      "channelNumber": 84,
+      "incrementalGroup": "224.0.20.84",
+      "incrementalPort": 30084,
+      "ttl": 1,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-eqt.json",
+      "snapshot": {
+        "group": "224.0.20.184",
+        "port": 30184,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "224.0.21.84",
+        "port": 31084,
+        "ttl": 1,
+        "cadenceMs": 5000
+      }
+    }
+  ]
+}
