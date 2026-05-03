@@ -43,7 +43,7 @@ catch (Exception ex)
 
 var instruments = cfg.Instruments.Select(ic =>
     (cfg: ic, strategies: (IReadOnlyList<IStrategy>)ic.Strategies
-        .Select(SyntheticTraderConfigLoader.BuildStrategy).ToList()));
+        .Select(s => SyntheticTraderConfigLoader.BuildStrategy(s, cfg.TickIntervalMs)).ToList()));
 
 var seed = cfg.Seed != 0 ? cfg.Seed : Environment.TickCount;
 var rng = new Random(seed);

@@ -204,20 +204,31 @@ public class AdditionalStrategyTests
             EntryThresholdTicks = 4,
             CrossTicks = 2,
             LotsPerOrder = 3,
-        }));
+        }, tickIntervalMs: 100));
         Assert.IsType<MomentumStrategy>(SyntheticTraderConfigLoader.BuildStrategy(new StrategyConfig
         {
             Kind = "momentum",
             TriggerTicks = 2,
             CrossTicks = 1,
             LotsPerOrder = 1,
-        }));
+        }, tickIntervalMs: 100));
         Assert.IsType<SweeperStrategy>(SyntheticTraderConfigLoader.BuildStrategy(new StrategyConfig
         {
             Kind = "sweeper",
             TriggerProbability = 0.05,
             SweepLots = 25,
             CrossTicks = 5,
-        }));
+        }, tickIntervalMs: 100));
+        Assert.IsType<NewsShockStrategy>(SyntheticTraderConfigLoader.BuildStrategy(new StrategyConfig
+        {
+            Kind = "newsShock",
+            MeanIntervalMs = 5000,
+            JitterMs = 1000,
+            ShockDurationMs = 1000,
+            FadeDurationMs = 2000,
+            LevelsToSweep = 3,
+            BurstQtyLots = 5,
+            DirectionBias = 0.5,
+        }, tickIntervalMs: 100));
     }
 }

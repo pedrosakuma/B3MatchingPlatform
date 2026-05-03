@@ -209,6 +209,7 @@ ship today (per `SyntheticTraderConfig.cs`):
 | `meanReverting` | `alpha`, `entryThresholdTicks`, `crossTicks`, `lotsPerOrder` | Tracks an EWMA of the mid (`alpha` ∈ (0,1]); when the live mid deviates by ≥ `entryThresholdTicks`, sends a marketable IOC of `lotsPerOrder × lotSize` in the *contrarian* direction. |
 | `momentum` | `triggerTicks`, `crossTicks`, `lotsPerOrder` | Compares the mid to the previous tick; when the per-tick step is ≥ `triggerTicks`, sends a marketable IOC *in the direction of the move*. |
 | `sweeper` | `triggerProbability`, `sweepLots`, `crossTicks` | Per-tick fire (uniform side) of a large marketable IOC sized `sweepLots × lotSize`, priced `crossTicks` past the mid. Configure `crossTicks ≥ N × marketMaker.quoteSpacingTicks` to actually walk N levels. |
+| `newsShock` | `meanIntervalMs`, `jitterMs`, `shockDurationMs`, `fadeDurationMs`, `levelsToSweep`, `burstQtyLots`, `directionBias` | Stateful three-phase sequence (idle → shock → fade). After a randomised idle window (`meanIntervalMs ± jitterMs`), enters a `shockDurationMs` burst emitting one marketable IOC per tick on a side picked by `directionBias` (0 = SELL only, 1 = BUY only, 0.5 = symmetric). Optional `fadeDurationMs` linearly tapers the size to zero before returning to idle. All ms-windows are converted to tick counts using the runner's `tickIntervalMs`. |
 
 Tuning recipes:
 
@@ -226,6 +227,13 @@ Tuning recipes:
   and `crossTicks ≥ levelsPerSide × quoteSpacingTicks` so the sweep walks
   the full visible book — exercises consumer-side trade-through fills
   and snapshot recovery.
+* **News-shock simulation:** add a `newsShock` strategy alongside a
+  `marketMaker` so the shock has a resting book to walk through.
+  Defaults (`meanIntervalMs=60000`, `shockDurationMs=1500`,
+  `fadeDurationMs=3000`) reproduce a roughly-once-per-minute directional
+  burst suitable for stress-testing UMDF burst rates and consumer
+  snapshot-recovery paths. Set `directionBias=1.0` (or `0.0`) to force a
+  one-sided shock for repeatable scenarios.
 * **Burst load (throttle exercise):** raise the synthetic trader's
   `tickIntervalMs` down to `10–20` and bump `noiseTaker.orderProbability`
   to `0.9` — the per-session throttle (`exch_throttle_rejected_total`)

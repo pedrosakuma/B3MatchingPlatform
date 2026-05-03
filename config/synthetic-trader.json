@@ -50,6 +50,17 @@
         //   "triggerProbability": 0.02,  // per-tick fire probability [0,1]
         //   "sweepLots": 25,             // size = sweepLots * lotSize
         //   "crossTicks": 5              // ≥ levels-to-clear * mm.quoteSpacingTicks
+        // },
+        // {
+        //   "kind": "newsShock",
+        //   "name": "shock-petr4",
+        //   "meanIntervalMs": 60000,     // mean time between shocks
+        //   "jitterMs": 15000,           // ± uniform jitter, must be < mean
+        //   "shockDurationMs": 1500,     // burst window length
+        //   "fadeDurationMs": 3000,      // optional taper window (0 disables)
+        //   "levelsToSweep": 4,          // price offset = levelsToSweep × tickSize
+        //   "burstQtyLots": 5,           // size = burstQtyLots × lotSize per emit
+        //   "directionBias": 0.5         // 0 = always SELL, 1 = always BUY, 0.5 = symmetric
         // }
       ]
     }
