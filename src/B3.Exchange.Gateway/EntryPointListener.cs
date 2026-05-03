@@ -32,6 +32,11 @@ public sealed class EntryPointListener : IAsyncDisposable
     private TcpListener? _listener;
     private Task? _acceptTask;
     private Task? _reaperTask;
+    // Atomic monotonic id allocator. Today the only writer is the accept
+    // loop (single thread), but we keep Interlocked.Increment to preserve
+    // the "any-thread safe" contract of DefaultIdentityFactory in case a
+    // future custom factory is invoked off the accept loop. Audited as
+    // part of issue #138.
     private long _nextConnectionId;
     private readonly List<FixpSession> _sessions = new();
     private readonly object _lock = new();

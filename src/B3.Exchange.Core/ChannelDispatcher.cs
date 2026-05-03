@@ -25,6 +25,30 @@ namespace B3.Exchange.Core;
 /// <see cref="IMatchingEventSink"/> (engine events out). The dispatch loop
 /// guarantees that the engine and the event-sink callbacks always run on the
 /// dedicated dispatch thread — there is no cross-thread call into the engine.
+///
+/// <para><b>Threading contract (issue #138):</b></para>
+/// <list type="bullet">
+/// <item><description><b>Producers</b> (any thread) call only the
+/// <c>Enqueue*</c> / <see cref="OnDecodeError"/> / <see cref="OnSessionClosed"/>
+/// methods, which post a <c>WorkItem</c> to the bounded
+/// <see cref="System.Threading.Channels.Channel{T}"/> and return. No engine
+/// or buffer state is mutated from the producer thread.</description></item>
+/// <item><description><b>The dispatch loop thread</b> (the single
+/// <see cref="Thread"/> spun up by <see cref="Start"/>) is the sole mutator of
+/// engine state, the packet buffer, the <c>_clOrdId</c> index, and the
+/// <see cref="SequenceNumber"/> / <see cref="SequenceVersion"/> counters.
+/// Every mutation path asserts <c>Thread.CurrentThread == _loopThread</c>
+/// in DEBUG builds via <see cref="AssertOnLoopThread"/>.</description></item>
+/// <item><description><b>External readers</b> (e.g. <c>HttpServer.RenderProm</c>
+/// on an HTTP worker thread) read <see cref="SequenceNumber"/> /
+/// <see cref="SequenceVersion"/> via the public getters, which use
+/// <see cref="Volatile.Read(ref uint)"/> / <see cref="Volatile.Read(ref ushort)"/>
+/// against the backing fields written with the corresponding
+/// <see cref="Volatile.Write(ref uint, uint)"/> calls. This guarantees no
+/// torn / hoisted reads on weak memory models (ARM64, AOT). All other
+/// counters reachable by HTTP scrapes go through <see cref="MetricsRegistry"/>,
+/// which already uses <see cref="Interlocked"/> primitives.</description></item>
+/// </list>
 /// </summary>
 public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEventSink, IAsyncDisposable
 {
@@ -40,8 +64,22 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
 
     public byte ChannelNumber { get; }
-    public ushort SequenceVersion { get; private set; }
-    public uint SequenceNumber { get; private set; }
+
+    // Backing fields for the cross-thread-readable counters. Written only on
+    // the dispatch loop thread via Volatile.Write; read from any thread via
+    // Volatile.Read (see SequenceVersion / SequenceNumber properties below).
+    // Marked volatile so that ARM64 / AOT codegen cannot hoist or reorder
+    // the load against neighbouring reads of the packet buffer (issue #138).
+    private uint _sequenceNumber;
+    private ushort _sequenceVersion;
+
+    /// <summary>Monotonic per-channel UMDF packet sequence version. Bumped on
+    /// channel-reset / counter rollover. Safe to read from any thread.</summary>
+    public ushort SequenceVersion => Volatile.Read(ref _sequenceVersion);
+
+    /// <summary>Monotonic UMDF packet sequence number within the current
+    /// <see cref="SequenceVersion"/>. Safe to read from any thread.</summary>
+    public uint SequenceNumber => Volatile.Read(ref _sequenceNumber);
 
     private readonly System.Threading.Channels.Channel<WorkItem> _inbound;
     private readonly MatchingEngine _engine;
@@ -75,6 +113,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
+    // Captured on entry to RunLoopAsync; used by AssertOnLoopThread() to
+    // enforce the dispatch-thread invariant in DEBUG builds.
+    private Thread? _loopThread;
 
     /// <summary>
     /// The snapshot rotator bound to this dispatcher, if any. Always invoked
@@ -98,8 +139,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _tradeDate = tradeDate;
         _metrics = metrics;
-        SequenceVersion = 1;
-        SequenceNumber = 0;
+        // Direct field writes are safe here: ctor runs on the constructing
+        // thread before Start() and before any other thread can observe the
+        // instance. No memory barrier is needed.
+        _sequenceVersion = 1;
+        _sequenceNumber = 0;
         _inbound = System.Threading.Channels.Channel.CreateBounded<WorkItem>(
             new System.Threading.Channels.BoundedChannelOptions(inboundCapacity)
             {
@@ -122,6 +166,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
+        // Capture the dispatch-loop thread identity on entry so
+        // AssertOnLoopThread() in mutation paths can enforce the
+        // single-writer invariant in DEBUG builds (issue #138).
+        _loopThread = Thread.CurrentThread;
+
         // Heartbeat is recorded on every loop wakeup (whether triggered by
         // new work or by the periodic timeout) so a stuck/dead dispatch
         // thread is detected by /health/live within HeartbeatInterval +
@@ -164,6 +213,25 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private void RecordHeartbeat()
         => _metrics?.RecordTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
+    /// <summary>
+    /// Asserts the calling thread is the dispatch-loop thread. Compiled out
+    /// in Release builds. Guards every mutation path — engine state, packet
+    /// buffer, sequence counters, and the per-session order-id index — to
+    /// catch any future producer-thread regression at test time (issue #138).
+    /// </summary>
+    [System.Diagnostics.Conditional("DEBUG")]
+    private void AssertOnLoopThread()
+    {
+        var t = _loopThread;
+        // _loopThread is null only before Start() (e.g. unit tests calling
+        // ProcessOne directly on the test thread). Allow that case.
+        System.Diagnostics.Debug.Assert(
+            t == null || Thread.CurrentThread == t,
+            $"ChannelDispatcher mutation off the dispatch loop thread "
+            + $"(channel={ChannelNumber}, expected={t?.ManagedThreadId}, "
+            + $"actual={Thread.CurrentThread.ManagedThreadId})");
+    }
+
     private void ProcessBumpVersion()
     {
         // Atomic operator-initiated channel reset (issue #6). Order matters:
@@ -176,9 +244,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // Anything that races with this would violate the dispatch-thread
         // invariant — ProcessOne is the sole caller and is invoked only
         // from the dispatch loop.
+        AssertOnLoopThread();
         _engine.ResetForChannelReset();
-        SequenceVersion = (ushort)(SequenceVersion + 1);
-        SequenceNumber = 0;
+        Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
+        Volatile.Write(ref _sequenceNumber, 0u);
         _snapshotRotator?.BumpSequenceVersion();
 
         // Force-write the ChannelReset_11 frame using the standard
@@ -203,6 +272,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     private void ProcessTradeBust(OperatorTradeBust bust)
     {
+        AssertOnLoopThread();
         uint rptSeq = _engine.AllocateNextRptSeq();
         _packetWritten = 0;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
@@ -217,6 +287,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     internal void ProcessOne(in WorkItem item)
     {
+        AssertOnLoopThread();
         if (item.Kind == WorkKind.SnapshotRotation || item.Kind == WorkKind.OperatorSnapshotNow)
         {
             // Snapshot ticks bypass the per-command incremental packet buffer
@@ -367,24 +438,25 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // counter. Downstream consumers treat a new SequenceVersion as a
         // discontinuity and resync from snapshot — same code path they use
         // for a host restart.
-        if (SequenceNumber == uint.MaxValue)
+        AssertOnLoopThread();
+        if (_sequenceNumber == uint.MaxValue)
         {
-            SequenceVersion++;
-            SequenceNumber = 0;
+            Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
+            Volatile.Write(ref _sequenceNumber, 0u);
             // The packet buffer's SequenceVersion was written by
             // ReserveOrFlush with the pre-bump value; rewrite it now so the
             // on-wire header matches the new (version, seq) tuple.
-            ushort newVer = SequenceVersion;
+            ushort newVer = _sequenceVersion;
             System.Runtime.InteropServices.MemoryMarshal.Write(
                 _packetBuf.AsSpan(B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSequenceVersionOffset, 2),
                 in newVer);
         }
-        SequenceNumber++;
+        Volatile.Write(ref _sequenceNumber, _sequenceNumber + 1);
         ulong now = _nowNanos();
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
-            _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), SequenceNumber, now);
+            _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), _sequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
-        LogPacketFlushed(ChannelNumber, SequenceNumber, _packetWritten);
+        LogPacketFlushed(ChannelNumber, _sequenceNumber, _packetWritten);
         _metrics?.IncPacketsOut();
         _packetWritten = 0;
     }
@@ -395,7 +467,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// processed (i.e. before <see cref="Start"/>) — there is no
     /// thread-safety contract beyond "called from the test thread on a
     /// quiescent dispatcher".</summary>
-    internal void TestSetSequenceNumber(uint value) => SequenceNumber = value;
+    internal void TestSetSequenceNumber(uint value) => Volatile.Write(ref _sequenceNumber, value);
 
     private Span<byte> ReserveOrFlush(int frameSize)
     {
@@ -572,6 +644,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnOrderAccepted(in OrderAcceptedEvent e)
     {
+        AssertOnLoopThread();
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
@@ -588,6 +661,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e)
     {
+        AssertOnLoopThread();
         // Update on the wire = OrderAdded with action UPDATE (0x01).
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
@@ -607,6 +681,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
+        AssertOnLoopThread();
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
@@ -626,6 +701,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnOrderFilled(in OrderFilledEvent e)
     {
+        AssertOnLoopThread();
         // Fully consumed by trades — emit DeleteOrder; the per-fill ER_Trade
         // events were already dispatched via OnTrade.
         var entryType = e.Side == Side.Buy
@@ -645,6 +721,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnTrade(in TradeEvent e)
     {
+        AssertOnLoopThread();
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.TradeBlockLength);
@@ -672,6 +749,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     public void OnReject(in RejectEvent e)
     {
+        AssertOnLoopThread();
         if (_hasCurrentSession)
             _outbound.WriteExecutionReportReject(_currentSession, e, _currentClOrdId);
     }
