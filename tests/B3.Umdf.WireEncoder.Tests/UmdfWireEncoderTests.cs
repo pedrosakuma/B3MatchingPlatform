@@ -121,6 +121,28 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void TradeBust_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteTradeBustFrame(buf, securityId: 900_000_000_001L,
+            priceMantissa: 250_5000L, size: 100L, tradeId: 7,
+            tradeDate: 9000, transactTimeNanos: 12345UL, rptSeq: 17);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.TradeBustBlockLength, n);
+
+        var msgLen = MemoryMarshal.Read<ushort>(buf.AsSpan(0, 2));
+        Assert.Equal((ushort)n, msgLen);
+
+        Assert.True(TradeBust_57Data.TryParse(buf.AsSpan(FrameOffset, WireOffsets.TradeBustBlockLength), out var rdr));
+        Assert.Equal(900_000_000_001L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(250_5000L, rdr.Data.MDEntryPx.Mantissa);
+        Assert.Equal(100L, rdr.Data.MDEntrySize.Value);
+        Assert.Equal(7u, rdr.Data.TradeID.Value);
+        Assert.Equal(9000, (ushort)rdr.Data.TradeDate.Value);
+        Assert.Equal(12345UL, rdr.Data.TransactTime.Time);
+        Assert.Equal(17u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
     public void Trade_NullableBuyerSeller_AreNull()
     {
         var buf = new byte[80];

@@ -358,6 +358,47 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// Writes <c>TradeBust_57</c> (V16). Used by the operator-triggered
+    /// trade-bust replay path (issue #15) to surface a trade reversal on
+    /// the incremental channel without going through the matching engine.
+    /// </summary>
+    public static int WriteTradeBustFrame(
+        Span<byte> dst,
+        long securityId,
+        long priceMantissa,
+        long size,
+        uint tradeId,
+        ushort tradeDate,
+        ulong transactTimeNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.TradeBustBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.TradeBust_57Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.TradeBustBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator: bit 7 (EndOfEvent, 0x80). Single-message bust
+        // packets are self-contained events, so flag end-of-event here.
+        body[WireOffsets.TradeBustBodyMatchEventIndicatorOffset] = 0x80;
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyMdEntryPxOffset, 8), in priceMantissa);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyMdEntrySizeOffset, 8), in size);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyTradeIdOffset, 4), in tradeId);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyTradeDateOffset, 2), in tradeDate);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyTransactTimeOffset, 8), in transactTimeNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TradeBustBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

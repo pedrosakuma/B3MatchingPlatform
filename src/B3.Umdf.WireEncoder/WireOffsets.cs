@@ -80,6 +80,24 @@ public static class WireOffsets
     public const int SnapOrdersGroupSizeEncodingSize = 3;      // BlockLength(ushort) + NumInGroup(byte)
     public const int SnapOrdersEntrySize = 42;                 // per-entry (V16 layout)
 
+    // ---- TradeBust_57 (V16) ----
+    // Body layout (BLOCK_LENGTH=48): securityID@0 (long), securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte) — encoder writes the
+    // MEI and leaves securityExchange/tradingSessionID as 0; tradingSessionID@9
+    // (byte); mDEntryPx@12 (long mantissa); mDEntrySize@20 (long); tradeID@28
+    // (uint); tradeDate@32 (ushort); transactTime@36 (ulong nanos); rptSeq@44
+    // (uint, 0 = NULL).
+    public const int TradeBustBlockLength = 48;
+    public const int TradeBustBodySecurityIdOffset = 0;
+    public const int TradeBustBodyMatchEventIndicatorOffset = 8;
+    public const int TradeBustBodyTradingSessionIdOffset = 9;
+    public const int TradeBustBodyMdEntryPxOffset = 12;
+    public const int TradeBustBodyMdEntrySizeOffset = 20;
+    public const int TradeBustBodyTradeIdOffset = 28;
+    public const int TradeBustBodyTradeDateOffset = 32;
+    public const int TradeBustBodyTransactTimeOffset = 36;
+    public const int TradeBustBodyRptSeqOffset = 44;
+
     // ---- ChannelReset_11 (V16) ----
     // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
     // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then

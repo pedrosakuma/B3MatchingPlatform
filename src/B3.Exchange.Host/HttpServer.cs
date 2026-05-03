@@ -148,6 +148,15 @@ public sealed class HttpServer : IAsyncDisposable
         app.MapPost("/channel/{ch:int}/bump-version", (int ch, HttpContext ctx) =>
             HandleOperatorEnqueue(ctx, ch, d => d.EnqueueOperatorBumpVersion(), "bump-version"));
 
+        // Operator endpoint (issue #15): trade-bust replay. tradeId is in
+        // the path; the echo fields the consumer audits (securityId, price,
+        // size, tradeDate) come as query-string parameters so the call is
+        // shell-friendly. priceMantissa/size default to 0; tradeDate
+        // defaults to today's UTC date encoded as LocalMktDate (days since
+        // 1970-01-01) when omitted. Returns 400 for malformed input.
+        app.MapPost("/channel/{ch:int}/trade-bust/{tradeId:long}", (int ch, long tradeId, HttpContext ctx) =>
+            HandleTradeBust(ctx, ch, tradeId));
+
         // #GAP-09 (#47): on-demand trading-day rollover. Terminates every
         // live FIXP session so clients reconnect with Negotiate +
         // Establish(nextSeqNo=1). The scheduled timer (HostConfig.dailyReset)
@@ -296,6 +305,69 @@ public sealed class HttpServer : IAsyncDisposable
         }
         ctx.Response.StatusCode = StatusCodes.Status202Accepted;
         return Results.Text($"accepted {opName} channel={channelNumber}\n", "text/plain");
+    }
+
+    private IResult HandleTradeBust(HttpContext ctx, int channelNumber, long tradeId)
+    {
+        if (channelNumber < 0 || channelNumber > 255 ||
+            !_dispatchers.TryGetValue((byte)channelNumber, out var disp))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"unknown channel {channelNumber}\n", "text/plain");
+        }
+        if (tradeId <= 0 || tradeId > uint.MaxValue)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"tradeId must be in (0, {uint.MaxValue}]\n", "text/plain");
+        }
+        var q = ctx.Request.Query;
+        if (!TryParseLong(q["securityId"], out long securityId) || securityId <= 0)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'securityId' query parameter\n", "text/plain");
+        }
+        if (!TryParseLong(q["priceMantissa"], out long priceMantissa, allowMissing: true))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("invalid 'priceMantissa' query parameter\n", "text/plain");
+        }
+        if (!TryParseLong(q["size"], out long size, allowMissing: true) || size < 0)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("invalid 'size' query parameter\n", "text/plain");
+        }
+        ushort tradeDate;
+        if (q.ContainsKey("tradeDate"))
+        {
+            if (!TryParseLong(q["tradeDate"], out long td) || td < 0 || td > ushort.MaxValue)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return Results.Text($"invalid 'tradeDate' (LocalMktDate; days since 1970-01-01, 0..{ushort.MaxValue})\n", "text/plain");
+            }
+            tradeDate = (ushort)td;
+        }
+        else
+        {
+            tradeDate = (ushort)(DateTimeOffset.UtcNow.Date - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalDays;
+        }
+
+        if (!disp.EnqueueOperatorTradeBust(securityId, priceMantissa, size, (uint)tradeId, tradeDate))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text($"channel {channelNumber} inbound queue full\n", "text/plain");
+        }
+        ctx.Response.StatusCode = StatusCodes.Status202Accepted;
+        return Results.Text(
+            $"accepted trade-bust channel={channelNumber} tradeId={tradeId} securityId={securityId}\n",
+            "text/plain");
+    }
+
+    private static bool TryParseLong(Microsoft.Extensions.Primitives.StringValues values, out long value, bool allowMissing = false)
+    {
+        value = 0;
+        var s = values.ToString();
+        if (string.IsNullOrEmpty(s)) return allowMissing;
+        return long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
     }
 
     private static IPEndPoint ParseEndpoint(string s)
