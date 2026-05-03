@@ -311,6 +311,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     internal void ProcessOne(in WorkItem item)
     {
         AssertOnLoopThread();
+        // Issue #173: dispatch_wait = enqueue → loop pickup. EnqueueTicks
+        // is 0 for in-process synthetic items (e.g. snapshot tick scheduled
+        // via Timer); skip the observation in that case to avoid skewing
+        // the histogram with 1970-style "ages".
+        long pickupTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (item.EnqueueTicks > 0 && _metrics != null)
+            _metrics.DispatchWait.ObserveTicks(pickupTicks - item.EnqueueTicks);
+
         if (item.Kind == WorkKind.SnapshotRotation || item.Kind == WorkKind.OperatorSnapshotNow)
         {
             // Snapshot ticks bypass the per-command incremental packet buffer
@@ -348,6 +356,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         };
         _packetWritten = 0;
         bool succeeded = false;
+        long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             switch (item.Kind)
@@ -428,13 +437,23 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         }
         finally
         {
+            // Issue #173: engine_process = engine entry → engine exit
+            // (regardless of crash/success). outbound_emit measured
+            // separately around FlushPacket so the two phases are
+            // distinguishable in the histogram.
+            long engineEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_metrics != null)
+                _metrics.EngineProcess.ObserveTicks(engineEnd - engineStart);
             // Issue #170: do not publish a half-built UMDF packet if the
             // command crashed mid-flight — the dispatcher loop will catch
             // the exception, count the crash, and move on; flushing
             // partial state would corrupt downstream consumers.
             if (succeeded)
             {
+                long flushStart = engineEnd;
                 FlushPacket();
+                if (_metrics != null)
+                    _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
             }
             else
             {
@@ -532,7 +551,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
-            clOrdIdValue, 0, cmd, null, null, null)))
+            clOrdIdValue, 0, cmd, null, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
             return true;
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New);
         return false;
@@ -542,7 +561,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, cmd, null, null)))
+            clOrdIdValue, origClOrdIdValue, null, cmd, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
             return true;
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel);
         return false;
@@ -552,7 +571,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, null, cmd, null)))
+            clOrdIdValue, origClOrdIdValue, null, null, cmd, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
             return true;
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace);
         return false;
@@ -561,7 +580,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
-            cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd)))
+            cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
             return true;
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross);
         return false;
@@ -595,7 +614,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         if (orderIds == null || orderIds.Count == 0) return true;
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
-            0, 0, null, null, null, null, mc)))
+            0, 0, null, null, null, null, mc, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
             return true;
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
         return false;
@@ -884,7 +903,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ReplaceOrderCommand? Replace,
         CrossOrderCommand? Cross,
         ResolvedMassCancel? MassCancel = null,
-        OperatorTradeBust? TradeBust = null);
+        OperatorTradeBust? TradeBust = null,
+        long EnqueueTicks = 0);
 
     /// <summary>
     /// Per-channel mass-cancel payload after gateway-side resolution: a
