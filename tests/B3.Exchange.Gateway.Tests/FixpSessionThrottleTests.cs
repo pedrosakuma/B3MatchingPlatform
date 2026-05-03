@@ -198,7 +198,7 @@ public class FixpSessionThrottleTests
         try
         {
             long now = 1_000_000;
-            var metrics = new B3.Exchange.Core.ThrottleMetrics();
+            var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
             var session = NewSession(server,
                 new FixpSessionOptions { ThrottleTimeWindowMs = 1_000, ThrottleMaxMessages = 3, ThrottleMetrics = metrics },
                 () => now);
@@ -227,7 +227,7 @@ public class FixpSessionThrottleTests
         try
         {
             long now = 1_000_000;
-            var metrics = new B3.Exchange.Core.ThrottleMetrics();
+            var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
             var session = NewSession(server,
                 new FixpSessionOptions { ThrottleTimeWindowMs = 1_000, ThrottleMaxMessages = 2, ThrottleMetrics = metrics },
                 () => now);
@@ -260,7 +260,7 @@ public class FixpSessionThrottleTests
         try
         {
             long now = 1_000_000;
-            var metrics = new B3.Exchange.Core.ThrottleMetrics();
+            var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
             var session = NewSession(server,
                 new FixpSessionOptions { ThrottleTimeWindowMs = 1_000, ThrottleMaxMessages = 2, ThrottleMetrics = metrics },
                 () => now);
@@ -294,7 +294,7 @@ public class FixpSessionThrottleTests
         try
         {
             long now = 1_000_000;
-            var metrics = new B3.Exchange.Core.ThrottleMetrics();
+            var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
             var session = NewSession(server,
                 new FixpSessionOptions { ThrottleTimeWindowMs = 1_000, ThrottleMaxMessages = 1, ThrottleMetrics = metrics },
                 () => now);
