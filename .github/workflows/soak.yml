@@ -1,0 +1,197 @@
+name: Soak (long-haul)
+
+# Long-running stability test for the exchange host. Runs an exchange host
+# under a sustained synthetic-trader load and samples process metrics every
+# 30s. Issue #120.
+#
+# - Schedule: 03:00 UTC nightly, default 60min runtime.
+# - Manual dispatch: defaults to 5min for fast iteration.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Soak runtime in minutes (1–360).'
+        required: false
+        default: '10'
+      synth_clients:
+        description: 'Number of synthetic-trader processes to launch.'
+        required: false
+        default: '2'
+
+concurrency:
+  group: soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: Soak host + ${{ github.event.inputs.synth_clients || '2' }} synth traders
+    runs-on: ubuntu-latest
+    # 60min default schedule + ~10min for build/start/teardown/analysis.
+    # Manual dispatch up to 360min still fits within the 6h GitHub-hosted cap.
+    timeout-minutes: 380
+
+    env:
+      DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || (github.event_name == 'schedule' && '60') || '10' }}
+      SYNTH_CLIENTS: ${{ github.event.inputs.synth_clients || '2' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK (pinned by global.json)
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.slnx', 'Directory.Build.props', 'Directory.Packages.props', 'global.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore + build (Release)
+        run: |
+          dotnet restore SbeB3Exchange.slnx
+          dotnet build SbeB3Exchange.slnx --no-restore -c Release
+
+      - name: Prepare artifact dir
+        run: mkdir -p artifacts/soak
+
+      - name: Start exchange host
+        id: start_host
+        run: |
+          set -euo pipefail
+          # Detach so subsequent steps can run; redirect logs to artifact.
+          # Run the published DLL directly (not `dotnet run --project`) so
+          # the working directory stays at the repo root and the relative
+          # `instruments` path inside the JSON resolves correctly.
+          # The soak config omits firms[]/sessions[] to use the legacy
+          # single-tenant fallback so SyntheticTrader (no FIXP Negotiate)
+          # can connect and drive sustained load.
+          nohup dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
+            config/exchange-simulator.soak.json \
+            > artifacts/soak/host.log 2>&1 &
+          echo "HOST_PID=$!" >> "$GITHUB_ENV"
+          echo "Host PID: $!"
+
+      - name: Wait for host readiness (/health/ready)
+        run: |
+          set -euo pipefail
+          for i in {1..60}; do
+            if curl -fs --max-time 2 http://127.0.0.1:8080/health/ready >/dev/null; then
+              echo "host ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "host did not become ready within 60s" >&2
+          tail -200 artifacts/soak/host.log >&2 || true
+          exit 1
+
+      - name: Start synthetic traders (best-effort)
+        # KNOWN LIMITATION: SyntheticTrader does not yet implement the FIXP
+        # Negotiate/Establish handshake required by the modern Gateway.
+        # Each connection is rejected with `app-message-before-negotiate`
+        # within milliseconds and the trader process exits without retry.
+        # Tracked as a follow-up to #120; for now this step provides only a
+        # brief burst of TCP-accept activity at start-of-soak. The host's
+        # snapshot rotator + instrument-definition publisher continue to
+        # generate steady UDP multicast traffic for the full soak duration,
+        # which exercises the publishers, timers, and HTTP server even with
+        # zero sustained client load.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/soak/traders
+          for i in $(seq 1 "${SYNTH_CLIENTS}"); do
+            nohup dotnet src/B3.Exchange.SyntheticTrader/bin/Release/net10.0/B3.Exchange.SyntheticTrader.dll \
+              config/synthetic-trader.soak.json \
+              > "artifacts/soak/traders/trader-${i}.log" 2>&1 &
+            pid=$!
+            echo "trader ${i} PID: ${pid}"
+            echo "${pid}" >> artifacts/soak/trader-pids.txt
+          done
+          sleep 5
+
+      - name: Run sampler for ${{ env.DURATION_MINUTES }}min
+        env:
+          OUTPUT_CSV: artifacts/soak/samples.csv
+          METRICS_URL: http://127.0.0.1:8080/metrics
+          SAMPLE_INTERVAL_SECONDS: 30
+        run: |
+          set -euo pipefail
+          chmod +x tools/soak/sample.sh
+          DURATION_SECONDS=$(( DURATION_MINUTES * 60 )) \
+            bash tools/soak/sample.sh
+
+      - name: Stop synthetic traders
+        if: always()
+        run: |
+          set +e
+          if [[ -f artifacts/soak/trader-pids.txt ]]; then
+            while read -r pid; do
+              [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+            done < artifacts/soak/trader-pids.txt
+          fi
+          # Give them a moment to flush logs.
+          sleep 3
+          true
+
+      - name: Stop host
+        if: always()
+        run: |
+          set +e
+          if [[ -n "${HOST_PID:-}" ]]; then
+            kill "${HOST_PID}" 2>/dev/null
+            for i in {1..15}; do
+              kill -0 "${HOST_PID}" 2>/dev/null || break
+              sleep 1
+            done
+            kill -9 "${HOST_PID}" 2>/dev/null
+          fi
+          true
+
+      - name: Analyze samples
+        id: analyze
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ ! -s artifacts/soak/samples.csv ]]; then
+            echo "no samples collected — failing" >&2
+            exit 1
+          fi
+          python3 tools/soak/analyze.py artifacts/soak/samples.csv \
+            | tee artifacts/soak/summary.md
+          # Mirror the summary into the workflow run page.
+          {
+            echo "## Soak summary"
+            echo
+            cat artifacts/soak/summary.md
+            echo
+            echo "<details><summary>First 10 + last 10 samples</summary>"
+            echo
+            echo '```'
+            head -1 artifacts/soak/samples.csv
+            tail -n +2 artifacts/soak/samples.csv | head -10
+            echo "..."
+            tail -10 artifacts/soak/samples.csv
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: soak-${{ github.run_number }}
+          path: artifacts/soak/**/*
+          if-no-files-found: warn
+          retention-days: 30

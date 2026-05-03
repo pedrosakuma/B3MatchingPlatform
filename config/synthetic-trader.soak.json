@@ -1,0 +1,20 @@
+{
+  "host": { "host": "127.0.0.1", "port": 9876 },
+  "firm": 1,
+  "seed": 4242,
+  "tickIntervalMs": 50,
+  "instruments": [
+    {
+      "securityId": 900000000001,
+      "tickSize": 100,
+      "lotSize": 100,
+      "initialMidMantissa": 123400,
+      "midDriftProbability": 0.1,
+      "strategies": [
+        { "kind": "marketMaker", "name": "mm-soak", "levelsPerSide": 3, "quoteSpacingTicks": 1, "replaceDistanceTicks": 5, "quantity": 100 },
+        { "kind": "noiseTaker", "name": "noise-soak", "orderProbability": 0.4, "maxLotMultiple": 2, "crossTicks": 2 },
+        { "kind": "meanReverting", "name": "meanrev-soak", "alpha": 0.1, "entryThresholdTicks": 5, "crossTicks": 2, "lotsPerOrder": 1 }
+      ]
+    }
+  ]
+}
