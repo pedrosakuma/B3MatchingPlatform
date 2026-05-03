@@ -22,6 +22,8 @@ public sealed class ChannelMetrics
     private long _chaosDropped;
     private long _chaosDuplicated;
     private long _chaosReordered;
+    private long _dispatchQueueFull;
+    private long _decodeErrors;
 
     public ChannelMetrics(byte channelNumber)
     {
@@ -36,6 +38,8 @@ public sealed class ChannelMetrics
     public long ChaosDropped => Interlocked.Read(ref _chaosDropped);
     public long ChaosDuplicated => Interlocked.Read(ref _chaosDuplicated);
     public long ChaosReordered => Interlocked.Read(ref _chaosReordered);
+    public long DispatchQueueFull => Interlocked.Read(ref _dispatchQueueFull);
+    public long DecodeErrors => Interlocked.Read(ref _decodeErrors);
 
     public void IncOrdersIn() => Interlocked.Increment(ref _ordersIn);
     public void IncPacketsOut() => Interlocked.Increment(ref _packetsOut);
@@ -44,6 +48,8 @@ public sealed class ChannelMetrics
     public void IncChaosDropped() => Interlocked.Increment(ref _chaosDropped);
     public void IncChaosDuplicated() => Interlocked.Increment(ref _chaosDuplicated);
     public void IncChaosReordered() => Interlocked.Increment(ref _chaosReordered);
+    public void IncDispatchQueueFull() => Interlocked.Increment(ref _dispatchQueueFull);
+    public void IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
 
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
@@ -108,9 +114,11 @@ public sealed class MetricsRegistry
     private ISessionMetricsProvider? _sessions;
     private readonly SessionLifecycleMetrics _sessionLifecycle = new();
     private readonly ThrottleMetrics _throttle = new();
+    private readonly TransportMetrics _transport = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
     public ThrottleMetrics Throttle => _throttle;
+    public TransportMetrics Transport => _transport;
 
     public ChannelMetrics RegisterChannel(byte channelNumber)
     {
@@ -172,6 +180,12 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "umdf_chaos_reordered_total",
             "Total UMDF packets held back for reorder by the chaos decorator (issue #119).",
             channels, c => c.ChaosReordered);
+        EmitCounter(sb, "exch_dispatch_queue_full_total",
+            "Total inbound work items dropped because the per-channel dispatcher's bounded queue was full (issue #155). A non-zero value usually means a producer is outpacing the engine — alert / investigate.",
+            channels, c => c.DispatchQueueFull);
+        EmitCounter(sb, "exch_decode_errors_total",
+            "Total inbound frames that failed gateway decoding for this channel (issue #155). A non-zero value indicates a malformed/incompatible producer; the gateway emits a SessionReject and may close the session.",
+            channels, c => c.DecodeErrors);
 
         sb.Append("# HELP exch_send_queue_depth Per-session ExecutionReport send-queue depth (channel=\"all\" because the session queue is shared).\n");
         sb.Append("# TYPE exch_send_queue_depth gauge\n");
@@ -231,6 +245,9 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_throttle_rejected_total",
             "Total inbound application messages rejected with BusinessMessageReject(\"Throttle limit exceeded\") by the per-session sliding-window throttle (issue #56 / GAP-20).",
             _throttle.Rejected);
+        EmitProcessCounter(sb, "exch_transport_send_queue_full_total",
+            "Total times the gateway's TcpTransport closed a session because its bounded outbound send queue overflowed (issue #155). A non-zero value means a stuck/slow consumer is causing teardowns — alert.",
+            _transport.SendQueueFull);
 
         return sb.ToString();
     }

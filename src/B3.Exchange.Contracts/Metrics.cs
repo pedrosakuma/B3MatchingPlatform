@@ -54,3 +54,22 @@ public sealed class ThrottleMetrics
     public void IncAccepted() => Interlocked.Increment(ref _accepted);
     public void IncRejected() => Interlocked.Increment(ref _rejected);
 }
+
+/// <summary>
+/// Process-wide SRE counter for transport-layer backpressure events
+/// (issue #155). Today the gateway's <c>TcpTransport</c> closes a
+/// connection on send-queue overflow to avoid unbounded memory growth;
+/// this counter records every such event so operators can alert on
+/// repeated overflows (typically a stuck or slow peer).
+///
+/// <para>Lives in <c>B3.Exchange.Contracts</c> so the Gateway can consume
+/// the type without taking a project reference on Core.</para>
+/// </summary>
+public sealed class TransportMetrics
+{
+    private long _sendQueueFull;
+
+    public long SendQueueFull => Interlocked.Read(ref _sendQueueFull);
+
+    public void IncSendQueueFull() => Interlocked.Increment(ref _sendQueueFull);
+}

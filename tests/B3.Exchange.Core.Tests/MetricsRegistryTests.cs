@@ -106,6 +106,45 @@ public class MetricsRegistryTests
         Assert.Contains("exch_session_reaped_total 0\n", text);
     }
 
+    [Fact]
+    public void SreCounters_AreRenderedEvenAtZero()
+    {
+        // Issue #155: dispatch-queue-full, decode-errors, and
+        // transport-send-queue-full counters must be present in the
+        // scrape output from t=0 so alerting rules can be written
+        // before the first incident happens.
+        var reg = new MetricsRegistry();
+        reg.RegisterChannel(84);
+
+        var text = reg.RenderProm();
+
+        Assert.Contains("# TYPE exch_dispatch_queue_full_total counter\n", text);
+        Assert.Contains("exch_dispatch_queue_full_total{channel=\"84\"} 0\n", text);
+        Assert.Contains("# TYPE exch_decode_errors_total counter\n", text);
+        Assert.Contains("exch_decode_errors_total{channel=\"84\"} 0\n", text);
+        Assert.Contains("# TYPE exch_transport_send_queue_full_total counter\n", text);
+        Assert.Contains("exch_transport_send_queue_full_total 0\n", text);
+    }
+
+    [Fact]
+    public void SreCounters_IncrementsArePropagatedToScrape()
+    {
+        var reg = new MetricsRegistry();
+        var ch = reg.RegisterChannel(84);
+        ch.IncDispatchQueueFull();
+        ch.IncDispatchQueueFull();
+        ch.IncDispatchQueueFull();
+        ch.IncDecodeErrors();
+        reg.Transport.IncSendQueueFull();
+        reg.Transport.IncSendQueueFull();
+
+        var text = reg.RenderProm();
+
+        Assert.Contains("exch_dispatch_queue_full_total{channel=\"84\"} 3\n", text);
+        Assert.Contains("exch_decode_errors_total{channel=\"84\"} 1\n", text);
+        Assert.Contains("exch_transport_send_queue_full_total 2\n", text);
+    }
+
     private sealed class StubSessionProvider : ISessionMetricsProvider
     {
         private readonly SessionDiagnostics[] _samples;

@@ -474,6 +474,59 @@ public class ChannelDispatcherTests
         }
     }
 
+    [Fact]
+    public void DispatchQueueFull_IncrementsMetricAndDropsItem()
+    {
+        // Issue #155: verify the SRE counter ticks when the bounded
+        // dispatch queue is full. inboundCapacity=1 + a non-started
+        // dispatcher leaves the queue static so the second TryWrite
+        // returns false deterministically.
+        var pkt = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var metrics = new ChannelMetrics(channelNumber: 1);
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
+            packetSink: pkt,
+            outbound: outbound,
+            logger: NullLogger<ChannelDispatcher>.Instance,
+            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
+            inboundCapacity: 1,
+            metrics: metrics);
+
+        var reply = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        Assert.Equal(0, metrics.DispatchQueueFull);
+
+        // Second enqueue must fail because the loop is not draining.
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        Assert.Equal(1, metrics.DispatchQueueFull);
+    }
+
+    [Fact]
+    public void OnDecodeError_IncrementsDecodeErrorsMetric()
+    {
+        // Issue #155: every gateway decode failure must bump the SRE counter.
+        var pkt = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var metrics = new ChannelMetrics(channelNumber: 1);
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
+            packetSink: pkt,
+            outbound: outbound,
+            logger: NullLogger<ChannelDispatcher>.Instance,
+            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
+            metrics: metrics);
+
+        var reply = new FakeSession(outbound);
+        disp.OnDecodeError(reply.Id, "bad sbe header");
+        disp.OnDecodeError(reply.Id, "short body");
+
+        Assert.Equal(2, metrics.DecodeErrors);
+    }
+
     private static MatchingEngine GetEngine(ChannelDispatcher disp)
     {
         var f = typeof(ChannelDispatcher).GetField("_engine",

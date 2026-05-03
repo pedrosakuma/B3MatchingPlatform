@@ -149,7 +149,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             {
                 SingleReader = true,
                 SingleWriter = false,
-                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropWrite,
+                // Use Wait so that TryWrite returns false when the channel
+                // is full (instead of silently dropping the item as DropWrite
+                // does). Callers handle the false return by incrementing the
+                // exch_dispatch_queue_full_total counter and logging.
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
             });
         _engine = engineFactory(this);
     }
@@ -497,7 +501,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
             clOrdIdValue, 0, cmd, null, null, null)))
-            LogQueueFull(ChannelNumber, WorkKind.New);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New); }
     }
 
     public void EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
@@ -505,7 +509,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, cmd, null, null)))
-            LogQueueFull(ChannelNumber, WorkKind.Cancel);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel); }
     }
 
     public void EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
@@ -513,14 +517,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, null, cmd, null)))
-            LogQueueFull(ChannelNumber, WorkKind.Replace);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace); }
     }
 
     public void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
             cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd)))
-            LogQueueFull(ChannelNumber, WorkKind.Cross);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross); }
     }
 
     public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
@@ -552,15 +556,16 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
             0, 0, null, null, null, null, mc)))
-            LogQueueFull(ChannelNumber, WorkKind.MassCancel);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel); }
     }
 
     public void OnDecodeError(SessionId session, string error)
     {
         _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
+        _metrics?.IncDecodeErrors();
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, session, 0, true,
             0, 0, null, null, null, null)))
-            LogQueueFull(ChannelNumber, WorkKind.DecodeError);
+        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.DecodeError); }
     }
 
     /// <summary>
