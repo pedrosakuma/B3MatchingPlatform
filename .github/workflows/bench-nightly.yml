@@ -58,7 +58,7 @@ jobs:
           dotnet run --no-build -c Release
           --project bench/B3.Exchange.Bench
           --
-          --filter '${{ github.event.inputs.filter || ''*'' }}'
+          --filter '${{ github.event.inputs.filter || '*' }}'
           --exporters github
 
       - name: Upload BenchmarkDotNet artifacts
