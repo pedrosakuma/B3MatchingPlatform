@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using System.Buffers.Binary;
 using System.Text;
 using B3.Exchange.Gateway;

@@ -1,4 +1,4 @@
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Walks and validates the length-prefixed variable-length data segments

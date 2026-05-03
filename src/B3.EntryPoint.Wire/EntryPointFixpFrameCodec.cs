@@ -1,8 +1,7 @@
 using System.Buffers.Binary;
-using B3.Exchange.Gateway;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.SyntheticTrader.Fixp;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoders and decoders for the FIXP session-layer frames the
@@ -22,7 +21,7 @@ namespace B3.Exchange.SyntheticTrader.Fixp;
 /// the generated <see cref="FixpSbe.NegotiateData"/> / etc. structs and
 /// are commented inline so a future schema bump can be audited cheaply.</para>
 /// </summary>
-internal static class FixpFrameCodec
+public static class EntryPointFixpFrameCodec
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
 

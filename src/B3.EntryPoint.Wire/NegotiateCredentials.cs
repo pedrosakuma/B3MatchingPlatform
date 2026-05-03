@@ -2,7 +2,7 @@ using System.Buffers.Text;
 using System.Text;
 using System.Text.Json;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Parsed FIXP <c>credentials</c> blob. Per spec §4.5.2 the field is a

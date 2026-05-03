@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoders for FIXP session-layer frames (currently just
@@ -8,7 +8,7 @@ namespace B3.Exchange.Gateway;
 /// <see cref="ExecutionReportEncoder"/> so the application-layer encoder
 /// stays focused on ExecutionReports.
 /// </summary>
-internal static class SessionFrameEncoder
+public static class SessionFrameEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int SequenceBlock = 4;

@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj" />
     <Project Path="src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj" />
+    <Project Path="src/B3.EntryPoint.Wire/B3.EntryPoint.Wire.csproj" />
     <Project Path="src/B3.Umdf.WireEncoder/B3.Umdf.WireEncoder.csproj" />
     <Project Path="src/B3.Exchange.Contracts/B3.Exchange.Contracts.csproj" />
     <Project Path="src/B3.Exchange.Instruments/B3.Exchange.Instruments.csproj" />
@@ -19,6 +20,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.Umdf.WireEncoder.Tests/B3.Umdf.WireEncoder.Tests.csproj" />
+    <Project Path="tests/B3.EntryPoint.Wire.Tests/B3.EntryPoint.Wire.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Instruments.Tests/B3.Exchange.Instruments.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Matching.Tests/B3.Exchange.Matching.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Gateway.Tests/B3.Exchange.Gateway.Tests.csproj" />

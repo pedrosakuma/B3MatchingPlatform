@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
 
 namespace B3.Exchange.Gateway.Tests;

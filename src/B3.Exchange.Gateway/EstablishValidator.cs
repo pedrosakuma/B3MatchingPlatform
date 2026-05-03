@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.Gateway;

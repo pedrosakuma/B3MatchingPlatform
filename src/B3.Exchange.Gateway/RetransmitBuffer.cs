@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 namespace B3.Exchange.Gateway;
 
 /// <summary>

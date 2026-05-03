@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoder for the B3 EntryPoint <c>Terminate</c> message
@@ -16,7 +16,7 @@ namespace B3.Exchange.Gateway;
 /// Field offsets are pinned to the V6 schema generated under
 /// <c>B3.Entrypoint.Fixp.Sbe.V6.TerminateData</c>.
 /// </summary>
-internal static class SessionRejectEncoder
+public static class SessionRejectEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int TerminateBlock = 13;

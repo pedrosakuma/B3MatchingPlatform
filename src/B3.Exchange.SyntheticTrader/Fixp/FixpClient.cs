@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Text;
-using B3.Exchange.Gateway;
+using B3.EntryPoint.Wire;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.SyntheticTrader.Fixp;
@@ -42,9 +42,9 @@ public sealed class FixpClient : IAsyncDisposable
     private readonly Action<string>? _logDebug;
     private readonly Action<string>? _logWarn;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly TaskCompletionSource<FixpFrameCodec.NegotiateResponseFrame> _negotiateTcs =
+    private readonly TaskCompletionSource<EntryPointFixpFrameCodec.NegotiateResponseFrame> _negotiateTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource<FixpFrameCodec.EstablishAckFrame> _establishTcs =
+    private readonly TaskCompletionSource<EntryPointFixpFrameCodec.EstablishAckFrame> _establishTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _seqLock = new();
 
@@ -104,7 +104,7 @@ public sealed class FixpClient : IAsyncDisposable
         ulong negotiateTs = NowNanos();
         byte[] credentials = BuildCredentialsJson(_options.SessionId, _options.AccessKey);
         byte[] buf = new byte[1024];
-        int len = FixpFrameCodec.EncodeNegotiate(buf, _sessionIdNumeric, _sessionVerId, negotiateTs,
+        int len = EntryPointFixpFrameCodec.EncodeNegotiate(buf, _sessionIdNumeric, _sessionVerId, negotiateTs,
             _options.EnteringFirm, onBehalfFirm: null,
             credentials: credentials,
             clientIp: ReadOnlySpan<byte>.Empty,
@@ -121,7 +121,7 @@ public sealed class FixpClient : IAsyncDisposable
 
         ulong establishTs = NowNanos();
         ushort codType = _options.CancelOnDisconnect ? (ushort)4 : (ushort)0;
-        len = FixpFrameCodec.EncodeEstablish(buf, _sessionIdNumeric, _sessionVerId, establishTs,
+        len = EntryPointFixpFrameCodec.EncodeEstablish(buf, _sessionIdNumeric, _sessionVerId, establishTs,
             keepAliveIntervalMillis: _options.KeepAliveIntervalMillis,
             nextSeqNo: NextOutboundSeqNo,
             cancelOnDisconnectType: codType,
@@ -191,14 +191,14 @@ public sealed class FixpClient : IAsyncDisposable
         switch (templateId)
         {
             case EntryPointFrameReader.TidNegotiateResponse:
-                if (FixpFrameCodec.TryDecodeNegotiateResponse(body, out var nr))
+                if (EntryPointFixpFrameCodec.TryDecodeNegotiateResponse(body, out var nr))
                     _negotiateTcs.TrySetResult(nr);
                 else
                     _negotiateTcs.TrySetException(new InvalidOperationException("malformed NegotiateResponse"));
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidNegotiateReject:
-                if (FixpFrameCodec.TryDecodeNegotiateReject(body, out var nrj))
+                if (EntryPointFixpFrameCodec.TryDecodeNegotiateReject(body, out var nrj))
                 {
                     _state = FixpClientState.Failed;
                     _negotiateTcs.TrySetException(new FixpHandshakeRejectedException(
@@ -211,14 +211,14 @@ public sealed class FixpClient : IAsyncDisposable
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidEstablishAck:
-                if (FixpFrameCodec.TryDecodeEstablishAck(body, out var ea))
+                if (EntryPointFixpFrameCodec.TryDecodeEstablishAck(body, out var ea))
                     _establishTcs.TrySetResult(ea);
                 else
                     _establishTcs.TrySetException(new InvalidOperationException("malformed EstablishAck"));
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidEstablishReject:
-                if (FixpFrameCodec.TryDecodeEstablishReject(body, out var erj))
+                if (EntryPointFixpFrameCodec.TryDecodeEstablishReject(body, out var erj))
                 {
                     _state = FixpClientState.Failed;
                     _establishTcs.TrySetException(new FixpHandshakeRejectedException(
@@ -231,7 +231,7 @@ public sealed class FixpClient : IAsyncDisposable
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidSequence:
-                if (FixpFrameCodec.TryDecodeSequence(body, out var seq))
+                if (EntryPointFixpFrameCodec.TryDecodeSequence(body, out var seq))
                 {
                     // Spec §4.5.5: a Sequence message restates the sender's nextSeqNo;
                     // it does not consume a sequence number itself. We use it both as
@@ -242,7 +242,7 @@ public sealed class FixpClient : IAsyncDisposable
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidNotApplied:
-                if (FixpFrameCodec.TryDecodeNotApplied(body, out var na))
+                if (EntryPointFixpFrameCodec.TryDecodeNotApplied(body, out var na))
                 {
                     // Idempotent client→server flow: server already advanced
                     // its expected past the gap and accepted the latest message.
@@ -254,7 +254,7 @@ public sealed class FixpClient : IAsyncDisposable
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidRetransmission:
-                if (FixpFrameCodec.TryDecodeRetransmission(body, out var rt))
+                if (EntryPointFixpFrameCodec.TryDecodeRetransmission(body, out var rt))
                 {
                     // The retransmitted business messages follow as
                     // independent SBE frames on the wire after this
@@ -269,14 +269,14 @@ public sealed class FixpClient : IAsyncDisposable
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidRetransmitReject:
-                if (FixpFrameCodec.TryDecodeRetransmitReject(body, out var rrj))
+                if (EntryPointFixpFrameCodec.TryDecodeRetransmitReject(body, out var rrj))
                 {
                     _logWarn?.Invoke($"fixp RetransmitReject: code={rrj.RejectCode} requestTs={rrj.RequestTimestampNanos}");
                 }
                 return InboundDisposition.HandledControl;
 
             case EntryPointFrameReader.TidTerminate:
-                if (FixpFrameCodec.TryDecodeTerminate(body, out var tm))
+                if (EntryPointFixpFrameCodec.TryDecodeTerminate(body, out var tm))
                 {
                     _logDebug?.Invoke($"fixp Terminate received code={tm.TerminationCode}");
                 }
@@ -338,8 +338,8 @@ public sealed class FixpClient : IAsyncDisposable
         if (_state != FixpClientState.Established) return;
         var sinceOut = DateTime.UtcNow - LastOutboundUtc;
         if (sinceOut < KeepAlive / 2) return;
-        byte[] buf = new byte[FixpFrameCodec.SequenceBlock + EntryPointFrameReader.WireHeaderSize];
-        int len = FixpFrameCodec.EncodeSequence(buf, NextOutboundSeqNo);
+        byte[] buf = new byte[EntryPointFixpFrameCodec.SequenceBlock + EntryPointFrameReader.WireHeaderSize];
+        int len = EntryPointFixpFrameCodec.EncodeSequence(buf, NextOutboundSeqNo);
         await WriteRawAsync(buf.AsMemory(0, len), ct).ConfigureAwait(false);
         _logDebug?.Invoke($"fixp Sequence heartbeat sent next={NextOutboundSeqNo}");
     }
@@ -362,8 +362,8 @@ public sealed class FixpClient : IAsyncDisposable
         _state = FixpClientState.Terminating;
         try
         {
-            byte[] buf = new byte[FixpFrameCodec.TerminateBlock + EntryPointFrameReader.WireHeaderSize];
-            int len = FixpFrameCodec.EncodeTerminate(buf, _sessionIdNumeric, _sessionVerId, code);
+            byte[] buf = new byte[EntryPointFixpFrameCodec.TerminateBlock + EntryPointFrameReader.WireHeaderSize];
+            int len = EntryPointFixpFrameCodec.EncodeTerminate(buf, _sessionIdNumeric, _sessionVerId, code);
             await WriteRawAsync(buf.AsMemory(0, len), ct).ConfigureAwait(false);
             _logDebug?.Invoke($"fixp Terminate sent code={code}");
         }
@@ -402,8 +402,8 @@ public sealed class FixpClient : IAsyncDisposable
     {
         try
         {
-            byte[] buf = new byte[FixpFrameCodec.RetransmitRequestBlock + EntryPointFrameReader.WireHeaderSize];
-            int len = FixpFrameCodec.EncodeRetransmitRequest(buf, _sessionIdNumeric,
+            byte[] buf = new byte[EntryPointFixpFrameCodec.RetransmitRequestBlock + EntryPointFrameReader.WireHeaderSize];
+            int len = EntryPointFixpFrameCodec.EncodeRetransmitRequest(buf, _sessionIdNumeric,
                 NowNanos(), fromSeqNo, count);
             await WriteRawAsync(buf.AsMemory(0, len), ct).ConfigureAwait(false);
             _logDebug?.Invoke($"fixp RetransmitRequest sent from={fromSeqNo} count={count}");
