@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts;
 using B3.Exchange.Core;
 
 namespace B3.Exchange.Core.Tests;
@@ -240,6 +241,79 @@ public class MetricsRegistryTests
         Assert.Equal(0, snap.OverflowCount);
         Assert.All(snap.BucketCounts, c => Assert.Equal(0, c));
         Assert.Equal(0.0, snap.SumSeconds);
+    }
+
+    [Fact]
+    public void Render_EmitsThroughputCounters_Issue174()
+    {
+        var reg = new MetricsRegistry();
+        var ch = reg.RegisterChannel(11);
+
+        ch.IncInboundMessage(InboundMessageKind.New);
+        ch.IncInboundMessage(InboundMessageKind.New);
+        ch.IncInboundMessage(InboundMessageKind.Cancel);
+        ch.IncInboundMessage(InboundMessageKind.DecodeError);
+
+        ch.IncExecutionReport(ExecutionReportKind.New);
+        ch.IncExecutionReport(ExecutionReportKind.Trade);
+        ch.IncExecutionReport(ExecutionReportKind.TradePassive);
+        ch.IncExecutionReport(ExecutionReportKind.CancelPassive);
+        ch.IncExecutionReport(ExecutionReportKind.Reject);
+
+        ch.IncUmdfPacket(UmdfFeedKind.Incremental, 1200);
+        ch.IncUmdfPacket(UmdfFeedKind.Incremental, 800);
+        ch.IncUmdfPacket(UmdfFeedKind.Snapshot, 1400);
+        ch.IncUmdfPacket(UmdfFeedKind.InstrumentDef, 600);
+
+        var text = reg.RenderProm();
+
+        // Single HELP/TYPE per metric covering every label permutation.
+        Assert.Contains("# TYPE exch_inbound_messages_total counter\n", text);
+        Assert.Contains("exch_inbound_messages_total{channel=\"11\",msg_type=\"new\"} 2\n", text);
+        Assert.Contains("exch_inbound_messages_total{channel=\"11\",msg_type=\"cancel\"} 1\n", text);
+        Assert.Contains("exch_inbound_messages_total{channel=\"11\",msg_type=\"decode_error\"} 1\n", text);
+        // Unobserved kinds are still emitted with value 0 so the series
+        // exists from t=0 (Prometheus treats absent series as gaps).
+        Assert.Contains("exch_inbound_messages_total{channel=\"11\",msg_type=\"replace\"} 0\n", text);
+
+        Assert.Contains("# TYPE exch_execution_reports_total counter\n", text);
+        Assert.Contains("exch_execution_reports_total{channel=\"11\",exec_type=\"new\"} 1\n", text);
+        Assert.Contains("exch_execution_reports_total{channel=\"11\",exec_type=\"trade\"} 1\n", text);
+        Assert.Contains("exch_execution_reports_total{channel=\"11\",exec_type=\"trade_passive\"} 1\n", text);
+        Assert.Contains("exch_execution_reports_total{channel=\"11\",exec_type=\"cancel_passive\"} 1\n", text);
+        Assert.Contains("exch_execution_reports_total{channel=\"11\",exec_type=\"reject\"} 1\n", text);
+
+        Assert.Contains("# TYPE exch_umdf_packets_total counter\n", text);
+        Assert.Contains("exch_umdf_packets_total{channel=\"11\",feed=\"incremental\"} 2\n", text);
+        Assert.Contains("exch_umdf_packets_total{channel=\"11\",feed=\"snapshot\"} 1\n", text);
+        Assert.Contains("exch_umdf_packets_total{channel=\"11\",feed=\"instrumentdef\"} 1\n", text);
+
+        Assert.Contains("# TYPE exch_umdf_bytes_total counter\n", text);
+        Assert.Contains("exch_umdf_bytes_total{channel=\"11\",feed=\"incremental\"} 2000\n", text);
+        Assert.Contains("exch_umdf_bytes_total{channel=\"11\",feed=\"snapshot\"} 1400\n", text);
+        Assert.Contains("exch_umdf_bytes_total{channel=\"11\",feed=\"instrumentdef\"} 600\n", text);
+    }
+
+    [Fact]
+    public void CountingUdpPacketSinkDecorator_Increments_ThenForwards()
+    {
+        var reg = new MetricsRegistry();
+        var ch = reg.RegisterChannel(3);
+        var inner = new CapturingSink();
+        var dec = new CountingUdpPacketSinkDecorator(inner, ch, UmdfFeedKind.Snapshot);
+
+        dec.Publish(3, new byte[] { 1, 2, 3, 4, 5 });
+        dec.Publish(3, new byte[] { 9, 9 });
+
+        Assert.Equal(2, ch.ReadUmdfPackets(UmdfFeedKind.Snapshot));
+        Assert.Equal(7, ch.ReadUmdfBytes(UmdfFeedKind.Snapshot));
+        Assert.Equal(2, inner.PublishCount);
+    }
+
+    private sealed class CapturingSink : IUmdfPacketSink
+    {
+        public int PublishCount;
+        public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) => PublishCount++;
     }
 
     private sealed class StubSessionProvider : ISessionMetricsProvider

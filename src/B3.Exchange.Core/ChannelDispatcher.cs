@@ -429,6 +429,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                         _outbound.WriteExecutionReportReject(_currentSession,
                             new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
                             _currentClOrdId);
+                        _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
                     }
                     break;
             }
@@ -477,6 +478,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             _outbound.WriteExecutionReportReject(_currentSession,
                 new RejectEvent(clOrdId, securityId, 0, RejectReason.UnknownOrderId, nowNanos),
                 _currentClOrdId);
+            _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
     }
 
@@ -513,6 +515,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
         LogPacketFlushed(ChannelNumber, _sequenceNumber, _packetWritten);
         _metrics?.IncPacketsOut();
+        // Issue #174: per-feed packet/byte throughput. The incremental feed
+        // is published from the dispatcher's command-loop FlushPacket; the
+        // snapshot/instrumentdef feeds account for themselves via the
+        // CountingUdpPacketSinkDecorator wired in the host.
+        _metrics?.IncUmdfPacket(UmdfFeedKind.Incremental, _packetWritten);
         _packetWritten = 0;
     }
 
@@ -552,7 +559,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
             clOrdIdValue, 0, cmd, null, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-            return true;
+        { _metrics?.IncInboundMessage(InboundMessageKind.New); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New);
         return false;
     }
@@ -562,7 +569,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, cmd, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-            return true;
+        { _metrics?.IncInboundMessage(InboundMessageKind.Cancel); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel);
         return false;
     }
@@ -572,7 +579,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, null, cmd, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-            return true;
+        { _metrics?.IncInboundMessage(InboundMessageKind.Replace); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace);
         return false;
     }
@@ -581,7 +588,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
             cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-            return true;
+        { _metrics?.IncInboundMessage(InboundMessageKind.Cross); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross);
         return false;
     }
@@ -615,7 +622,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
             0, 0, null, null, null, null, mc, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-            return true;
+        { _metrics?.IncInboundMessage(InboundMessageKind.MassCancel); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
         return false;
     }
@@ -624,8 +631,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         _logger.LogWarning("channel {ChannelNumber} inbound decode error: {Error}", ChannelNumber, error);
         _metrics?.IncDecodeErrors();
+        _metrics?.IncInboundMessage(InboundMessageKind.DecodeError);
         if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.DecodeError, session, 0, true,
-            0, 0, null, null, null, null)))
+            0, 0, null, null, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
         { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.DecodeError); }
     }
 
@@ -722,7 +730,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         Commit(n);
 
         if (_hasCurrentSession)
+        {
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos);
+            _metrics?.IncExecutionReport(ExecutionReportKind.New);
+        }
     }
 
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e)
@@ -763,6 +774,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // so the wire ER carries the requester's id while OrigClOrdID
         // points to the owner's original ClOrdID.
         _outbound.WriteExecutionReportPassiveCancel(e.OrderId, e, _currentClOrdId, _currentReceivedTimeNanos);
+        _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
     }
 
     public void OnOrderFilled(in OrderFilledEvent e)
@@ -807,17 +819,22 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
                 ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
                 leavesQty: 0, cumQty: e.Quantity);
+            _metrics?.IncExecutionReport(ExecutionReportKind.Trade);
         }
         // ER_Trade for the resting side: Gateway resolves owner via the
         // OrderOwnershipMap.
         _outbound.WriteExecutionReportPassiveTrade(e.RestingOrderId, e, leavesQty: 0, cumQty: e.Quantity);
+        _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
     }
 
     public void OnReject(in RejectEvent e)
     {
         AssertOnLoopThread();
         if (_hasCurrentSession)
+        {
             _outbound.WriteExecutionReportReject(_currentSession, e, _currentClOrdId);
+            _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
+        }
     }
 
     // ====== shutdown ======
