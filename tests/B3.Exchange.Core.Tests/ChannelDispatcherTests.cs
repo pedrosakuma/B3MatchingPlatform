@@ -481,20 +481,5 @@ public class ChannelDispatcherTests
         return (MatchingEngine)f.GetValue(disp)!;
     }
 
-    private static void DrainInbound(ChannelDispatcher disp)
-    {
-        // Reflect into the bounded channel and process until empty without
-        // starting the dispatcher's own loop.
-        var field = typeof(ChannelDispatcher).GetField("_inbound", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        var inbound = field.GetValue(disp)!;
-        var readerProp = inbound.GetType().GetProperty("Reader")!;
-        var reader = readerProp.GetValue(inbound)!;
-        var tryRead = reader.GetType().GetMethod("TryRead")!;
-        var args = new object?[] { null };
-        var processOne = typeof(ChannelDispatcher).GetMethod("ProcessOne", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        while ((bool)tryRead.Invoke(reader, args)!)
-        {
-            processOne.Invoke(disp, new[] { args[0] });
-        }
-    }
+    private static void DrainInbound(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();
 }
