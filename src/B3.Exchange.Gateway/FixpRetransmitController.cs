@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using System.Buffers.Binary;
 using B3.Entrypoint.Fixp.Sbe.V6;
 using Microsoft.Extensions.Logging;

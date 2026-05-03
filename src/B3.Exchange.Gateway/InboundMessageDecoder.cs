@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using System.Runtime.InteropServices;
 using B3.Exchange.Matching;
 

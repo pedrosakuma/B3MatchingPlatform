@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoders for FIXP retransmission session-layer responses
@@ -10,7 +10,7 @@ namespace B3.Exchange.Gateway;
 /// business <c>MsgSeqNum</c> (same as <c>Sequence</c>). They share the
 /// same SOFH+SBE 12-byte wire header as every other FIXP frame.</para>
 /// </summary>
-internal static class RetransmissionEncoder
+public static class RetransmissionEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
 

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.EntryPoint.Wire</RootNamespace>
+    <AssemblyName>B3.EntryPoint.Wire</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\B3.EntryPoint.Sbe\B3.EntryPoint.Sbe.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.EntryPoint.Wire.Tests" />
+  </ItemGroup>
+
+</Project>

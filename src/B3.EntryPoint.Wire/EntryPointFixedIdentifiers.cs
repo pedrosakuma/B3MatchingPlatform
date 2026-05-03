@@ -1,4 +1,4 @@
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Validates the fixed-block ASCII identifier slots

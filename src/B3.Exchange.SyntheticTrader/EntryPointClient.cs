@@ -2,7 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Threading.Channels;
-using B3.Exchange.Gateway;
+using B3.EntryPoint.Wire;
 using B3.Exchange.SyntheticTrader.Fixp;
 
 namespace B3.Exchange.SyntheticTrader;
@@ -69,8 +69,9 @@ public sealed class EntryPointClient : IAsyncDisposable
     private const int MaxAcceptedBlockLength = 1024;
 
     // Per-template expected block lengths (mirroring ExecutionReportEncoder
-    // constants in B3.Exchange.Gateway, which is internal). Used as a
-    // tighter, schema-aware validation before allocating the body buffer.
+    // constants in B3.Exchange.Gateway, which the synth trader does not link
+    // against). Used as a tighter, schema-aware validation before allocating
+    // the body buffer.
     // ER_New/Modify/Cancel were bumped to V3 in #49 (#GAP-11) to carry the
     // optional `receivedTime` (tag 35544) trailing field; ER_Trade and
     // ER_Reject continue to ride V2.

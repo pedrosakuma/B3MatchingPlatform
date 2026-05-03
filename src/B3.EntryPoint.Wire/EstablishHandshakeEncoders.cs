@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoder for the FIXP <c>EstablishAck</c> message
@@ -15,7 +15,7 @@ namespace B3.Exchange.Gateway;
 ///           | semanticVersion(Version @36, 4 bytes)
 /// Total wire size = 8 + 40 = 48 bytes.
 /// </summary>
-internal static class EstablishAckEncoder
+public static class EstablishAckEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int Block = FixpSbe.EstablishAckData.BLOCK_LENGTH;
@@ -60,7 +60,7 @@ internal static class EstablishAckEncoder
 ///           | lastIncomingSeqNo(uint32 optional @22)
 /// Total wire size = 8 + 26 = 34 bytes.
 /// </summary>
-internal static class EstablishRejectEncoder
+public static class EstablishRejectEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int Block = FixpSbe.EstablishRejectData.BLOCK_LENGTH;

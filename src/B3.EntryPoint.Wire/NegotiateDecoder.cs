@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level decoder for the FIXP <c>Negotiate</c> message
@@ -14,7 +14,7 @@ namespace B3.Exchange.Gateway;
 /// responsibility of <see cref="NegotiateCredentials.TryParse"/>; this
 /// decoder only verifies the SBE wire shape.</para>
 /// </summary>
-internal static class NegotiateDecoder
+public static class NegotiateDecoder
 {
     /// <summary>FIXP Negotiate template id.</summary>
     public const ushort TemplateId = FixpSbe.NegotiateData.MESSAGE_ID;

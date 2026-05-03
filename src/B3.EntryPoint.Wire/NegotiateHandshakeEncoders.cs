@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Byte-level encoder for the FIXP <c>NegotiateResponse</c> message
@@ -15,7 +15,7 @@ namespace B3.Exchange.Gateway;
 ///           | semanticVersion(Version @24, 4 bytes: major,minor,patch,build)
 /// Total wire size = 8 + 28 = 36 bytes.
 /// </summary>
-internal static class NegotiateResponseEncoder
+public static class NegotiateResponseEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int Block = FixpSbe.NegotiateResponseData.BLOCK_LENGTH;
@@ -58,7 +58,7 @@ internal static class NegotiateResponseEncoder
 ///           | currentSessionVerID(uint64 optional @28)
 /// Total wire size = 8 + 36 = 44 bytes.
 /// </summary>
-internal static class NegotiateRejectEncoder
+public static class NegotiateRejectEncoder
 {
     private const int HeaderSize = EntryPointFrameReader.WireHeaderSize;
     public const int Block = FixpSbe.NegotiateRejectData.BLOCK_LENGTH;

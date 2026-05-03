@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.Core;

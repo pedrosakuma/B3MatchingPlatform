@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
-namespace B3.Exchange.Gateway;
+namespace B3.EntryPoint.Wire;
 
 /// <summary>
 /// Decoded FIXP <c>Establish</c> root block (spec §4.5.3).
@@ -23,7 +23,7 @@ public readonly record struct EstablishRequest(
 /// <see cref="EntryPointVarData.TryValidate"/> and intentionally not
 /// re-parsed here — Negotiate already authenticated the session.
 /// </summary>
-internal static class EstablishDecoder
+public static class EstablishDecoder
 {
     public const ushort TemplateId = FixpSbe.EstablishData.MESSAGE_ID;
     public const int BlockLength = FixpSbe.EstablishData.BLOCK_LENGTH;
