@@ -198,13 +198,16 @@ once at startup so the inbound recv thread has a fixed identity table).
 
 ## 4. Synthetic trader recipes
 
-`config/synthetic-trader.json` is the bundled sample. Two strategies
+`config/synthetic-trader.json` is the bundled sample. Five strategies
 ship today (per `SyntheticTraderConfig.cs`):
 
 | Strategy `kind` | Knobs | Behaviour |
 | --- | --- | --- |
 | `marketMaker` | `levelsPerSide`, `quoteSpacingTicks`, `replaceDistanceTicks`, `quantity` | Posts `levelsPerSide` resting quotes either side of the mid; replaces when the mid drifts more than `replaceDistanceTicks`. |
 | `noiseTaker` | `orderProbability`, `maxLotMultiple`, `crossTicks` | On each tick, with `orderProbability`, sends an aggressive marketable order up to `maxLotMultiple` × lot, priced `crossTicks` past the touch. |
+| `meanReverting` | `alpha`, `entryThresholdTicks`, `crossTicks`, `lotsPerOrder` | Tracks an EWMA of the mid (`alpha` ∈ (0,1]); when the live mid deviates by ≥ `entryThresholdTicks`, sends a marketable IOC of `lotsPerOrder × lotSize` in the *contrarian* direction. |
+| `momentum` | `triggerTicks`, `crossTicks`, `lotsPerOrder` | Compares the mid to the previous tick; when the per-tick step is ≥ `triggerTicks`, sends a marketable IOC *in the direction of the move*. |
+| `sweeper` | `triggerProbability`, `sweepLots`, `crossTicks` | Per-tick fire (uniform side) of a large marketable IOC sized `sweepLots × lotSize`, priced `crossTicks` past the mid. Configure `crossTicks ≥ N × marketMaker.quoteSpacingTicks` to actually walk N levels. |
 
 Tuning recipes:
 
@@ -212,6 +215,16 @@ Tuning recipes:
   `quoteSpacingTicks=1`, `quantity=100`. Drop the `noiseTaker`.
 * **Continuous trade flow:** `marketMaker` with `levelsPerSide=3` plus
   one `noiseTaker` at `orderProbability=0.3`. (This is the default.)
+* **Trend / mean-reversion mix:** add a `momentum` strategy
+  (`triggerTicks=2`, `lotsPerOrder=1`) plus a `meanReverting`
+  (`alpha=0.1`, `entryThresholdTicks=5`) — momentum amplifies short
+  mid-drift bursts and mean-revert fades extended drifts; together they
+  produce more interesting trade prints than `noiseTaker` alone.
+* **Trade-through / sweep exercise:** add a `sweeper` with
+  `triggerProbability=0.02`, `sweepLots` ≥ 5×`marketMaker.quantity`/`lotSize`,
+  and `crossTicks ≥ levelsPerSide × quoteSpacingTicks` so the sweep walks
+  the full visible book — exercises consumer-side trade-through fills
+  and snapshot recovery.
 * **Burst load (throttle exercise):** raise the synthetic trader's
   `tickIntervalMs` down to `10–20` and bump `noiseTaker.orderProbability`
   to `0.9` — the per-session throttle (`exch_throttle_rejected_total`)

@@ -48,7 +48,8 @@ public sealed class InstrumentConfig
 
 public sealed class StrategyConfig
 {
-    /// <summary>One of: <c>marketMaker</c>, <c>noiseTaker</c>.</summary>
+    /// <summary>One of: <c>marketMaker</c>, <c>noiseTaker</c>,
+    /// <c>meanReverting</c>, <c>momentum</c>, <c>sweeper</c>.</summary>
     [JsonPropertyName("kind")] public string Kind { get; set; } = "";
     [JsonPropertyName("name")] public string Name { get; set; } = "";
 
@@ -62,6 +63,20 @@ public sealed class StrategyConfig
     [JsonPropertyName("orderProbability")] public double OrderProbability { get; set; } = 0.2;
     [JsonPropertyName("maxLotMultiple")] public int MaxLotMultiple { get; set; } = 3;
     [JsonPropertyName("crossTicks")] public int CrossTicks { get; set; } = 1;
+
+    // MeanReverting / Momentum / Sweeper
+    /// <summary>EWMA smoothing factor for <c>meanReverting</c> (0,1].</summary>
+    [JsonPropertyName("alpha")] public double Alpha { get; set; } = 0.1;
+    /// <summary>Tick-distance from the EWMA at which <c>meanReverting</c> fires.</summary>
+    [JsonPropertyName("entryThresholdTicks")] public int EntryThresholdTicks { get; set; } = 3;
+    /// <summary>Per-tick mid-step (in ticks) at which <c>momentum</c> fires.</summary>
+    [JsonPropertyName("triggerTicks")] public int TriggerTicks { get; set; } = 2;
+    /// <summary>Lots per order for <c>meanReverting</c> / <c>momentum</c>.</summary>
+    [JsonPropertyName("lotsPerOrder")] public long LotsPerOrder { get; set; } = 1;
+    /// <summary>Per-tick fire probability for <c>sweeper</c> [0,1].</summary>
+    [JsonPropertyName("triggerProbability")] public double TriggerProbability { get; set; } = 0.05;
+    /// <summary>Lots per sweep order; size <c>sweepLots * lotSize</c>.</summary>
+    [JsonPropertyName("sweepLots")] public long SweepLots { get; set; } = 10;
 }
 
 public static class SyntheticTraderConfigLoader
@@ -91,6 +106,15 @@ public static class SyntheticTraderConfigLoader
         "noiseTaker" => new NoiseTakerStrategy(
             string.IsNullOrEmpty(sc.Name) ? "noise" : sc.Name,
             sc.OrderProbability, sc.MaxLotMultiple, sc.CrossTicks),
+        "meanReverting" => new MeanRevertingStrategy(
+            string.IsNullOrEmpty(sc.Name) ? "meanrev" : sc.Name,
+            sc.Alpha, sc.EntryThresholdTicks, sc.CrossTicks, sc.LotsPerOrder),
+        "momentum" => new MomentumStrategy(
+            string.IsNullOrEmpty(sc.Name) ? "momo" : sc.Name,
+            sc.TriggerTicks, sc.CrossTicks, sc.LotsPerOrder),
+        "sweeper" => new SweeperStrategy(
+            string.IsNullOrEmpty(sc.Name) ? "sweep" : sc.Name,
+            sc.TriggerProbability, sc.SweepLots, sc.CrossTicks),
         _ => throw new InvalidOperationException($"unknown strategy kind '{sc.Kind}'"),
     };
 }
