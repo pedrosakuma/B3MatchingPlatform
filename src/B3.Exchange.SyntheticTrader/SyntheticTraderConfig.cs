@@ -49,7 +49,8 @@ public sealed class InstrumentConfig
 public sealed class StrategyConfig
 {
     /// <summary>One of: <c>marketMaker</c>, <c>noiseTaker</c>,
-    /// <c>meanReverting</c>, <c>momentum</c>, <c>sweeper</c>.</summary>
+    /// <c>meanReverting</c>, <c>momentum</c>, <c>sweeper</c>,
+    /// <c>newsShock</c>.</summary>
     [JsonPropertyName("kind")] public string Kind { get; set; } = "";
     [JsonPropertyName("name")] public string Name { get; set; } = "";
 
@@ -77,6 +78,17 @@ public sealed class StrategyConfig
     [JsonPropertyName("triggerProbability")] public double TriggerProbability { get; set; } = 0.05;
     /// <summary>Lots per sweep order; size <c>sweepLots * lotSize</c>.</summary>
     [JsonPropertyName("sweepLots")] public long SweepLots { get; set; } = 10;
+
+    // NewsShock (issue #117)
+    /// <summary>Mean ticks-between-shocks (used directly when configured in
+    /// ticks); when <see cref="MeanIntervalMs"/> is set, takes precedence.</summary>
+    [JsonPropertyName("meanIntervalMs")] public int MeanIntervalMs { get; set; } = 60000;
+    [JsonPropertyName("jitterMs")] public int JitterMs { get; set; }
+    [JsonPropertyName("shockDurationMs")] public int ShockDurationMs { get; set; } = 1500;
+    [JsonPropertyName("fadeDurationMs")] public int FadeDurationMs { get; set; } = 3000;
+    [JsonPropertyName("levelsToSweep")] public int LevelsToSweep { get; set; } = 3;
+    [JsonPropertyName("burstQtyLots")] public long BurstQtyLots { get; set; } = 5;
+    [JsonPropertyName("directionBias")] public double DirectionBias { get; set; } = 0.5;
 }
 
 public static class SyntheticTraderConfigLoader
@@ -98,7 +110,7 @@ public static class SyntheticTraderConfigLoader
         return cfg;
     }
 
-    public static IStrategy BuildStrategy(StrategyConfig sc) => sc.Kind switch
+    public static IStrategy BuildStrategy(StrategyConfig sc, int tickIntervalMs) => sc.Kind switch
     {
         "marketMaker" => new MarketMakerStrategy(
             string.IsNullOrEmpty(sc.Name) ? "mm" : sc.Name,
@@ -115,6 +127,12 @@ public static class SyntheticTraderConfigLoader
         "sweeper" => new SweeperStrategy(
             string.IsNullOrEmpty(sc.Name) ? "sweep" : sc.Name,
             sc.TriggerProbability, sc.SweepLots, sc.CrossTicks),
+        "newsShock" => new NewsShockStrategy(
+            string.IsNullOrEmpty(sc.Name) ? "shock" : sc.Name,
+            tickIntervalMs,
+            sc.MeanIntervalMs, sc.JitterMs,
+            sc.ShockDurationMs, sc.FadeDurationMs,
+            sc.LevelsToSweep, sc.BurstQtyLots, sc.DirectionBias),
         _ => throw new InvalidOperationException($"unknown strategy kind '{sc.Kind}'"),
     };
 }
