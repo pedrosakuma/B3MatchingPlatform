@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using B3.Exchange.Contracts;
 
 namespace B3.Exchange.Core;
 
@@ -94,51 +95,6 @@ public readonly record struct SessionDiagnostics(
 /// list firms without a Core→Gateway dependency.
 /// </summary>
 public readonly record struct FirmInfo(string Id, string Name, uint EnteringFirmCode);
-
-/// <summary>
-/// Process-wide counters for FIXP session lifecycle events. Exposed via
-/// <see cref="MetricsRegistry.Sessions"/>. All increments are atomic and
-/// safe to call from any thread (state-machine transitions, listener
-/// reaper, etc).
-/// </summary>
-public sealed class SessionLifecycleMetrics
-{
-    private long _established;
-    private long _suspended;
-    private long _rebound;
-    private long _reaped;
-    private long _cancelOnDisconnectFired;
-
-    public long Established => Interlocked.Read(ref _established);
-    public long Suspended => Interlocked.Read(ref _suspended);
-    public long Rebound => Interlocked.Read(ref _rebound);
-    public long Reaped => Interlocked.Read(ref _reaped);
-    public long CancelOnDisconnectFired => Interlocked.Read(ref _cancelOnDisconnectFired);
-
-    public void IncEstablished() => Interlocked.Increment(ref _established);
-    public void IncSuspended() => Interlocked.Increment(ref _suspended);
-    public void IncRebound() => Interlocked.Increment(ref _rebound);
-    public void IncReaped() => Interlocked.Increment(ref _reaped);
-    public void IncCancelOnDisconnectFired() => Interlocked.Increment(ref _cancelOnDisconnectFired);
-}
-
-/// <summary>
-/// Process-wide counters for the per-session inbound sliding-window
-/// throttle (issue #56 / GAP-20, guidelines §4.9). Increments are atomic
-/// so the FIXP recv thread can advance them while a metrics scrape runs
-/// concurrently on the HTTP thread.
-/// </summary>
-public sealed class ThrottleMetrics
-{
-    private long _accepted;
-    private long _rejected;
-
-    public long Accepted => Interlocked.Read(ref _accepted);
-    public long Rejected => Interlocked.Read(ref _rejected);
-
-    public void IncAccepted() => Interlocked.Increment(ref _accepted);
-    public void IncRejected() => Interlocked.Increment(ref _rejected);
-}
 
 /// <summary>
 /// Central registry of channel metrics + a Prometheus text-format

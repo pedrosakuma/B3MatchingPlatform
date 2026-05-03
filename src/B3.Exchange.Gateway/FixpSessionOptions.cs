@@ -61,7 +61,7 @@ public sealed record FixpSessionOptions
     /// successful reap. Optional so unit tests can construct sessions
     /// without wiring <c>MetricsRegistry</c>.
     /// </summary>
-    public B3.Exchange.Core.SessionLifecycleMetrics? LifecycleMetrics { get; init; }
+    public B3.Exchange.Contracts.SessionLifecycleMetrics? LifecycleMetrics { get; init; }
 
     /// <summary>
     /// Per-session inbound rate cap (issue #56 / GAP-20, guidelines §4.9):
@@ -81,12 +81,12 @@ public sealed record FixpSessionOptions
 
     /// <summary>
     /// Optional process-wide throttle counters. When non-null the session
-    /// increments <see cref="B3.Exchange.Core.ThrottleMetrics.Accepted"/>
+    /// increments <see cref="B3.Exchange.Contracts.ThrottleMetrics.Accepted"/>
     /// every time an application message is admitted by the throttle and
-    /// <see cref="B3.Exchange.Core.ThrottleMetrics.Rejected"/> on every
+    /// <see cref="B3.Exchange.Contracts.ThrottleMetrics.Rejected"/> on every
     /// throttle-driven BusinessMessageReject.
     /// </summary>
-    public B3.Exchange.Core.ThrottleMetrics? ThrottleMetrics { get; init; }
+    public B3.Exchange.Contracts.ThrottleMetrics? ThrottleMetrics { get; init; }
 
     public static FixpSessionOptions Default { get; } = new();
 
