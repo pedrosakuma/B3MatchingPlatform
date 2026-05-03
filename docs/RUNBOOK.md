@@ -374,6 +374,70 @@ Goal: trigger the per-session sliding-window throttle (#56 / GAP-20).
 3. Stop the burst; the rejection counter freezes and the accept counter
    resumes growing.
 
+### 5.7 Multicast chaos injection (controlled drop / dup / reorder)
+
+To exercise a consumer's gap-detection and snapshot-bootstrap paths without
+bringing in `tc`/`netem` or a real flaky network, the host can wrap any
+incremental UDP sink with a chaos decorator (issue #119). All probabilities
+default to 0 — chaos is opt-in per channel.
+
+Add a `chaos` block to one or more `channels[]` entries in
+`config/exchange-simulator.json`:
+
+```jsonc
+{
+  "channelNumber": 1,
+  "incrementalGroup": "239.1.1.1",
+  "incrementalPort": 30001,
+  "instrumentsFile": "config/instruments.json",
+  // ... existing fields ...
+  "chaos": {
+    "dropProbability": 0.01,        // 1% packet loss
+    "duplicateProbability": 0.005,  // 0.5% duplicates
+    "reorderProbability": 0.01,     // 1% reordered
+    "reorderMaxLagPackets": 3,      // hold reordered packets up to 3 slots
+    "seed": 42                      // deterministic across restarts
+  }
+}
+```
+
+Verify the decorator is active (host log line at startup):
+
+```
+chaos decorator active: drop=1.00 % dup=0.50 % reorder=1.00 % maxLag=3 seed=42
+```
+
+Watch the counters in `/metrics`:
+
+```
+umdf_chaos_dropped_total{channel="1"}     <n>
+umdf_chaos_duplicated_total{channel="1"}  <n>
+umdf_chaos_reordered_total{channel="1"}   <n>
+```
+
+Recovery scenario (companion `SbeB3UmdfConsumer`):
+
+1. Start the host with `dropProbability: 0.01` on a channel of interest.
+2. Drive load with a synthetic trader.
+3. The consumer should observe gaps in `MsgSeqNum`, request a snapshot
+   from the snapshot multicast group, and resume processing without losing
+   book state.
+4. Set `dropProbability: 0` and restart — the channel returns to lossless
+   behavior; counters stop incrementing.
+
+Notes:
+
+- Chaos lives **only on the incremental sink** wired in `ExchangeHost`.
+  Snapshot and InstrumentDef sinks are unaffected so the consumer always has
+  a clean recovery channel to bootstrap from.
+- The decorator is **not thread-safe** (matches the contract of the
+  underlying sinks): it is invoked exclusively from the channel's
+  `ChannelDispatcher` thread.
+- Reorder semantics: a reordered packet is held back by a random lag in
+  `[1, reorderMaxLagPackets]` Publish-calls, then released **after** a
+  later packet so it appears later in the wire stream. Held packets are
+  flushed on host shutdown.
+
 ---
 
 ## 6. Common tuning + debugging

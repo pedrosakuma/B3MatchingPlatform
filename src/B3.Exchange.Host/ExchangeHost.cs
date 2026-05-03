@@ -123,6 +123,22 @@ public sealed class ExchangeHost : IAsyncDisposable
             var engineLogger = _loggerFactory.CreateLogger<MatchingEngine>();
             var channelMetrics = _metrics.RegisterChannel(ch.ChannelNumber);
 
+            // Wrap with chaos decorator if configured (issue #119). Off by
+            // default; only activates when the operator opts in via config.
+            if (ch.Chaos is { } chaosCfg)
+            {
+                var coreCfg = chaosCfg.ToCore();
+                if (coreCfg.IsActive)
+                {
+                    var chaos = new ChaosUdpPacketSinkDecorator(
+                        sink, coreCfg,
+                        _loggerFactory.CreateLogger<ChaosUdpPacketSinkDecorator>(),
+                        channelMetrics);
+                    _ownedSinks.Add(chaos);
+                    sink = chaos;
+                }
+            }
+
             // Capture the engine via a side-channel so we can build a snapshot
             // source that reads through the live book on the dispatcher thread.
             MatchingEngine? capturedEngine = null;
