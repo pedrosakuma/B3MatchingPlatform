@@ -202,7 +202,26 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                 if (!more) return; // channel completed
                 while (reader.TryRead(out var item))
                 {
-                    ProcessOne(item);
+                    // Issue #170: contain unhandled exceptions per work-item
+                    // so a single bad command (engine bug, sink throw, etc.)
+                    // cannot kill the dispatch loop and silence the entire
+                    // channel. We log with full context and bump
+                    // exch_dispatcher_crash_total; the loop continues so
+                    // healthy commands still get serviced. Cancellation
+                    // bypasses containment because it is the cooperative
+                    // shutdown path — let it bubble to the outer handler.
+                    try
+                    {
+                        ProcessOne(item);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        _metrics?.IncDispatcherCrashes();
+                        LogDispatcherCrash(ex, ChannelNumber, item.Kind,
+                            item.HasSession ? item.Session.ToString() : "(no-session)",
+                            item.Firm, item.ClOrdId);
+                    }
                     RecordHeartbeat();
                 }
             }
@@ -328,6 +347,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
+        bool succeeded = false;
         try
         {
             switch (item.Kind)
@@ -404,10 +424,22 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                     break;
             }
             LogCommandProcessed(ChannelNumber, item.Kind, _currentClOrdId);
+            succeeded = true;
         }
         finally
         {
-            FlushPacket();
+            // Issue #170: do not publish a half-built UMDF packet if the
+            // command crashed mid-flight — the dispatcher loop will catch
+            // the exception, count the crash, and move on; flushing
+            // partial state would corrupt downstream consumers.
+            if (succeeded)
+            {
+                FlushPacket();
+            }
+            else
+            {
+                _packetWritten = 0;
+            }
             _currentSession = default;
             _currentFirm = 0;
             _hasCurrentSession = false;
@@ -886,4 +918,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     [LoggerMessage(EventId = 1003, Level = LogLevel.Warning,
         Message = "channel {ChannelNumber} inbound queue full; dropped {WorkKind} (slow consumer)")]
     private partial void LogQueueFull(byte channelNumber, WorkKind workKind);
+
+    [LoggerMessage(EventId = 1004, Level = LogLevel.Error,
+        Message = "channel {ChannelNumber} dispatcher work-item crash workKind={WorkKind} session={Session} firm={Firm} clOrdId={ClOrdId}")]
+    private partial void LogDispatcherCrash(Exception ex, byte channelNumber, WorkKind workKind, string session, uint firm, ulong clOrdId);
 }

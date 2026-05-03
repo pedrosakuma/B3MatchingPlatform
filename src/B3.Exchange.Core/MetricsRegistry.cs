@@ -24,6 +24,7 @@ public sealed class ChannelMetrics
     private long _chaosReordered;
     private long _dispatchQueueFull;
     private long _decodeErrors;
+    private long _dispatcherCrashes;
 
     public ChannelMetrics(byte channelNumber)
     {
@@ -40,6 +41,7 @@ public sealed class ChannelMetrics
     public long ChaosReordered => Interlocked.Read(ref _chaosReordered);
     public long DispatchQueueFull => Interlocked.Read(ref _dispatchQueueFull);
     public long DecodeErrors => Interlocked.Read(ref _decodeErrors);
+    public long DispatcherCrashes => Interlocked.Read(ref _dispatcherCrashes);
 
     public void IncOrdersIn() => Interlocked.Increment(ref _ordersIn);
     public void IncPacketsOut() => Interlocked.Increment(ref _packetsOut);
@@ -50,6 +52,7 @@ public sealed class ChannelMetrics
     public void IncChaosReordered() => Interlocked.Increment(ref _chaosReordered);
     public void IncDispatchQueueFull() => Interlocked.Increment(ref _dispatchQueueFull);
     public void IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
+    public void IncDispatcherCrashes() => Interlocked.Increment(ref _dispatcherCrashes);
 
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
@@ -186,6 +189,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_decode_errors_total",
             "Total inbound frames that failed gateway decoding for this channel (issue #155). A non-zero value indicates a malformed/incompatible producer; the gateway emits a SessionReject and may close the session.",
             channels, c => c.DecodeErrors);
+        EmitCounter(sb, "exch_dispatcher_crash_total",
+            "Total work-items whose ProcessOne raised an unhandled exception (issue #170). The dispatcher loop catches and logs these, then continues draining; a non-zero value is a hard bug-report signal — every increment is a wedge that would have killed the channel before the containment fix.",
+            channels, c => c.DispatcherCrashes);
 
         sb.Append("# HELP exch_send_queue_depth Per-session ExecutionReport send-queue depth (channel=\"all\" because the session queue is shared).\n");
         sb.Append("# TYPE exch_send_queue_depth gauge\n");

@@ -531,6 +531,85 @@ public class ChannelDispatcherTests
         Assert.Equal(2, metrics.DecodeErrors);
     }
 
+    /// <summary>
+    /// Issue #170 — a single bad work-item (engine bug, sink throw, etc.)
+    /// must NOT terminate the channel's dispatch loop. The loop catches
+    /// the exception, increments <c>exch_dispatcher_crash_total</c>, logs
+    /// with full context, and continues draining so subsequent commands
+    /// still get serviced.
+    /// </summary>
+    private sealed class ThrowingOutbound : ICoreOutbound
+    {
+        public int Throws;
+        public int Successes;
+        public bool ThrowOnNext = true;
+        public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
+        {
+            if (ThrowOnNext) { ThrowOnNext = false; Throws++; throw new InvalidOperationException("synthetic crash"); }
+            Successes++;
+            return true;
+        }
+        public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
+        public bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e, long leavesQty, long cumQty) => true;
+        public bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue) => true;
+        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue) => true;
+        public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue) => true;
+        public void NotifyOrderTerminal(long orderId) { }
+    }
+
+    private sealed class TestSession
+    {
+        public B3.Exchange.Contracts.SessionId Id { get; } = new("crashtest");
+        public uint EnteringFirm => 7;
+    }
+
+    [Fact]
+    public async Task DispatcherLoop_ContainsWorkItemException_LoopSurvivesAndCrashCounterIncrements()
+    {
+        var pkt = new RecordingPacketSink();
+        var outbound = new ThrowingOutbound();
+        var metrics = new ChannelMetrics(channelNumber: 1);
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
+            packetSink: pkt,
+            outbound: outbound,
+            logger: NullLogger<ChannelDispatcher>.Instance,
+            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
+            metrics: metrics);
+        try
+        {
+            disp.Start();
+            var reply = new TestSession();
+
+            // First enqueue triggers the throw inside ProcessOne →
+            // dispatch loop catches it and bumps the crash counter.
+            Assert.True(disp.EnqueueNewOrder(
+                new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+                reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL));
+
+            // Second enqueue must succeed and be serviced — the loop must
+            // still be alive after containing the prior crash.
+            Assert.True(disp.EnqueueNewOrder(
+                new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(11m), 100, 7, 1_000UL),
+                reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL));
+
+            // Wait up to 2s for both work items to be processed.
+            var deadline = DateTime.UtcNow.AddSeconds(2);
+            while (DateTime.UtcNow < deadline && (metrics.DispatcherCrashes < 1 || outbound.Successes < 1))
+            {
+                await Task.Delay(20);
+            }
+
+            Assert.Equal(1, metrics.DispatcherCrashes);
+            Assert.Equal(1, outbound.Throws);
+            Assert.True(outbound.Successes >= 1, "second order must be processed after the loop survived the crash");
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
     private static MatchingEngine GetEngine(ChannelDispatcher disp)
     {
         var f = typeof(ChannelDispatcher).GetField("_engine",
