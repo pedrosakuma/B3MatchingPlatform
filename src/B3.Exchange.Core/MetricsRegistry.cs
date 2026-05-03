@@ -18,6 +18,9 @@ public sealed class ChannelMetrics
     private long _snapshotsEmitted;
     private long _instrumentDefsEmitted;
     private long _lastTickUnixMs;
+    private long _chaosDropped;
+    private long _chaosDuplicated;
+    private long _chaosReordered;
 
     public ChannelMetrics(byte channelNumber)
     {
@@ -29,11 +32,17 @@ public sealed class ChannelMetrics
     public long SnapshotsEmitted => Interlocked.Read(ref _snapshotsEmitted);
     public long InstrumentDefsEmitted => Interlocked.Read(ref _instrumentDefsEmitted);
     public long LastTickUnixMs => Interlocked.Read(ref _lastTickUnixMs);
+    public long ChaosDropped => Interlocked.Read(ref _chaosDropped);
+    public long ChaosDuplicated => Interlocked.Read(ref _chaosDuplicated);
+    public long ChaosReordered => Interlocked.Read(ref _chaosReordered);
 
     public void IncOrdersIn() => Interlocked.Increment(ref _ordersIn);
     public void IncPacketsOut() => Interlocked.Increment(ref _packetsOut);
     public void IncSnapshotsEmitted() => Interlocked.Increment(ref _snapshotsEmitted);
     public void IncInstrumentDefsEmitted() => Interlocked.Increment(ref _instrumentDefsEmitted);
+    public void IncChaosDropped() => Interlocked.Increment(ref _chaosDropped);
+    public void IncChaosDuplicated() => Interlocked.Increment(ref _chaosDuplicated);
+    public void IncChaosReordered() => Interlocked.Increment(ref _chaosReordered);
 
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
@@ -198,6 +207,15 @@ public sealed class MetricsRegistry
         EmitGauge(sb, "exch_dispatch_loop_last_tick_unixms",
             "Unix time (milliseconds) of the dispatcher loop's last heartbeat.",
             channels, c => c.LastTickUnixMs);
+        EmitCounter(sb, "umdf_chaos_dropped_total",
+            "Total UMDF packets dropped by the chaos decorator (issue #119). 0 unless chaos is enabled in HostConfig.",
+            channels, c => c.ChaosDropped);
+        EmitCounter(sb, "umdf_chaos_duplicated_total",
+            "Total UMDF packets duplicated by the chaos decorator (issue #119).",
+            channels, c => c.ChaosDuplicated);
+        EmitCounter(sb, "umdf_chaos_reordered_total",
+            "Total UMDF packets held back for reorder by the chaos decorator (issue #119).",
+            channels, c => c.ChaosReordered);
 
         sb.Append("# HELP exch_send_queue_depth Per-session ExecutionReport send-queue depth (channel=\"all\" because the session queue is shared).\n");
         sb.Append("# TYPE exch_send_queue_depth gauge\n");

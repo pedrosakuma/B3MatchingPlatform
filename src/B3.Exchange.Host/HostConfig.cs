@@ -204,6 +204,37 @@ public sealed class ChannelConfig
     /// instrument definitions are published for this channel.
     /// </summary>
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
+
+    /// <summary>
+    /// Optional chaos injection on the incremental UDP sink (issue #119).
+    /// When omitted or all probabilities are 0, the sink is unmodified.
+    /// Used to exercise the consumer's recovery paths (snapshot bootstrap,
+    /// gap detection) without external network-shaping tools.
+    /// </summary>
+    [JsonPropertyName("chaos")] public ChaosConfigJson? Chaos { get; set; }
+}
+
+/// <summary>
+/// JSON projection of <see cref="B3.Exchange.Core.ChaosConfig"/>. Lives here
+/// (rather than re-using the Core type directly) so the JSON shape is owned
+/// by the host config layer and the Core decorator stays POCO-free.
+/// </summary>
+public sealed class ChaosConfigJson
+{
+    [JsonPropertyName("dropProbability")] public double DropProbability { get; set; }
+    [JsonPropertyName("duplicateProbability")] public double DuplicateProbability { get; set; }
+    [JsonPropertyName("reorderProbability")] public double ReorderProbability { get; set; }
+    [JsonPropertyName("reorderMaxLagPackets")] public int ReorderMaxLagPackets { get; set; } = 3;
+    [JsonPropertyName("seed")] public int Seed { get; set; }
+
+    public B3.Exchange.Core.ChaosConfig ToCore() => new()
+    {
+        DropProbability = DropProbability,
+        DuplicateProbability = DuplicateProbability,
+        ReorderProbability = ReorderProbability,
+        ReorderMaxLagPackets = ReorderMaxLagPackets,
+        Seed = Seed,
+    };
 }
 
 public enum UmdfTransport
