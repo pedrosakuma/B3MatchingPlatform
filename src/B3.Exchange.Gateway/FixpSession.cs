@@ -75,6 +75,7 @@ public sealed class FixpSession : IAsyncDisposable
     /// transport can recover via <c>RetransmitRequest</c>.
     /// </summary>
     private readonly RetransmitBuffer _retxBuffer;
+    private readonly FixpOutboundEncoder _outboundEncoder;
     /// <summary>0 / 1 — set via <see cref="Interlocked.CompareExchange"/>
     /// for the duration of a single retransmission replay (per spec
     /// §4.5.6: "one outstanding request at a time"). Cleared after the
@@ -328,6 +329,15 @@ public sealed class FixpSession : IAsyncDisposable
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
         _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity);
+        _outboundEncoder = new FixpOutboundEncoder(
+            sessionId: () => SessionId,
+            nextMsgSeqNum: NextMsgSeqNum,
+            transport: () => _transport!,
+            retxBuffer: _retxBuffer,
+            outboundLock: _outboundLock,
+            nowNanos: () => _nowNanos(),
+            isOpen: () => IsOpen,
+            close: Close);
         if (_options.ThrottleMaxMessages > 0 && _options.ThrottleTimeWindowMs > 0)
         {
             _throttle = new InboundThrottle(
@@ -1559,87 +1569,20 @@ public sealed class FixpSession : IAsyncDisposable
     }
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
-    {
-        if (!IsOpen) return false;
-        ulong clOrd = ulong.TryParse(e.ClOrdId, out var v) ? v : 0;
-        var exact = new byte[ExecutionReportEncoder.ExecReportNewTotal];
-        lock (_outboundLock)
-        {
-            ExecutionReportEncoder.EncodeExecReportNew(exact,
-                SessionId, NextMsgSeqNum(), e.InsertTimestampNanos,
-                e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
-                (ulong)e.RptSeq, e.InsertTimestampNanos,
-                OrderType.Limit, TimeInForce.Day,
-                e.RemainingQuantity, e.PriceMantissa,
-                receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
+        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos);
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
-    {
-        if (!IsOpen) return false;
-        var side = isAggressor ? e.AggressorSide : (e.AggressorSide == Side.Buy ? Side.Sell : Side.Buy);
-        var exact = new byte[ExecutionReportEncoder.ExecReportTradeTotal];
-        lock (_outboundLock)
-        {
-            ExecutionReportEncoder.EncodeExecReportTrade(exact,
-                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-                side, clOrdIdValue, ownerOrderId, e.SecurityId, ownerOrderId,
-                e.Quantity, e.PriceMantissa,
-                (ulong)e.RptSeq, e.TransactTimeNanos, leavesQty, cumQty,
-                isAggressor, e.TradeId,
-                isAggressor ? e.RestingFirm : e.AggressorFirm,
-                tradeDate: 0,
-                orderQty: leavesQty + cumQty);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
+        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty);
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue)
-    {
-        if (!IsOpen) return false;
-        var exact = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
-        lock (_outboundLock)
-        {
-            ExecutionReportEncoder.EncodeExecReportCancel(exact,
-                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-                e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
-                e.SecurityId, e.OrderId,
-                (ulong)e.RptSeq, e.TransactTimeNanos,
-                cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa,
-                receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
+        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos);
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue)
-    {
-        if (!IsOpen) return false;
-        var exact = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
-        lock (_outboundLock)
-        {
-            ExecutionReportEncoder.EncodeExecReportModify(exact,
-                SessionId, NextMsgSeqNum(), transactTimeNanos,
-                side, clOrdIdValue, origClOrdIdValue, orderId,
-                securityId, orderId, (ulong)rptSeq, transactTimeNanos,
-                leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
-                receivedTimeNanos: receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
-
-    /// <summary>
-    /// Per-session monotonic counter sourcing
-    /// <c>OrderMassActionReport.MassActionReportID</c> (template 702).
-    /// Spec requires an engine-assigned unique id; deriving it from a
-    /// per-session counter is sufficient because the (sessionId, id)
-    /// pair is globally unique.
-    /// </summary>
-    private long _massActionReportSeq;
+        => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos);
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
@@ -1651,115 +1594,28 @@ public sealed class FixpSession : IAsyncDisposable
     public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
         byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,
         string? text = null)
-    {
-        if (!IsOpen) return false;
-        ulong reportId = (ulong)Interlocked.Increment(ref _massActionReportSeq);
-        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text!.Length, OrderMassActionReportEncoder.MaxTextLength);
-        var exact = new byte[OrderMassActionReportEncoder.TotalSize(textLen)];
-        lock (_outboundLock)
-        {
-            OrderMassActionReportEncoder.EncodeOrderMassActionReportWithText(exact,
-                SessionId, NextMsgSeqNum(), transactTimeNanos,
-                clOrdIdValue, reportId, transactTimeNanos,
-                massActionResponse, massActionRejectReason, side, securityId, text);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
+        => _outboundEncoder.WriteOrderMassActionReport(clOrdIdValue, massActionResponse,
+            massActionRejectReason, side, securityId, transactTimeNanos, text);
 
     public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue)
-    {
-        if (!IsOpen) return false;
-        uint rej = MapRejectReason(e.Reason);
-        var exact = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
-        lock (_outboundLock)
-        {
-            ExecutionReportEncoder.EncodeExecReportReject(exact,
-                SessionId, NextMsgSeqNum(), e.TransactTimeNanos,
-                clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
-                rej, e.TransactTimeNanos);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
-
-    /// <summary>
-    /// Must be called with <see cref="_outboundLock"/> held. Reads the
-    /// already-allocated <c>MsgSeqNum</c> back out of the encoded
-    /// frame, appends to the retx buffer, then enqueues onto the
-    /// transport. Centralizes the two-step "buffer + enqueue" so every
-    /// business-frame write site has identical semantics.
-    /// </summary>
-    private bool AppendAndEnqueueLocked(byte[] exact)
-    {
-        // OutboundBusinessHeader.MsgSeqNum sits at body offset 4
-        // (SessionID(4) | MsgSeqNum(4) | …) → absolute offset
-        // WireHeaderSize + 4 = 16. Read it back so the buffer key
-        // exactly matches what's on the wire.
-        uint seq = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
-            exact.AsSpan(EntryPointFrameReader.WireHeaderSize + 4, 4));
-        // Append BEFORE enqueue: per spec recovery semantics, any seq
-        // that has been allocated MUST be replayable, even if the local
-        // send queue rejects the frame (gpt-5.5 critique #9).
-        _retxBuffer.Append(seq, exact);
-        return _transport.TryEnqueueFrame(exact);
-    }
+        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue);
 
     public bool WriteSessionReject(byte terminationCode)
-    {
-        if (!IsOpen) return false;
-        var exact = new byte[SessionRejectEncoder.TerminateTotal];
-        SessionRejectEncoder.EncodeTerminate(exact, SessionId, 0, terminationCode);
-        bool result = _transport.TryEnqueueFrame(exact);
-        Close();
-        return result;
-    }
+        => _outboundEncoder.WriteSessionReject(terminationCode);
 
     public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
         uint businessRejectReason, string? text = null)
-    {
-        if (!IsOpen) return false;
-        int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
-        int total = BusinessMessageRejectEncoder.TotalSize(textLen);
-        var exact = new byte[total];
-        lock (_outboundLock)
-        {
-            BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
-                exact, SessionId, NextMsgSeqNum(), _nowNanos(),
-                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
-            return AppendAndEnqueueLocked(exact);
-        }
-    }
+        => _outboundEncoder.WriteBusinessMessageReject(refMsgType, refSeqNum, businessRejectRefId,
+            businessRejectReason, text);
 
     /// <summary>
     /// Maps engine <see cref="RejectReason"/> to the FIX OrdRejReason wire code
-    /// emitted on ExecutionReport_Reject (#GAP-17 / issue #53). Standard FIX 4.4
-    /// codes used:
-    ///   0  = Broker / exchange option (generic / no closer match)
-    ///   1  = Unknown symbol
-    ///   3  = Order exceeds limit (used here for price-band / tick / non-positive price)
-    ///   5  = Unknown order
-    ///   11 = Unsupported order characteristic (used for invalid quantity and
-    ///        Market/IOC-only constraints not satisfied by the inbound order)
-    /// Engine reasons that have no direct FIX peer (e.g. <see cref="RejectReason.MarketNoLiquidity"/>,
-    /// <see cref="RejectReason.FokUnfillable"/>, <see cref="RejectReason.SelfTradePrevention"/>)
-    /// fall through to 0 (Broker/exchange option) — context is conveyed via the
-    /// <c>Text</c> tag where applicable.
+    /// emitted on ExecutionReport_Reject. See
+    /// <see cref="FixpOutboundEncoder.MapRejectReason"/> for the full mapping
+    /// table; this property is kept on <see cref="FixpSession"/> as an
+    /// internal stable reference for tests that pre-date the #121 refactor.
     /// </summary>
-    internal static uint MapRejectReason(RejectReason r) => r switch
-    {
-        RejectReason.UnknownInstrument => 1u,
-        RejectReason.UnknownOrderId => 5u,
-        RejectReason.PriceOutOfBand => 3u,
-        RejectReason.PriceNotOnTick => 3u,
-        RejectReason.PriceNonPositive => 3u,
-        RejectReason.QuantityNonPositive => 11u,
-        RejectReason.QuantityNotMultipleOfLot => 11u,
-        RejectReason.MarketNotImmediateOrCancel => 11u,
-        RejectReason.InvalidTimeInForceForMarket => 11u,
-        RejectReason.MarketNoLiquidity => 0u,
-        RejectReason.FokUnfillable => 0u,
-        RejectReason.SelfTradePrevention => 0u,
-        _ => 0u,
-    };
+    internal static uint MapRejectReason(RejectReason r) => FixpOutboundEncoder.MapRejectReason(r);
 
     public void Close() => Close("close");
 
