@@ -1,5 +1,14 @@
 namespace B3.Exchange.Contracts;
 
+// CONVENTION (#156): The enum families in B3.Exchange.Contracts use
+// FIX wire numbering (e.g. Side.Buy = '1' = byte 1). The parallel
+// enums in B3.Exchange.Matching (Side, OrderType, TimeInForce) use
+// internal 0-indexed declaration order. The two families are NOT
+// directly castable — translation goes through the canonical mapping
+// table pinned by EnumMappingTests in B3.Exchange.Core.Tests. Adding
+// or renumbering a value in either family requires updating the
+// table, otherwise CI breaks.
+
 /// <summary>Side of an order. Wire-neutral mirror of FIX tag 54.</summary>
 public enum Side : byte
 {
