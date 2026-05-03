@@ -84,6 +84,30 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// Issue #153: emits <c>BusinessMessageReject(SystemBusy=8)</c> when
+    /// the dispatcher backpressure path returns <c>false</c> (per-channel
+    /// inbound queue full). Keeps the session OPEN — overload is a
+    /// transient business condition, not a protocol violation. Counters
+    /// are already bumped by the dispatcher (<c>exch_dispatch_queue_full_total</c>);
+    /// this method is purely about telling the offending peer.
+    /// </summary>
+    internal void WriteSystemBusyReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string workKindLabel)
+    {
+        uint refSeqNum = fixedBlock.Length >= 8
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+            : 0u;
+        WriteBusinessMessageReject(
+            refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
+            refSeqNum: refSeqNum,
+            businessRejectRefId: clOrdId,
+            businessRejectReason: BusinessMessageRejectEncoder.Reason.SystemBusy,
+            text: "System busy: dispatcher queue full");
+        _logger.LogWarning(
+            "fixp session {ConnectionId} system-busy reject (dispatcher queue full) template={Template} workKind={WorkKind}",
+            ConnectionId, templateId, workKindLabel);
+    }
+
+    /// <summary>
     /// Spec §4.6.3.1 / §4.10 (#GAP-10): validates that an inbound business
     /// message's <c>InboundBusinessHeader.sessionID</c> matches this
     /// session's negotiated SessionId. Returns <c>true</c> if the header

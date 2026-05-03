@@ -169,7 +169,15 @@ public sealed partial class FixpSession
         _logger.LogInformation(
             "fixp session {ConnectionId} cancel-on-disconnect firing (mode={Mode} windowMs={WindowMs})",
             ConnectionId, CancelOnDisconnectType, CodTimeoutWindowMs);
-        try { _sink.EnqueueMassCancel(cmd, Identity, EnteringFirm); }
+        try
+        {
+            if (!_sink.EnqueueMassCancel(cmd, Identity, EnteringFirm))
+            {
+                _logger.LogWarning(
+                    "fixp session {ConnectionId} cancel-on-disconnect: dispatcher queue full, mass-cancel dropped",
+                    ConnectionId);
+            }
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,

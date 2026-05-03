@@ -192,7 +192,8 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
-                    _sink.EnqueueNewOrder(no, Identity, EnteringFirm, noClOrd);
+                    if (!_sink.EnqueueNewOrder(no, Identity, EnteringFirm, noClOrd))
+                        WriteSystemBusyReject(info.TemplateId, fixedBlock, noClOrd, "New");
                     return true;
                 }
                 _sink.OnDecodeError(Identity, noErr ?? "decode error: SimpleNewOrder");
@@ -201,7 +202,8 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidSimpleModifyOrder:
                 if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
                 {
-                    _sink.EnqueueReplace(rp, Identity, EnteringFirm, rpClOrd, rpOrigClOrd);
+                    if (!_sink.EnqueueReplace(rp, Identity, EnteringFirm, rpClOrd, rpOrigClOrd))
+                        WriteSystemBusyReject(info.TemplateId, fixedBlock, rpClOrd, "Replace");
                     return true;
                 }
                 _sink.OnDecodeError(Identity, rpErr ?? "decode error: SimpleModifyOrder");
@@ -213,7 +215,8 @@ public sealed partial class FixpSession
                         fixedBlock, EnteringFirm, now, out var nos, out var nosClOrd, out var nosMsg);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
-                        _sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd);
+                        if (!_sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd))
+                            WriteSystemBusyReject(info.TemplateId, fixedBlock, nosClOrd, "New");
                         return true;
                     }
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
@@ -231,7 +234,8 @@ public sealed partial class FixpSession
                         fixedBlock, now, out var ocr, out var ocrClOrd, out var ocrOrigClOrd, out var ocrMsg);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
-                        _sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd);
+                        if (!_sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd))
+                            WriteSystemBusyReject(info.TemplateId, fixedBlock, ocrClOrd, "Replace");
                         return true;
                     }
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
@@ -253,7 +257,8 @@ public sealed partial class FixpSession
                         fullBodySpan, EnteringFirm, now, out var cross, out var crossId, out var crossMsg);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
-                        _sink.EnqueueCross(cross, Identity, EnteringFirm);
+                        if (!_sink.EnqueueCross(cross, Identity, EnteringFirm))
+                            WriteSystemBusyReject(info.TemplateId, fixedBlock, crossId, "Cross");
                         return true;
                     }
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
@@ -270,7 +275,8 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
                 {
-                    _sink.EnqueueCancel(cn, Identity, EnteringFirm, cnClOrd, cnOrigClOrd);
+                    if (!_sink.EnqueueCancel(cn, Identity, EnteringFirm, cnClOrd, cnOrigClOrd))
+                        WriteSystemBusyReject(info.TemplateId, fixedBlock, cnClOrd, "Cancel");
                     return true;
                 }
                 _sink.OnDecodeError(Identity, cnErr ?? "decode error: OrderCancelRequest");
@@ -282,10 +288,18 @@ public sealed partial class FixpSession
                         fixedBlock, now, out var mcCmd, out var mcClOrd, out var mcMsg);
                     if (mcOutcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
-                        // Spec §4.8 — acknowledge synchronously with
-                        // OrderMassActionReport(ACCEPTED) ahead of the
-                        // per-order ER_Cancel frames the engine will emit
-                        // asynchronously when it processes EnqueueMassCancel.
+                        // Spec §4.8 — under normal load we ack synchronously
+                        // with OrderMassActionReport(ACCEPTED) ahead of the
+                        // per-order ER_Cancel frames the engine emits later.
+                        // This ordering matters: the ACCEPTED ack travels
+                        // straight to the TCP stream from the gateway thread
+                        // while the ER_Cancel frames go through the
+                        // dispatcher's UMDF-packet path, so reversing it
+                        // would let cancels race ahead. We therefore keep
+                        // ACCEPTED-first and, if the enqueue then fails due
+                        // to backpressure (#153), follow up with a
+                        // BusinessMessageReject(SystemBusy) so the peer
+                        // knows the action will not be performed.
                         byte? sideByte = mcCmd.SideFilter switch
                         {
                             Matching.Side.Buy => (byte)'1',
@@ -297,7 +311,14 @@ public sealed partial class FixpSession
                             massActionRejectReason: null,
                             side: sideByte, securityId: mcCmd.SecurityId,
                             transactTimeNanos: now);
-                        _sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm);
+                        if (!_sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm))
+                        {
+                            WriteSystemBusyReject(
+                                templateId: EntryPointFrameReader.TidOrderMassActionRequest,
+                                fixedBlock: fixedBlock,
+                                clOrdId: mcClOrd,
+                                workKindLabel: "MassCancel");
+                        }
                         return true;
                     }
                     if (mcOutcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)

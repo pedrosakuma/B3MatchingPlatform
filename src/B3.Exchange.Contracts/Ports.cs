@@ -99,12 +99,32 @@ public interface ICoreOutbound
 /// </summary>
 public interface IInboundCommandSink
 {
-    void EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue);
+    /// <summary>
+    /// Enqueue a new-order command for dispatch on the per-channel matching
+    /// thread. Returns <c>false</c> when the dispatcher's bounded inbound
+    /// queue is full (i.e. backpressure). Callers (the Gateway) MUST react
+    /// to <c>false</c> by emitting a client-visible reject (e.g.
+    /// <c>BusinessMessageReject(SystemBusy)</c>) so the offending session
+    /// learns the venue is overloaded instead of silently losing its
+    /// command. Returning <c>true</c> means the work item was accepted onto
+    /// the queue; it does NOT imply the matching engine has processed it
+    /// yet.
+    /// </summary>
+    bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue);
 
-    void EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
+    /// <summary>
+    /// Enqueue a cancel command. Same backpressure semantics as
+    /// <see cref="EnqueueNewOrder"/>: <c>false</c> means the dispatcher
+    /// queue is full and the gateway MUST reject the command.
+    /// </summary>
+    bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue);
 
-    void EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
+    /// <summary>
+    /// Enqueue a replace command. Same backpressure semantics as
+    /// <see cref="EnqueueNewOrder"/>.
+    /// </summary>
+    bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue);
 
     /// <summary>
@@ -114,8 +134,12 @@ public interface IInboundCommandSink
     /// with other producers. Implementations queue ONE work item carrying
     /// both legs; <see cref="ChannelDispatcher"/> submits buy then sell in
     /// a single dispatch turn under one packet flush.
+    ///
+    /// <para>Same backpressure semantics as <see cref="EnqueueNewOrder"/>:
+    /// returns <c>false</c> when the dispatcher queue is full and the
+    /// gateway MUST reject the cross to the originating session.</para>
     /// </summary>
-    void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm);
+    bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm);
 
     /// <summary>
     /// Enqueues a mass-cancel command (OrderMassActionRequest template 701,
@@ -131,8 +155,15 @@ public interface IInboundCommandSink
     /// <para>A <c>SecurityId == 0</c> on the command means "any
     /// instrument"; the host router fans the command out to every
     /// dispatcher in that case.</para>
+    ///
+    /// <para>Returns <c>false</c> when ANY targeted channel's queue is
+    /// full (partial accept is still possible — what gets enqueued stays
+    /// enqueued); the gateway MUST then emit
+    /// <c>OrderMassActionReport(REJECTED)</c> with reason "system busy"
+    /// instead of the ACCEPTED ack so the peer learns the request was
+    /// dropped under load.</para>
     /// </summary>
-    void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm);
+    bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm);
 
     /// <summary>Called when a frame fails decoding. Logging hook only — the
     /// Gateway-side <c>FixpSession</c> is responsible for the actual

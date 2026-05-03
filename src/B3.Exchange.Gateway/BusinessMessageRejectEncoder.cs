@@ -72,6 +72,14 @@ internal static class BusinessMessageRejectEncoder
         public const uint UnsupportedMessageType = 3;
         public const uint InvalidField = 5;
         public const uint UnknownOrderId = 6;
+        /// <summary>
+        /// FIX 4.4 BusinessRejectReason "Application not available" (8). Used
+        /// by the dispatcher backpressure path: when the per-channel inbound
+        /// queue is full the gateway emits BMR(8) so the offending session
+        /// learns the venue is overloaded instead of silently losing the
+        /// command. See issue #153.
+        /// </summary>
+        public const uint SystemBusy = 8;
     }
 
     public static int EncodeBusinessMessageReject(Span<byte> dst,
