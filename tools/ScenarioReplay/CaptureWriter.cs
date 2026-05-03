@@ -36,12 +36,13 @@ public sealed class CaptureWriter : IDisposable
 
     public void WriteEr(string execType, ulong clOrdId, long securityId, long orderId,
         long lastQty = 0, long lastPxMantissa = 0, long leavesQty = 0, long cumQty = 0,
-        ulong origClOrdId = 0, byte ordRejReason = 0, string side = "")
+        ulong origClOrdId = 0, byte ordRejReason = 0, string side = "", string? session = null)
     {
         var rec = new
         {
             t = _timestampFn(),
             src = "er",
+            session,
             execType,
             clOrdId,
             securityId,
@@ -73,9 +74,9 @@ public sealed class CaptureWriter : IDisposable
         WriteLine(rec);
     }
 
-    public void WriteEvent(string @event, string? detail = null)
+    public void WriteEvent(string @event, string? detail = null, string? session = null)
     {
-        var rec = new { t = _timestampFn(), src = "evt", @event, detail };
+        var rec = new { t = _timestampFn(), src = "evt", session, @event, detail };
         WriteLine(rec);
     }
 

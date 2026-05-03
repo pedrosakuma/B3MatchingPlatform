@@ -28,9 +28,17 @@ dotnet run --project tools/ScenarioReplay -- \
 ```
 ScenarioReplay --script <path.jsonl> [options]
 
-connection:
+single-session connection (legacy, no FIXP handshake):
   --host <ip|hostname>      EntryPoint host (default 127.0.0.1)
   --port <n>                EntryPoint port (default 9876)
+
+multi-session connection (FIXP handshake per session):
+  --session <spec>          Repeatable. Spec: name=sessionId:firm[@host:port]
+                            e.g. firmA=100:1@127.0.0.1:9876
+                            The first --session is the default target for
+                            events that omit "session".
+  --access-key <name>=<key> Repeatable. Access key for a named session;
+                            default is empty (works in auth.devMode=true).
 
 capture:
   --out <path>              Tape file (JSONL); default: discard
@@ -72,6 +80,28 @@ break older scripts.
 | `type`        | `new` (optional)                 | `limit` (default) or `market`                                         |
 | `tif`         | `new` (optional)                 | `day` (default), `ioc`, or `fok`                                      |
 | `origClOrdId` | `cancel`                         | the resting order's original `clOrdId`                                |
+| `session`     | optional (multi-session only)    | session name (matches a `--session` `name=...` arg). When omitted, the event is routed to the first declared session (or the legacy single client). |
+
+## Multi-session example
+
+```bash
+# Host config: two firms (codes 1 + 2) and two FIXP sessions (100, 200)
+# under auth.requireFixpHandshake=true.
+dotnet run --project tools/ScenarioReplay -- \
+    --session firmA=100:1 --session firmB=200:2 \
+    --script crossing.jsonl \
+    --out tape.jsonl
+```
+
+```jsonl
+# crossing.jsonl: firmA posts a resting bid; firmB sweeps it.
+{"atMs": 0,  "session": "firmA", "kind": "new",  "clOrdId": 1, "securityId": 900000000001, "side": "buy",  "type": "limit", "tif": "day", "qty": 100, "px": 320000}
+{"atMs": 50, "session": "firmB", "kind": "new",  "clOrdId": 1, "securityId": 900000000001, "side": "sell", "type": "limit", "tif": "ioc", "qty": 100, "px": 320000}
+```
+
+clOrdId reuse across sessions is fine — the gateway namespaces resting
+orders by `(firm, clOrdId)` and the replay runner keeps a per-session
+`clOrdId → orderId` map for cancel resolution.
 
 ## Tape format (JSONL)
 
@@ -84,13 +114,13 @@ jq 'select(.src=="mcast") | {sequenceNumber, messageCount}' tape.jsonl
 
 Record types:
 
-- `{"src":"er", "execType":"new"|"trade"|"cancel"|"reject", ...}` — decoded
-  ExecutionReport fields.
+- `{"src":"er", "session":"<name>", "execType":"new"|"trade"|"cancel"|"reject", ...}` — decoded
+  ExecutionReport fields. `session` is the originating session name.
 - `{"src":"mcast", "channel", "sequenceVersion", "sequenceNumber",
   "messageCount", "bytes":"<hex>"}` — full UMDF packet bytes plus PacketHeader
   metadata (multicast capture only; requires `--multicast`).
-- `{"src":"evt", "event":"script_start"|"submit_new"|"submit_cancel"|"script_end"|"disconnect"|"aborted", ...}`
-  — runner lifecycle annotations.
+- `{"src":"evt", "session":"<name>", "event":"script_start"|"submit_new"|"submit_cancel"|"script_end"|"disconnect"|"aborted", ...}`
+  — runner lifecycle annotations. `session` is null on script-wide events.
 
 The `t` field is a unix-millisecond timestamp; mask it (or pipe through
 `jq 'del(.t)'`) when diffing across runs.
@@ -99,10 +129,9 @@ The `t` field is a unix-millisecond timestamp; mask it (or pipe through
 
 This MVP is intentionally narrow:
 
-- single TCP session (no multi-session scripts yet)
-- no "diff harness" subcommand (use plain `diff` / `jq` for now)
-- no FIXP authentication (host must be configured with
-  `auth.requireFixpHandshake=false`)
+- no "diff harness" subcommand (use plain `diff` / `jq` for now —
+  follow-up tracked in #116)
+- single TCP connection per session (no automatic reconnect on drop)
 
 Follow-ups will live as separate issues.
 

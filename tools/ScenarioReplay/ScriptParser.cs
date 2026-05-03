@@ -87,7 +87,8 @@ public static class ScriptParser
         {
             ulong origClOrdId = (ulong)ReadLong(root, "origClOrdId", lineNo, required: true);
             return new ScriptEvent(atMs, kind, clOrdId, securityId, side,
-                OrderType.Limit, Tif.Day, 0, 0, origClOrdId, lineNo);
+                OrderType.Limit, Tif.Day, 0, 0, origClOrdId, lineNo,
+                Session: ReadString(root, "session", lineNo, required: false));
         }
 
         var typeStr = ReadString(root, "type", lineNo, required: false) ?? "limit";
@@ -108,7 +109,8 @@ public static class ScriptParser
         long qty = ReadLong(root, "qty", lineNo, required: true);
         long px = type == OrderType.Market ? 0 : ReadLong(root, "px", lineNo, required: true);
         if (qty <= 0) throw new FormatException($"line {lineNo}: qty must be > 0");
-        return new ScriptEvent(atMs, kind, clOrdId, securityId, side, type, tif, qty, px, 0, lineNo);
+        return new ScriptEvent(atMs, kind, clOrdId, securityId, side, type, tif, qty, px, 0, lineNo,
+            Session: ReadString(root, "session", lineNo, required: false));
     }
 
     private static long ReadLong(JsonElement root, string name, int lineNo, bool required)
