@@ -1,6 +1,7 @@
 using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
+using B3.Exchange.SyntheticTrader;
 
 namespace B3.Exchange.SyntheticTrader.Tests;
 
