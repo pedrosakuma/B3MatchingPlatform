@@ -745,3 +745,67 @@ Other items deferred to v2:
 - Optional TLS between client and gateway.
 - Multi-process Gateway/Core deployment (the §3 contract makes this
   mechanical; deferring the operational work).
+
+---
+
+## Upgrading vendored SBE schemas
+
+The two SBE XML schemas live under `schemas/`:
+
+- `schemas/b3-entrypoint-messages-8.4.2.xml` — inbound EntryPoint
+  protocol; consumed by `src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj`.
+- `schemas/b3-market-data-messages-2.2.0.xml` — outbound UMDF protocol;
+  consumed by `src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj`.
+
+Both `.csproj` files use the `SbeSourceGenerator` package to regenerate
+strongly-typed C# bindings from the XML at build time (the generated
+files land under `generated/` per project; `EmitCompilerGeneratedFiles`
+is on so they are inspectable).
+
+**EntryPoint and UMDF version independently.** Each schema is bumped on
+its own cadence; you do not need to upgrade both at once. The companion
+[`SbeB3UmdfConsumer`](https://github.com/pedrosakuma/SbeB3UmdfConsumer)
+repo vendors the same UMDF schema and must be kept in lock-step when the
+UMDF version moves.
+
+### Upgrade checklist
+
+1. **Drop the new XML** into `schemas/` (replacing or alongside the old
+   file).
+2. **Update the `.csproj`** that references the schema:
+   ```xml
+   <AdditionalFiles Include="..\..\schemas\b3-entrypoint-messages-X.Y.Z.xml" />
+   ```
+   Bump the path to point at the new file. Remove the old `<AdditionalFiles>`
+   entry once you are confident the new bindings work.
+3. **Rebuild** the affected `.Sbe` project. The source generator will
+   regenerate `generated/*.cs`. Inspect the diff (`git status` will not
+   show generated files because they are gitignored, but you can read
+   them directly under `src/B3.EntryPoint.Sbe/generated/` or
+   `src/B3.Umdf.Sbe/generated/`).
+4. **Run the wire-level tests** to surface schema-shape regressions:
+   ```bash
+   dotnet test tests/B3.EntryPoint.Wire.Tests   -c Release
+   dotnet test tests/B3.Umdf.WireEncoder.Tests  -c Release
+   ```
+5. **Reconcile codecs.** Hand-written codecs in
+   `src/B3.EntryPoint.Wire/` and `src/B3.Umdf.WireEncoder/` reference
+   generated types directly. Renamed fields, removed templates, or
+   changed block lengths will surface as build failures here — fix
+   them.
+6. **Run the full suite** (`dotnet test SbeB3Exchange.slnx -c Release`).
+   New or changed templates may need additional Gateway tests (decoder
+   coverage) or Core tests (engine routing).
+7. **Update compliance docs.**
+   [`B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md) lists
+   the version we target and per-template gap status; bump the version
+   and audit any newly added or removed templates.
+8. **Mirror UMDF changes** in
+   [`SbeB3UmdfConsumer`](https://github.com/pedrosakuma/SbeB3UmdfConsumer)
+   when bumping the market-data schema; the consumer is what proves the
+   wire is end-to-end correct.
+
+If the upgrade introduces breaking changes that downstream OMS / market
+data consumers cannot absorb in lock-step, gate the new version behind a
+configuration switch and keep the previous bindings in `generated/` for
+one release cycle.

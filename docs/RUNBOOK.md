@@ -7,6 +7,15 @@ exchange simulator. Architecture and protocol details live in
 on the operator-facing surface: bringing the host up, watching it, tuning
 it, and triggering the recovery scenarios that consumers care about.
 
+> **Single-active-instance.** The simulator is designed to run as a
+> single active instance per channel set. Active-active HA is **out of
+> scope**: running two instances against the same UMDF multicast group
+> would emit duplicate sequence numbers and ER frames, and the engine
+> state lives in process memory only. When HA becomes a goal it will
+> require external coordination (lease / fencing) plus persistent
+> journaling — neither of which exists today. Plan deployments around a
+> single primary with manual failover.
+
 ---
 
 ## 1. Bringing the host up
