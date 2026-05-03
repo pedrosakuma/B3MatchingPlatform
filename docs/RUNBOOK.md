@@ -481,14 +481,10 @@ HOST_PID=$HOST_PID OUTPUT_CSV=/tmp/samples.csv DURATION_SECONDS=900 \
 python3 tools/soak/analyze.py /tmp/samples.csv
 ```
 
-**Known limitation:** `SyntheticTrader` does not yet implement the FIXP
-Negotiate/Establish handshake required by the modern Gateway, so its
-connections are rejected within milliseconds of accept. The host's
-snapshot rotator + instrument-definition publisher continue to drive
-steady UDP multicast traffic for the full soak duration, exercising the
-publishers, timers, and HTTP surface; full client-side load coverage is
-gated on adding FIXP support to the synth trader (tracked as a #120
-follow-up).
+**Note on the soak config:** `config/exchange-simulator.soak.json` sets
+`auth.requireFixpHandshake = false` so the SyntheticTrader's plain-SBE
+business protocol can drive sustained client load. Production hosts
+must keep the flag at its default (`true`).
 
 ---
 

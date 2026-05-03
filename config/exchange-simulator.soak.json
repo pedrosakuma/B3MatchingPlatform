@@ -11,7 +11,7 @@
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000
   },
-  "auth": { "devMode": true },
+  "auth": { "devMode": true, "requireFixpHandshake": false },
   "http": {
     "listen": "0.0.0.0:8080",
     "livenessStaleMs": 5000
