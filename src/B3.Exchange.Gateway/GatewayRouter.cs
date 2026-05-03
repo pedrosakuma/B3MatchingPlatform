@@ -28,19 +28,26 @@ namespace B3.Exchange.Gateway;
 public sealed class GatewayRouter : ICoreOutbound
 {
     private readonly SessionRegistry _registry;
+    private readonly OrderOwnershipMap _ownership;
     private readonly ILogger<GatewayRouter> _logger;
 
-    public GatewayRouter(SessionRegistry registry, ILogger<GatewayRouter> logger)
+    public GatewayRouter(SessionRegistry registry, OrderOwnershipMap ownership, ILogger<GatewayRouter> logger)
     {
         ArgumentNullException.ThrowIfNull(registry);
+        ArgumentNullException.ThrowIfNull(ownership);
         ArgumentNullException.ThrowIfNull(logger);
         _registry = registry;
+        _ownership = ownership;
         _logger = logger;
     }
 
-    public bool WriteExecutionReportNew(ContractsSessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e,
+    public bool WriteExecutionReportNew(ContractsSessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e,
         ulong receivedTimeNanos = ulong.MaxValue)
     {
+        // Register ownership before sending so a passive trade emitted in
+        // the same dispatch turn (single-threaded by construction) finds the
+        // entry. Eviction lives on the cancel/full-fill paths below.
+        _ownership.Register(e.OrderId, session, clOrdIdValue, enteringFirm, e.Side, e.SecurityId);
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
         return s.WriteExecutionReportNew(e, receivedTimeNanos);
     }
@@ -52,12 +59,32 @@ public sealed class GatewayRouter : ICoreOutbound
         return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty);
     }
 
-    public bool WriteExecutionReportCancel(ContractsSessionId session, in OrderCanceledEvent e,
-        ulong clOrdIdValue, ulong origClOrdIdValue,
-        ulong receivedTimeNanos = ulong.MaxValue)
+    public bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e,
+        long leavesQty, long cumQty)
     {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportCancel"); return false; }
-        return s.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos);
+        if (!_ownership.TryResolve(restingOrderId, out var owner))
+        {
+            _logger.LogTrace("dropping passive ExecReportTrade for unknown orderId {OrderId}", restingOrderId);
+            return false;
+        }
+        if (!_registry.TryGet(owner.Session, out var s)) { LogMiss(owner.Session, "ExecReportPassiveTrade"); return false; }
+        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, owner.ClOrdId, leavesQty, cumQty);
+    }
+
+    public bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e,
+        ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
+    {
+        if (!_ownership.TryResolve(orderId, out var owner))
+        {
+            _logger.LogTrace("dropping passive ExecReportCancel for unknown orderId {OrderId}", orderId);
+            return false;
+        }
+        // Always evict — the order is gone from the book regardless of
+        // whether the routing succeeds.
+        _ownership.Evict(orderId);
+        if (!_registry.TryGet(owner.Session, out var s)) { LogMiss(owner.Session, "ExecReportPassiveCancel"); return false; }
+        ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : owner.ClOrdId;
+        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, owner.ClOrdId, receivedTimeNanos);
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
@@ -75,6 +102,8 @@ public sealed class GatewayRouter : ICoreOutbound
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportReject"); return false; }
         return s.WriteExecutionReportReject(e, clOrdIdValue);
     }
+
+    public void NotifyOrderTerminal(long orderId) => _ownership.Evict(orderId);
 
     private void LogMiss(ContractsSessionId session, string kind)
     {

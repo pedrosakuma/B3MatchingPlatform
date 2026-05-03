@@ -33,15 +33,37 @@ namespace B3.Exchange.Core;
 /// </summary>
 public interface ICoreOutbound
 {
-    bool WriteExecutionReportNew(SessionId session, ulong clOrdIdValue, in OrderAcceptedEvent e,
+    bool WriteExecutionReportNew(SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e,
         ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor,
         long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty);
 
-    bool WriteExecutionReportCancel(SessionId session, in OrderCanceledEvent e,
-        ulong clOrdIdValue, ulong origClOrdIdValue,
-        ulong receivedTimeNanos = ulong.MaxValue);
+    /// <summary>
+    /// Routes an <c>ExecutionReport_Trade</c> for the resting (passive) side
+    /// of <paramref name="e"/>. The Core does not know which session owns
+    /// the resting order: implementations resolve <paramref name="restingOrderId"/>
+    /// → <c>(SessionId, ClOrdId)</c> via the Gateway-side
+    /// <c>OrderOwnershipMap</c> and forward the wire-encoded ER. When the
+    /// resting order's owner has gone away the report is dropped silently
+    /// (same behaviour as the active path).
+    /// </summary>
+    bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e,
+        long leavesQty, long cumQty);
+
+    /// <summary>
+    /// Routes an <c>ExecutionReport_Cancel</c> for the owner of
+    /// <paramref name="orderId"/> (whether the cancel was self-initiated, a
+    /// mass-cancel, or any other engine-driven cancel). The Gateway resolves
+    /// the owning session from the ownership map, sends the ER, and evicts
+    /// the entry — passing <paramref name="requesterClOrdIdOrZero"/> as the
+    /// new <c>ClOrdId</c> on the wire (with the owner's original ClOrdId
+    /// becoming <c>OrigClOrdID</c>); pass zero when the cancel was not
+    /// initiated by a request from a live session (e.g. engine-internal
+    /// cancel).
+    /// </summary>
+    bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e,
+        ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
@@ -49,6 +71,14 @@ public interface ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportReject(SessionId session, in RejectEvent e, ulong clOrdIdValue);
+
+    /// <summary>
+    /// Signals that <paramref name="orderId"/> has reached a terminal state
+    /// other than cancel (currently: full fill). The Gateway evicts the
+    /// owner entry; no <c>ExecutionReport</c> is emitted (the per-fill
+    /// <c>ER_Trade</c>s have already done the wire work).
+    /// </summary>
+    void NotifyOrderTerminal(long orderId);
 }
 
 /// <summary>
