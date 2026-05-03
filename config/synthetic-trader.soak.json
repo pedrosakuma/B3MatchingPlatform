@@ -3,6 +3,13 @@
   "firm": 1,
   "seed": 4242,
   "tickIntervalMs": 50,
+  "fixp": {
+    "sessionId": "100",
+    "accessKey": "",
+    "keepAliveIntervalMs": 5000,
+    "cancelOnDisconnect": false,
+    "retransmitOnGap": true
+  },
   "instruments": [
     {
       "securityId": 900000000001,

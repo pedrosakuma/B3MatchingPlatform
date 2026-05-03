@@ -33,7 +33,27 @@ Info($"connecting to {cfg.Host.Host}:{cfg.Host.Port}");
 EntryPointClient client;
 try
 {
-    client = await EntryPointClient.ConnectAsync(cfg.Host.Host, cfg.Host.Port, Debug, Warn, shutdown.Token);
+    if (cfg.Fixp != null)
+    {
+        var fixpOptions = new B3.Exchange.SyntheticTrader.Fixp.FixpClientOptions
+        {
+            SessionId = cfg.Fixp.SessionId,
+            EnteringFirm = cfg.Firm,
+            AccessKey = cfg.Fixp.AccessKey,
+            KeepAliveIntervalMillis = cfg.Fixp.KeepAliveIntervalMs,
+            CancelOnDisconnect = cfg.Fixp.CancelOnDisconnect,
+            RetransmitOnGap = cfg.Fixp.RetransmitOnGap,
+            ClientAppName = cfg.Fixp.ClientAppName,
+            ClientAppVersion = cfg.Fixp.ClientAppVersion,
+        };
+        Info($"FIXP handshake sessionId={cfg.Fixp.SessionId} firm={cfg.Firm} keepAlive={cfg.Fixp.KeepAliveIntervalMs}ms cod={cfg.Fixp.CancelOnDisconnect}");
+        client = await EntryPointClient.ConnectAsync(cfg.Host.Host, cfg.Host.Port, fixpOptions, Debug, Warn, shutdown.Token);
+        Info("FIXP session established");
+    }
+    else
+    {
+        client = await EntryPointClient.ConnectAsync(cfg.Host.Host, cfg.Host.Port, Debug, Warn, shutdown.Token);
+    }
 }
 catch (Exception ex)
 {

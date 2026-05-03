@@ -5,6 +5,18 @@
   "firm": 1,
   "seed": 42,
   "tickIntervalMs": 100,
+  // Optional FIXP block — uncomment when the host has
+  // auth.requireFixpHandshake=true. The sessionId must match a
+  // sessions[] entry in the host config and be a decimal uint32 string
+  // (no leading zeros, > 0). accessKey is ignored when the host has
+  // auth.devMode=true.
+  // "fixp": {
+  //   "sessionId": "100",
+  //   "accessKey": "",
+  //   "keepAliveIntervalMs": 5000,
+  //   "cancelOnDisconnect": false,
+  //   "retransmitOnGap": true
+  // },
   "instruments": [
     {
       "securityId": 900000000001,
