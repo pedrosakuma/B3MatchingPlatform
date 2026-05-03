@@ -1,9 +1,8 @@
-using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
-using RejectEvent = B3.Exchange.Matching.RejectEvent;
-using Side = B3.Exchange.Matching.Side;
+using MatchingRejectEvent = B3.Exchange.Matching.RejectEvent;
+using MatchingSide = B3.Exchange.Matching.Side;
 
-namespace B3.Exchange.Core;
+namespace B3.Exchange.Contracts;
 
 /// <summary>
 /// Outbound surface that <see cref="ChannelDispatcher"/> calls to deliver
@@ -67,10 +66,10 @@ public interface ICoreOutbound
 
     bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
-        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue);
 
-    bool WriteExecutionReportReject(SessionId session, in RejectEvent e, ulong clOrdIdValue);
+    bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue);
 
     /// <summary>
     /// Signals that <paramref name="orderId"/> has reached a terminal state

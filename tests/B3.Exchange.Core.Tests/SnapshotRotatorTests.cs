@@ -1,10 +1,14 @@
+using B3.Exchange.Contracts;
+using Side = B3.Exchange.Matching.Side;
+using RejectEvent = B3.Exchange.Matching.RejectEvent;
+using OrderType = B3.Exchange.Matching.OrderType;
+using TimeInForce = B3.Exchange.Matching.TimeInForce;
 using System.Runtime.InteropServices;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
-using Side = B3.Exchange.Matching.Side;
 
 namespace B3.Exchange.Core.Tests;
 
@@ -334,7 +338,7 @@ public class ChannelDispatcherSnapshotTests
     }
 }
 
-internal sealed class ChannelDispatcherTests_RecordingOutbound : B3.Exchange.Core.ICoreOutbound
+internal sealed class ChannelDispatcherTests_RecordingOutbound : B3.Exchange.Contracts.ICoreOutbound
 {
     public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue) => true;
     public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;

@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts;
 using System.IO;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;

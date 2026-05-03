@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;

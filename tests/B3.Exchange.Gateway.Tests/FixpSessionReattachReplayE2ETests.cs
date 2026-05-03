@@ -1,3 +1,6 @@
+using B3.Exchange.Contracts;
+using Side = B3.Exchange.Matching.Side;
+using RejectEvent = B3.Exchange.Matching.RejectEvent;
 using B3.EntryPoint.Wire;
 using System.Net;
 using System.Net.Sockets;
