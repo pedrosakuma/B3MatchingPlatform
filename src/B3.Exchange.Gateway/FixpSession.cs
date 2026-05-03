@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using System.Buffers;
+using B3.Exchange.Contracts;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -398,7 +399,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos);
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
-        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue)
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
             side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos);
@@ -416,7 +417,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         => _outboundEncoder.WriteOrderMassActionReport(clOrdIdValue, massActionResponse,
             massActionRejectReason, side, securityId, transactTimeNanos, text);
 
-    public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue)
         => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue);
 
     public bool WriteSessionReject(byte terminationCode)

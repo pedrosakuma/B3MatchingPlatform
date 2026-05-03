@@ -1,3 +1,8 @@
+using B3.Exchange.Contracts;
+using Side = B3.Exchange.Matching.Side;
+using RejectEvent = B3.Exchange.Matching.RejectEvent;
+using OrderType = B3.Exchange.Matching.OrderType;
+using TimeInForce = B3.Exchange.Matching.TimeInForce;
 using System.Runtime.InteropServices;
 using B3.Exchange.Gateway;
 using B3.Exchange.Instruments;

@@ -5,4 +5,8 @@
     <AssemblyName>B3.Exchange.Contracts</AssemblyName>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
+  </ItemGroup>
+
 </Project>
