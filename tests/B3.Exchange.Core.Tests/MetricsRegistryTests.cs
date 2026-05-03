@@ -145,6 +145,36 @@ public class MetricsRegistryTests
         Assert.Contains("exch_transport_send_queue_full_total 2\n", text);
     }
 
+    [Fact]
+    public void Render_EmitsRuntimeMetrics_Issue177()
+    {
+        var reg = new MetricsRegistry();
+        var text = reg.RenderProm();
+
+        // Process metrics — names mirror prometheus-net DotNetStats so that
+        // existing dashboards work without modification.
+        Assert.Contains("# TYPE process_cpu_seconds_total counter\n", text);
+        Assert.Contains("# TYPE process_resident_memory_bytes gauge\n", text);
+        Assert.Contains("# TYPE process_virtual_memory_bytes gauge\n", text);
+        Assert.Contains("# TYPE process_start_time_seconds gauge\n", text);
+
+        // Managed heap.
+        Assert.Contains("# TYPE dotnet_total_memory_bytes gauge\n", text);
+        Assert.Contains("# TYPE dotnet_total_allocated_bytes counter\n", text);
+
+        // GC pause + per-generation collection counts.
+        Assert.Contains("# TYPE dotnet_gc_collections_total counter\n", text);
+        Assert.Contains("dotnet_gc_collections_total{generation=\"0\"} ", text);
+        Assert.Contains("dotnet_gc_collections_total{generation=\"1\"} ", text);
+        Assert.Contains("dotnet_gc_collections_total{generation=\"2\"} ", text);
+        Assert.Contains("# TYPE dotnet_gc_pause_seconds_total counter\n", text);
+
+        // ThreadPool.
+        Assert.Contains("# TYPE dotnet_threadpool_threads_count gauge\n", text);
+        Assert.Contains("# TYPE dotnet_threadpool_queue_length gauge\n", text);
+        Assert.Contains("# TYPE dotnet_threadpool_completed_items_total counter\n", text);
+    }
+
     private sealed class StubSessionProvider : ISessionMetricsProvider
     {
         private readonly SessionDiagnostics[] _samples;

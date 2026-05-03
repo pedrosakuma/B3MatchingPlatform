@@ -279,7 +279,101 @@ public sealed class MetricsRegistry
             "Total times the gateway's TcpTransport closed a session because its bounded outbound send queue overflowed (issue #155). A non-zero value means a stuck/slow consumer is causing teardowns — alert.",
             _transport.SendQueueFull);
 
+        // Issue #177: CLR/GC/threadpool/process runtime metrics. Hand-rolled
+        // (no dependency on prometheus-net or System.Diagnostics.Metrics)
+        // to keep the deps surface minimal and the output deterministic.
+        // Names mirror the prometheus-net DotNetStats conventions so any
+        // dashboard built against a stock .NET exporter will work as-is.
+        EmitRuntimeMetrics(sb);
+
         return sb.ToString();
+    }
+
+    private static void EmitRuntimeMetrics(StringBuilder sb)
+    {
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+
+        // process_cpu_seconds_total is the conventional name; we pick the
+        // user+kernel sum (= TotalProcessorTime) which is what `node_exporter`
+        // and prometheus-net both use.
+        EmitProcessCounterFloat(sb, "process_cpu_seconds_total",
+            "Total user and kernel CPU time spent in seconds.",
+            proc.TotalProcessorTime.TotalSeconds);
+        EmitProcessGaugeFloat(sb, "process_resident_memory_bytes",
+            "Resident set size of the process in bytes.",
+            proc.WorkingSet64);
+        EmitProcessGaugeFloat(sb, "process_virtual_memory_bytes",
+            "Virtual memory size of the process in bytes.",
+            proc.VirtualMemorySize64);
+        EmitProcessGaugeFloat(sb, "process_start_time_seconds",
+            "Start time of the process since unix epoch in seconds.",
+            new DateTimeOffset(proc.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0);
+        // process_open_fds is Linux-only — best-effort by counting /proc/self/fd
+        // entries; on Windows we silently skip it to keep the exposition clean.
+        if (System.IO.Directory.Exists("/proc/self/fd"))
+        {
+            try
+            {
+                int fds = System.IO.Directory.EnumerateFileSystemEntries("/proc/self/fd").Count();
+                EmitProcessGaugeFloat(sb, "process_open_fds",
+                    "Number of open file descriptors (Linux only).", fds);
+            }
+            catch { /* /proc may not be readable in some sandboxes; just skip */ }
+        }
+
+        // dotnet_total_memory_bytes — managed heap in use.
+        EmitProcessGaugeFloat(sb, "dotnet_total_memory_bytes",
+            "Total bytes currently allocated on the managed heap.",
+            GC.GetTotalMemory(forceFullCollection: false));
+        EmitProcessCounterFloat(sb, "dotnet_total_allocated_bytes",
+            "Total bytes ever allocated by the managed runtime.",
+            GC.GetTotalAllocatedBytes());
+
+        // GC collection counts per generation. .NET 10 has 3 generations
+        // plus a virtual 'LOH'/'PinnedObjectHeap' bucket — we expose the
+        // three real generations explicitly.
+        sb.Append("# HELP dotnet_gc_collections_total Total GC collections per generation.\n");
+        sb.Append("# TYPE dotnet_gc_collections_total counter\n");
+        for (int gen = 0; gen <= 2; gen++)
+        {
+            sb.Append("dotnet_gc_collections_total{generation=\"")
+              .Append(gen.ToString(CultureInfo.InvariantCulture))
+              .Append("\"} ")
+              .Append(GC.CollectionCount(gen).ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+        // .NET 7+: cumulative GC pause time across the process lifetime.
+        EmitProcessCounterFloat(sb, "dotnet_gc_pause_seconds_total",
+            "Total time the runtime spent paused for GC, in seconds (cumulative across all generations).",
+            GC.GetTotalPauseDuration().TotalSeconds);
+
+        // ThreadPool — current worker thread count (busy + idle) and the
+        // depth of the global work-item queue. A growing queue is the
+        // classic signal of threadpool starvation under sync-over-async or
+        // CPU saturation.
+        EmitProcessGaugeFloat(sb, "dotnet_threadpool_threads_count",
+            "Number of currently active threadpool worker threads.",
+            ThreadPool.ThreadCount);
+        EmitProcessGaugeFloat(sb, "dotnet_threadpool_queue_length",
+            "Number of work items currently queued to the threadpool but not yet started.",
+            ThreadPool.PendingWorkItemCount);
+        EmitProcessCounterFloat(sb, "dotnet_threadpool_completed_items_total",
+            "Total work items that have completed execution on the threadpool.",
+            ThreadPool.CompletedWorkItemCount);
+    }
+
+    private static void EmitProcessCounterFloat(StringBuilder sb, string name, string help, double value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" counter\n");
+        sb.Append(name).Append(' ').Append(value.ToString("0.######", CultureInfo.InvariantCulture)).Append('\n');
+    }
+
+    private static void EmitProcessGaugeFloat(StringBuilder sb, string name, string help, double value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" gauge\n");
+        sb.Append(name).Append(' ').Append(value.ToString("0.######", CultureInfo.InvariantCulture)).Append('\n');
     }
 
     private static void EmitProcessCounter(StringBuilder sb, string name, string help, long value)
