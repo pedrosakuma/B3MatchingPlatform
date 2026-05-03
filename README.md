@@ -74,6 +74,9 @@ dotnet test SbeB3Exchange.slnx
 dotnet run --project src/B3.Exchange.Host -- config/exchange-simulator.json
 ```
 
+For day-2 operations (HTTP surface, multi-firm config, recovery
+scenarios, tuning recipes) see [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
 ## Docker
 
 ### Build locally
