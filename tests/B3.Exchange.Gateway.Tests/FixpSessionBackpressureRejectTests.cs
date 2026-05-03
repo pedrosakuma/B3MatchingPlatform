@@ -11,13 +11,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace B3.Exchange.Gateway.Tests;
 
 /// <summary>
-/// Issue #48 (#GAP-10) — businessHeader.sessionID validation. Every inbound
-/// application message must carry the negotiated SessionId; mismatches
-/// must be answered with <c>BusinessMessageReject(reason=33003)</c> and
-/// the offending message dropped (the session itself stays open per spec
-/// §4.6.3.1).
+/// Issue #153 — when the per-channel ChannelDispatcher inbound queue is
+/// full, <c>IInboundCommandSink.Enqueue*</c> returns <c>false</c> and the
+/// gateway must surface that backpressure to the offending peer as a
+/// <c>BusinessMessageReject(reason=SystemBusy=8)</c>, NOT silently drop
+/// the message and NOT terminate the session. Counters
+/// (<c>exch_dispatch_queue_full_total</c>) are bumped by the dispatcher
+/// itself; this test only locks in the wire-level behaviour.
 /// </summary>
-public class BusinessHeaderSessionIdValidationTests
+public class FixpSessionBackpressureRejectTests
 {
     private sealed class NoOpEngineSink : IInboundCommandSink
     {
@@ -43,24 +45,21 @@ public class BusinessHeaderSessionIdValidationTests
     }
 
     /// <summary>
-    /// Build a stand-in business message body whose first 20 bytes are a
-    /// well-formed <c>InboundBusinessHeader</c>. The exact template body
-    /// content beyond the header is irrelevant — sessionID validation
-    /// runs BEFORE the per-template decoder.
+    /// Build a stand-in fixed block whose first 20 bytes are a well-formed
+    /// InboundBusinessHeader (sessionID@0, msgSeqNum@4). The
+    /// WriteSystemBusyReject helper only reads msgSeqNum@4 to populate
+    /// refSeqNum, so the rest of the body is irrelevant.
     /// </summary>
-    private static byte[] BuildHeaderOnlyBody(uint headerSessionId, uint headerMsgSeqNum, ulong clOrdId, int totalLen)
+    private static byte[] BuildFixedBlock(uint sessionId, uint msgSeqNum)
     {
-        var body = new byte[totalLen];
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(0, 4), headerSessionId);
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(4, 4), headerMsgSeqNum);
-        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(8, 8), 0UL); // sendingTime
-        // body[16] = eventIndicator; body[17] = marketSegmentID; both default 0.
-        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(20, 8), clOrdId);
-        return body;
+        var fb = new byte[82];
+        BinaryPrimitives.WriteUInt32LittleEndian(fb.AsSpan(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(fb.AsSpan(4, 4), msgSeqNum);
+        return fb;
     }
 
     [Fact]
-    public async Task Matching_sessionID_passes_validation()
+    public async Task Dispatcher_backpressure_emits_BusinessMessageReject_SystemBusy_8_and_keeps_session_open()
     {
         var (server, client) = await ConnectPairAsync();
         try
@@ -69,55 +68,17 @@ public class BusinessHeaderSessionIdValidationTests
                 connectionId: 1, enteringFirm: 7, sessionId: 100,
                 stream: server, sink: new NoOpEngineSink(),
                 logger: NullLogger<FixpSession>.Instance);
-            // Drive to Established so the session is "open" for writes.
-            session.ApplyTransition(FixpEvent.Negotiate);
-            session.ApplyTransition(FixpEvent.Establish);
-
-            var body = BuildHeaderOnlyBody(headerSessionId: 100, headerMsgSeqNum: 7, clOrdId: 42, totalLen: 82);
-
-            bool accepted = session.TryAcceptBusinessHeaderSessionId(
-                EntryPointFrameReader.TidSimpleNewOrder, body);
-            Assert.True(accepted);
-
-            // No BMR should have been sent — the client side stream stays empty.
-            Assert.Equal(0, client.Available);
-            session.Close("test");
-        }
-        finally
-        {
-            client.Close();
-            server.Dispose();
-        }
-    }
-
-    [Fact]
-    public async Task Mismatched_sessionID_emits_BusinessMessageReject_33003_and_drops_frame()
-    {
-        var (server, client) = await ConnectPairAsync();
-        try
-        {
-            var session = new FixpSession(
-                connectionId: 1, enteringFirm: 7, sessionId: /* negotiated */ 100,
-                stream: server, sink: new NoOpEngineSink(),
-                logger: NullLogger<FixpSession>.Instance);
             session.Start();
             session.ApplyTransition(FixpEvent.Negotiate);
             session.ApplyTransition(FixpEvent.Establish);
 
-            var body = BuildHeaderOnlyBody(headerSessionId: /* WRONG */ 999, headerMsgSeqNum: 13, clOrdId: 4242, totalLen: 82);
+            var fb = BuildFixedBlock(sessionId: 100, msgSeqNum: 77);
+            session.WriteSystemBusyReject(
+                templateId: EntryPointFrameReader.TidSimpleNewOrder,
+                fixedBlock: fb,
+                clOrdId: 4242UL,
+                workKindLabel: "NewOrder");
 
-            bool accepted = session.TryAcceptBusinessHeaderSessionId(
-                EntryPointFrameReader.TidSimpleNewOrder, body);
-            Assert.False(accepted);
-
-            // Drain the BMR frame off the client side. Layout:
-            //   SOFH(4) + SBE header(8) + body(BlockLength + varData)
-            //   businessHeader: sessionID@0 + msgSeqNum@4 + sendingTime@8
-            //                   + eventIndicator@16 + marketSegmentID@17
-            //   then BMR payload starting at body[20]:
-            //     refMsgType(byte @20), refSeqNum(uint32 @22),
-            //     businessRejectRefId(ulong @26), businessRejectReason(uint32 @34)
-            // We only assert template-id and businessRejectReason here.
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var ns = client.GetStream();
             var head = new byte[EntryPointFrameReader.WireHeaderSize];
@@ -141,23 +102,25 @@ public class BusinessHeaderSessionIdValidationTests
                 if (n <= 0) throw new EndOfStreamException();
                 read += n;
             }
-            // OutboundBusinessHeader: sessionID(@0,4) + msgSeqNum(@4,4) +
-            // sendingTime(@8,8) + eventIndicator(@16) + marketSegmentID(@17)
-            // BMR payload: refMsgType(byte @18) + padding(@19) +
+            // OutboundBusinessHeader: sessionID@0..4 + msgSeqNum@4..4 +
+            // sendingTime@8..8 + eventIndicator@16 + marketSegmentID@17.
+            // BMR payload at body[18]: refMsgType(byte) + padding +
             // refSeqNum(uint32 @20) + businessRejectRefId(ulong @24) +
             // businessRejectReason(uint32 @32).
             byte refMsgType = bodyBuf[18];
             uint refSeqNum = BinaryPrimitives.ReadUInt32LittleEndian(bodyBuf.AsSpan(20, 4));
             ulong businessRejectRefId = BinaryPrimitives.ReadUInt64LittleEndian(bodyBuf.AsSpan(24, 8));
             uint businessRejectReason = BinaryPrimitives.ReadUInt32LittleEndian(bodyBuf.AsSpan(32, 4));
-            // GAP-14 fix: refMsgType MUST be the schema MessageType enum
-            // byte (15 = SimpleNewOrder), NOT the raw templateId byte
-            // (102). Locking this in so a regression to (byte)templateId
-            // is caught.
+            // SimpleNewOrder schema MessageType byte is 15.
             Assert.Equal((byte)15, refMsgType);
-            Assert.Equal(13u, refSeqNum);
+            Assert.Equal(77u, refSeqNum);
             Assert.Equal(4242UL, businessRejectRefId);
-            Assert.Equal(33003u, businessRejectReason);
+            // Reason 8 = SystemBusy (FIX 4.4 "Application not available").
+            Assert.Equal(8u, businessRejectReason);
+
+            // Session must remain OPEN — backpressure is a transient
+            // business-layer condition, never grounds for Terminate.
+            Assert.True(session.IsOpen);
             session.Close("test");
         }
         finally

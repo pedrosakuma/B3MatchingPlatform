@@ -495,13 +495,17 @@ public class ChannelDispatcherTests
 
         var reply = new FakeSession(outbound);
 
-        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+        bool first = disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
             reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        Assert.True(first, "first enqueue with a 1-slot channel should succeed");
         Assert.Equal(0, metrics.DispatchQueueFull);
 
         // Second enqueue must fail because the loop is not draining.
-        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+        // Issue #153: the bool return is the contract the gateway uses to
+        // emit BusinessMessageReject(SystemBusy) on the wire.
+        bool second = disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
             reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        Assert.False(second, "second enqueue must report backpressure to caller");
         Assert.Equal(1, metrics.DispatchQueueFull);
     }
 

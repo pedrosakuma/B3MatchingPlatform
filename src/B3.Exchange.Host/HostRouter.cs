@@ -48,54 +48,57 @@ public sealed class HostRouter : IInboundCommandSink
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
 
-    public void EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
+    public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
         if (_bySecId.TryGetValue(cmd.SecurityId, out var disp))
-            disp.EnqueueNewOrder(cmd, session, enteringFirm, clOrdIdValue);
-        else
-            RejectUnknownInstrument(cmd.SecurityId, session, clOrdIdValue);
+            return disp.EnqueueNewOrder(cmd, session, enteringFirm, clOrdIdValue);
+        // Unknown-instrument is a *deterministic business reject* the router
+        // emits inline; from the caller's perspective the work is done, so
+        // return true (the false return is reserved for backpressure only).
+        RejectUnknownInstrument(cmd.SecurityId, session, clOrdIdValue);
+        return true;
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
+    public bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         var resolved = ResolveOrderIdIfNeeded(cmd, enteringFirm, origClOrdIdValue, out var ok);
         if (!ok)
         {
             RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue);
-            return;
+            return true;
         }
         if (_bySecId.TryGetValue(resolved.SecurityId, out var disp))
-            disp.EnqueueCancel(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
-        else
-            RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+            return disp.EnqueueCancel(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
+        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+        return true;
     }
 
-    public void EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
+    public bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
         var resolved = ResolveOrderIdIfNeeded(cmd, enteringFirm, origClOrdIdValue, out var ok);
         if (!ok)
         {
             RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue);
-            return;
+            return true;
         }
         if (_bySecId.TryGetValue(resolved.SecurityId, out var disp))
-            disp.EnqueueReplace(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
-        else
-            RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+            return disp.EnqueueReplace(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
+        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+        return true;
     }
 
-    public void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
+    public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
         // Both legs MUST belong to the same security (decoder enforces).
         if (_bySecId.TryGetValue(cmd.Buy.SecurityId, out var disp))
-            disp.EnqueueCross(cmd, session, enteringFirm);
-        else
-            RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue);
+            return disp.EnqueueCross(cmd, session, enteringFirm);
+        RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue);
+        return true;
     }
 
-    public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
+    public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
     {
         // Spec §4.8 / #GAP-19. Resolve the (session, firm, Side?, SecurityId?)
         // filter against the Gateway-side OrderOwnershipMap, then group the
@@ -103,7 +106,7 @@ public sealed class HostRouter : IInboundCommandSink
         // see only the resolved per-channel orderId list — no filter logic
         // and no per-order session state lives in Core anymore (#66).
         var matches = _ownership.FilterMassCancel(session, enteringFirm, cmd.SideFilter, cmd.SecurityId);
-        if (matches.Count == 0) return;
+        if (matches.Count == 0) return true;
 
         Dictionary<ChannelDispatcher, List<long>>? perChannel = null;
         foreach (var (orderId, securityId) in matches)
@@ -119,9 +122,19 @@ public sealed class HostRouter : IInboundCommandSink
             }
             list.Add(orderId);
         }
-        if (perChannel == null) return;
+        if (perChannel == null) return true;
+
+        // Fan-out: report backpressure if ANY targeted channel rejected the
+        // resolved batch. Partial accept is preserved (whatever made it
+        // onto a queue stays there) — the gateway treats this as a single
+        // reject from the client's POV (OrderMassActionReport REJECTED).
+        bool allOk = true;
         foreach (var (disp, ids) in perChannel)
-            disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd.EnteredAtNanos);
+        {
+            if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd.EnteredAtNanos))
+                allOk = false;
+        }
+        return allOk;
     }
 
     public void OnDecodeError(SessionId session, string error)

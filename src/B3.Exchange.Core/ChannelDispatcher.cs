@@ -497,37 +497,45 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     // ====== IInboundCommandSink ======
 
-    public void EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
+    public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
             clOrdIdValue, 0, cmd, null, null, null)))
-        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New); }
+            return true;
+        _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New);
+        return false;
     }
 
-    public void EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
+    public bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, cmd, null, null)))
-        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel); }
+            return true;
+        _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel);
+        return false;
     }
 
-    public void EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
+    public bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, null, cmd, null)))
-        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace); }
+            return true;
+        _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace);
+        return false;
     }
 
-    public void EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
+    public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
             cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd)))
-        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross); }
+            return true;
+        _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross);
+        return false;
     }
 
-    public void EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
+    public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
     {
         // OrderId resolution + filtering is the HostRouter's job (it owns
         // access to the Gateway-side OrderOwnershipMap). Forwarding the
@@ -549,14 +557,16 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// <c>ER_Cancel</c> per order is routed back to the originating session
     /// via <c>OnOrderCanceled</c>.
     /// </summary>
-    public void EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
+    public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
         ulong enteredAtNanos)
     {
-        if (orderIds == null || orderIds.Count == 0) return;
+        if (orderIds == null || orderIds.Count == 0) return true;
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
-        if (!_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
             0, 0, null, null, null, null, mc)))
-        { _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel); }
+            return true;
+        _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
+        return false;
     }
 
     public void OnDecodeError(SessionId session, string error)
