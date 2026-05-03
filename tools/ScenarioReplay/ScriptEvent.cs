@@ -17,7 +17,8 @@ public sealed record ScriptEvent(
     long Quantity,
     long PriceMantissa,
     ulong OrigClOrdId,
-    int LineNumber);
+    int LineNumber,
+    string? Session = null);
 
 public enum ScriptEventKind { New, Cancel }
 public enum Side : byte { Buy, Sell }

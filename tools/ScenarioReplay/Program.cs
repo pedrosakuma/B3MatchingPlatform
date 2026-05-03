@@ -1,6 +1,7 @@
 using System.Net;
 using B3.Exchange.ScenarioReplay;
 using B3.Exchange.SyntheticTrader;
+using B3.Exchange.SyntheticTrader.Fixp;
 
 if (args.Length == 1 && (args[0] == "-h" || args[0] == "--help"))
 {
@@ -39,21 +40,56 @@ await using var mcast = opts.MulticastGroup != null
 using var shutdown = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
 
-EntryPointClient client;
+// Resolve the session list. If --session was used we open one client per
+// declared session and require all events to address a known one (or use
+// the first declared session as the default for back-compat with scripts
+// that omit the field). Without --session we fall back to a single
+// implicit "default" session over the legacy raw frame protocol.
+var sessions = new Dictionary<string, EntryPointClient>();
+string defaultSession;
 try
 {
-    client = await EntryPointClient.ConnectAsync(opts.Host, opts.Port, logDebug: null, logWarn: Warn, shutdown.Token);
+    if (opts.Sessions.Count == 0)
+    {
+        var legacy = await EntryPointClient.ConnectAsync(opts.Host, opts.Port, logDebug: null, logWarn: Warn, shutdown.Token);
+        sessions["default"] = legacy;
+        defaultSession = "default";
+        Info($"connected legacy session to {opts.Host}:{opts.Port}");
+    }
+    else
+    {
+        foreach (var s in opts.Sessions)
+        {
+            var fixp = new FixpClientOptions
+            {
+                SessionId = s.SessionId,
+                EnteringFirm = s.EnteringFirm,
+                AccessKey = opts.AccessKeys.TryGetValue(s.Name, out var k) ? k : "",
+                CancelOnDisconnect = false,
+                RetransmitOnGap = true,
+            };
+            var client = await EntryPointClient.ConnectAsync(
+                s.Host, s.Port, fixp, logDebug: null, logWarn: Warn, shutdown.Token);
+            sessions[s.Name] = client;
+            Info($"connected session '{s.Name}' (sessionId={s.SessionId} firm={s.EnteringFirm}) to {s.Host}:{s.Port}");
+        }
+        defaultSession = opts.Sessions[0].Name;
+    }
 }
 catch (Exception ex)
 {
     Warn($"connect failed: {ex.Message}");
+    foreach (var c in sessions.Values)
+    {
+        try { await c.DisposeAsync(); } catch { }
+    }
     return 4;
 }
 
-await using (client)
+try
 {
     var clock = new SystemClock(opts.Speed);
-    var runner = new ReplayRunner(client, clock, capture, Info, Warn);
+    var runner = new ReplayRunner(sessions, defaultSession, clock, capture, Info, Warn);
     try
     {
         await runner.RunAsync(events, shutdown.Token);
@@ -76,8 +112,15 @@ await using (client)
         catch (OperationCanceledException) { }
     }
 }
+finally
+{
+    foreach (var c in sessions.Values)
+    {
+        try { await c.DisposeAsync(); } catch { }
+    }
+}
 
-Info($"done; submitted={(args.Length > 0 ? "<see capture>" : "0")}");
+Info("done");
 return 0;
 
 static void PrintUsage()
@@ -88,9 +131,19 @@ static void PrintUsage()
         required:
           --script <path>             JSONL replay script
 
-        connection:
+        single-session connection (legacy, no FIXP handshake):
           --host <ip|hostname>        EntryPoint host (default 127.0.0.1)
           --port <n>                  EntryPoint port (default 9876)
+
+        multi-session connection (FIXP handshake per session):
+          --session <spec>            Repeatable. Spec format:
+                                          name=sessionId:firm[@host:port]
+                                      e.g. firmA=100:1@127.0.0.1:9876
+                                      The first --session is the default
+                                      target for events that omit "session".
+          --access-key <name>=<key>   Repeatable. Access key for a named
+                                      session; default is empty (works in
+                                      auth.devMode=true hosts).
 
         capture:
           --out <path>                Tape file (JSONL); default: discard
@@ -105,6 +158,49 @@ static void PrintUsage()
         """);
 }
 
+internal sealed class SessionSpec
+{
+    public string Name { get; init; } = "";
+    public string SessionId { get; init; } = "";
+    public uint EnteringFirm { get; init; }
+    public string Host { get; init; } = "127.0.0.1";
+    public int Port { get; init; } = 9876;
+
+    /// <summary>
+    /// Parses <c>name=sessionId:firm[@host:port]</c>.
+    /// </summary>
+    public static SessionSpec Parse(string raw, string defaultHost, int defaultPort)
+    {
+        var eq = raw.IndexOf('=');
+        if (eq <= 0 || eq == raw.Length - 1)
+            throw new ArgumentException($"invalid --session '{raw}': expected name=sessionId:firm[@host:port]");
+        var name = raw.Substring(0, eq);
+        var rhs = raw.Substring(eq + 1);
+        string host = defaultHost;
+        int port = defaultPort;
+        var at = rhs.IndexOf('@');
+        if (at >= 0)
+        {
+            var hp = rhs.Substring(at + 1);
+            rhs = rhs.Substring(0, at);
+            var colon = hp.LastIndexOf(':');
+            if (colon < 0) throw new ArgumentException($"invalid --session '{raw}': host segment must be host:port");
+            host = hp.Substring(0, colon);
+            if (!int.TryParse(hp.AsSpan(colon + 1), out port))
+                throw new ArgumentException($"invalid --session '{raw}': port is not an integer");
+        }
+        var sc = rhs.IndexOf(':');
+        if (sc <= 0 || sc == rhs.Length - 1)
+            throw new ArgumentException($"invalid --session '{raw}': credentials must be sessionId:firm");
+        var sid = rhs.Substring(0, sc);
+        if (!uint.TryParse(rhs.AsSpan(sc + 1), out var firm) || firm == 0)
+            throw new ArgumentException($"invalid --session '{raw}': firm must be a positive uint32");
+        if (!uint.TryParse(sid, out var sidNum) || sidNum == 0)
+            throw new ArgumentException($"invalid --session '{raw}': sessionId must be a positive uint32 decimal string");
+        return new SessionSpec { Name = name, SessionId = sid, EnteringFirm = firm, Host = host, Port = port };
+    }
+}
+
 internal sealed class CliOptions
 {
     public string Host { get; private set; } = "127.0.0.1";
@@ -115,10 +211,13 @@ internal sealed class CliOptions
     public int MulticastPort { get; private set; }
     public double Speed { get; private set; } = 1.0;
     public int TrailingTimeoutMs { get; private set; } = 1000;
+    public List<SessionSpec> Sessions { get; } = new();
+    public Dictionary<string, string> AccessKeys { get; } = new(StringComparer.Ordinal);
 
     public static CliOptions? Parse(string[] args, out string? error)
     {
         var o = new CliOptions();
+        var rawSessions = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -138,6 +237,15 @@ internal sealed class CliOptions
                     }
                 case "--speed": o.Speed = double.Parse(Need(args, ref i), System.Globalization.CultureInfo.InvariantCulture); break;
                 case "--timeout-ms": o.TrailingTimeoutMs = int.Parse(Need(args, ref i)); break;
+                case "--session": rawSessions.Add(Need(args, ref i)); break;
+                case "--access-key":
+                    {
+                        var v = Need(args, ref i);
+                        var idx = v.IndexOf('=');
+                        if (idx <= 0) { error = $"invalid --access-key '{v}', expected name=key"; return null; }
+                        o.AccessKeys[v.Substring(0, idx)] = v.Substring(idx + 1);
+                        break;
+                    }
                 default:
                     error = $"unknown argument '{args[i]}'";
                     return null;
@@ -146,6 +254,25 @@ internal sealed class CliOptions
         if (string.IsNullOrEmpty(o.ScriptPath)) { error = "--script is required"; return null; }
         if (o.Speed <= 0) { error = "--speed must be > 0"; return null; }
         if (!File.Exists(o.ScriptPath)) { error = $"script not found: {o.ScriptPath}"; return null; }
+        try
+        {
+            foreach (var raw in rawSessions)
+                o.Sessions.Add(SessionSpec.Parse(raw, o.Host, o.Port));
+        }
+        catch (ArgumentException ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var s in o.Sessions)
+        {
+            if (!seen.Add(s.Name))
+            {
+                error = $"duplicate --session name '{s.Name}'";
+                return null;
+            }
+        }
         error = null;
         return o;
     }
