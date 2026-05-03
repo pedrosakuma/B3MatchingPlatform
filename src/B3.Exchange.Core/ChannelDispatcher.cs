@@ -768,6 +768,51 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         try { _cts.Cancel(); } catch { }
     }
 
+    /// <summary>
+    /// Returns a test-only probe that exposes drain/kill helpers without
+    /// requiring reflection or InternalsVisibleTo. The probe is the
+    /// supported test seam — internal fields and methods are not part of
+    /// the supported surface and can change without notice.
+    /// </summary>
+    public TestProbe CreateTestProbe() => new TestProbe(this);
+
+    /// <summary>
+    /// Test-only probe encapsulating drain/kill operations on a
+    /// <see cref="ChannelDispatcher"/>. Production code must not call
+    /// <see cref="CreateTestProbe"/>; the probe exists solely so tests
+    /// can drive the dispatcher synchronously without piercing
+    /// encapsulation via reflection.
+    /// </summary>
+    public sealed class TestProbe
+    {
+        private readonly ChannelDispatcher _disp;
+
+        internal TestProbe(ChannelDispatcher disp) => _disp = disp;
+
+        /// <summary>
+        /// Synchronously processes every pending <c>WorkItem</c> on the
+        /// dispatcher's inbound queue using the dispatcher's own
+        /// <c>ProcessOne</c> path. The dispatcher loop is bypassed; the
+        /// caller's thread does the work. Useful in unit tests that
+        /// enqueue commands and need a deterministic point at which the
+        /// engine has observed them.
+        /// </summary>
+        public void DrainInbound()
+        {
+            var reader = _disp._inbound.Reader;
+            while (reader.TryRead(out var item))
+            {
+                _disp.ProcessOne(item);
+            }
+        }
+
+        /// <summary>
+        /// Cancels the dispatcher loop without disposing. See
+        /// <see cref="ChannelDispatcher.KillForTesting"/>.
+        /// </summary>
+        public void Kill() => _disp.KillForTesting();
+    }
+
     public async ValueTask DisposeAsync()
     {
         _logger.LogInformation("channel {ChannelNumber} dispatcher stopping (sequenceNumber={SequenceNumber})",

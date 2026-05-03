@@ -77,15 +77,9 @@ public class HostRouterTests
             new B3.Exchange.Contracts.SessionId("s1"), enteringFirm: 1, clOrdIdValue: 1);
 
         Assert.Empty(outbound.Rejects);
-        // Drain the dispatcher queue + assert it actually processed an order
-        var field = typeof(ChannelDispatcher).GetField("_inbound", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        var inbound = field.GetValue(disp)!;
-        var reader = inbound.GetType().GetProperty("Reader")!.GetValue(inbound)!;
-        var tryRead = reader.GetType().GetMethod("TryRead")!;
-        var args = new object?[] { null };
-        var processOne = typeof(ChannelDispatcher).GetMethod("ProcessOne", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        Assert.True((bool)tryRead.Invoke(reader, args)!);
-        processOne.Invoke(disp, new[] { args[0] });
+        // Drain the dispatcher queue and assert it processed the order
+        // (replaces the prior reflection-based drain — issue #157).
+        disp.CreateTestProbe().DrainInbound();
         Assert.Single(pkt.Calls);
     }
 
