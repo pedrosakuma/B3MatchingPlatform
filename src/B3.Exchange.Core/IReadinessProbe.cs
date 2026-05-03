@@ -39,3 +39,26 @@ public sealed class StartupReadinessProbe : IReadinessProbe
 
     public void MarkReady() => Interlocked.Exchange(ref _ready, 1);
 }
+
+/// <summary>
+/// Inverse-polarity readiness probe used during graceful shutdown
+/// (issue #171 / A7). Starts ready; <see cref="MarkNotReady"/> flips it
+/// to NOT_READY so /health/ready returns 503 and load balancers stop
+/// routing new connections to the host while in-flight work drains.
+/// Idempotent and lock-free.
+/// </summary>
+public sealed class ShutdownReadinessProbe : IReadinessProbe
+{
+    private int _notReady;
+
+    public ShutdownReadinessProbe(string name = "shutdown")
+    {
+        Name = name;
+    }
+
+    public string Name { get; }
+
+    public bool IsReady => Volatile.Read(ref _notReady) == 0;
+
+    public void MarkNotReady() => Interlocked.Exchange(ref _notReady, 1);
+}

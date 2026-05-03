@@ -63,4 +63,9 @@ try { await Task.Delay(Timeout.Infinite, shutdown.Token).ConfigureAwait(false); 
 catch (OperationCanceledException) { }
 
 bootLogger.LogInformation("shutting down");
+// Bound the graceful shutdown so a stuck phase can't pin the process
+// indefinitely. The host's per-phase logging makes any breach visible.
+using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+try { await host.StopAsync(stopCts.Token).ConfigureAwait(false); }
+catch (Exception ex) { bootLogger.LogError(ex, "graceful shutdown failed"); }
 return 0;

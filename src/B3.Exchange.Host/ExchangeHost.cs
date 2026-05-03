@@ -1,4 +1,5 @@
 using System.Net;
+using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
 using B3.Exchange.Instruments;
 using B3.Exchange.Core;
@@ -33,6 +34,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<Timer> _snapshotTimers = new();
     private readonly MetricsRegistry _metrics = new();
     private readonly StartupReadinessProbe _startupProbe = new("startup");
+    private readonly ShutdownReadinessProbe _shutdownProbe = new("shutdown");
     private readonly List<IReadinessProbe> _probes = new();
     private readonly object _probesLock = new();
     private EntryPointListener? _listener;
@@ -52,6 +54,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         _snapshotSinkFactory = snapshotSinkFactory;
         _instrumentDefSinkFactory = instrumentDefSinkFactory;
         _probes.Add(_startupProbe);
+        _probes.Add(_shutdownProbe);
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
@@ -479,7 +482,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _logger.LogInformation("exchange host shutting down");
+        await StopAsync().ConfigureAwait(false);
         if (_dailyReset != null) await _dailyReset.DisposeAsync().ConfigureAwait(false);
         if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
@@ -487,5 +490,130 @@ public sealed class ExchangeHost : IAsyncDisposable
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
+    }
+
+    private int _stopCalled;
+
+    /// <summary>
+    /// Graceful shutdown (issue #171 / A7). Drives the host through the
+    /// phases the operability spec requires:
+    ///
+    /// <list type="number">
+    ///   <item>Flip the shutdown readiness probe → NOT_READY so /health/ready
+    ///         returns 503 and load balancers stop routing traffic to us.</item>
+    ///   <item>Stop the EntryPoint accept loop (no new TCP connections).</item>
+    ///   <item>Wait up to <c>HostConfig.Shutdown.DrainGraceMs</c> for every
+    ///         per-channel inbound queue to drain so in-flight work is
+    ///         observed by the engine before we close anything.</item>
+    ///   <item>Broadcast <c>Terminate(Finished=1)</c> to every live FIXP
+    ///         session so clients see an orderly drain instead of an RST/timeout.</item>
+    ///   <item>Dispose dispatchers (each flushes its last UMDF packet on
+    ///         the way down) and the listener.</item>
+    /// </list>
+    ///
+    /// <para>Each phase logs <c>shutdown phase=X duration=Yms</c>. Idempotent —
+    /// only the first caller does work; subsequent callers return immediately.
+    /// <see cref="DisposeAsync"/> calls this; callers driving shutdown
+    /// from a SIGTERM handler should call it explicitly so they can pass
+    /// a <see cref="CancellationToken"/> bounding the total duration.</para>
+    /// </summary>
+    public async Task StopAsync(CancellationToken ct = default)
+    {
+        if (Interlocked.Exchange(ref _stopCalled, 1) == 1) return;
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("graceful shutdown starting");
+
+        // Phase 1: flip readiness so external probes (LB, k8s) stop sending traffic.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _shutdownProbe.MarkNotReady();
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=mark-not-ready duration={DurationMs}ms", sw.ElapsedMilliseconds);
+
+        // Phase 2: stop accepting new connections; existing sessions stay alive.
+        sw.Restart();
+        if (_listener != null)
+        {
+            try { await _listener.StopAcceptingAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "stop-accepting threw"); }
+        }
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=stop-accepting duration={DurationMs}ms", sw.ElapsedMilliseconds);
+
+        // Phase 3: poll-wait for per-channel inbound queues to drain so the
+        // engine has observed every command currently held by the gateway.
+        sw.Restart();
+        int graceMs = Math.Max(0, _config.Shutdown.DrainGraceMs);
+        int pollMs = Math.Max(1, _config.Shutdown.DrainPollMs);
+        var drainDeadline = System.Diagnostics.Stopwatch.StartNew();
+        int residual;
+        while (true)
+        {
+            residual = 0;
+            foreach (var d in _dispatchers) residual += d.InboundQueueDepth;
+            if (residual == 0) break;
+            if (drainDeadline.ElapsedMilliseconds >= graceMs) break;
+            if (ct.IsCancellationRequested) break;
+            try { await Task.Delay(pollMs, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+        }
+        sw.Stop();
+        if (residual == 0)
+        {
+            _logger.LogInformation("shutdown phase=drain-inbound duration={DurationMs}ms residual=0",
+                sw.ElapsedMilliseconds);
+        }
+        else
+        {
+            _logger.LogWarning("shutdown phase=drain-inbound duration={DurationMs}ms residual={Residual} (grace expired)",
+                sw.ElapsedMilliseconds, residual);
+        }
+
+        // Phase 4: broadcast Terminate(Finished) and close each session.
+        sw.Restart();
+        int terminated = 0;
+        if (_listener != null)
+        {
+            try
+            {
+                terminated = await _listener.TerminateAllSessionsAsync(
+                    SessionRejectEncoder.TerminationCode.Finished, "graceful-shutdown")
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "terminate-all threw"); }
+        }
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=terminate-sessions duration={DurationMs}ms count={Count}",
+            sw.ElapsedMilliseconds, terminated);
+
+        // Phase 5: stop snapshot/instrument-def cadence so we don't emit
+        // packets after dispatchers tear their sinks down.
+        sw.Restart();
+        foreach (var t in _snapshotTimers)
+        {
+            try { await t.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+        _snapshotTimers.Clear();
+        foreach (var p in _instrumentDefPublishers)
+        {
+            try { await p.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+        _instrumentDefPublishers.Clear();
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=stop-publishers duration={DurationMs}ms", sw.ElapsedMilliseconds);
+
+        // Phase 6: dispose dispatchers (each flushes its last UMDF packet).
+        sw.Restart();
+        foreach (var d in _dispatchers)
+        {
+            try { await d.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex)
+            { _logger.LogWarning(ex, "dispatcher dispose threw"); }
+        }
+        _dispatchers.Clear();
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=close-dispatchers duration={DurationMs}ms", sw.ElapsedMilliseconds);
+
+        totalSw.Stop();
+        _logger.LogInformation("graceful shutdown complete totalDuration={TotalMs}ms", totalSw.ElapsedMilliseconds);
     }
 }

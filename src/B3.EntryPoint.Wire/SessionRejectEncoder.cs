@@ -29,6 +29,10 @@ public static class SessionRejectEncoder
     public static class TerminationCode
     {
         public const byte Unspecified = 0;
+        /// <summary>Sender announces a clean session termination (graceful
+        /// shutdown). Used by the host on SIGTERM (issue #171) so clients
+        /// can distinguish an orderly drain from an abrupt RST/timeout.</summary>
+        public const byte Finished = 1;
         /// <summary>Peer sent an application message before completing
         /// FIXP <c>Negotiate</c>. Spec §4.5 strict-gating rule.</summary>
         public const byte Unnegotiated = 2;
