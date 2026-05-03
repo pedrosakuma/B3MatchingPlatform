@@ -135,6 +135,7 @@ when the bounded queue is full (`DropWrite`).
 | --- | --- | --- |
 | `/channel/{ch}/snapshot-now` | POST | Force the next snapshot rotation tick to fire. Useful for triggering a recovery-bootstrap window for a freshly connected MD consumer. |
 | `/channel/{ch}/bump-version` | POST | Advance the channel's `SessionVerId` (snapshot generation), forcing consumers to re-bootstrap. |
+| `/channel/{ch}/trade-bust/{tradeId}` | POST | Publish a `TradeBust_57` (trade reversal) on the incremental channel. Required query: `securityId`. Optional: `priceMantissa`, `size`, `tradeDate` (LocalMktDate; days since 1970-01-01, default = today UTC). The simulator does not retain a per-trade audit log — the operator supplies the echo fields the consumer audits. The bust frame is stamped with the engine's next `RptSeq` so the per-instrument sequence stays dense. |
 
 ### 2.5 Daily reset — `/admin/daily-reset`
 
@@ -266,6 +267,23 @@ curl -X POST http://127.0.0.1:8080/channel/84/bump-version
 
 Expected: `SessionVerId` on emitted frames increments; conformant
 consumers detect the version bump and replay snapshot → incremental.
+
+### 5.2.1 Replay a trade-bust (trade reversal)
+
+Goal: exercise the consumer's `TradeBust` handler end-to-end. The
+simulator does not record per-trade history, so the operator supplies
+the trade ID being busted plus the price/size echo fields.
+
+```bash
+# tradeId is in the path; securityId is required, the rest is optional.
+curl -X POST 'http://127.0.0.1:8080/channel/84/trade-bust/4242?securityId=900000000001&priceMantissa=2505000&size=100'
+```
+
+Expected: a single `TradeBust_57` frame on the incremental channel,
+stamped with the next available `RptSeq` (so the per-instrument
+sequence stays dense). The matching engine itself is not mutated — the
+bust is purely a market-data event the consumer's bust path must
+process by removing the matching trade from any aggregated counters.
 
 ### 5.3 EntryPoint Suspend → re-attach (FIXP)
 

@@ -289,6 +289,60 @@ public class ChannelDispatcherTests
     }
 
     [Fact]
+    public void OperatorTradeBust_EmitsSinglePacketWithBustFrame_AndAllocatesNextRptSeq()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        // Seed one resting order so the engine's RptSeq counter is non-zero.
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        uint rptBefore = GetEngine(disp).CurrentRptSeq;
+        Assert.True(rptBefore > 0);
+        pkt.Packets.Clear();
+        uint seqBefore = disp.SequenceNumber;
+        ushort versionBefore = disp.SequenceVersion;
+
+        Assert.True(disp.EnqueueOperatorTradeBust(securityId: Petr,
+            priceMantissa: Px(10m), size: 100, tradeId: 4242, tradeDate: 19_500));
+        DrainInbound(disp);
+
+        // Engine RptSeq was bumped exactly once by the bust.
+        Assert.Equal(rptBefore + 1, GetEngine(disp).CurrentRptSeq);
+
+        // Single bust packet emitted on the incremental channel.
+        Assert.Single(pkt.Packets);
+        var packet = pkt.Packets[0];
+        int expectedLen = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize + WireOffsets.TradeBustBlockLength;
+        Assert.Equal(expectedLen, packet.Length);
+
+        // Packet header: same SequenceVersion, monotonic SequenceNumber.
+        Assert.Equal(versionBefore, MemoryMarshal.Read<ushort>(packet.AsSpan(WireOffsets.PacketHeaderSequenceVersionOffset, 2)));
+        Assert.Equal(seqBefore + 1, MemoryMarshal.Read<uint>(packet.AsSpan(WireOffsets.PacketHeaderSequenceNumberOffset, 4)));
+
+        // SBE TemplateId == 57 (TradeBust).
+        int sbeHdrStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize;
+        ushort templateId = MemoryMarshal.Read<ushort>(packet.AsSpan(sbeHdrStart + 2, 2));
+        Assert.Equal((ushort)57, templateId);
+
+        // Body: SecurityId + tradeId + rptSeq match.
+        int bodyStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        Assert.Equal(Petr, MemoryMarshal.Read<long>(packet.AsSpan(bodyStart + WireOffsets.TradeBustBodySecurityIdOffset, 8)));
+        Assert.Equal(4242u, MemoryMarshal.Read<uint>(packet.AsSpan(bodyStart + WireOffsets.TradeBustBodyTradeIdOffset, 4)));
+        Assert.Equal(rptBefore + 1, MemoryMarshal.Read<uint>(packet.AsSpan(bodyStart + WireOffsets.TradeBustBodyRptSeqOffset, 4)));
+
+        // Engine state untouched: book still has the seeded order.
+        Assert.Equal(1, GetEngine(disp).OrderCount(Petr));
+
+        // No execution reports flowed back to the FakeSession — the bust is
+        // purely a market-data event.
+        Assert.Empty(reply.Trades);
+        Assert.Empty(reply.Cancels);
+    }
+
+    [Fact]
     public void OperatorBumpVersion_ClearsBook_BumpsVersions_EmitsChannelResetPacket()
     {
         var (disp, pkt, outbound) = NewDispatcher();

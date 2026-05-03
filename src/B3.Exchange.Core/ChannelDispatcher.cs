@@ -193,6 +193,28 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         FlushPacket();
     }
 
+    /// <summary>
+    /// Operator-triggered trade-bust replay (issue #15). Synthesises a
+    /// <c>TradeBust_57</c> frame on the incremental channel using the
+    /// next available <see cref="MatchingEngine.AllocateNextRptSeq"/>.
+    /// The bust is flushed as a single-message packet under the current
+    /// SequenceVersion. No engine state is mutated — the matching engine
+    /// is unaware that a previously-emitted trade has been busted.
+    /// </summary>
+    private void ProcessTradeBust(OperatorTradeBust bust)
+    {
+        uint rptSeq = _engine.AllocateNextRptSeq();
+        _packetWritten = 0;
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength);
+        int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
+            bust.SecurityId, bust.PriceMantissa, bust.Size, bust.TradeId, bust.TradeDate,
+            _nowNanos(), rptSeq);
+        Commit(written);
+        FlushPacket();
+    }
+
     internal void ProcessOne(in WorkItem item)
     {
         if (item.Kind == WorkKind.SnapshotRotation || item.Kind == WorkKind.OperatorSnapshotNow)
@@ -207,6 +229,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         if (item.Kind == WorkKind.OperatorBumpVersion)
         {
             ProcessBumpVersion();
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorTradeBust)
+        {
+            ProcessTradeBust(item.TradeBust!);
             return;
         }
 
@@ -523,6 +551,23 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBumpVersion, default, 0, false,
             0, 0, null, null, null, null));
 
+    /// <summary>
+    /// Operator command (issue #15): publishes a <c>TradeBust_57</c> frame
+    /// for a previously-emitted trade identified by
+    /// (<paramref name="securityId"/>, <paramref name="tradeId"/>). The
+    /// price/size/date echo fields are caller-supplied — the simulator
+    /// does not retain a per-trade audit log. The bust frame is stamped
+    /// with the next available <c>RptSeq</c> from the channel's matching
+    /// engine and emitted under the current <c>SequenceVersion</c>.
+    /// Returns <c>false</c> if the inbound queue is full. Safe to call
+    /// from any thread.
+    /// </summary>
+    public bool EnqueueOperatorTradeBust(long securityId, long priceMantissa, long size,
+        uint tradeId, ushort tradeDate)
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorTradeBust, default, 0, false,
+            0, 0, null, null, null, null,
+            TradeBust: new OperatorTradeBust(securityId, priceMantissa, size, tradeId, tradeDate)));
+
     // ====== IMatchingEventSink ======
 
     public void OnOrderAccepted(in OrderAcceptedEvent e)
@@ -655,7 +700,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _cts.Dispose();
     }
 
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust }
 
     internal sealed record WorkItem(
         WorkKind Kind,
@@ -668,7 +713,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         CancelOrderCommand? Cancel,
         ReplaceOrderCommand? Replace,
         CrossOrderCommand? Cross,
-        ResolvedMassCancel? MassCancel = null);
+        ResolvedMassCancel? MassCancel = null,
+        OperatorTradeBust? TradeBust = null);
 
     /// <summary>
     /// Per-channel mass-cancel payload after gateway-side resolution: a
@@ -676,6 +722,18 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// inbound timestamp.
     /// </summary>
     internal sealed record ResolvedMassCancel(IReadOnlyList<long> OrderIds, ulong EnteredAtNanos);
+
+    /// <summary>
+    /// Operator-triggered trade-bust payload (issue #15): identifies a
+    /// previously-published trade by (SecurityId, TradeId) and carries the
+    /// echo fields (price/size/date) the consumer audits.
+    /// </summary>
+    internal sealed record OperatorTradeBust(
+        long SecurityId,
+        long PriceMantissa,
+        long Size,
+        uint TradeId,
+        ushort TradeDate);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

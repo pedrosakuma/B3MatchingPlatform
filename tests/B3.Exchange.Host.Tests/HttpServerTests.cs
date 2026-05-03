@@ -137,6 +137,53 @@ public class HttpServerTests
     }
 
     [Fact]
+    public async Task OperatorTradeBust_Returns202_AndEmitsTradeBustOnIncrementalSink()
+    {
+        var (cfg, _) = BuildConfig();
+        var incSink = new RecordingPacketSink();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => incSink);
+        await host.StartAsync();
+        var http = host.HttpEndpoint!;
+
+        using var client = new HttpClient { BaseAddress = new Uri($"http://{http}") };
+
+        // securityId 900_000_000_001 = PETR4 (matches config/instruments-eqt.json).
+        var url = "/channel/84/trade-bust/4242?securityId=900000000001&priceMantissa=2505000&size=100&tradeDate=19500";
+        var resp = await client.PostAsync(url, content: null);
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("trade-bust", body);
+        Assert.Contains("4242", body);
+
+        // Wait for dispatcher to drain.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (incSink.Packets.Count == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+        Assert.True(incSink.Packets.Count >= 1, "expected TradeBust packet on incremental sink");
+
+        var packet = incSink.Packets[0];
+        // SBE TemplateId @ packet[16+4+2..+4] == 57.
+        ushort templateId = System.Runtime.InteropServices.MemoryMarshal.Read<ushort>(packet.AsSpan(16 + 4 + 2, 2));
+        Assert.Equal((ushort)57, templateId);
+
+        // Bad channel.
+        var unknown = await client.PostAsync("/channel/200/trade-bust/4242?securityId=1", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
+
+        // Missing securityId.
+        var missing = await client.PostAsync("/channel/84/trade-bust/4242", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, missing.StatusCode);
+
+        // Invalid securityId (zero).
+        var invalid = await client.PostAsync("/channel/84/trade-bust/4242?securityId=0", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, invalid.StatusCode);
+
+        // Invalid tradeDate (out of ushort range).
+        var badDate = await client.PostAsync("/channel/84/trade-bust/4242?securityId=900000000001&tradeDate=70000", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, badDate.StatusCode);
+    }
+
+    [Fact]
     public async Task OperatorBumpVersion_Returns202_AndEmitsChannelResetOnIncrementalSink()
     {
         var (cfg, _) = BuildConfig();

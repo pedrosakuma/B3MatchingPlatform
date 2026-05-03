@@ -66,6 +66,22 @@ public sealed class MatchingEngine
     public SelfTradePrevention SelfTradePrevention => _stp;
 
     /// <summary>
+    /// Allocates and returns the next <c>RptSeq</c> value without emitting
+    /// any matching event. Designed for the operator-triggered trade-bust
+    /// replay path (issue #15) where the dispatcher synthesises a
+    /// <c>TradeBust_57</c> frame outside the engine but must keep the
+    /// channel's <c>RptSeq</c> sequence dense. May only be invoked from the
+    /// dispatch thread; throws if called while the engine is mid-dispatch
+    /// (i.e. from inside a sink callback).
+    /// </summary>
+    public uint AllocateNextRptSeq()
+    {
+        if (_dispatching)
+            throw new InvalidOperationException("AllocateNextRptSeq called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        return ++_rptSeq;
+    }
+
+    /// <summary>
     /// Hard reset of every per-instrument book and the engine's
     /// <c>RptSeq</c> counter. Designed for the operator-initiated
     /// channel-reset path (issue #6): the dispatcher invokes this on
