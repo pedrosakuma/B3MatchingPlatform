@@ -336,7 +336,8 @@ public sealed partial class FixpSession : IAsyncDisposable
     {
         TcpTransport? bound = null;
         bound = new TcpTransport(ConnectionId, stream, _transportLogger, _sendQueueCapacity,
-            onClose: reason => OnTransportClosed(reason, bound));
+            onClose: reason => OnTransportClosed(reason, bound),
+            onSendQueueFull: _options.OnTransportSendQueueFull);
         return bound;
     }
 

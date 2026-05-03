@@ -30,6 +30,7 @@ public sealed class TcpTransport : IAsyncDisposable
     private readonly SemaphoreSlim _streamWriteLock = new(1, 1);
     private readonly long _connectionId;
     private readonly Action<string>? _onClose;
+    private readonly Action? _onSendQueueFull;
     private int _isOpen = 1;
     private long _lastOutboundTickMs;
     private Task? _sendTask;
@@ -59,7 +60,8 @@ public sealed class TcpTransport : IAsyncDisposable
     public long LastOutboundTickMs => Volatile.Read(ref _lastOutboundTickMs);
 
     public TcpTransport(long connectionId, Stream stream, ILogger<TcpTransport> logger,
-        int sendQueueCapacity, Action<string>? onClose = null)
+        int sendQueueCapacity, Action<string>? onClose = null,
+        Action? onSendQueueFull = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(logger);
@@ -67,6 +69,7 @@ public sealed class TcpTransport : IAsyncDisposable
         _stream = stream;
         _logger = logger;
         _onClose = onClose;
+        _onSendQueueFull = onSendQueueFull;
         _sendQueue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(sendQueueCapacity)
         {
             SingleReader = true,
@@ -96,6 +99,7 @@ public sealed class TcpTransport : IAsyncDisposable
     {
         if (!IsOpen) return false;
         if (_sendQueue.Writer.TryWrite(frame)) return true;
+        try { _onSendQueueFull?.Invoke(); } catch { }
         Close("send-queue-full");
         return false;
     }

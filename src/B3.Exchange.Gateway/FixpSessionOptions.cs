@@ -86,6 +86,13 @@ public sealed record FixpSessionOptions
     /// <see cref="B3.Exchange.Contracts.ThrottleMetrics.Rejected"/> on every
     /// throttle-driven BusinessMessageReject.
     /// </summary>
+    /// <summary>Optional callback invoked when the per-session
+    /// <c>TcpTransport</c> closes the connection because its bounded
+    /// outbound send queue overflowed (issue #155). The host wires this
+    /// to <c>MetricsRegistry.Transport.IncSendQueueFull()</c> so SREs can
+    /// alert on repeated overflows (typically a stuck/slow peer).</summary>
+    public Action? OnTransportSendQueueFull { get; init; }
+
     public B3.Exchange.Contracts.ThrottleMetrics? ThrottleMetrics { get; init; }
 
     public static FixpSessionOptions Default { get; } = new();
