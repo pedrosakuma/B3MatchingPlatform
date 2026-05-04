@@ -109,7 +109,7 @@ internal static partial class InboundMessageDecoder
             message = "Minimum-fill orders not supported (MinQty must be NULL)";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (routing != RoutingInstructionNull)
+        if (routing != RoutingInstructionNull && routing != RoutingInstructionDefault)
         {
             message = $"RoutingInstruction={routing} not supported";
             return InboundDecodeOutcome.UnsupportedFeature;

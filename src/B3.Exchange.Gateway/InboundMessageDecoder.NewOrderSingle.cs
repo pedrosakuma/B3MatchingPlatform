@@ -113,7 +113,7 @@ internal static partial class InboundMessageDecoder
             // #211: iceberg accepted on NewOrderSingle. The engine validates
             // MaxFloor in (0, Quantity] / lot multiple / Limit + Day|Gtc.
         }
-        if (routing != RoutingInstructionNull)
+        if (routing != RoutingInstructionNull && routing != RoutingInstructionDefault)
         {
             message = $"RoutingInstruction={routing} not supported";
             return InboundDecodeOutcome.UnsupportedFeature;
