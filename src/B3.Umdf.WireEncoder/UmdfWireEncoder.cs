@@ -608,6 +608,112 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// Writes <c>TheoreticalOpeningPrice_16</c> (V16). Returns total bytes.
+    /// Emitted on every accumulation event during an auction phase
+    /// (gap-functional §6 / Onda M · M2 / #229). When <paramref name="hasTop"/>
+    /// is false the encoder writes <c>mDUpdateAction=DELETE</c> with NULL
+    /// price and quantity, signalling the consumer to clear any prior TOP.
+    /// </summary>
+    public static int WriteTheoreticalOpeningPriceFrame(
+        Span<byte> dst,
+        long securityId,
+        bool hasTop,
+        long priceMantissa,
+        long quantity,
+        ushort tradeDate,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.TheoreticalOpeningPriceBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.TheoreticalOpeningPrice_16Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.TheoreticalOpeningPriceBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator overlays SecurityExchange at offset 8 (1 byte).
+        // Leave at 0 (no flags set).
+        body[WireOffsets.TheoreticalOpeningPriceBodyMdUpdateActionOffset] = hasTop ? (byte)0 : (byte)2;
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodyTradeDateOffset, 2), in tradeDate);
+        long pxOnWire = hasTop ? priceMantissa : long.MinValue;
+        long qtyOnWire = hasTop ? quantity : long.MinValue;
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodyMdEntryPxOffset, 8), in pxOnWire);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodyMdEntrySizeOffset, 8), in qtyOnWire);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.TheoreticalOpeningPriceBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
+    /// <summary>
+    /// <c>ImbalanceCondition</c> bitset value for "more buyers" (bit 8 set).
+    /// </summary>
+    public const ushort ImbalanceConditionMoreBuyers = 1 << 8;
+
+    /// <summary>
+    /// <c>ImbalanceCondition</c> bitset value for "more sellers" (bit 9 set).
+    /// </summary>
+    public const ushort ImbalanceConditionMoreSellers = 1 << 9;
+
+    /// <summary>
+    /// Writes <c>AuctionImbalance_19</c> (V16). Returns total bytes.
+    /// Emitted alongside <c>TheoreticalOpeningPrice_16</c> on every
+    /// accumulation event during an auction phase (gap-functional §6 /
+    /// Onda M · M2 / #229). <paramref name="imbalanceCondition"/> is
+    /// the raw bitset (0 = balanced, <see cref="ImbalanceConditionMoreBuyers"/>,
+    /// or <see cref="ImbalanceConditionMoreSellers"/>);
+    /// <paramref name="imbalanceQty"/> is the residual one-sided
+    /// quantity that would be left unmatched at the TOP price (or the
+    /// total resting on the only populated side when no crossing
+    /// exists). When the auction has cleared and there is no remaining
+    /// imbalance, pass <c>hasImbalance=false</c> and the encoder writes
+    /// <c>mDUpdateAction=DELETE</c> with NULL quantity.
+    /// </summary>
+    public static int WriteAuctionImbalanceFrame(
+        Span<byte> dst,
+        long securityId,
+        bool hasImbalance,
+        ushort imbalanceCondition,
+        long imbalanceQty,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.AuctionImbalanceBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.AuctionImbalance_19Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.AuctionImbalanceBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.AuctionImbalanceBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator at offset 8 left zeroed.
+        body[WireOffsets.AuctionImbalanceBodyMdUpdateActionOffset] = hasImbalance ? (byte)0 : (byte)2;
+        ushort cond = hasImbalance ? imbalanceCondition : (ushort)0;
+        MemoryMarshal.Write(body.Slice(WireOffsets.AuctionImbalanceBodyImbalanceConditionOffset, 2), in cond);
+        long qtyOnWire = hasImbalance ? imbalanceQty : long.MinValue;
+        MemoryMarshal.Write(body.Slice(WireOffsets.AuctionImbalanceBodyMdEntrySizeOffset, 8), in qtyOnWire);
+        MemoryMarshal.Write(body.Slice(WireOffsets.AuctionImbalanceBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.AuctionImbalanceBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

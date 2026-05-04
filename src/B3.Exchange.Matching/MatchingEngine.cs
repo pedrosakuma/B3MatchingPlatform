@@ -66,6 +66,22 @@ public sealed class MatchingEngine
     private readonly Dictionary<long, List<RestingStop>> _stopsBySymbol;
     private readonly Dictionary<long, RestingStop> _stopById;
 
+    // Issue #229 (Onda M · M2): per-instrument indicative auction state.
+    // Used by RecomputeAuctionTopIfApplicable to throttle UMDF
+    // TheoreticalOpeningPrice_16 / AuctionImbalance_19 emission so an
+    // accumulation event that does not change the indicative state does
+    // not produce duplicate frames. Entries are seeded lazily; the
+    // sentinel "no prior state" is the all-default record.
+    private readonly Dictionary<long, AuctionTopState> _auctionTopById = new();
+
+    private readonly record struct AuctionTopState(
+        bool HasTop,
+        long TopPriceMantissa,
+        long TopQuantity,
+        bool HasImbalance,
+        Side ImbalanceSide,
+        long ImbalanceQuantity);
+
     private bool _dispatching;
 
     // Single-thread invariant (issue #169). Latched on first call to any
@@ -385,6 +401,7 @@ public sealed class MatchingEngine
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownOrderId, cmd.EnteredAtNanos); return; }
 
             EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.Client);
+            RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
         }
         finally { ExitDispatch(); }
     }
@@ -539,6 +556,7 @@ public sealed class MatchingEngine
                     InsertTimestampNanos: resting.InsertTimestampNanos,
                     TransactTimeNanos: cmd.EnteredAtNanos,
                     RptSeq: NextRptSeq()));
+                RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }
 
@@ -561,6 +579,16 @@ public sealed class MatchingEngine
                 Quantity: cmd.NewQuantity,
                 EnteringFirm: resting.EnteringFirm,
                 EnteredAtNanos: cmd.EnteredAtNanos);
+
+            // Issue #228 / #229 (Onda M): in auction phases the replacement
+            // must rest like a fresh accumulation order, not aggress. The
+            // phase gate above guarantees GoodForAuction (Reserved) /
+            // AtClose (FinalClosingCall), both Limit-only.
+            if (phase == TradingPhase.Reserved || phase == TradingPhase.FinalClosingCall)
+            {
+                RestForAuction(replacement, book);
+                return;
+            }
             ExecuteAggressor(replacement, rules, book);
         }
         finally { ExitDispatch(); }
@@ -613,6 +641,137 @@ public sealed class MatchingEngine
             EnteringFirm: resting.EnteringFirm,
             InsertTimestampNanos: resting.InsertTimestampNanos,
             RptSeq: NextRptSeq()));
+
+        RecomputeAuctionTopIfApplicable(book.SecurityId, cmd.EnteredAtNanos);
+    }
+
+    /// <summary>
+    /// Issue #229 (Onda M · M2): recompute the Theoretical Opening Price
+    /// and auction imbalance for <paramref name="securityId"/>, and emit
+    /// <see cref="AuctionTopChangedEvent"/> only when the indicative
+    /// state actually changed since the last emission. Caller MUST be on
+    /// the dispatch thread and MUST only call from a code path that has
+    /// already validated <paramref name="securityId"/> against
+    /// <see cref="_booksById"/>. Hook points: post-rest in
+    /// <see cref="RestForAuction"/>, post-cancel in
+    /// <see cref="EmitCanceled"/> when phase is auction, and post-replace
+    /// when the priority-keep branch fires.
+    /// <para>
+    /// The TOP algorithm is a single linear walk over the union of buy
+    /// and sell price levels in best-first order, accumulating the
+    /// crossable buy and sell totals at each candidate price. The
+    /// matchable volume at price P is min(cumBuy@P, cumSell@P) where
+    /// cumBuy@P is the total buy quantity with price &gt;= P, and
+    /// cumSell@P is the total sell quantity with price &lt;= P. The TOP
+    /// is the price that maximizes matchable volume; ties are broken by
+    /// smallest |cumBuy - cumSell|, then by the lower price (the
+    /// reference-price tiebreak from the spec is deferred to a later
+    /// wave that wires the per-instrument seed through HostConfig).
+    /// </para>
+    /// </summary>
+    private void RecomputeAuctionTopIfApplicable(long securityId, ulong txnNanos)
+    {
+        var phase = _phaseById[securityId];
+        if (phase != TradingPhase.Reserved && phase != TradingPhase.FinalClosingCall)
+            return;
+
+        var book = _booksById[securityId];
+        var newState = ComputeAuctionTop(book);
+
+        if (_auctionTopById.TryGetValue(securityId, out var prev) && prev == newState)
+            return;
+        _auctionTopById[securityId] = newState;
+
+        _sink.OnAuctionTopChanged(new AuctionTopChangedEvent(
+            SecurityId: securityId,
+            HasTop: newState.HasTop,
+            TopPriceMantissa: newState.TopPriceMantissa,
+            TopQuantity: newState.TopQuantity,
+            HasImbalance: newState.HasImbalance,
+            ImbalanceSide: newState.ImbalanceSide,
+            ImbalanceQuantity: newState.ImbalanceQuantity,
+            TransactTimeNanos: txnNanos,
+            RptSeq: NextRptSeq()));
+    }
+
+    private static AuctionTopState ComputeAuctionTop(LimitOrderBook book)
+    {
+        // Snapshot both sides; bids enumerated highest-first, asks
+        // enumerated lowest-first (each is best-first per book).
+        var bids = new List<(long Px, long Qty)>();
+        foreach (var lvl in book.EnumerateLevels(Side.Buy))
+            bids.Add(lvl);
+        var asks = new List<(long Px, long Qty)>();
+        foreach (var lvl in book.EnumerateLevels(Side.Sell))
+            asks.Add(lvl);
+
+        long buyTotal = 0;
+        foreach (var (_, q) in bids) buyTotal += q;
+        long sellTotal = 0;
+        foreach (var (_, q) in asks) sellTotal += q;
+
+        // No crossing: best bid < best ask, or one side empty.
+        bool anyCross = bids.Count > 0 && asks.Count > 0 && bids[0].Px >= asks[0].Px;
+        if (!anyCross)
+        {
+            if (buyTotal == 0 && sellTotal == 0)
+                return default;
+            // Imbalance is "all of the populated side" — there is no TOP
+            // and the entire one-sided book is the residual.
+            if (buyTotal > sellTotal)
+                return new AuctionTopState(false, 0, 0, true, Side.Buy, buyTotal - sellTotal);
+            if (sellTotal > buyTotal)
+                return new AuctionTopState(false, 0, 0, true, Side.Sell, sellTotal - buyTotal);
+            // Both sides equal nonzero with no crossing — extremely rare
+            // (would require one side empty, contradicting the totals).
+            return new AuctionTopState(false, 0, 0, false, Side.Buy, 0);
+        }
+
+        // Build the candidate price set: every distinct price in either
+        // side. Walk best-first on bids and asks, maintaining running
+        // cumulatives. To get cumBuy@P (qty with bid >= P) and
+        // cumSell@P (qty with ask <= P) we sort the union ascending in
+        // PRICE and scan once.
+        var candidates = new SortedSet<long>();
+        foreach (var (px, _) in bids) candidates.Add(px);
+        foreach (var (px, _) in asks) candidates.Add(px);
+
+        long bestMatched = -1;
+        long bestImbalance = long.MaxValue;
+        long bestPx = 0;
+        long bestCumBuy = 0;
+        long bestCumSell = 0;
+        foreach (var px in candidates)
+        {
+            long cumBuy = 0;
+            foreach (var (bpx, bqty) in bids)
+                if (bpx >= px) cumBuy += bqty;
+            long cumSell = 0;
+            foreach (var (apx, aqty) in asks)
+                if (apx <= px) cumSell += aqty;
+            long matched = Math.Min(cumBuy, cumSell);
+            if (matched <= 0) continue;
+            long imbalance = Math.Abs(cumBuy - cumSell);
+            if (matched > bestMatched
+                || (matched == bestMatched && imbalance < bestImbalance)
+                || (matched == bestMatched && imbalance == bestImbalance && px < bestPx))
+            {
+                bestMatched = matched;
+                bestImbalance = imbalance;
+                bestPx = px;
+                bestCumBuy = cumBuy;
+                bestCumSell = cumSell;
+            }
+        }
+
+        if (bestMatched <= 0)
+            return default;
+
+        long resid = bestCumBuy - bestCumSell;
+        bool hasImb = resid != 0;
+        Side imbSide = resid > 0 ? Side.Buy : Side.Sell;
+        long imbQty = Math.Abs(resid);
+        return new AuctionTopState(true, bestPx, bestMatched, hasImb, imbSide, imbQty);
     }
 
 

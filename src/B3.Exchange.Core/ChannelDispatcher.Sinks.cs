@@ -105,6 +105,43 @@ public sealed partial class ChannelDispatcher
         Commit(n);
     }
 
+    public void OnAuctionTopChanged(in AuctionTopChangedEvent e)
+    {
+        AssertOnLoopThread();
+
+        var topDst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.TheoreticalOpeningPriceBlockLength);
+        int nTop = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTheoreticalOpeningPriceFrame(
+            topDst,
+            securityId: e.SecurityId,
+            hasTop: e.HasTop,
+            priceMantissa: e.TopPriceMantissa,
+            quantity: e.TopQuantity,
+            tradeDate: _tradeDate,
+            mdEntryTimestampNanos: e.TransactTimeNanos,
+            rptSeq: e.RptSeq);
+        Commit(nTop);
+
+        ushort cond = e.HasImbalance
+            ? (e.ImbalanceSide == Side.Buy
+                ? B3.Umdf.WireEncoder.UmdfWireEncoder.ImbalanceConditionMoreBuyers
+                : B3.Umdf.WireEncoder.UmdfWireEncoder.ImbalanceConditionMoreSellers)
+            : (ushort)0;
+        var imbDst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.AuctionImbalanceBlockLength);
+        int nImb = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteAuctionImbalanceFrame(
+            imbDst,
+            securityId: e.SecurityId,
+            hasImbalance: e.HasImbalance,
+            imbalanceCondition: cond,
+            imbalanceQty: e.ImbalanceQuantity,
+            mdEntryTimestampNanos: e.TransactTimeNanos,
+            rptSeq: e.RptSeq);
+        Commit(nImb);
+    }
+
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
         AssertOnLoopThread();

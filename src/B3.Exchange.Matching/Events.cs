@@ -162,6 +162,40 @@ public readonly record struct IcebergReplenishedEvent(
     uint AddRptSeq);
 
 /// <summary>
+/// Fired during an auction phase whenever the indicative state of the
+/// auction changes (TOP price, TOP quantity, or imbalance side/size).
+/// Issue #229 (Onda M · M2). The integration layer translates this into
+/// a paired UMDF emission: <c>TheoreticalOpeningPrice_16</c> +
+/// <c>AuctionImbalance_19</c>. The engine throttles emission so an
+/// accumulation event that does not change the indicative state does
+/// not produce duplicate frames.
+/// <para>
+/// When <see cref="HasTop"/> is false there is no crossing in the book
+/// (one side is empty, or the best bid is below the best ask). The
+/// integration layer encodes the TOP frame with <c>mDUpdateAction=DELETE</c>
+/// and NULL price/qty so any prior TOP value at the consumer is
+/// invalidated.
+/// </para>
+/// <para>
+/// <see cref="ImbalanceSide"/> is <see cref="Side.Buy"/> for "more
+/// buyers" and <see cref="Side.Sell"/> for "more sellers"; it is
+/// undefined when <see cref="HasImbalance"/> is false (the auction is
+/// perfectly balanced and would clear with no leftover at the TOP
+/// price).
+/// </para>
+/// </summary>
+public readonly record struct AuctionTopChangedEvent(
+    long SecurityId,
+    bool HasTop,
+    long TopPriceMantissa,
+    long TopQuantity,
+    bool HasImbalance,
+    Side ImbalanceSide,
+    long ImbalanceQuantity,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// Fired when a stop order (StopLoss or StopLimit) is accepted by the
 /// engine and parked off-book in the per-instrument trigger book.
 /// Issue #214. Carries the original order parameters so the integration
@@ -294,4 +328,12 @@ public interface IMatchingEventSink
     /// never on the book.
     /// </summary>
     void OnStopOrderCanceled(in StopOrderCanceledEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted during an auction phase when the
+    /// indicative TOP / imbalance state changes (issue #229). Default
+    /// no-op; production sink fans out to UMDF
+    /// <c>TheoreticalOpeningPrice_16</c> + <c>AuctionImbalance_19</c>.
+    /// </summary>
+    void OnAuctionTopChanged(in AuctionTopChangedEvent e) { }
 }

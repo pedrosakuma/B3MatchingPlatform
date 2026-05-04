@@ -165,6 +165,40 @@ public static class WireOffsets
     public const int SecurityGroupPhaseBodyTradSesOpenTimeOffset = 16;
     public const int SecurityGroupPhaseBodyTransactTimeOffset = 24;
 
+    // ---- TheoreticalOpeningPrice_16 (V16) ----
+    // Body layout (BLOCK_LENGTH=40): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); mDUpdateAction@9
+    // (byte, 0=NEW / 2=DELETE); tradeDate@10 (ushort, LocalMktDate);
+    // mDEntryPx@12 (long mantissa, /10000; long.MinValue = NULL);
+    // mDEntrySize@20 (long; long.MinValue = NULL); mDEntryTimestamp@28
+    // (ulong nanos); rptSeq@36 (uint, 0 = NULL).
+    public const int TheoreticalOpeningPriceBlockLength = 40;
+    public const int TheoreticalOpeningPriceBodySecurityIdOffset = 0;
+    public const int TheoreticalOpeningPriceBodyMatchEventIndicatorOffset = 8;
+    public const int TheoreticalOpeningPriceBodyMdUpdateActionOffset = 9;
+    public const int TheoreticalOpeningPriceBodyTradeDateOffset = 10;
+    public const int TheoreticalOpeningPriceBodyMdEntryPxOffset = 12;
+    public const int TheoreticalOpeningPriceBodyMdEntrySizeOffset = 20;
+    public const int TheoreticalOpeningPriceBodyMdEntryTimestampOffset = 28;
+    public const int TheoreticalOpeningPriceBodyRptSeqOffset = 36;
+
+    // ---- AuctionImbalance_19 (V16) ----
+    // Body layout (BLOCK_LENGTH=32): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); mDUpdateAction@9
+    // (byte, 0=NEW / 2=DELETE); imbalanceCondition@10 (ushort bitset:
+    // bit 8 = MoreBuyers, bit 9 = MoreSellers, all-zero = balanced);
+    // mDEntrySize@12 (long; remaining auction qty on the imbalance side;
+    // long.MinValue = NULL); mDEntryTimestamp@20 (ulong nanos);
+    // rptSeq@28 (uint, 0 = NULL).
+    public const int AuctionImbalanceBlockLength = 32;
+    public const int AuctionImbalanceBodySecurityIdOffset = 0;
+    public const int AuctionImbalanceBodyMatchEventIndicatorOffset = 8;
+    public const int AuctionImbalanceBodyMdUpdateActionOffset = 9;
+    public const int AuctionImbalanceBodyImbalanceConditionOffset = 10;
+    public const int AuctionImbalanceBodyMdEntrySizeOffset = 12;
+    public const int AuctionImbalanceBodyMdEntryTimestampOffset = 20;
+    public const int AuctionImbalanceBodyRptSeqOffset = 28;
+
     // ---- ChannelReset_11 (V16) ----
     // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
     // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then

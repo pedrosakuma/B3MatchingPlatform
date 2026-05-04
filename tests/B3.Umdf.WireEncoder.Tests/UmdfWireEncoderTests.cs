@@ -56,7 +56,7 @@ public class UmdfWireEncoderTests
 
         Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.OrderBlockLength), out var rdr));
-        Assert.Equal(900_000_000_001L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(0x12340000_00000005L, (long)rdr.Data.SecondaryOrderID.Value);
         Assert.Equal(MDEntryType.BID, rdr.Data.MDEntryType);
         Assert.Equal(MDUpdateAction.NEW, rdr.Data.MDUpdateAction);
@@ -77,7 +77,7 @@ public class UmdfWireEncoderTests
 
         Assert.True(DeleteOrder_MBO_51Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.DeleteOrderBlockLength), out var rdr));
-        Assert.Equal(42L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(42L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(MDEntryType.OFFER, rdr.Data.MDEntryType);
         Assert.Equal(200L, rdr.Data.MDEntrySize.Value);
         Assert.Equal(0xABCDEF12345L, (long)rdr.Data.SecondaryOrderID.Value);
@@ -109,7 +109,7 @@ public class UmdfWireEncoderTests
         Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.TradeBlockLength, n);
 
         Assert.True(Trade_53Data.TryParse(buf.AsSpan(FrameOffset, WireOffsets.TradeBlockLength), out var rdr));
-        Assert.Equal(5L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(5L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(250_5000L, rdr.Data.MDEntryPx.Mantissa);
         Assert.Equal(100L, rdr.Data.MDEntrySize.Value);
         Assert.Equal(7u, rdr.Data.TradeID.Value);
@@ -133,7 +133,7 @@ public class UmdfWireEncoderTests
         Assert.Equal((ushort)n, msgLen);
 
         Assert.True(TradeBust_57Data.TryParse(buf.AsSpan(FrameOffset, WireOffsets.TradeBustBlockLength), out var rdr));
-        Assert.Equal(900_000_000_001L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(250_5000L, rdr.Data.MDEntryPx.Mantissa);
         Assert.Equal(100L, rdr.Data.MDEntrySize.Value);
         Assert.Equal(7u, rdr.Data.TradeID.Value);
@@ -163,7 +163,7 @@ public class UmdfWireEncoderTests
 
         Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var rdr));
-        Assert.Equal(7L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(7L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(3u, rdr.Data.TotNumReports);
         Assert.Equal(2u, rdr.Data.TotNumBids);
         Assert.Equal(1u, rdr.Data.TotNumOffers);
@@ -202,7 +202,7 @@ public class UmdfWireEncoderTests
         // Decode group via SBE reader
         var bodySpan = buf.AsSpan(FrameOffset);
         Assert.True(SnapshotFullRefresh_Orders_MBO_71Data.TryParse(bodySpan, out var rdr));
-        Assert.Equal(7L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(7L, (long)(ulong)rdr.Data.SecurityID.Value);
 
         // Walk the repeating group manually using the offsets the encoder used,
         // since the generated reader's group iterator API varies.
@@ -324,7 +324,7 @@ public class UmdfWireEncoderTests
         Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.EmptyBookBlockLength, n);
         Assert.True(EmptyBook_9Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.EmptyBookBlockLength), out var rdr));
-        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.MDEntryTimestamp.Time);
     }
 
@@ -339,7 +339,7 @@ public class UmdfWireEncoderTests
 
         Assert.True(MassDeleteOrders_MBO_52Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.MassDeleteOrdersBlockLength), out var rdr));
-        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(MDEntryType.BID, rdr.Data.MDEntryType);
         Assert.Equal(MDUpdateAction.DELETE_THRU, rdr.Data.MDUpdateAction);
         Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
@@ -362,7 +362,7 @@ public class UmdfWireEncoderTests
         Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecurityStatusBlockLength, n);
         Assert.True(SecurityStatus_3Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.SecurityStatusBlockLength), out var rdr));
-        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(SecurityTradingStatus.OPEN, rdr.Data.SecurityTradingStatus);
         Assert.Null(rdr.Data.SecurityTradingEvent);
         Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
@@ -393,6 +393,75 @@ public class UmdfWireEncoderTests
         // Verify the group bytes were written at offset 0.
         var groupSlice = buf.AsSpan(FrameOffset, 4).ToArray();
         Assert.Equal(group, groupSlice);
+    }
+
+    [Fact]
+    public void TheoreticalOpeningPrice_Roundtrip_HasTop()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteTheoreticalOpeningPriceFrame(buf,
+            securityId: 900_000_000_001L,
+            hasTop: true,
+            priceMantissa: 100_500L,
+            quantity: 300L,
+            tradeDate: 9000,
+            mdEntryTimestampNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 7);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.TheoreticalOpeningPriceBlockLength, n);
+        Assert.True(TheoreticalOpeningPrice_16Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.TheoreticalOpeningPriceBlockLength), out var rdr));
+        Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID);
+        Assert.Equal(MDUpdateAction.NEW, rdr.Data.MDUpdateAction);
+        Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
+        Assert.Equal(100_500L, rdr.Data.MDEntryPx.Mantissa);
+        Assert.Equal(300L, rdr.Data.MDEntrySize);
+        Assert.Equal(7u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void TheoreticalOpeningPrice_NoTop_WritesDeleteAndNullValues()
+    {
+        var buf = new byte[80];
+        UmdfWireEncoder.WriteTheoreticalOpeningPriceFrame(buf,
+            securityId: 1L, hasTop: false, priceMantissa: 0, quantity: 0,
+            tradeDate: 0, mdEntryTimestampNanos: 1, rptSeq: 1);
+        Assert.True(TheoreticalOpeningPrice_16Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.TheoreticalOpeningPriceBlockLength), out var rdr));
+        Assert.Equal(MDUpdateAction.DELETE, rdr.Data.MDUpdateAction);
+        Assert.Null(rdr.Data.MDEntrySize);
+    }
+
+    [Fact]
+    public void AuctionImbalance_Roundtrip_HasImbalance_MoreBuyers()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteAuctionImbalanceFrame(buf,
+            securityId: 900_000_000_001L,
+            hasImbalance: true,
+            imbalanceCondition: UmdfWireEncoder.ImbalanceConditionMoreBuyers,
+            imbalanceQty: 200L,
+            mdEntryTimestampNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 9);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.AuctionImbalanceBlockLength, n);
+        Assert.True(AuctionImbalance_19Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.AuctionImbalanceBlockLength), out var rdr));
+        Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID);
+        Assert.Equal(MDUpdateAction.NEW, rdr.Data.MDUpdateAction);
+        Assert.Equal(200L, rdr.Data.MDEntrySize);
+        Assert.Equal(9u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void AuctionImbalance_NoImbalance_WritesDeleteAndNullQty()
+    {
+        var buf = new byte[80];
+        UmdfWireEncoder.WriteAuctionImbalanceFrame(buf,
+            securityId: 1L, hasImbalance: false, imbalanceCondition: 0,
+            imbalanceQty: 0, mdEntryTimestampNanos: 1, rptSeq: 1);
+        Assert.True(AuctionImbalance_19Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.AuctionImbalanceBlockLength), out var rdr));
+        Assert.Equal(MDUpdateAction.DELETE, rdr.Data.MDUpdateAction);
+        Assert.Null(rdr.Data.MDEntrySize);
     }
 
     [Fact]

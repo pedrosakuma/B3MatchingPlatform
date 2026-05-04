@@ -45,6 +45,7 @@ internal sealed class RecordingSink : IMatchingEventSink
     public List<StopOrderAcceptedEvent> StopAccepted => Events.OfType<StopOrderAcceptedEvent>().ToList();
     public List<StopOrderTriggeredEvent> StopTriggered => Events.OfType<StopOrderTriggeredEvent>().ToList();
     public List<StopOrderCanceledEvent> StopCanceled => Events.OfType<StopOrderCanceledEvent>().ToList();
+    public List<AuctionTopChangedEvent> AuctionTops => Events.OfType<AuctionTopChangedEvent>().ToList();
     public void Clear() => Events.Clear();
     public void OnOrderAccepted(in OrderAcceptedEvent e) => Events.Add(e);
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e) => Events.Add(e);
@@ -59,4 +60,5 @@ internal sealed class RecordingSink : IMatchingEventSink
     public void OnStopOrderAccepted(in StopOrderAcceptedEvent e) => Events.Add(e);
     public void OnStopOrderTriggered(in StopOrderTriggeredEvent e) => Events.Add(e);
     public void OnStopOrderCanceled(in StopOrderCanceledEvent e) => Events.Add(e);
+    public void OnAuctionTopChanged(in AuctionTopChangedEvent e) => Events.Add(e);
 }
