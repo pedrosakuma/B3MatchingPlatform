@@ -213,6 +213,20 @@ public sealed class MatchingEngine
             if (cmd.MinQty != 0 && (long)cmd.MinQty > cmd.Quantity)
             { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
 
+            // #211: iceberg validation. MaxFloor in (0, Quantity], multiple
+            // of lot, and only meaningful for resting limit orders. Market
+            // / IOC / FOK / Gtd / AtClose / GoodForAuction would never let
+            // hidden qty replenish, so reject them.
+            if (cmd.MaxFloor != 0)
+            {
+                if ((long)cmd.MaxFloor > cmd.Quantity
+                    || (long)cmd.MaxFloor % rules.LotSize != 0)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+                if (cmd.Type != OrderType.Limit
+                    || (cmd.Tif != TimeInForce.Day && cmd.Tif != TimeInForce.Gtc))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+            }
+
             if (cmd.Type == OrderType.Limit)
             {
                 if (cmd.PriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
@@ -549,6 +563,66 @@ public sealed class MatchingEngine
 
                 if (maker.RemainingQuantity == 0)
                 {
+                    // #211: iceberg replenish — if the maker has hidden
+                    // reserve, the visible slice was just exhausted but
+                    // the order is not yet fully filled. Take a fresh
+                    // visible slice from the hidden reserve, re-insert
+                    // at the BACK of the same price level (time-priority
+                    // loss), and emit IcebergReplenishedEvent so the
+                    // sink can flush a paired Delete + Add MBO frame
+                    // for the same OrderID. The aggressor does NOT
+                    // re-cross the replenished slice in the same dispatch
+                    // (loop iterates via the pre-captured `next`), which
+                    // matches the spec's "loses time priority" guarantee.
+                    if (maker.HiddenQuantity > 0)
+                    {
+                        long newVisible = Math.Min(maker.MaxFloor, maker.HiddenQuantity);
+                        long newHidden = maker.HiddenQuantity - newVisible;
+                        var icebergSide = maker.Side;
+                        long icebergPx = maker.PriceMantissa;
+                        long icebergOid = maker.OrderId;
+                        // Atomically: remove from current spot, mutate
+                        // visible/hidden counters, re-insert at tail of
+                        // same level. The book.Remove + book.Insert pair
+                        // is correct even if this is the only order at
+                        // the level (Insert recreates the level).
+                        book.Remove(maker);
+                        maker.RemainingQuantity = newVisible;
+                        maker.HiddenQuantity = newHidden;
+                        // Reset insert timestamp to the trade time — the
+                        // replenished slice is logically a fresh entry at
+                        // the back of the queue.
+                        var refreshed = new RestingOrder
+                        {
+                            OrderId = icebergOid,
+                            ClOrdId = maker.ClOrdId,
+                            Side = icebergSide,
+                            PriceMantissa = icebergPx,
+                            EnteringFirm = maker.EnteringFirm,
+                            InsertTimestampNanos = cmd.EnteredAtNanos,
+                            RemainingQuantity = newVisible,
+                            Tif = maker.Tif,
+                            MaxFloor = maker.MaxFloor,
+                            HiddenQuantity = newHidden,
+                        };
+                        book.Insert(refreshed);
+                        uint deleteSeq = NextRptSeq();
+                        uint addSeq = NextRptSeq();
+                        _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
+                            SecurityId: book.SecurityId,
+                            OrderId: icebergOid,
+                            Side: icebergSide,
+                            PriceMantissa: icebergPx,
+                            NewVisibleQuantity: newVisible,
+                            RemainingHiddenQuantity: newHidden,
+                            InsertTimestampNanos: cmd.EnteredAtNanos,
+                            TransactTimeNanos: cmd.EnteredAtNanos,
+                            DeleteRptSeq: deleteSeq,
+                            AddRptSeq: addSeq));
+                        maker = next;
+                        continue;
+                    }
+
                     // Maker fully filled → remove + OnOrderFilled.
                     long finalFilled = tradeQty; // For simplicity OrderFilledEvent reports
                                                  // the LAST trade's qty; downstream cares
@@ -621,6 +695,16 @@ public sealed class MatchingEngine
         }
 
         // Day/GTC order with remainder rests on the book.
+        // Day/GTC order with remainder rests on the book. For iceberg
+        // orders (#211), expose only the visible slice on the book and
+        // hold the rest as HiddenQuantity for replenish on consumption.
+        long visible = aggressorRemaining;
+        long hidden = 0;
+        if (cmd.MaxFloor != 0 && (long)cmd.MaxFloor < aggressorRemaining)
+        {
+            visible = (long)cmd.MaxFloor;
+            hidden = aggressorRemaining - visible;
+        }
         var resting = new RestingOrder
         {
             OrderId = aggressorOrderIdForTrades,
@@ -629,8 +713,10 @@ public sealed class MatchingEngine
             PriceMantissa = limitPx,
             EnteringFirm = cmd.EnteringFirm,
             InsertTimestampNanos = cmd.EnteredAtNanos,
-            RemainingQuantity = aggressorRemaining,
+            RemainingQuantity = visible,
             Tif = cmd.Tif,
+            MaxFloor = (long)cmd.MaxFloor,
+            HiddenQuantity = hidden,
         };
         book.Insert(resting);
         _sink.OnOrderAccepted(new OrderAcceptedEvent(

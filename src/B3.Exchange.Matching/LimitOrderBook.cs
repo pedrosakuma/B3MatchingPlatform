@@ -23,6 +23,25 @@ internal sealed class RestingOrder
     /// </summary>
     public TimeInForce Tif { get; init; } = TimeInForce.Day;
 
+    /// <summary>
+    /// Iceberg visible-slice size (FIX MaxFloor). 0 means "not an iceberg"
+    /// and <see cref="HiddenQuantity"/> is always 0 in that case. When
+    /// non-zero, <see cref="RemainingQuantity"/> represents only the
+    /// visible portion currently exposed in the book; the hidden reserve
+    /// lives in <see cref="HiddenQuantity"/> and replenishes the visible
+    /// slice when it is fully consumed (the order is then re-inserted at
+    /// the back of the same price level, losing time priority).
+    /// Issue #211.
+    /// </summary>
+    public long MaxFloor { get; init; }
+
+    /// <summary>
+    /// Hidden iceberg reserve. Mutable: decreases each time a fresh
+    /// visible slice is taken from it. Always 0 when
+    /// <see cref="MaxFloor"/> is 0. Issue #211.
+    /// </summary>
+    public long HiddenQuantity;
+
     public long RemainingQuantity;
     public PriceLevel? Level;
     public RestingOrder? Prev;

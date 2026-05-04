@@ -163,6 +163,25 @@ public sealed record NewOrderCommand(
     /// Issue #203 (MinQty subset).
     /// </summary>
     public ulong MinQty { get; init; }
+
+    /// <summary>
+    /// Optional iceberg visible quantity (FIX MaxFloor). When non-zero
+    /// and strictly less than <see cref="Quantity"/>, the engine exposes
+    /// only <c>MaxFloor</c> shares at a time on the book; on full
+    /// consumption of the visible slice the engine replenishes a new
+    /// visible slice from the hidden reserve and re-inserts the order at
+    /// the back of the same price level, losing time priority. Must
+    /// satisfy <c>0 &lt; MaxFloor &lt;= Quantity</c> and be a multiple of
+    /// the instrument's lot size; values outside that range yield
+    /// <see cref="RejectReason.InvalidField"/>. Iceberg requires
+    /// <see cref="OrderType.Limit"/> and a resting TIF
+    /// (<see cref="TimeInForce.Day"/> or <see cref="TimeInForce.Gtc"/>);
+    /// IOC/FOK/Market combinations are rejected with
+    /// <see cref="RejectReason.InvalidField"/>. <c>MaxFloor == Quantity</c>
+    /// is accepted as a no-op (degenerate iceberg with no hidden reserve).
+    /// Default 0 means "not an iceberg". Issue #211.
+    /// </summary>
+    public ulong MaxFloor { get; init; }
 }
 
 public sealed record CancelOrderCommand(
