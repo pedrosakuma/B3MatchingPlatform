@@ -130,6 +130,41 @@ public static class WireOffsets
     public const int MassDeleteOrdersBodyTransactTimeOffset = 16;
     public const int MassDeleteOrdersBodyRptSeqOffset = 24;
 
+    // ---- SecurityStatus_3 (V16) ----
+    // Body layout (BLOCK_LENGTH=36): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); tradingSessionID@9
+    // (byte); securityTradingStatus@10 (byte); securityTradingEvent@11
+    // (byte, 255 = NULL); tradeDate@12 (ushort, LocalMktDate); pad@14;
+    // tradSesOpenTime@16 (ulong nanos); transactTime@24 (ulong nanos);
+    // rptSeq@32 (uint, 0 = NULL).
+    public const int SecurityStatusBlockLength = 36;
+    public const int SecurityStatusBodySecurityIdOffset = 0;
+    public const int SecurityStatusBodyMatchEventIndicatorOffset = 8;
+    public const int SecurityStatusBodyTradingSessionIdOffset = 9;
+    public const int SecurityStatusBodySecurityTradingStatusOffset = 10;
+    public const int SecurityStatusBodySecurityTradingEventOffset = 11;
+    public const int SecurityStatusBodyTradeDateOffset = 12;
+    public const int SecurityStatusBodyTradSesOpenTimeOffset = 16;
+    public const int SecurityStatusBodyTransactTimeOffset = 24;
+    public const int SecurityStatusBodyRptSeqOffset = 32;
+
+    // ---- SecurityGroupPhase_10 (V16) ----
+    // Body layout (BLOCK_LENGTH=32): securityGroup@0 (8-byte char array);
+    // matchEventIndicator@8 (byte); tradingSessionID@9 (byte);
+    // tradingSessionSubID@10 (byte); securityTradingEvent@11 (byte,
+    // 255 = NULL); tradeDate@12 (ushort, LocalMktDate); pad@14;
+    // tradSesOpenTime@16 (ulong nanos); transactTime@24 (ulong nanos).
+    public const int SecurityGroupPhaseBlockLength = 32;
+    public const int SecurityGroupPhaseBodySecurityGroupOffset = 0;
+    public const int SecurityGroupPhaseBodySecurityGroupLength = 8;
+    public const int SecurityGroupPhaseBodyMatchEventIndicatorOffset = 8;
+    public const int SecurityGroupPhaseBodyTradingSessionIdOffset = 9;
+    public const int SecurityGroupPhaseBodyTradingSessionSubIdOffset = 10;
+    public const int SecurityGroupPhaseBodySecurityTradingEventOffset = 11;
+    public const int SecurityGroupPhaseBodyTradeDateOffset = 12;
+    public const int SecurityGroupPhaseBodyTradSesOpenTimeOffset = 16;
+    public const int SecurityGroupPhaseBodyTransactTimeOffset = 24;
+
     // ---- ChannelReset_11 (V16) ----
     // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
     // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then

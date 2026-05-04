@@ -84,6 +84,27 @@ public sealed partial class ChannelDispatcher
         Commit(n);
     }
 
+    public void OnTradingPhaseChanged(in TradingPhaseChangedEvent e)
+    {
+        AssertOnLoopThread();
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
+        // tradingSessionID/securityTradingEvent unused for now (255 = NULL
+        // for the optional event); tradeDate/tradSesOpenTime defaulted to 0.
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
+            dst,
+            securityId: e.SecurityId,
+            tradingSessionId: 0,
+            securityTradingStatus: (byte)e.Phase,
+            securityTradingEvent: 255,
+            tradeDate: 0,
+            tradSesOpenTimeNanos: 0,
+            transactTimeNanos: e.TransactTimeNanos,
+            rptSeq: e.RptSeq);
+        Commit(n);
+    }
+
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
         AssertOnLoopThread();

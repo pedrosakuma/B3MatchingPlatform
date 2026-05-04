@@ -10,7 +10,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase }
 
     internal sealed record WorkItem(
         WorkKind Kind,
@@ -25,6 +25,7 @@ public sealed partial class ChannelDispatcher
         CrossOrderCommand? Cross,
         ResolvedMassCancel? MassCancel = null,
         OperatorTradeBust? TradeBust = null,
+        OperatorTradingPhase? TradingPhase = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -46,6 +47,14 @@ public sealed partial class ChannelDispatcher
         long Size,
         uint TradeId,
         ushort TradeDate);
+
+    /// <summary>
+    /// Operator-triggered trading-phase change payload (gap-functional §5
+    /// / issue #201): identifies the affected instrument and the target
+    /// phase. The transition is applied on the dispatch thread so the
+    /// engine remains single-threaded.
+    /// </summary>
+    internal sealed record OperatorTradingPhase(long SecurityId, B3.Exchange.Matching.TradingPhase Phase);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

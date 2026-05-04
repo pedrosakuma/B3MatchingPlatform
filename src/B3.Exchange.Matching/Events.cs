@@ -92,6 +92,18 @@ public readonly record struct RejectEvent(
     ulong TransactTimeNanos);
 
 /// <summary>
+/// Fired when the trading phase for an instrument transitions. Carries
+/// the new phase plus a per-event RptSeq so the integration layer can
+/// emit a sequenced UMDF <c>SecurityStatus_3</c> frame
+/// (gap-functional §5 / #201).
+/// </summary>
+public readonly record struct TradingPhaseChangedEvent(
+    long SecurityId,
+    TradingPhase Phase,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// Fired when a book side that had at least one resting order becomes
 /// empty as a result of an order cancel/fill in the same dispatch turn.
 /// The integration layer translates this to the UMDF
@@ -149,4 +161,12 @@ public interface IMatchingEventSink
     /// <c>ChannelDispatcher</c> overrides it to emit <c>EmptyBook_9</c>.
     /// </summary>
     void OnOrderBookSideEmpty(in OrderBookSideEmptyEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted when an instrument's trading phase changes.
+    /// Default no-op so legacy sinks compile; the production
+    /// <c>ChannelDispatcher</c> overrides it to emit
+    /// <c>SecurityStatus_3</c>.
+    /// </summary>
+    void OnTradingPhaseChanged(in TradingPhaseChangedEvent e) { }
 }

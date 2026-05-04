@@ -307,6 +307,55 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void SecurityStatus_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteSecurityStatusFrame(buf,
+            securityId: 4242L,
+            tradingSessionId: 1,
+            securityTradingStatus: (byte)SecurityTradingStatus.OPEN,
+            securityTradingEvent: 255,
+            tradeDate: 9000,
+            tradSesOpenTimeNanos: 0UL,
+            transactTimeNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 42);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecurityStatusBlockLength, n);
+        Assert.True(SecurityStatus_3Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.SecurityStatusBlockLength), out var rdr));
+        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(SecurityTradingStatus.OPEN, rdr.Data.SecurityTradingStatus);
+        Assert.Null(rdr.Data.SecurityTradingEvent);
+        Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
+        Assert.Equal(42u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void SecurityGroupPhase_Roundtrip()
+    {
+        var buf = new byte[80];
+        var group = System.Text.Encoding.ASCII.GetBytes("PETR");
+        int n = UmdfWireEncoder.WriteSecurityGroupPhaseFrame(buf,
+            securityGroup: group,
+            tradingSessionId: 1,
+            tradingSessionSubId: (byte)TradingSessionSubID.OPEN,
+            securityTradingEvent: 255,
+            tradeDate: 9000,
+            tradSesOpenTimeNanos: 0UL,
+            transactTimeNanos: 1_700_000_000_000_000_000UL);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecurityGroupPhaseBlockLength, n);
+        Assert.True(SecurityGroupPhase_10Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.SecurityGroupPhaseBlockLength), out var rdr));
+        Assert.Equal(TradingSessionSubID.OPEN, rdr.Data.TradingSessionSubID);
+        Assert.Null(rdr.Data.SecurityTradingEvent);
+        Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
+        // Verify the group bytes were written at offset 0.
+        var groupSlice = buf.AsSpan(FrameOffset, 4).ToArray();
+        Assert.Equal(group, groupSlice);
+    }
+
+    [Fact]
     public void Encoder_ThrowsOnSmallBuffer()
     {
         var small = new byte[8];

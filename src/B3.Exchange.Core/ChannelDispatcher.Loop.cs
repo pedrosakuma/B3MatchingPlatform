@@ -44,6 +44,12 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.OperatorSetTradingPhase)
+        {
+            ProcessSetTradingPhase(item.TradingPhase!);
+            return;
+        }
+
         _currentSession = item.Session;
         _currentFirm = item.Firm;
         _hasCurrentSession = item.HasSession;

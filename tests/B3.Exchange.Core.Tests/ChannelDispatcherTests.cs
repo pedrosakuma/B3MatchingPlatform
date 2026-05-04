@@ -615,4 +615,61 @@ public class ChannelDispatcherTests
     }
 
     private static void DrainInbound(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();
+
+    [Fact]
+    public void OperatorSetTradingPhase_EmitsSecurityStatusFrameAndGatesNewOrders()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        // Transition PETR to CLOSE — engine emits a SecurityStatus frame.
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Close));
+        DrainInbound(disp);
+
+        Assert.Single(pkt.Packets);
+        var packet = pkt.Packets[0];
+        int expectedLen = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecurityStatusBlockLength;
+        Assert.Equal(expectedLen, packet.Length);
+
+        // SBE TemplateId == 3 (SecurityStatus).
+        int sbeHdrStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize;
+        ushort templateId = MemoryMarshal.Read<ushort>(packet.AsSpan(sbeHdrStart + 2, 2));
+        Assert.Equal((ushort)3, templateId);
+
+        int bodyStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        Assert.Equal(Petr, MemoryMarshal.Read<long>(packet.AsSpan(bodyStart + WireOffsets.SecurityStatusBodySecurityIdOffset, 8)));
+        Assert.Equal((byte)4 /* CLOSE */, packet[bodyStart + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset]);
+        pkt.Packets.Clear();
+
+        // A new order while CLOSE must be rejected with MarketClosed.
+        disp.EnqueueNewOrder(new NewOrderCommand("c1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 9_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        var rej = Assert.Single(reply.Rejects);
+        Assert.Equal(RejectReason.MarketClosed, rej.Reason);
+
+        // Reopen and confirm a subsequent order is accepted.
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Open));
+        DrainInbound(disp);
+        reply.Rejects.Clear();
+        disp.EnqueueNewOrder(new NewOrderCommand("c2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 9_001UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+        Assert.Empty(reply.Rejects);
+        Assert.Equal(1, GetEngine(disp).OrderCount(Petr));
+    }
+
+    [Fact]
+    public void OperatorSetTradingPhase_Idempotent_NoPacketEmitted()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        _ = new FakeSession(outbound);
+
+        // Default is Open; transitioning to Open should be a no-op.
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Open));
+        DrainInbound(disp);
+
+        Assert.Empty(pkt.Packets);
+    }
 }

@@ -60,5 +60,6 @@ public enum OrdRejReason : byte
     UnknownOrder = 5,
     DuplicateOrder = 6,
     UnsupportedOrderCharacteristic = 11,
+    ExchangeClosed = 13,
     Other = 99,
 }

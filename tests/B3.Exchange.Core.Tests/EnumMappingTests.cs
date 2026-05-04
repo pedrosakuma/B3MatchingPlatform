@@ -185,6 +185,7 @@ public class EnumMappingTests
         MatchingRejectReason.MarketNotImmediateOrCancel => OrdRejReason.UnsupportedOrderCharacteristic,
         MatchingRejectReason.InvalidTimeInForceForMarket => OrdRejReason.UnsupportedOrderCharacteristic,
         MatchingRejectReason.SelfTradePrevention => OrdRejReason.Other,
+        MatchingRejectReason.MarketClosed => OrdRejReason.ExchangeClosed,
         _ => throw new ArgumentOutOfRangeException(nameof(r), r, "unmapped Matching.RejectReason"),
     };
 
