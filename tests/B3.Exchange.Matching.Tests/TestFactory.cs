@@ -38,6 +38,7 @@ internal sealed class RecordingSink : IMatchingEventSink
     public List<OrderCanceledEvent> Canceled => Events.OfType<OrderCanceledEvent>().ToList();
     public List<OrderFilledEvent> Filled => Events.OfType<OrderFilledEvent>().ToList();
     public List<OrderQuantityReducedEvent> QtyReduced => Events.OfType<OrderQuantityReducedEvent>().ToList();
+    public List<OrderModifiedEvent> Modified => Events.OfType<OrderModifiedEvent>().ToList();
     public List<OrderMassCanceledEvent> MassCanceled => Events.OfType<OrderMassCanceledEvent>().ToList();
     public List<OrderBookSideEmptyEvent> BookSideEmpty => Events.OfType<OrderBookSideEmptyEvent>().ToList();
     public List<TradingPhaseChangedEvent> PhaseChanges => Events.OfType<TradingPhaseChangedEvent>().ToList();
@@ -50,6 +51,7 @@ internal sealed class RecordingSink : IMatchingEventSink
     public void Clear() => Events.Clear();
     public void OnOrderAccepted(in OrderAcceptedEvent e) => Events.Add(e);
     public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e) => Events.Add(e);
+    public void OnOrderModified(in OrderModifiedEvent e) => Events.Add(e);
     public void OnOrderCanceled(in OrderCanceledEvent e) => Events.Add(e);
     public void OnOrderFilled(in OrderFilledEvent e) => Events.Add(e);
     public void OnTrade(in TradeEvent e) => Events.Add(e);

@@ -55,6 +55,29 @@ public sealed class OrderRegistry
     }
 
     /// <summary>
+    /// Updates the canonical entry for <paramref name="orderId"/> so it
+    /// owns <paramref name="newClOrdId"/> instead of its previous ClOrdId,
+    /// and refreshes the reverse <c>(Firm, ClOrdId)</c> index accordingly.
+    /// Used after a successful Replace ack so subsequent Cancel/Modify by
+    /// <c>OrigClOrdID = newClOrdId</c> resolves to this order. Issue #251.
+    /// Returns <c>false</c> when the entry no longer exists. Setting
+    /// <paramref name="newClOrdId"/> to <c>0</c> is treated as "no
+    /// change" and the call is a no-op.
+    /// </summary>
+    public bool Reregister(long orderId, ulong newClOrdId)
+    {
+        if (newClOrdId == 0) return false;
+        if (!_byOrderId.TryGetValue(orderId, out var owner)) return false;
+        if (owner.ClOrdId == newClOrdId) return true;
+        var updated = owner with { ClOrdId = newClOrdId };
+        _byOrderId[orderId] = updated;
+        if (owner.ClOrdId != 0)
+            _byClOrdId.TryRemove(new KeyValuePair<(uint, ulong), long>((owner.Firm, owner.ClOrdId), orderId));
+        _byClOrdId[(owner.Firm, newClOrdId)] = orderId;
+        return true;
+    }
+
+    /// <summary>
     /// Removes the entry for <paramref name="orderId"/> and the matching
     /// reverse <c>(Firm, ClOrdId)</c> index entry (if any).
     /// </summary>

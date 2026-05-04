@@ -42,6 +42,14 @@ public class CancelReplaceTests
         Assert.Equal(1000UL, u.InsertTimestampNanos); // priority preserved → original timestamp
         Assert.Equal(2000UL, u.TransactTimeNanos);
         Assert.Empty(sink.Canceled);
+        // Issue #251: priority-kept Replace also emits a per-session
+        // modify-ack hook with the same RptSeq as the UMDF UPDATE.
+        var m = Assert.Single(sink.Modified);
+        Assert.Equal(oid, m.OrderId);
+        Assert.Equal(Px(10m), m.NewPriceMantissa);
+        Assert.Equal(300, m.NewRemainingQuantity);
+        Assert.Equal(2000UL, m.TransactTimeNanos);
+        Assert.Equal(u.RptSeq, m.RptSeq);
     }
 
     [Fact]

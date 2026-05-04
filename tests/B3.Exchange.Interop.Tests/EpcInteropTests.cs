@@ -267,7 +267,7 @@ public class EpcInteropTests : IAsyncLifetime
         Assert.Contains(events, e => e is OrderCancelled);
     }
 
-    [Fact(Skip = "Blocked by #251 — gateway does not emit ER_Modify on priority-kept Replace")]
+    [Fact]
     public async Task SimpleModify_Submit_Modify_RoundTrips()
     {
         var sessionVerId = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -295,12 +295,14 @@ public class EpcInteropTests : IAsyncLifetime
             Side = Side.Buy,
             OrderType = SimpleOrderType.Limit,
             TimeInForce = SimpleTimeInForce.Day,
-            OrderQty = 100,
+            OrderQty = 200,
             Price = 32.0m,
         }, cts.Token);
 
         await WaitFor(events, l => l.OfType<OrderAccepted>().Any(), cts.Token);
 
+        // Price unchanged + new qty (100) <= remaining (200) → priority kept
+        // path. Issue #251: gateway must surface ExecutionReport_Modify.
         await client.ReplaceSimpleAsync(new SimpleModifyRequest
         {
             ClOrdID = new ClOrdID(21),
@@ -309,8 +311,8 @@ public class EpcInteropTests : IAsyncLifetime
             Side = Side.Buy,
             OrderType = SimpleOrderType.Limit,
             TimeInForce = SimpleTimeInForce.Day,
-            OrderQty = 200,
-            Price = 31.95m,
+            OrderQty = 100,
+            Price = 32.0m,
         }, cts.Token);
 
         await WaitFor(events, l => l.OfType<OrderModified>().Any(), cts.Token);

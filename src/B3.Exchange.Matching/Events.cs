@@ -290,6 +290,28 @@ public readonly record struct StopOrderCanceledEvent(
     uint RptSeq);
 
 /// <summary>
+/// Fired when a resting order has been successfully replaced by a client
+/// request and the replace kept priority (price unchanged, quantity reduced,
+/// type/TIF unchanged). The integration layer translates this into an
+/// <c>ExecutionReport_Modify</c> back to the requesting session. Issue #251.
+///
+/// <para>The matching engine emits this <em>in addition</em> to the
+/// <see cref="OrderQuantityReducedEvent"/> that drives the UMDF UPDATE
+/// frame, so that legacy sinks observing only book-level mutations stay
+/// unaffected. The integration layer overrides this method to write the
+/// per-session ER and to refresh the (Firm, ClOrdID) → OrderId index so
+/// subsequent Cancel/Modify by the new ClOrdID resolve correctly.</para>
+/// </summary>
+public readonly record struct OrderModifiedEvent(
+    long SecurityId,
+    long OrderId,
+    Side Side,
+    long NewPriceMantissa,
+    long NewRemainingQuantity,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// from any of these methods — the engine is single-threaded per channel and
 /// reentrant commands corrupt internal linked lists.
 /// </summary>
@@ -301,6 +323,15 @@ public interface IMatchingEventSink
     void OnOrderFilled(in OrderFilledEvent e);
     void OnTrade(in TradeEvent e);
     void OnReject(in RejectEvent e);
+
+    /// <summary>
+    /// Optional event emitted right after the
+    /// <see cref="OrderQuantityReducedEvent"/> on a priority-kept Replace,
+    /// to drive the per-session <c>ExecutionReport_Modify</c>. Default
+    /// no-op so legacy sinks (matching unit tests, bench) compile
+    /// unchanged. Issue #251.
+    /// </summary>
+    void OnOrderModified(in OrderModifiedEvent e) { }
 
     /// <summary>
     /// Optional summary event emitted once per (SecurityId, Side) at the

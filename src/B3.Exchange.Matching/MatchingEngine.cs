@@ -825,6 +825,7 @@ public sealed class MatchingEngine
                 long delta = resting.RemainingQuantity - cmd.NewQuantity;
                 resting.RemainingQuantity = cmd.NewQuantity;
                 resting.Level!.TotalQuantity -= delta;
+                uint rptSeq = NextRptSeq();
                 _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
                     SecurityId: book.SecurityId,
                     OrderId: resting.OrderId,
@@ -833,7 +834,22 @@ public sealed class MatchingEngine
                     NewRemainingQuantity: cmd.NewQuantity,
                     InsertTimestampNanos: resting.InsertTimestampNanos,
                     TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: NextRptSeq()));
+                    RptSeq: rptSeq));
+                // Issue #251: priority-kept Replace must also surface as
+                // an ExecutionReport_Modify on the requesting session.
+                // The book mutation is announced via the UMDF UPDATE
+                // emitted above; this second event is the per-session ack
+                // hook the integration layer translates into ER_Modify
+                // (no additional UMDF frame, so the same RptSeq is reused
+                // for ER_Modify's MDEntry correlation).
+                _sink.OnOrderModified(new OrderModifiedEvent(
+                    SecurityId: book.SecurityId,
+                    OrderId: resting.OrderId,
+                    Side: resting.Side,
+                    NewPriceMantissa: resting.PriceMantissa,
+                    NewRemainingQuantity: cmd.NewQuantity,
+                    TransactTimeNanos: cmd.EnteredAtNanos,
+                    RptSeq: rptSeq));
                 RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }
