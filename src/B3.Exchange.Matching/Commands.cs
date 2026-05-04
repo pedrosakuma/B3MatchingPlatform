@@ -244,13 +244,89 @@ public sealed record ReplaceOrderCommand(
 /// turn so the cross cannot be split, dropped half-way, or interleaved with
 /// other producers (Self-Trading Prevention is tracked separately as #14;
 /// without STP both legs cross naturally on the book).
+///
+/// <para>Issue #218 (Onda L · L5) extended this with <see cref="CrossType"/>,
+/// <see cref="CrossPrioritization"/>, and <see cref="MaxSweepQty"/>. The
+/// defaults reproduce the pre-#218 behavior (AllOrNone cross between the
+/// two legs, Buy submitted first, no book interaction).</para>
 /// </summary>
 public sealed record CrossOrderCommand(
     NewOrderCommand Buy,
     NewOrderCommand Sell,
     ulong BuyClOrdIdValue,
     ulong SellClOrdIdValue,
-    ulong CrossId);
+    ulong CrossId)
+{
+    /// <summary>Spec §16.1.5 / SBE enum <c>CrossType</c>. Default
+    /// <see cref="CrossType.AllOrNone"/> reproduces the pre-#218 behavior:
+    /// the two legs cross internally with no public-book interaction.
+    /// <see cref="CrossType.AgainstBook"/> activates the
+    /// <see cref="MaxSweepQty"/> sweep phase. Auction-related variants
+    /// (VWAP, ClosingPrice) are deferred and rejected at the decoder.</summary>
+    public CrossType CrossType { get; init; } = CrossType.AllOrNone;
+
+    /// <summary>Spec §16.1.5 / SBE enum <c>CrossPrioritization</c>. Controls
+    /// which leg submits first into the engine (and therefore which leg
+    /// gets to sweep first when <see cref="CrossType"/> is
+    /// <see cref="Matching.CrossType.AgainstBook"/>).
+    /// <see cref="CrossPrioritization.None"/> (default) treats Buy as the
+    /// implicitly prioritized side, matching pre-#218 submission order.</summary>
+    public CrossPrioritization CrossPrioritization { get; init; } = CrossPrioritization.None;
+
+    /// <summary>When <see cref="CrossType"/> is
+    /// <see cref="Matching.CrossType.AgainstBook"/>, the prioritized leg may
+    /// sweep up to this many shares against the opposing public book at the
+    /// cross price (or better) before the residual prints internally with
+    /// the other leg. Zero (default) means "no sweep" — equivalent to
+    /// AllOrNone semantics for the residual phase.</summary>
+    public long MaxSweepQty { get; init; } = 0;
+}
+
+/// <summary>
+/// NewOrderCross <c>CrossType</c> values per the EntryPoint SBE schema
+/// (b3-entrypoint-messages-8.4.2.xml). Wire byte values are preserved so
+/// the decoder can map directly. Issue #218 (Onda L · L5).
+/// </summary>
+public enum CrossType : byte
+{
+    /// <summary>Cross prints atomically between the two parties with no
+    /// public-book interaction. Wire value 1 — also the in-engine default
+    /// when the inbound message omits CrossType (null on the wire).</summary>
+    AllOrNone = 1,
+
+    /// <summary>Prioritized leg sweeps the opposing public book up to
+    /// <see cref="CrossOrderCommand.MaxSweepQty"/> shares at the cross
+    /// price (or better) before the residual prints internally between
+    /// the two cross legs. Wire value 4.</summary>
+    AgainstBook = 4,
+
+    /// <summary>VWAP cross — auction-tied, deferred. Wire value 7.</summary>
+    VwapCross = 7,
+
+    /// <summary>Closing-price cross — auction-tied, deferred. Wire value 8.</summary>
+    ClosingPriceCross = 8,
+}
+
+/// <summary>
+/// NewOrderCross <c>CrossPrioritization</c> values per the EntryPoint SBE
+/// schema. Wire byte values preserved. Issue #218 (Onda L · L5).
+/// </summary>
+public enum CrossPrioritization : byte
+{
+    /// <summary>No explicit prioritization. The engine treats this as
+    /// Buy-prioritized (Buy leg submits first), matching pre-#218
+    /// behavior. Wire value 0 — also the in-engine default when the
+    /// inbound message omits CrossPrioritization (null on the wire).</summary>
+    None = 0,
+
+    /// <summary>Buy leg submits first; sweeps before the Sell leg under
+    /// <see cref="CrossType.AgainstBook"/>. Wire value 1.</summary>
+    BuyPrioritized = 1,
+
+    /// <summary>Sell leg submits first; sweeps before the Buy leg under
+    /// <see cref="CrossType.AgainstBook"/>. Wire value 2.</summary>
+    SellPrioritized = 2,
+}
 
 /// <summary>
 /// Mass-cancel command (OrderMassActionRequest template 701, spec §4.8 /

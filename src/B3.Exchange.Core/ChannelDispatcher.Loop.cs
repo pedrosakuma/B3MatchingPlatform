@@ -125,13 +125,71 @@ public sealed partial class ChannelDispatcher
                         // per-leg ClOrdID. The packet buffer accumulates
                         // both legs' UMDF events and flushes once at the
                         // end of this dispatch turn.
+                        //
+                        // Issue #218 (Onda L · L5): respect
+                        // CrossPrioritization (BuyPrioritized / None →
+                        // Buy first; SellPrioritized → Sell first), and
+                        // implement CrossType=AgainstBook by inserting a
+                        // sweep phase before the cross prints internally.
                         var cross = item.Cross!;
-                        _metrics?.IncOrdersIn();
-                        _currentClOrdId = cross.BuyClOrdIdValue;
-                        _engine.Submit(cross.Buy);
-                        _metrics?.IncOrdersIn();
-                        _currentClOrdId = cross.SellClOrdIdValue;
-                        _engine.Submit(cross.Sell);
+                        bool buyFirst = cross.CrossPrioritization != CrossPrioritization.SellPrioritized;
+                        var prioLeg = buyFirst ? cross.Buy : cross.Sell;
+                        ulong prioClOrd = buyFirst ? cross.BuyClOrdIdValue : cross.SellClOrdIdValue;
+                        var otherLeg = buyFirst ? cross.Sell : cross.Buy;
+                        ulong otherClOrd = buyFirst ? cross.SellClOrdIdValue : cross.BuyClOrdIdValue;
+
+                        if (cross.CrossType == CrossType.AgainstBook && cross.MaxSweepQty > 0)
+                        {
+                            // Phase 1: prioritized leg sweeps the opposing
+                            // public book at cross price (or better) up to
+                            // min(MaxSweepQty, OrderQty) via Limit IOC.
+                            // Any leftover from the cap is canceled (IOC).
+                            long sweepQty = Math.Min(cross.MaxSweepQty, prioLeg.Quantity);
+                            var sweepLeg = prioLeg with
+                            {
+                                Type = B3.Exchange.Matching.OrderType.Limit,
+                                Tif = B3.Exchange.Matching.TimeInForce.IOC,
+                                Quantity = sweepQty,
+                            };
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = prioClOrd;
+                            _crossSweepFilledQty = 0;
+                            _engine.Submit(sweepLeg);
+                            long swept = _crossSweepFilledQty.GetValueOrDefault();
+                            _crossSweepFilledQty = null;
+
+                            // Phase 2: residual prioritized leg as the
+                            // original Limit Day at cross price; rests on
+                            // the book ready for the other leg to cross.
+                            long residual = prioLeg.Quantity - swept;
+                            if (residual > 0)
+                            {
+                                _metrics?.IncOrdersIn();
+                                _currentClOrdId = prioClOrd;
+                                _engine.Submit(prioLeg with { Quantity = residual });
+                            }
+
+                            // Phase 3: the other leg at full OrderQty —
+                            // crosses against the resting prioritized
+                            // residual; any remainder rests on the book
+                            // (price-time priority handles the rest).
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = otherClOrd;
+                            _engine.Submit(otherLeg);
+                        }
+                        else
+                        {
+                            // AON cross (default): existing behavior. The
+                            // prioritized side rests, the other side
+                            // crosses against it → 1 internal trade at
+                            // cross price.
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = prioClOrd;
+                            _engine.Submit(prioLeg);
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = otherClOrd;
+                            _engine.Submit(otherLeg);
+                        }
                         break;
                     }
                 case WorkKind.MassCancel:

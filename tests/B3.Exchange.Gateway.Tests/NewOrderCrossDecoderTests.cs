@@ -160,28 +160,63 @@ public class NewOrderCrossDecoderTests
     }
 
     [Fact]
-    public void UnsupportedFeature_NonNullCrossType()
+    public void Success_AcceptsCrossType_AllOrNone()
     {
-        var body = BuildCross(crossType: 1); // any non-null
+        // Issue #218 (Onda L · L5): wire CrossType=1 (AllOrNone) is now
+        // accepted; prior to L5 this was rejected as UnsupportedFeature.
+        var body = BuildCross(crossType: 1);
         var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
-            body, SessionFirm, 1UL, out _, out _, out var msg);
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("CrossType", msg);
+            body, SessionFirm, 1UL, out var cross, out _, out _);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal(CrossType.AllOrNone, cross.CrossType);
     }
 
     [Fact]
-    public void UnsupportedFeature_NonNullCrossPrioritization()
+    public void Success_AcceptsCrossType_AgainstBook()
     {
-        var body = BuildCross(crossPri: 0);
+        // Issue #218 (Onda L · L5): wire CrossType=4 (AgainstBook).
+        var body = BuildCross(crossType: 4, maxSweepQty: 50UL);
         var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
-            body, SessionFirm, 1UL, out _, out _, out var msg);
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("CrossPrioritization", msg);
+            body, SessionFirm, 1UL, out var cross, out _, out _);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal(CrossType.AgainstBook, cross.CrossType);
+        Assert.Equal(50L, cross.MaxSweepQty);
     }
 
     [Fact]
-    public void UnsupportedFeature_NonZeroMaxSweepQty()
+    public void UnsupportedFeature_AuctionCrossTypesDeferred()
     {
+        // Wire 7 (VWAP) and 8 (ClosingPrice) remain rejected — auction-tied.
+        foreach (byte ct in new byte[] { 7, 8 })
+        {
+            var body = BuildCross(crossType: ct);
+            var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
+                body, SessionFirm, 1UL, out _, out _, out var msg);
+            Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+            Assert.Contains("CrossType", msg);
+        }
+    }
+
+    [Fact]
+    public void Success_AcceptsCrossPrioritization_All()
+    {
+        // Issue #218 (Onda L · L5): wire CrossPrioritization 0/1/2 all
+        // accepted; prior to L5 these were rejected as UnsupportedFeature.
+        foreach (byte cp in new byte[] { 0, 1, 2 })
+        {
+            var body = BuildCross(crossPri: cp);
+            var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
+                body, SessionFirm, 1UL, out var cross, out _, out _);
+            Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+            Assert.Equal((CrossPrioritization)cp, cross.CrossPrioritization);
+        }
+    }
+
+    [Fact]
+    public void UnsupportedFeature_MaxSweepQtyWithoutAgainstBook()
+    {
+        // MaxSweepQty without CrossType=AgainstBook is rejected (defensive —
+        // the field is meaningless except in the sweep variant).
         var body = BuildCross(maxSweepQty: 50UL);
         var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
             body, SessionFirm, 1UL, out _, out _, out var msg);
