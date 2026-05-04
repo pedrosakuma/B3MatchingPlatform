@@ -374,7 +374,7 @@ public class EpcInteropTests : IAsyncLifetime
         await pump;
     }
 
-    [Fact(Skip = "Blocked by #253 — FIXP reconnect with EPC SDK ReconnectAsync — second order not delivered after reconnect")]
+    [Fact(Skip = "EPC SDK 0.14.0 bug: FixpClientSession.RunInboundLoopAsync calls _eventWriter.TryComplete() when it receives a Terminate frame (case 7), but _eventWriter is the shared EntryPointClient._events channel — completing it permanently. EntryPointClient.ReconnectAsync sends Terminate to the prior session, which closes _events; the new session's inbound loop then faults on the next WriteAsync with 'The channel has been closed' and the test never observes the second order's ExecutionReport. The gateway behaves correctly: host logs confirm the second SimpleNewOrder is processed and its ER is sent on the wire — only the client-side event surface is broken across reconnects. Tracked by #253; re-enable when SDK 0.14.1+ scopes the writer per-session.")]
     public async Task Reconnect_WithNonZeroNextSeqNo_DoesNotTriggerNotApplied()
     {
         // Regression for #239(b): client reconnecting with NextSeqNo > 1
