@@ -336,6 +336,20 @@ public sealed class MatchingEngine
             // Issue #214: stop branch handled earlier (right after MinQty
             // range-check). Falling through here means cmd.Type is Limit
             // or Market.
+            //
+            // Issue #228 (Onda M · M1): during auction phases (Reserved /
+            // FinalClosingCall) the engine accepts the order onto the book
+            // but bypasses continuous matching entirely — no Trade_53 events
+            // are emitted until the operator-issued auction uncross (M3).
+            // The TIF gate above guarantees that only GoodForAuction (in
+            // Reserved) and AtClose (in FinalClosingCall) reach this path,
+            // and both are wire-restricted to Limit Order type, so we can
+            // rest cmd directly with cmd.PriceMantissa.
+            if (phase == TradingPhase.Reserved || phase == TradingPhase.FinalClosingCall)
+            {
+                RestForAuction(cmd, book);
+                return;
+            }
             ExecuteAggressor(cmd, rules, book);
         }
         finally { ExitDispatch(); }
@@ -554,6 +568,53 @@ public sealed class MatchingEngine
 
     private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
         => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++);
+
+    /// <summary>
+    /// Issue #228 (Onda M · M1): rest the order on the book without any
+    /// continuous-matching attempt. Called only when the instrument is in
+    /// an auction phase (<see cref="TradingPhase.Reserved"/> for opening
+    /// call, <see cref="TradingPhase.FinalClosingCall"/> for closing call).
+    /// Emits the same <see cref="OrderAcceptedEvent"/> that the regular
+    /// rest path emits, so UMDF <c>Order_MBO_50</c> add events are still
+    /// published — consumers see the auction book build up. Iceberg
+    /// (<see cref="NewOrderCommand.MaxFloor"/>) is honored so the visible
+    /// slice on the book matches the continuous-Open semantics from #211.
+    /// </summary>
+    private void RestForAuction(NewOrderCommand cmd, LimitOrderBook book)
+    {
+        long visible = cmd.Quantity;
+        long hidden = 0;
+        if (cmd.MaxFloor != 0 && (long)cmd.MaxFloor < cmd.Quantity)
+        {
+            visible = (long)cmd.MaxFloor;
+            hidden = cmd.Quantity - visible;
+        }
+        var resting = new RestingOrder
+        {
+            OrderId = _nextOrderId++,
+            ClOrdId = cmd.ClOrdId,
+            Side = cmd.Side,
+            PriceMantissa = cmd.PriceMantissa,
+            EnteringFirm = cmd.EnteringFirm,
+            InsertTimestampNanos = cmd.EnteredAtNanos,
+            RemainingQuantity = visible,
+            Tif = cmd.Tif,
+            MaxFloor = (long)cmd.MaxFloor,
+            HiddenQuantity = hidden,
+        };
+        book.Insert(resting);
+        _sink.OnOrderAccepted(new OrderAcceptedEvent(
+            SecurityId: book.SecurityId,
+            OrderId: resting.OrderId,
+            ClOrdId: cmd.ClOrdId,
+            Side: resting.Side,
+            PriceMantissa: resting.PriceMantissa,
+            RemainingQuantity: resting.RemainingQuantity,
+            EnteringFirm: resting.EnteringFirm,
+            InsertTimestampNanos: resting.InsertTimestampNanos,
+            RptSeq: NextRptSeq()));
+    }
+
 
     /// <summary>
     /// True when the order should walk the book ignoring its own price
