@@ -599,6 +599,39 @@ Internally, the gateway-side `OrderOwnershipMap` (post-#66) is the
 authority; it routes passive ER + CoD mass-cancels back to the owning
 session's retx buffer.
 
+### 6.7 Distributed tracing (OpenTelemetry, issue #175)
+
+The host emits W3C-trace-context spans on the `B3.Exchange`
+`ActivitySource`. Spans:
+
+| Span                | Where                                                | Parent             |
+| ------------------- | ---------------------------------------------------- | ------------------ |
+| `gateway.decode`    | `FixpSession.DispatchInboundAsync` (per inbound frame) | none (root)        |
+| `dispatch.enqueue`  | `ChannelDispatcher.Enqueue*`                          | `gateway.decode`   |
+| `engine.process`    | `ChannelDispatcher.ProcessOne` (dispatch thread)      | `dispatch.enqueue` |
+| `outbound.emit`     | UMDF packet flush                                    | `engine.process`   |
+
+Cross-thread propagation is explicit: the dispatch.enqueue
+`ActivityContext` is stamped on each `WorkItem` so engine.process can
+re-parent correctly when the dispatch loop picks the work up on its own
+thread.
+
+**Enable export** by setting the standard OTLP endpoint env var:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+export OTEL_SERVICE_NAME=b3-exchange   # default if unset
+dotnet run --project src/B3.Exchange.Host -- config/exchange-simulator.json
+```
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is unset the host logs
+`tracing disabled: ...` at startup and the ActivitySource has no
+listener — `StartActivity` returns `null` and the instrumented paths
+take a zero-overhead branch.
+
+All other `OTEL_*` env vars (protocol, headers, resource attributes,
+sampler) are honored by the SDK directly.
+
 ---
 
 ## 7. Where to look in the code

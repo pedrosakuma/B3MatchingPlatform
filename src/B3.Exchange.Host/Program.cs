@@ -52,6 +52,7 @@ catch (Exception ex)
 }
 
 await using var host = new ExchangeHost(cfg, loggerFactory);
+using var tracerProvider = TracingBootstrap.TryBuild(bootLogger);
 await host.StartAsync().ConfigureAwait(false);
 
 using var shutdown = new CancellationTokenSource();
