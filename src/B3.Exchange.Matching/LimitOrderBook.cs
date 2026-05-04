@@ -142,6 +142,19 @@ internal sealed class LimitOrderBook
         _byOrderId.Remove(o.OrderId);
     }
 
+    /// <summary>
+    /// Enumerates aggregated price levels on <paramref name="side"/> in match
+    /// priority order (best first). Each entry carries the price mantissa
+    /// and the total resting quantity at that level. Used by the auction
+    /// TOP / imbalance computation (#229) and any consumer that wants a
+    /// price-aggregated view without iterating every order.
+    /// </summary>
+    public IEnumerable<(long PriceMantissa, long TotalQuantity)> EnumerateLevels(Side side)
+    {
+        foreach (var kv in SideMap(side))
+            yield return (kv.Key, kv.Value.TotalQuantity);
+    }
+
     /// <summary>Returns the best (top) price level on the given side, or null if empty.</summary>
     public PriceLevel? BestLevel(Side side)
     {
