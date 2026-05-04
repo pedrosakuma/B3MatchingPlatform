@@ -29,6 +29,10 @@ public enum TimeInForce : byte
     Day = 0,
     IOC = 3,
     FOK = 4,
+    Gtc = 1,
+    Gtd = 6,
+    AtClose = 7,
+    GoodForAuction = (byte)'A',
 }
 
 /// <summary>

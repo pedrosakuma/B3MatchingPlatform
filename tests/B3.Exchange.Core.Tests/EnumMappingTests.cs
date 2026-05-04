@@ -82,6 +82,10 @@ public class EnumMappingTests
     [InlineData(MatchingTif.Day, ContractsTif.Day)]
     [InlineData(MatchingTif.IOC, ContractsTif.IOC)]
     [InlineData(MatchingTif.FOK, ContractsTif.FOK)]
+    [InlineData(MatchingTif.Gtc, ContractsTif.Gtc)]
+    [InlineData(MatchingTif.Gtd, ContractsTif.Gtd)]
+    [InlineData(MatchingTif.AtClose, ContractsTif.AtClose)]
+    [InlineData(MatchingTif.GoodForAuction, ContractsTif.GoodForAuction)]
     public void TimeInForce_MatchingToContracts(MatchingTif matching, ContractsTif expected)
     {
         Assert.Equal(expected, MapTif(matching));
@@ -90,8 +94,8 @@ public class EnumMappingTests
     [Fact]
     public void TimeInForce_AllValuesCovered()
     {
-        Assert.Equal(3, Enum.GetValues<MatchingTif>().Length);
-        Assert.Equal(3, Enum.GetValues<ContractsTif>().Length);
+        Assert.Equal(7, Enum.GetValues<MatchingTif>().Length);
+        Assert.Equal(7, Enum.GetValues<ContractsTif>().Length);
         foreach (var v in Enum.GetValues<MatchingTif>()) _ = MapTif(v);
     }
 
@@ -154,6 +158,10 @@ public class EnumMappingTests
         MatchingTif.Day => ContractsTif.Day,
         MatchingTif.IOC => ContractsTif.IOC,
         MatchingTif.FOK => ContractsTif.FOK,
+        MatchingTif.Gtc => ContractsTif.Gtc,
+        MatchingTif.Gtd => ContractsTif.Gtd,
+        MatchingTif.AtClose => ContractsTif.AtClose,
+        MatchingTif.GoodForAuction => ContractsTif.GoodForAuction,
         _ => throw new ArgumentOutOfRangeException(nameof(t), t, "unmapped Matching.TimeInForce"),
     };
 
@@ -186,6 +194,7 @@ public class EnumMappingTests
         MatchingRejectReason.InvalidTimeInForceForMarket => OrdRejReason.UnsupportedOrderCharacteristic,
         MatchingRejectReason.SelfTradePrevention => OrdRejReason.Other,
         MatchingRejectReason.MarketClosed => OrdRejReason.ExchangeClosed,
+        MatchingRejectReason.TimeInForceNotSupported => OrdRejReason.UnsupportedOrderCharacteristic,
         _ => throw new ArgumentOutOfRangeException(nameof(r), r, "unmapped Matching.RejectReason"),
     };
 

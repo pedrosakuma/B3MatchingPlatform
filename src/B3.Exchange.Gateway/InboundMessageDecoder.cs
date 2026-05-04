@@ -64,6 +64,10 @@ internal static partial class InboundMessageDecoder
             case (byte)'0': tif = TimeInForce.Day; return true;
             case (byte)'3': tif = TimeInForce.IOC; return true;
             case (byte)'4': tif = TimeInForce.FOK; return true;
+            case (byte)'1': tif = TimeInForce.Gtc; return true;
+            case (byte)'6': tif = TimeInForce.Gtd; return true;
+            case (byte)'7': tif = TimeInForce.AtClose; return true;
+            case (byte)'A': tif = TimeInForce.GoodForAuction; return true;
             default: tif = default; return false;
         }
     }
@@ -102,14 +106,14 @@ internal static partial class InboundMessageDecoder
     }
 
     /// <summary>
-    /// Three-way TimeInForce classification. Returns <c>true</c> for the
-    /// supported subset (Day=0, IOC=3, FOK=4). For other schema-valid
-    /// values (GTC=1, GTD=6, AtTheClose=7, GoodForAuction='A') returns
-    /// <c>false</c> with <paramref name="unsupportedReason"/> populated.
-    /// For bytes not in the schema returns <c>false</c> with the reason
-    /// <c>null</c>. The schema-NULL byte ('\0') is always reported as a
-    /// wire decode error here; callers that accept optional TIF must
-    /// short-circuit before invoking this helper.
+    /// Three-way TimeInForce classification. All seven schema-valid TIF
+    /// values (Day=0, IOC=3, FOK=4, GTC=1, GTD=6, AtTheClose=7,
+    /// GoodForAuction='A') are accepted at the wire layer; semantic
+    /// gating (GTD plumbing, phase enforcement) lives in the matching
+    /// engine. For bytes not in the schema returns <c>false</c> with the
+    /// reason <c>null</c>. The schema-NULL byte ('\0') is always reported
+    /// as a wire decode error here; callers that accept optional TIF
+    /// must short-circuit before invoking this helper.
     /// </summary>
     private static bool TryClassifyTif(byte b, out TimeInForce tif, out string? unsupportedReason)
     {
@@ -119,13 +123,10 @@ internal static partial class InboundMessageDecoder
             case (byte)'0': tif = TimeInForce.Day; return true;
             case (byte)'3': tif = TimeInForce.IOC; return true;
             case (byte)'4': tif = TimeInForce.FOK; return true;
-            case (byte)'1': // GOOD_TILL_CANCEL
-            case (byte)'6': // GOOD_TILL_DATE
-            case (byte)'7': // AT_THE_CLOSE
-            case (byte)'A': // GOOD_FOR_AUCTION
-                tif = default;
-                unsupportedReason = "unsupported TimeInForce";
-                return false;
+            case (byte)'1': tif = TimeInForce.Gtc; return true;
+            case (byte)'6': tif = TimeInForce.Gtd; return true;
+            case (byte)'7': tif = TimeInForce.AtClose; return true;
+            case (byte)'A': tif = TimeInForce.GoodForAuction; return true;
             default:
                 tif = default;
                 return false;
