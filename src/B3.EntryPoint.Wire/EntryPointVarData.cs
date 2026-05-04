@@ -52,9 +52,13 @@ public static class EntryPointVarData
     public static ReadOnlySpan<Field> ExpectedFor(ushort templateId, ushort version) => (templateId, version) switch
     {
         (EntryPointFrameReader.TidSimpleNewOrder, 2) => SimpleNewOrderFields,
+        (EntryPointFrameReader.TidSimpleNewOrder, 6) => SimpleNewOrderFields,                           // #239
         (EntryPointFrameReader.TidSimpleModifyOrder, 2) => SimpleModifyOrderFields,
+        (EntryPointFrameReader.TidSimpleModifyOrder, 6) => SimpleModifyOrderFields,                     // #239
         (EntryPointFrameReader.TidNewOrderSingle, 2) => NewOrderSingleFields,
+        (EntryPointFrameReader.TidNewOrderSingle, 6) => NewOrderSingleFields,                           // #239: EPC 0.8.0 stamps version=6
         (EntryPointFrameReader.TidOrderCancelReplaceRequest, 2) => OrderCancelReplaceFields,
+        (EntryPointFrameReader.TidOrderCancelReplaceRequest, 6) => OrderCancelReplaceFields,            // #239
         (EntryPointFrameReader.TidOrderCancelRequest, 0) => OrderCancelFields,
         (EntryPointFrameReader.TidNegotiate, 0) => NegotiateFields,
         (EntryPointFrameReader.TidEstablish, 0) => EstablishFields,

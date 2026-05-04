@@ -83,6 +83,11 @@ public sealed partial class FixpSession
             }
             KeepAliveIntervalMs = (long)req.KeepAliveIntervalMillis;
             ApplyCodEstablishParams(in req);
+            // #239: honor peer-declared starting sequence (FIXP §4.5.3).
+            // EPC 0.8.0 may carry over a non-1 NextSeqNo across reconnects;
+            // rebase so the first inbound at NextSeqNo passes the in-order
+            // gap check instead of triggering NotApplied(1, NextSeqNo-1).
+            RebaseLastIncomingSeqNoFromEstablish(req.NextSeqNo);
             var ackFrame = new byte[EstablishAckEncoder.Total];
             EstablishAckEncoder.Encode(ackFrame, req.SessionId, req.SessionVerId,
                 req.TimestampNanos, req.KeepAliveIntervalMillis,
@@ -124,6 +129,8 @@ public sealed partial class FixpSession
 
         KeepAliveIntervalMs = (long)req.KeepAliveIntervalMillis;
         ApplyCodEstablishParams(in req);
+        // #239: honor peer-declared starting sequence (FIXP §4.5.3).
+        RebaseLastIncomingSeqNoFromEstablish(req.NextSeqNo);
         var ack = new byte[EstablishAckEncoder.Total];
         EstablishAckEncoder.Encode(ack, req.SessionId, req.SessionVerId,
             req.TimestampNanos, req.KeepAliveIntervalMillis,
@@ -166,5 +173,29 @@ public sealed partial class FixpSession
         await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.Unspecified,
             step.LogReason).ConfigureAwait(false);
         return false;
+    }
+
+    /// <summary>
+    /// #239: applies the FIXP §4.5.3 rule that a peer's Establish
+    /// declares the next inbound business <c>MsgSeqNum</c> it will
+    /// send. We rebase <see cref="LastIncomingSeqNo"/> to
+    /// <c>NextSeqNo - 1</c> so the in-order check in
+    /// <see cref="TryAcceptBusinessHeaderMsgSeqNum"/> treats the very
+    /// first business message at <c>NextSeqNo</c> as in-order rather
+    /// than emitting <c>NotApplied(1, NextSeqNo - 1)</c>. Skipped when
+    /// <paramref name="peerNextSeqNo"/> is 0 (validator already
+    /// rejected) or 1 (default; nothing to rebase).
+    ///
+    /// This matches the EPC 0.8.0 client behaviour: it carries an
+    /// SDK-internal seq counter across reconnects and signals the
+    /// continuation point on Establish, instead of restarting from 1.
+    /// </summary>
+    private void RebaseLastIncomingSeqNoFromEstablish(uint peerNextSeqNo)
+    {
+        if (peerNextSeqNo <= 1) return;
+        if (peerNextSeqNo - 1 > LastIncomingSeqNo)
+        {
+            LastIncomingSeqNo = peerNextSeqNo - 1;
+        }
     }
 }
