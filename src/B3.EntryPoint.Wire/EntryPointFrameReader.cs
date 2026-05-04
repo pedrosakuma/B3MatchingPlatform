@@ -112,6 +112,7 @@ public static class EntryPointFrameReader
         (TidNegotiate, 0) => 28,                 // NegotiateData.BLOCK_LENGTH (V6 schema, root version 0)
         (TidEstablish, 0) => 42,                 // EstablishData.BLOCK_LENGTH
         (TidRetransmitRequest, 0) => 20,         // RetransmitRequestData.BLOCK_LENGTH
+        (TidTerminate, 0) => 13,                 // TerminateData.BLOCK_LENGTH (graceful logout from peer)
         _ => -1
     };
 
