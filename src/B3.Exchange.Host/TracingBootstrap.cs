@@ -1,4 +1,4 @@
-using B3.Exchange.Core;
+using B3.Exchange.Contracts;
 using Microsoft.Extensions.Logging;
 using OpenTelemetry;
 using OpenTelemetry.Resources;

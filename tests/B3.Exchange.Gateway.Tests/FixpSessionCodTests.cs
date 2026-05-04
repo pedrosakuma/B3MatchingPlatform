@@ -2,7 +2,6 @@ using B3.Exchange.Contracts;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using B3.Exchange.Core;
 using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;

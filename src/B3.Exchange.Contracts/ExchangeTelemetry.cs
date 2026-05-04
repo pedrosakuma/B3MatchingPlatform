@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace B3.Exchange.Core;
+namespace B3.Exchange.Contracts;
 
 /// <summary>
 /// Shared <see cref="ActivitySource"/> for B3 exchange spans (issue #175).
