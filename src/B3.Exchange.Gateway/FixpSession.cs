@@ -285,7 +285,13 @@ public sealed partial class FixpSession : IAsyncDisposable
             retxBuffer: _retxBuffer,
             outboundLock: _outboundLock,
             nowNanos: () => _nowNanos(),
-            isOpen: () => IsOpen,
+            // Use IsRegistered (not IsOpen) so that passive ERs delivered while
+            // the session is Suspended (transport down, but session-state alive)
+            // are still encoded, sequenced, and appended to the FIXP retransmit
+            // ring. The TryEnqueueFrame inside AppendAndEnqueueLocked silently
+            // fails when the transport is dead; the buffered frame is replayed
+            // on a subsequent Establish + RetransmitRequest. Issue #217 / L4.
+            isOpen: () => IsRegistered,
             close: Close);
         _retransmitController = new FixpRetransmitController(
             sessionId: () => SessionId,

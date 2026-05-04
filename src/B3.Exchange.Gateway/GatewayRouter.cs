@@ -22,8 +22,11 @@ namespace B3.Exchange.Gateway;
 ///
 /// <para>If the session is no longer registered (peer disconnected
 /// between the inbound command and the engine emitting the event) the
-/// report is dropped silently. Phase 3 (Suspended sessions) will route
-/// these into a retransmission ring instead.</para>
+/// report is dropped silently. While the session is merely
+/// <c>Suspended</c> the session is still registered, so the report is
+/// still encoded; the encoder appends to the FIXP retransmit ring even
+/// though the (dead) transport rejects it, and the frame is replayed on
+/// re-Establish (issue #217 / Onda L · L4).</para>
 ///
 /// <para>Thread-safety: invoked from any
 /// <see cref="ChannelDispatcher"/> dispatch thread; the registry lookup
