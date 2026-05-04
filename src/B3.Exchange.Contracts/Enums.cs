@@ -23,6 +23,13 @@ public enum OrderType : byte
     Limit = 2,
     StopLoss = 3,
     StopLimit = 4,
+    /// <summary>
+    /// Market with leftover-as-limit (FIX OrdType 'K' / B3
+    /// MARKET_WITH_LEFTOVER_AS_LIMIT). Sweeps the opposite side like a
+    /// Market; any unfilled remainder rests at the last execution price
+    /// as a Day Limit. Issue #215.
+    /// </summary>
+    MarketWithLeftover = 5,
 }
 
 /// <summary>Time-in-force. Wire-neutral mirror of FIX tag 59.</summary>

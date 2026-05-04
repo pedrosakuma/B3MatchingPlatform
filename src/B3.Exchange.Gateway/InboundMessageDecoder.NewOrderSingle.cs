@@ -134,7 +134,9 @@ internal static partial class InboundMessageDecoder
             return InboundDecodeOutcome.UnsupportedFeature;
         }
 
-        long enginePrice = ordType == OrderType.Market ? 0L : (priceMantissa == PriceNull ? 0L : priceMantissa);
+        long enginePrice = (ordType == OrderType.Market || ordType == OrderType.MarketWithLeftover)
+            ? 0L
+            : (priceMantissa == PriceNull ? 0L : priceMantissa);
         long engineStopPx = isStop ? stopPx : 0L;
 
         cmd = new NewOrderCommand(

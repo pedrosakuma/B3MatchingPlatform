@@ -93,7 +93,7 @@ internal static partial class InboundMessageDecoder
             case (byte)'2': type = OrderType.Limit; return true;
             case (byte)'3': type = OrderType.StopLoss; return true;
             case (byte)'4': type = OrderType.StopLimit; return true;
-            case (byte)'K': // MARKET_WITH_LEFTOVER_AS_LIMIT
+            case (byte)'K': type = OrderType.MarketWithLeftover; return true;
             case (byte)'W': // RLP
             case (byte)'P': // PEGGED_MIDPOINT
                 type = default;
