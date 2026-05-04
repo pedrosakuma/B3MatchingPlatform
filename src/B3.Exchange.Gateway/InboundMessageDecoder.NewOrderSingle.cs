@@ -31,7 +31,17 @@ internal static partial class InboundMessageDecoder
         public const int MinQty = 84;             // ulong (0 == null)
         public const int MaxFloor = 92;           // ulong (0 == null)
         public const int ExpireDate = 105;        // ushort (0 == null)
+        // V6 trailer (BlockLength=133). Both fields use 0 as the SBE
+        // null sentinel. Currently the engine rejects non-null values
+        // with BMR(33003) since strategy routing / sub-account tagging
+        // aren't supported (issue #238).
+        public const int StrategyID = 125;        // int32 (0 == null)
+        public const int TradingSubAccount = 129; // uint32 (0 == null)
     }
+
+    // V2 root size (matches ExpectedInboundBlockLength). Bodies of this
+    // size carry no V6 trailer; bodies of size 133 carry it. See #238.
+    private const int NewOrderSingleV2BodySize = 125;
 
     /// <summary>
     /// Decodes a NewOrderSingleV2 (id=102) body for #GAP-15. Returns
@@ -132,6 +142,28 @@ internal static partial class InboundMessageDecoder
         {
             message = "ExpireDate not supported (only Day/IOC/FOK)";
             return InboundDecodeOutcome.UnsupportedFeature;
+        }
+
+        // #238: V6 root carries +strategyID@125 (int32, 0=null) and
+        // +tradingSubAccount@129 (uint32, 0=null). The body span has
+        // already been sliced to BlockLength by the FIXP dispatch, so
+        // the trailer is present iff body.Length > V2 size. Engine
+        // doesn't honor either field — surface a BMR rather than
+        // silently ignore so partners notice.
+        if (body.Length > NewOrderSingleV2BodySize)
+        {
+            int strategyId = MemoryMarshal.Read<int>(body.Slice(NewOrderSingleOffsets.StrategyID, 4));
+            uint tradingSubAccount = MemoryMarshal.Read<uint>(body.Slice(NewOrderSingleOffsets.TradingSubAccount, 4));
+            if (strategyId != 0)
+            {
+                message = $"StrategyID={strategyId} not supported";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+            if (tradingSubAccount != 0)
+            {
+                message = $"TradingSubAccount={tradingSubAccount} not supported";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
         }
 
         long enginePrice = (ordType == OrderType.Market || ordType == OrderType.MarketWithLeftover)
