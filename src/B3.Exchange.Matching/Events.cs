@@ -92,6 +92,23 @@ public readonly record struct RejectEvent(
     ulong TransactTimeNanos);
 
 /// <summary>
+/// Fired ONCE per (SecurityID, Side) pair touched by a single
+/// <see cref="MatchingEngine.MassCancel"/> invocation, BEFORE the per-order
+/// <see cref="OrderCanceledEvent"/>s for the same group. The integration
+/// layer translates this to a <c>MassDeleteOrders_MBO_52</c> UMDF frame so
+/// consumers that recognise mass-delete semantics can apply them as an
+/// atomic boundary; consumers that only follow per-order
+/// <c>DeleteOrder_MBO_51</c>s remain correct because the per-order events
+/// are still emitted.
+/// </summary>
+public readonly record struct OrderMassCanceledEvent(
+    long SecurityId,
+    Side Side,
+    int CancelledCount,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// Sink of matching events. Implementations MUST NOT call back into the engine
 /// from any of these methods — the engine is single-threaded per channel and
 /// reentrant commands corrupt internal linked lists.
@@ -104,4 +121,12 @@ public interface IMatchingEventSink
     void OnOrderFilled(in OrderFilledEvent e);
     void OnTrade(in TradeEvent e);
     void OnReject(in RejectEvent e);
+
+    /// <summary>
+    /// Optional summary event emitted once per (SecurityId, Side) at the
+    /// start of a mass-cancel. Default implementation is a no-op so legacy
+    /// sinks keep compiling; the production <c>ChannelDispatcher</c>
+    /// overrides it to emit the UMDF <c>MassDeleteOrders_MBO_52</c> frame.
+    /// </summary>
+    void OnOrderMassCanceled(in OrderMassCanceledEvent e) { }
 }

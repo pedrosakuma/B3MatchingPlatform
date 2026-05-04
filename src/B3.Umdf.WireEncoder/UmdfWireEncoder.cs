@@ -399,6 +399,46 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// Writes <c>MassDeleteOrders_MBO_52</c> (V16). Returns total bytes.
+    /// Emitted once per (SecurityID, Side) at the start of a mass-cancel
+    /// operation as an atomic boundary marker (gap-functional #8 / #199).
+    /// Per-order <c>DeleteOrder_MBO_51</c> frames for the same orders
+    /// follow in the same UMDF packet, so consumers that ignore
+    /// <c>MassDeleteOrders</c> remain correct.
+    /// </summary>
+    public static int WriteMassDeleteOrdersFrame(
+        Span<byte> dst,
+        long securityId,
+        byte mdEntryType,
+        uint rptSeq,
+        ulong transactTimeNanos)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.MassDeleteOrdersBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.MassDeleteOrders_MBO_52Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.MassDeleteOrdersBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.MassDeleteOrdersBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator overlays SecurityExchange at offset 8 in the
+        // V16 schema (1 byte). Leave at 0 (no event flags set).
+        body[WireOffsets.MassDeleteOrdersBodyMdUpdateActionOffset] = (byte)MDUpdateAction.DELETE_THRU;
+        body[WireOffsets.MassDeleteOrdersBodyMdEntryTypeOffset] = mdEntryType;
+        MemoryMarshal.Write(body.Slice(WireOffsets.MassDeleteOrdersBodyTransactTimeOffset, 8), in transactTimeNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.MassDeleteOrdersBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

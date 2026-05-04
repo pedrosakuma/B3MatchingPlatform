@@ -59,6 +59,20 @@ public sealed partial class ChannelDispatcher
         Commit(n);
     }
 
+    public void OnOrderMassCanceled(in OrderMassCanceledEvent e)
+    {
+        AssertOnLoopThread();
+        var entryType = e.Side == Side.Buy
+            ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
+            : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.MassDeleteOrdersBlockLength);
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteMassDeleteOrdersFrame(
+            dst, e.SecurityId, entryType, e.RptSeq, e.TransactTimeNanos);
+        Commit(n);
+    }
+
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
         AssertOnLoopThread();

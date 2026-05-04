@@ -255,6 +255,24 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void MassDeleteOrders_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteMassDeleteOrdersFrame(buf,
+            securityId: 4242L, mdEntryType: UmdfWireEncoder.MdEntryTypeBid,
+            rptSeq: 7, transactTimeNanos: 1_700_000_000_000_000_000UL);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.MassDeleteOrdersBlockLength, n);
+
+        Assert.True(MassDeleteOrders_MBO_52Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.MassDeleteOrdersBlockLength), out var rdr));
+        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(MDEntryType.BID, rdr.Data.MDEntryType);
+        Assert.Equal(MDUpdateAction.DELETE_THRU, rdr.Data.MDUpdateAction);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
+        Assert.Equal(7u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
     public void Encoder_ThrowsOnSmallBuffer()
     {
         var small = new byte[8];
