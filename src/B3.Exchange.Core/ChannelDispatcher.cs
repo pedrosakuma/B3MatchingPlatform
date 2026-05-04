@@ -98,6 +98,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly Func<ulong> _nowNanos;
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
+    private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
 
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
@@ -137,7 +138,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ICoreOutbound outbound,
         ILogger<ChannelDispatcher> logger,
         Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
-        ChannelMetrics? metrics = null)
+        ChannelMetrics? metrics = null,
+        BoundedSessionFirmCounters? sessionFirmCounters = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -148,6 +150,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _nowNanos = nowNanos ?? DefaultNowNanos;
         _tradeDate = tradeDate;
         _metrics = metrics;
+        _sessionFirmCounters = sessionFirmCounters;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the
         // instance. No memory barrier is needed.
@@ -568,7 +571,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
             clOrdIdValue, 0, cmd, null, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-        { _metrics?.IncInboundMessage(InboundMessageKind.New); return true; }
+        { _metrics?.IncInboundMessage(InboundMessageKind.New); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New);
         return false;
     }
@@ -578,7 +581,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, cmd, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-        { _metrics?.IncInboundMessage(InboundMessageKind.Cancel); return true; }
+        { _metrics?.IncInboundMessage(InboundMessageKind.Cancel); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel);
         return false;
     }
@@ -588,7 +591,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
             clOrdIdValue, origClOrdIdValue, null, null, cmd, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-        { _metrics?.IncInboundMessage(InboundMessageKind.Replace); return true; }
+        { _metrics?.IncInboundMessage(InboundMessageKind.Replace); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace);
         return false;
     }
@@ -597,7 +600,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
             cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-        { _metrics?.IncInboundMessage(InboundMessageKind.Cross); return true; }
+        { _metrics?.IncInboundMessage(InboundMessageKind.Cross); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross);
         return false;
     }
@@ -631,7 +634,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
             0, 0, null, null, null, null, mc, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
-        { _metrics?.IncInboundMessage(InboundMessageKind.MassCancel); return true; }
+        { _metrics?.IncInboundMessage(InboundMessageKind.MassCancel); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
         return false;
     }

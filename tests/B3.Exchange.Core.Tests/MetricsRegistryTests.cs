@@ -295,6 +295,72 @@ public class MetricsRegistryTests
     }
 
     [Fact]
+    public void Render_EmitsBoundedSessionFirmCounters_Issue176()
+    {
+        var reg = new MetricsRegistry();
+        var bsfc = reg.SessionFirmMessages;
+
+        bsfc.Inc(7, "conn-1");
+        bsfc.Inc(7, "conn-1");
+        bsfc.Inc(7, "conn-2");
+        bsfc.Inc(42, "conn-3");
+
+        var text = reg.RenderProm();
+
+        Assert.Contains("# TYPE exch_session_messages_by_firm_total counter\n", text);
+        Assert.Contains("exch_session_messages_by_firm_total{firm=\"7\"} 3\n", text);
+        Assert.Contains("exch_session_messages_by_firm_total{firm=\"42\"} 1\n", text);
+        Assert.Contains("exch_session_messages_by_firm_total{firm=\"_other\"} 0\n", text);
+
+        Assert.Contains("# TYPE exch_session_messages_by_session_total counter\n", text);
+        Assert.Contains("exch_session_messages_by_session_total{session_id=\"conn-1\"} 2\n", text);
+        Assert.Contains("exch_session_messages_by_session_total{session_id=\"conn-2\"} 1\n", text);
+        Assert.Contains("exch_session_messages_by_session_total{session_id=\"conn-3\"} 1\n", text);
+        Assert.Contains("exch_session_messages_by_session_total{session_id=\"_other\"} 0\n", text);
+    }
+
+    [Fact]
+    public void BoundedSessionFirmCounters_OverflowsIntoOther_PastCap()
+    {
+        var bsfc = new BoundedSessionFirmCounters(maxFirms: 2, maxSessions: 2);
+
+        // First two firms / sessions take their own slot.
+        bsfc.Inc(1, "s1");
+        bsfc.Inc(2, "s2");
+        // Re-incrementing existing keys after the cap is reached is still
+        // routed to the existing slot (not overflow).
+        bsfc.Inc(1, "s1");
+        // New firm / session past the cap funnels into _other.
+        bsfc.Inc(3, "s3");
+        bsfc.Inc(4, "s4");
+        bsfc.Inc(5, "s5");
+
+        var firms = bsfc.FirmsSnapshot().ToDictionary(kv => kv.Key, kv => kv.Value);
+        Assert.Equal(2, firms[1]); // 1 hit twice
+        Assert.Equal(1, firms[2]);
+        Assert.Equal(2, firms.Count); // capped
+        Assert.Equal(3, bsfc.FirmOverflowCount); // firms 3,4,5
+
+        var sess = bsfc.SessionsSnapshot().ToDictionary(kv => kv.Key, kv => kv.Value);
+        Assert.Equal(2, sess["s1"]);
+        Assert.Equal(1, sess["s2"]);
+        Assert.Equal(2, sess.Count);
+        Assert.Equal(3, bsfc.SessionOverflowCount);
+    }
+
+    [Fact]
+    public void BoundedSessionFirmCounters_NullSessionId_OnlyIncsFirm()
+    {
+        var bsfc = new BoundedSessionFirmCounters();
+        bsfc.Inc(1, null);
+        bsfc.Inc(1, "");
+
+        Assert.Single(bsfc.FirmsSnapshot());
+        Assert.Equal(2, bsfc.FirmsSnapshot()[0].Value);
+        Assert.Empty(bsfc.SessionsSnapshot());
+    }
+
+    [Fact]
     public void CountingUdpPacketSinkDecorator_Increments_ThenForwards()
     {
         var reg = new MetricsRegistry();

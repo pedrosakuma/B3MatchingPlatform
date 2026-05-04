@@ -208,10 +208,19 @@ public sealed class MetricsRegistry
     private readonly SessionLifecycleMetrics _sessionLifecycle = new();
     private readonly ThrottleMetrics _throttle = new();
     private readonly TransportMetrics _transport = new();
+    private readonly BoundedSessionFirmCounters _sessionFirmMessages = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
     public ThrottleMetrics Throttle => _throttle;
     public TransportMetrics Transport => _transport;
+
+    /// <summary>
+    /// Bounded-cardinality per-firm/per-session inbound message counters
+    /// (issue #176). Increment from the dispatcher; rendered as
+    /// <c>exch_session_messages_total{firm,session_id}</c> with an
+    /// <c>"_other"</c> overflow series when the cap is exceeded.
+    /// </summary>
+    public BoundedSessionFirmCounters SessionFirmMessages => _sessionFirmMessages;
 
     public ChannelMetrics RegisterChannel(byte channelNumber)
     {
@@ -400,9 +409,74 @@ public sealed class MetricsRegistry
             ChannelMetrics.UmdfFeedKindNames,
             (c, i) => c.ReadUmdfBytes((UmdfFeedKind)i));
 
+        EmitSessionFirmCounters(sb);
+
         EmitRuntimeMetrics(sb);
 
         return sb.ToString();
+    }
+
+    private void EmitSessionFirmCounters(StringBuilder sb)
+    {
+        // Issue #176 (B4): bounded-cardinality per-firm and per-session
+        // inbound message counters. Two metric names with disjoint label
+        // sets so dashboards can group on either dimension cheaply
+        // without exploding the time-series count.
+        //
+        // Cardinality budget: ≤ MaxFirms+1 firm-series and
+        // ≤ MaxSessions+1 session-series (the +1 is the "_other"
+        // overflow). Beyond the cap, every newly-seen firm/session
+        // contributes to the overflow series only — its identity is
+        // lost on the metric (still visible via /sessions and audit
+        // logs). Document the cap in the operability runbook.
+        sb.Append("# HELP exch_session_messages_by_firm_total ")
+          .Append("Total inbound application messages received from a given firm (issue #176). Bounded to ")
+          .Append(_sessionFirmMessages.MaxFirms.ToString(CultureInfo.InvariantCulture))
+          .Append(" firms; overflow funnels into firm=\"")
+          .Append(BoundedSessionFirmCounters.OverflowLabel)
+          .Append("\".\n");
+        sb.Append("# TYPE exch_session_messages_by_firm_total counter\n");
+        var firms = _sessionFirmMessages.FirmsSnapshot();
+        Array.Sort(firms, (a, b) => a.Key.CompareTo(b.Key));
+        foreach (var kv in firms)
+        {
+            sb.Append("exch_session_messages_by_firm_total{firm=\"")
+              .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+        // Always emit the overflow series so dashboards can alert on
+        // rate(...{firm="_other"}[5m]) > 0 without having to special-case
+        // an absent label.
+        sb.Append("exch_session_messages_by_firm_total{firm=\"")
+          .Append(BoundedSessionFirmCounters.OverflowLabel)
+          .Append("\"} ")
+          .Append(_sessionFirmMessages.FirmOverflowCount.ToString(CultureInfo.InvariantCulture))
+          .Append('\n');
+
+        sb.Append("# HELP exch_session_messages_by_session_total ")
+          .Append("Total inbound application messages received on a given FIXP session (issue #176). Bounded to ")
+          .Append(_sessionFirmMessages.MaxSessions.ToString(CultureInfo.InvariantCulture))
+          .Append(" sessions; overflow funnels into session_id=\"")
+          .Append(BoundedSessionFirmCounters.OverflowLabel)
+          .Append("\".\n");
+        sb.Append("# TYPE exch_session_messages_by_session_total counter\n");
+        var sessionsArr = _sessionFirmMessages.SessionsSnapshot();
+        Array.Sort(sessionsArr, (a, b) => StringComparer.Ordinal.Compare(a.Key, b.Key));
+        foreach (var kv in sessionsArr)
+        {
+            sb.Append("exch_session_messages_by_session_total{session_id=\"")
+              .Append(EscapeLabel(kv.Key))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+        sb.Append("exch_session_messages_by_session_total{session_id=\"")
+          .Append(BoundedSessionFirmCounters.OverflowLabel)
+          .Append("\"} ")
+          .Append(_sessionFirmMessages.SessionOverflowCount.ToString(CultureInfo.InvariantCulture))
+          .Append('\n');
     }
 
     private static void EmitRuntimeMetrics(StringBuilder sb)
