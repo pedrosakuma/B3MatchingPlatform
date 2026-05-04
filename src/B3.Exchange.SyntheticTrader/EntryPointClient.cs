@@ -76,13 +76,14 @@ public sealed class EntryPointClient : IAsyncDisposable
     // optional `receivedTime` (tag 35544) trailing field; ER_Trade and
     // ER_Reject continue to ride V2.
     // Returns -1 for unknown template IDs (caller falls back to MaxAcceptedBlockLength).
+    // V6 ER schema (issue #248): match the gateway's bumped BlockLengths.
     private static int ExpectedBlockLength(ushort templateId) => templateId switch
     {
-        EntryPointFrameReader.TidExecutionReportNew => 172,
-        EntryPointFrameReader.TidExecutionReportModify => 183,
+        EntryPointFrameReader.TidExecutionReportNew => 176,
+        EntryPointFrameReader.TidExecutionReportModify => 188,
         EntryPointFrameReader.TidExecutionReportCancel => 182,
-        EntryPointFrameReader.TidExecutionReportTrade => 154,
-        EntryPointFrameReader.TidExecutionReportReject => 138,
+        EntryPointFrameReader.TidExecutionReportTrade => 174,
+        EntryPointFrameReader.TidExecutionReportReject => 164,
         _ => -1,
     };
 
