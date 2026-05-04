@@ -291,7 +291,12 @@ public static class UmdfWireEncoder
     /// for the consumer's instrument pipeline (SecurityID, SecurityExchange,
     /// Symbol, SecurityType, TotNoRelatedSym, ISIN, optional ValidityTimestamp,
     /// optional MaturityDate). Trailing 9 bytes encode three empty groups
-    /// (NoUnderlyings, NoLegs, NoInstrAttribs).
+    /// (NoUnderlyings, NoLegs, NoInstrAttribs); the final byte is the
+    /// <c>securityDesc</c> TextEncoding length prefix, written as 0 (empty
+    /// description). The length prefix is mandatory even when no text is
+    /// attached — without it the consumer's generated
+    /// <c>SecurityDefinition_12DataReader</c> reads past the SBE message
+    /// boundary and throws (issue #222).
     /// </summary>
     public static int WriteSecurityDefinitionFrame(
         Span<byte> dst,

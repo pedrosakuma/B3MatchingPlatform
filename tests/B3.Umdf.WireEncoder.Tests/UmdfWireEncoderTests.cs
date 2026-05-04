@@ -236,6 +236,38 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void SecurityDefinition_GeneratedReader_ReadsSecurityDescWithoutOverflow()
+    {
+        // Issue #222: prior to the trailing length-prefix fix, the
+        // generated SecurityDefinition_12Data reader's TextEncoding.Create
+        // call would slice past the SBE message buffer when the encoder
+        // omitted the securityDesc data section, throwing
+        // ArgumentOutOfRangeException. With the fix the reader observes a
+        // 0-length description and ReadGroups completes cleanly.
+        var buf = new byte[512];
+        int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(buf, securityId: 900_000_000_001L,
+            symbol: "PETR4", isin: "BRPETRACNPR6", securityTypeByte: 1, totNoRelatedSym: 1);
+
+        // Slice exactly to the encoded payload (excluding framing header)
+        // — that's what the consumer sees on the wire after stripping
+        // SOFH + SBE message header.
+        var sbeMessage = buf.AsSpan(WireOffsets.FramingHeaderSize, n - WireOffsets.FramingHeaderSize);
+        // Skip the SBE message header (8 bytes) — the V6 reader expects
+        // the slice to start at the block.
+        var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodyAndTail,
+            blockLength: WireOffsets.SecDefBlockLength, out var rdr));
+
+        int descLen = -1;
+        rdr.ReadGroups(
+            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoUnderlyingsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V16.TextEncoding desc) => { descLen = desc.VarData.Length; });
+        Assert.Equal(0, descLen);
+    }
+
+    [Fact]
     public void SecurityDefinition_Roundtrip_BasicFields()
     {
         var buf = new byte[512];
@@ -252,6 +284,14 @@ public class UmdfWireEncoderTests
         Assert.Equal((byte)1, body[WireOffsets.SecDefSecurityTypeOffset]);
         Assert.Equal(3u, MemoryMarshal.Read<uint>(body.Slice(WireOffsets.SecDefTotNoRelatedSymOffset, 4)));
         Assert.Equal("BRPETRACNPR6", System.Text.Encoding.ASCII.GetString(body.Slice(WireOffsets.SecDefIsinNumberOffset, 12)));
+
+        // Issue #222: trailing byte after the three empty group headers is
+        // the securityDesc TextEncoding length prefix (uint8). Must be 0
+        // when no description is attached so the consumer's generated
+        // reader doesn't slice past the SBE message boundary.
+        int descLengthOffset = FrameOffset + WireOffsets.SecDefBlockLength + WireOffsets.GroupSizeEncodingSize * 3;
+        Assert.Equal((byte)0, buf[descLengthOffset]);
+        Assert.Equal(descLengthOffset + 1, n);
     }
 
     [Fact]
