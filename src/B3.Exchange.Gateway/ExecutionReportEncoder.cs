@@ -56,6 +56,8 @@ internal static class ExecutionReportEncoder
     private const byte OrdStatusRejected = (byte)'8';
     private const byte OrdTypeMarket = (byte)'1';
     private const byte OrdTypeLimit = (byte)'2';
+    private const byte OrdTypeStopLoss = (byte)'3';
+    private const byte OrdTypeStopLimit = (byte)'4';
     private const byte TifDay = (byte)'0';
     private const byte TifIoc = (byte)'3';
     private const byte TifFok = (byte)'4';
@@ -66,7 +68,14 @@ internal static class ExecutionReportEncoder
     private const byte ExecTypeTrade = (byte)'F';
 
     private static byte EncodeSide(Matching.Side s) => s == Matching.Side.Buy ? SideBuy : SideSell;
-    private static byte EncodeOrdType(Matching.OrderType t) => t == Matching.OrderType.Market ? OrdTypeMarket : OrdTypeLimit;
+    private static byte EncodeOrdType(Matching.OrderType t) => t switch
+    {
+        Matching.OrderType.Market => OrdTypeMarket,
+        Matching.OrderType.Limit => OrdTypeLimit,
+        Matching.OrderType.StopLoss => OrdTypeStopLoss,
+        Matching.OrderType.StopLimit => OrdTypeStopLimit,
+        _ => OrdTypeLimit,
+    };
     private static byte EncodeTif(Matching.TimeInForce t) => t switch
     {
         Matching.TimeInForce.Day => TifDay,

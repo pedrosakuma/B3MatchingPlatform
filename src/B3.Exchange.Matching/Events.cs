@@ -162,7 +162,68 @@ public readonly record struct IcebergReplenishedEvent(
     uint AddRptSeq);
 
 /// <summary>
-/// Sink of matching events. Implementations MUST NOT call back into the engine
+/// Fired when a stop order (StopLoss or StopLimit) is accepted by the
+/// engine and parked off-book in the per-instrument trigger book.
+/// Issue #214. Carries the original order parameters so the integration
+/// layer can emit ER_New back to the originating session. The order is
+/// off-book so NO MBO frame is emitted; only ER_New surfaces to the
+/// client. The order remains parked until either:
+/// <list type="bullet">
+///   <item>a trade prints at or through <see cref="StopPxMantissa"/>
+///   on the watching side, in which case it triggers and is re-routed
+///   through the matching path (see <see cref="StopOrderTriggeredEvent"/>);</item>
+///   <item>or it is cancelled by the client (see <see cref="StopOrderCanceledEvent"/>).</item>
+/// </list>
+/// </summary>
+public readonly record struct StopOrderAcceptedEvent(
+    long SecurityId,
+    long OrderId,
+    string ClOrdId,
+    Side Side,
+    OrderType StopType,
+    TimeInForce Tif,
+    long StopPxMantissa,
+    long LimitPriceMantissa,
+    long Quantity,
+    uint EnteringFirm,
+    ulong InsertTimestampNanos,
+    uint RptSeq);
+
+/// <summary>
+/// Fired when a parked stop order's trigger condition fires. Issue #214.
+/// Informational: the engine internally re-routes the triggered order
+/// through the normal aggression path (which then emits Trade /
+/// OrderAccepted / OrderFilled etc. with the SAME <see cref="OrderId"/>).
+/// The integration layer's default is to log this and emit no separate
+/// frame; per-trade and per-resting-event frames already cover the
+/// client-visible state changes.
+/// </summary>
+public readonly record struct StopOrderTriggeredEvent(
+    long SecurityId,
+    long OrderId,
+    Side Side,
+    long StopPxMantissa,
+    long TriggerTradePriceMantissa,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
+/// Fired when a parked stop order is cancelled by the client (the only
+/// reason for a stop cancel — stops do not auto-expire in this engine).
+/// Issue #214. The integration layer translates this to ER_Cancel back
+/// to the owning session; no MBO frame is emitted because the stop was
+/// never on the book.
+/// </summary>
+public readonly record struct StopOrderCanceledEvent(
+    long SecurityId,
+    long OrderId,
+    Side Side,
+    long StopPxMantissa,
+    long RemainingQuantityAtCancel,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// from any of these methods — the engine is single-threaded per channel and
 /// reentrant commands corrupt internal linked lists.
 /// </summary>
@@ -206,4 +267,31 @@ public interface IMatchingEventSink
     /// pair for the same OrderID. Issue #211.
     /// </summary>
     void OnIcebergReplenished(in IcebergReplenishedEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted when a stop order is accepted off-book and
+    /// parked in the trigger book (issue #214). Default no-op so legacy
+    /// sinks compile; the production <c>ChannelDispatcher</c> overrides
+    /// it to emit ER_New only (NO MBO — the stop is off-book).
+    /// </summary>
+    void OnStopOrderAccepted(in StopOrderAcceptedEvent e) { }
+
+    /// <summary>
+    /// Optional informational event emitted when a parked stop order's
+    /// trigger condition fires (issue #214). The engine internally
+    /// re-routes the triggered order via the normal matching path; the
+    /// integration layer typically logs this and emits no separate
+    /// frame, since per-trade and per-resting-event frames cover the
+    /// client-visible state changes.
+    /// </summary>
+    void OnStopOrderTriggered(in StopOrderTriggeredEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted when a parked stop order is cancelled by
+    /// the client (issue #214). Default no-op; production sink emits
+    /// ER_Cancel back to the owning session and evicts the canonical
+    /// order-state entry. NO MBO frame is emitted because the stop was
+    /// never on the book.
+    /// </summary>
+    void OnStopOrderCanceled(in StopOrderCanceledEvent e) { }
 }

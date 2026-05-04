@@ -94,9 +94,18 @@ internal static partial class InboundMessageDecoder
                 ? InboundDecodeOutcome.UnsupportedFeature
                 : InboundDecodeOutcome.DecodeError;
         }
-        if (stopPx != PriceNull)
+        bool isStop = ordType == OrderType.StopLoss || ordType == OrderType.StopLimit;
+        if (isStop)
         {
-            message = "Stop orders not supported (StopPx must be NULL)";
+            if (stopPx == PriceNull)
+            {
+                message = "Stop orders require StopPx";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+        }
+        else if (stopPx != PriceNull)
+        {
+            message = "StopPx only valid on Stop orders";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (maxFloor != 0)
@@ -126,6 +135,7 @@ internal static partial class InboundMessageDecoder
         }
 
         long enginePrice = ordType == OrderType.Market ? 0L : (priceMantissa == PriceNull ? 0L : priceMantissa);
+        long engineStopPx = isStop ? stopPx : 0L;
 
         cmd = new NewOrderCommand(
             ClOrdId: clOrdId.ToString(),
@@ -140,6 +150,7 @@ internal static partial class InboundMessageDecoder
         {
             MinQty = minQty,
             MaxFloor = maxFloor,
+            StopPxMantissa = engineStopPx,
         };
         return InboundDecodeOutcome.Success;
     }

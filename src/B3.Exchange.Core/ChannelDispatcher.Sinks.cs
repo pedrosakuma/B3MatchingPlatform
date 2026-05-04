@@ -231,4 +231,73 @@ public sealed partial class ChannelDispatcher
             e.AddRptSeq, e.InsertTimestampNanos);
         Commit(an);
     }
+
+    /// <summary>
+    /// Issue #214: stop order accepted off-book. We register the canonical
+    /// order ownership (so a later cancel or a triggered passive trade
+    /// can resolve the owner) and emit ER_New back to the active session.
+    /// No MBO frame is emitted because stops are not on the public book
+    /// until they trigger. The wire ER reuses the regular OrderAccepted
+    /// shape and therefore does not carry StopPx/OrdType=Stop on the
+    /// wire — an MVP limitation tracked in the issue body.
+    /// </summary>
+    public void OnStopOrderAccepted(in StopOrderAcceptedEvent e)
+    {
+        AssertOnLoopThread();
+        if (_hasCurrentSession)
+        {
+            _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
+            var accepted = new OrderAcceptedEvent(
+                SecurityId: e.SecurityId,
+                OrderId: e.OrderId,
+                ClOrdId: e.ClOrdId,
+                Side: e.Side,
+                PriceMantissa: e.LimitPriceMantissa,
+                RemainingQuantity: e.Quantity,
+                EnteringFirm: e.EnteringFirm,
+                InsertTimestampNanos: e.InsertTimestampNanos,
+                RptSeq: e.RptSeq);
+            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, accepted, _currentReceivedTimeNanos);
+            _metrics?.IncExecutionReport(ExecutionReportKind.New);
+        }
+    }
+
+    /// <summary>
+    /// Issue #214: untriggered stop canceled. Mirrors the passive-cancel
+    /// path of <see cref="OnOrderCanceled"/> — resolve owner, emit
+    /// ER_Cancel, evict ownership. No MBO frame (the stop never showed
+    /// on the public book).
+    /// </summary>
+    public void OnStopOrderCanceled(in StopOrderCanceledEvent e)
+    {
+        AssertOnLoopThread();
+        if (_orders.TryResolve(e.OrderId, out var owner))
+        {
+            _orders.Evict(e.OrderId);
+            var canceled = new OrderCanceledEvent(
+                SecurityId: e.SecurityId,
+                OrderId: e.OrderId,
+                Side: e.Side,
+                PriceMantissa: e.StopPxMantissa,
+                RemainingQuantityAtCancel: e.RemainingQuantityAtCancel,
+                TransactTimeNanos: e.TransactTimeNanos,
+                Reason: CancelReason.Client,
+                RptSeq: e.RptSeq);
+            _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
+                _currentClOrdId, _currentReceivedTimeNanos);
+            _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
+        }
+    }
+
+    /// <summary>
+    /// Issue #214: stop trigger fired. The triggered execution that
+    /// follows is routed through <see cref="OnTrade"/> /
+    /// <see cref="OnOrderAccepted"/> just like a fresh aggressor, so
+    /// nothing on the wire needs to be emitted here. Hook reserved for
+    /// future telemetry / audit instrumentation.
+    /// </summary>
+    public void OnStopOrderTriggered(in StopOrderTriggeredEvent e)
+    {
+        AssertOnLoopThread();
+    }
 }
