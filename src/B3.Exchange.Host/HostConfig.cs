@@ -226,6 +226,15 @@ public sealed class ChannelConfig
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
 
     /// <summary>
+    /// Optional UMDF retransmit ring sizing (issue #216 / Onda L · L3a).
+    /// When omitted, the default ring size is used. Set
+    /// <c>bufferSize=0</c> to disable retransmit buffering entirely (the
+    /// dispatcher will not retain published packets and any future
+    /// retransmit responder will report an empty window).
+    /// </summary>
+    [JsonPropertyName("umdfRetransmit")] public UmdfRetransmitConfig? UmdfRetransmit { get; set; }
+
+    /// <summary>
     /// Optional chaos injection on the incremental UDP sink (issue #119).
     /// When omitted or all probabilities are 0, the sink is unmodified.
     /// Used to exercise the consumer's recovery paths (snapshot bootstrap,
@@ -367,4 +376,18 @@ public static class HostConfigLoader
             throw new InvalidOperationException("HostConfig.Channels is empty");
         return cfg;
     }
+}
+
+/// <summary>
+/// Per-channel UMDF retransmit ring sizing (issue #216 / Onda L · L3a).
+/// </summary>
+public sealed class UmdfRetransmitConfig
+{
+    /// <summary>
+    /// Ring capacity in packets. <c>null</c> uses the default
+    /// (<see cref="B3.Exchange.Core.RetransmitBufferDefaults.UmdfRingCapacity"/>);
+    /// <c>0</c> disables the ring entirely (no buffer is allocated and
+    /// the dispatcher publishes without retaining packets).
+    /// </summary>
+    [JsonPropertyName("bufferSize")] public int? BufferSize { get; set; }
 }

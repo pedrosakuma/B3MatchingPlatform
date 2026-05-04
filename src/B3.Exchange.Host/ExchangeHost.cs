@@ -146,6 +146,14 @@ public sealed class ExchangeHost : IAsyncDisposable
             // Capture the engine via a side-channel so we can build a snapshot
             // source that reads through the live book on the dispatcher thread.
             MatchingEngine? capturedEngine = null;
+            // Issue #216 (L3a): build the UMDF retransmit ring per channel
+            // unless the operator explicitly opted out via bufferSize=0.
+            UmdfPacketRetransmitBuffer? retxBuffer = null;
+            int retxCapacity = ch.UmdfRetransmit?.BufferSize ?? RetransmitBufferDefaults.UmdfRingCapacity;
+            if (retxCapacity > 0)
+            {
+                retxBuffer = new UmdfPacketRetransmitBuffer(retxCapacity);
+            }
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
@@ -158,7 +166,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 outbound: gatewayRouter,
                 logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
                 metrics: channelMetrics,
-                sessionFirmCounters: _metrics.SessionFirmMessages);
+                sessionFirmCounters: _metrics.SessionFirmMessages,
+                retxBuffer: retxBuffer);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)

@@ -37,12 +37,24 @@ public sealed partial class ChannelDispatcher
             System.Runtime.InteropServices.MemoryMarshal.Write(
                 _packetBuf.AsSpan(B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSequenceVersionOffset, 2),
                 in newVer);
+            // Issue #216 (L3a): the (version, seq) tuple identifies a
+            // packet uniquely; once version bumps, the previously-stored
+            // packets address a now-stale namespace and would mislead a
+            // gap-fill responder. Wipe the ring before appending under
+            // the new version.
+            _retxBuffer?.Reset();
         }
         Volatile.Write(ref _sequenceNumber, _sequenceNumber + 1);
         ulong now = _nowNanos();
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), _sequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
+        // Issue #216 (L3a): retain a deep-copied snapshot of the just-
+        // published incremental packet for the future retransmit
+        // responder (L3b). Snapshot/instrumentdef feeds are NOT routed
+        // through here — they reach the wire via the host-owned
+        // CountingUdpPacketSinkDecorator, by design.
+        _retxBuffer?.Append(_sequenceNumber, _packetBuf.AsSpan(0, _packetWritten));
         LogPacketFlushed(ChannelNumber, _sequenceNumber, _packetWritten);
         _metrics?.IncPacketsOut();
         // Issue #174: per-feed packet/byte throughput. The incremental feed
