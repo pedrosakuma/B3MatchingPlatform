@@ -34,7 +34,7 @@ public class MultiSessionReplayTests
         throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
     }
 
-    [Fact(Skip = "Flake under FIXP watchdog 'peer stale' tear-down — #161")]
+    [Fact]
     public async Task TwoSessions_CrossingScript_LandsErTradesOnBothSides()
     {
         var sink = new CountingSink();
