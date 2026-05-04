@@ -102,10 +102,14 @@ public static class EntryPointFrameReader
     public static int ExpectedInboundBlockLength(ushort templateId, ushort version) => (templateId, version) switch
     {
         (TidSimpleNewOrder, 2) => 82,            // SimpleNewOrderV2.MESSAGE_SIZE
+        (TidSimpleNewOrder, 6) => 82,            // SimpleNewOrder root V6 (no schema delta vs V2; SDK 0.8.0 stamps version=6). #236
         (TidSimpleModifyOrder, 2) => 98,         // SimpleModifyOrderV2.MESSAGE_SIZE
+        (TidSimpleModifyOrder, 6) => 98,         // SimpleModifyOrder root V6 (no schema delta vs V2). #236
         (TidNewOrderSingle, 2) => 125,           // NewOrderSingleV2.MESSAGE_SIZE
+        (TidNewOrderSingle, 6) => 133,           // NewOrderSingle root V6 (+strategyID@125, +tradingSubAccount@129). Decoder ignores trailing fields. #236
         (TidNewOrderCross, 6) => 84,             // NewOrderCross.MESSAGE_SIZE (root V6, group + varData follow)
         (TidOrderCancelReplaceRequest, 2) => 142, // OrderCancelReplaceRequestV2.MESSAGE_SIZE
+        (TidOrderCancelReplaceRequest, 6) => 150, // OrderCancelReplaceRequest root V6 (+strategyID@142, +tradingSubAccount@146). Decoder ignores trailing fields. #236
         (TidOrderCancelRequest, 0) => 76,        // OrderCancelRequest.MESSAGE_SIZE (V6 base)
         (TidOrderMassActionRequest, 6) => 52,    // OrderMassActionRequestData.MESSAGE_SIZE (V6 base, no varData)
         (TidSequence, 0) => 4,                   // Sequence: nextSeqNo (uint32). messageType is constant.
