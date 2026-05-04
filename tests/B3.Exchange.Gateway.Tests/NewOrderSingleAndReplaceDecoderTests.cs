@@ -144,15 +144,18 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
-    public void NewOrderSingle_MaxFloorRejectsAsUnsupported()
+    public void NewOrderSingle_AcceptsMaxFloor()
     {
-        var body = BuildNewOrderSingleV2(maxFloor: 10UL);
+        // #211: iceberg accepted on NewOrderSingle. The decoder forwards
+        // MaxFloor to the engine; engine validates lot/multiple/Type/TIF.
+        var body = BuildNewOrderSingleV2(maxFloor: 10UL, qty: 100L);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-            body, 1, 0, out _, out _, out var msg);
+            body, 1, 0, out var cmd, out _, out var msg);
 
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("Iceberg", msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(10UL, cmd.MaxFloor);
     }
 
     [Fact]

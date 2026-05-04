@@ -197,4 +197,38 @@ public sealed partial class ChannelDispatcher
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
     }
+
+    public void OnIcebergReplenished(in IcebergReplenishedEvent e)
+    {
+        AssertOnLoopThread();
+        // #211: encode the replenish as a Delete + Add MBO frame pair for
+        // the same OrderID. The order's canonical state (and therefore the
+        // owning session/ClOrdID for ER routing) is intentionally NOT
+        // touched: the order is logically the same; only its position in
+        // the price-level queue changed. No ExecutionReport is emitted —
+        // the per-trade ER_Trade frames already covered the fills that
+        // exhausted the visible slice.
+        var entryType = e.Side == Side.Buy
+            ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
+            : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
+
+        // 1. DeleteOrder for the consumed visible spot. Quantity is 0
+        //    because the slice was fully traded away (it's a "removed by
+        //    consumption" delete from the consumer's perspective).
+        var del = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.DeleteOrderBlockLength);
+        int dn = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderDeletedFrame(del,
+            e.SecurityId, e.OrderId, entryType, 0L, e.DeleteRptSeq, e.TransactTimeNanos, e.PriceMantissa);
+        Commit(dn);
+
+        // 2. OrderAdded for the replenished slice at the back of the level.
+        var add = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.OrderBlockLength);
+        int an = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderAddedFrame(add,
+            e.SecurityId, e.OrderId, entryType, e.PriceMantissa, e.NewVisibleQuantity,
+            e.AddRptSeq, e.InsertTimestampNanos);
+        Commit(an);
+    }
 }

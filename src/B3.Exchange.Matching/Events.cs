@@ -134,6 +134,34 @@ public readonly record struct OrderMassCanceledEvent(
     uint RptSeq);
 
 /// <summary>
+/// Fired when an iceberg order's visible slice is fully consumed by
+/// trades and a fresh visible slice is taken from the hidden reserve
+/// (issue #211). Carries the same <see cref="OrderId"/> as the
+/// original order — the order is logically still the same. The
+/// integration layer translates this to a UMDF
+/// <c>DeleteOrder_MBO_51</c> for the consumed spot followed by an
+/// <c>OrderAdded_MBO_50</c> for the replenished slice at the back of
+/// the same price level (time-priority loss). No
+/// <c>ExecutionReport</c> is emitted: the per-trade ER_Trade frames
+/// already covered the fills, and the order has not changed cumulative
+/// quantity or status from the client's perspective.
+/// <see cref="NewVisibleQuantity"/> is the size of the new exposed
+/// slice; <see cref="RemainingHiddenQuantity"/> is what is left in the
+/// reserve after this replenish (may be zero on the last replenish).
+/// </summary>
+public readonly record struct IcebergReplenishedEvent(
+    long SecurityId,
+    long OrderId,
+    Side Side,
+    long PriceMantissa,
+    long NewVisibleQuantity,
+    long RemainingHiddenQuantity,
+    ulong InsertTimestampNanos,
+    ulong TransactTimeNanos,
+    uint DeleteRptSeq,
+    uint AddRptSeq);
+
+/// <summary>
 /// Sink of matching events. Implementations MUST NOT call back into the engine
 /// from any of these methods — the engine is single-threaded per channel and
 /// reentrant commands corrupt internal linked lists.
@@ -169,4 +197,13 @@ public interface IMatchingEventSink
     /// <c>SecurityStatus_3</c>.
     /// </summary>
     void OnTradingPhaseChanged(in TradingPhaseChangedEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted when an iceberg order replenishes its
+    /// visible slice from the hidden reserve. Default no-op so legacy
+    /// sinks compile; the production <c>ChannelDispatcher</c> overrides
+    /// it to emit a UMDF <c>DeleteOrder_MBO_51</c> + <c>OrderAdded_MBO_50</c>
+    /// pair for the same OrderID. Issue #211.
+    /// </summary>
+    void OnIcebergReplenished(in IcebergReplenishedEvent e) { }
 }

@@ -101,8 +101,8 @@ internal static partial class InboundMessageDecoder
         }
         if (maxFloor != 0)
         {
-            message = "Iceberg orders not supported (MaxFloor must be NULL)";
-            return InboundDecodeOutcome.UnsupportedFeature;
+            // #211: iceberg accepted on NewOrderSingle. The engine validates
+            // MaxFloor in (0, Quantity] / lot multiple / Limit + Day|Gtc.
         }
         if (routing != RoutingInstructionNull)
         {
@@ -139,6 +139,7 @@ internal static partial class InboundMessageDecoder
             EnteredAtNanos: enteredAtNanos)
         {
             MinQty = minQty,
+            MaxFloor = maxFloor,
         };
         return InboundDecodeOutcome.Success;
     }
