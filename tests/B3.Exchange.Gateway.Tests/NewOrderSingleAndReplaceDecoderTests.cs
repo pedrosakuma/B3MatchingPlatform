@@ -156,15 +156,16 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
-    public void NewOrderSingle_MinQtyRejectsAsUnsupported()
+    public void NewOrderSingle_AcceptsMinQty()
     {
-        var body = BuildNewOrderSingleV2(minQty: 5UL);
+        var body = BuildNewOrderSingleV2(minQty: 5UL, qty: 100L);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-            body, 1, 0, out _, out _, out var msg);
+            body, 1, 0, out var cmd, out _, out var msg);
 
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("Minimum-fill", msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(5UL, cmd.MinQty);
     }
 
     [Fact]

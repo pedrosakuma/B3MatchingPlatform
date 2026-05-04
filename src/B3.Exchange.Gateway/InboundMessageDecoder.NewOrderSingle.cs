@@ -104,11 +104,6 @@ internal static partial class InboundMessageDecoder
             message = "Iceberg orders not supported (MaxFloor must be NULL)";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (minQty != 0)
-        {
-            message = "Minimum-fill orders not supported (MinQty must be NULL)";
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
         if (routing != RoutingInstructionNull)
         {
             message = $"RoutingInstruction={routing} not supported";
@@ -141,7 +136,10 @@ internal static partial class InboundMessageDecoder
             PriceMantissa: enginePrice,
             Quantity: qty,
             EnteringFirm: enteringFirm,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            MinQty = minQty,
+        };
         return InboundDecodeOutcome.Success;
     }
 }

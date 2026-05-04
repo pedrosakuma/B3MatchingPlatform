@@ -77,6 +77,16 @@ public enum RejectReason : byte
     /// <c>ExpireDate</c> is plumbed through the inbound command).
     /// Issue #202.</summary>
     TimeInForceNotSupported,
+    /// <summary>The aggressor specified a non-zero
+    /// <see cref="NewOrderCommand.MinQty"/> but the immediately fillable
+    /// quantity against the opposite book at the order's limit price was
+    /// less than that minimum. The order is rejected before any state
+    /// change. Issue #203 (MinQty subset).</summary>
+    MinQtyNotMet,
+    /// <summary>A request field was outside the engine's accepted range
+    /// (e.g. <see cref="NewOrderCommand.MinQty"/> &gt;
+    /// <see cref="NewOrderCommand.Quantity"/>). Issue #203.</summary>
+    InvalidField,
 }
 
 /// <summary>
@@ -138,7 +148,22 @@ public sealed record NewOrderCommand(
     long PriceMantissa,
     long Quantity,
     uint EnteringFirm,
-    ulong EnteredAtNanos);
+    ulong EnteredAtNanos)
+{
+    /// <summary>
+    /// Optional minimum-fill (FIX MinQty). When non-zero, the engine
+    /// requires that at submission time the immediately fillable quantity
+    /// against the opposite side at this order's limit (or any price for
+    /// market orders) is at least <c>MinQty</c>; otherwise the order is
+    /// rejected with <see cref="RejectReason.MinQtyNotMet"/> and never
+    /// touches the book. Must satisfy <c>0 &lt; MinQty &lt;= Quantity</c>;
+    /// values outside that range yield
+    /// <see cref="RejectReason.InvalidField"/>. Default 0 means "no
+    /// minimum-fill constraint" and preserves legacy behaviour.
+    /// Issue #203 (MinQty subset).
+    /// </summary>
+    public ulong MinQty { get; init; }
+}
 
 public sealed record CancelOrderCommand(
     string ClOrdId,
