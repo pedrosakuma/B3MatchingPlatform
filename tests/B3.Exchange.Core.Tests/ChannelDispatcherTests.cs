@@ -67,23 +67,21 @@ public class ChannelDispatcherTests
         { _owners[e.OrderId] = (session, clOrdIdValue); if (Find(session) is { } s) { s.News.Add(e); s.Calls.Add("New"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
         { if (Find(session) is { } s) { s.Trades.Add(e); s.Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); } return true; }
-        public bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e, long leavesQty, long cumQty)
-        { if (_owners.TryGetValue(restingOrderId, out var o) && Find(o.Session) is { } s) { s.Trades.Add(e); s.Calls.Add("TradePass"); } return true; }
-        public bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
+        public bool WriteExecutionReportPassiveTrade(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty)
+        { if (Find(ownerSession) is { } s) { s.Trades.Add(e); s.Calls.Add("TradePass"); } return true; }
+        public bool WriteExecutionReportPassiveCancel(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
         {
-            if (_owners.TryGetValue(orderId, out var o) && Find(o.Session) is { } s)
+            if (Find(ownerSession) is { } s)
             {
                 s.Cancels.Add(e); s.Calls.Add("Cancel"); s.LastReceivedTime = receivedTimeNanos;
-                if (s.CaptureCancelIds) s.CancelIds.Add((requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : o.ClOrdId, o.ClOrdId));
+                if (s.CaptureCancelIds) s.CancelIds.Add((requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : ownerClOrdId, ownerClOrdId));
             }
-            _owners.Remove(orderId);
             return true;
         }
         public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue)
         { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue)
         { if (Find(session) is { } s) { s.Rejects.Add(e); s.Calls.Add("Reject"); } return true; }
-        public void NotifyOrderTerminal(long orderId) => _owners.Remove(orderId);
     }
 
     private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()
@@ -550,11 +548,10 @@ public class ChannelDispatcherTests
             return true;
         }
         public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty) => true;
-        public bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e, long leavesQty, long cumQty) => true;
-        public bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue) => true;
+        public bool WriteExecutionReportPassiveTrade(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty) => true;
+        public bool WriteExecutionReportPassiveCancel(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue) => true;
         public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue) => true;
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue) => true;
-        public void NotifyOrderTerminal(long orderId) { }
     }
 
     private sealed class TestSession

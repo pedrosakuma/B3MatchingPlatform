@@ -1,17 +1,17 @@
 using B3.Exchange.Contracts;
-using B3.Exchange.Gateway;
+using B3.Exchange.Core;
 using Side = B3.Exchange.Matching.Side;
 
-namespace B3.Exchange.Gateway.Tests;
+namespace B3.Exchange.Core.Tests;
 
-public class OrderOwnershipMapTests
+public class OrderRegistryTests
 {
     private static SessionId S(string s) => new SessionId(s);
 
     [Fact]
     public void Register_Then_TryResolve_ReturnsOwner()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(orderId: 100, S("a"), clOrdId: 7, firm: 1, Side.Buy, securityId: 42);
 
         Assert.True(map.TryResolve(100, out var owner));
@@ -25,7 +25,7 @@ public class OrderOwnershipMapTests
     [Fact]
     public void TryResolveByClOrdId_FindsOrderId()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(100, S("a"), 7, 1, Side.Buy, 42);
 
         Assert.True(map.TryResolveByClOrdId(1, 7, out var oid));
@@ -39,7 +39,7 @@ public class OrderOwnershipMapTests
     [Fact]
     public void Evict_RemovesBothIndices()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(100, S("a"), 7, 1, Side.Buy, 42);
 
         Assert.True(map.Evict(100));
@@ -51,7 +51,7 @@ public class OrderOwnershipMapTests
     [Fact]
     public void FilterMassCancel_ScopesBySessionFirmSideInstrument()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(1, S("a"), 1, 1, Side.Buy, 42);
         map.Register(2, S("a"), 2, 1, Side.Sell, 42);
         map.Register(3, S("a"), 3, 1, Side.Buy, 99);
@@ -78,7 +78,7 @@ public class OrderOwnershipMapTests
     [Fact]
     public void EvictSession_DropsOnlyMatchingSessionEntries()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(1, S("a"), 1, 1, Side.Buy, 42);
         map.Register(2, S("a"), 2, 1, Side.Buy, 42);
         map.Register(3, S("b"), 3, 1, Side.Buy, 42);
@@ -95,7 +95,7 @@ public class OrderOwnershipMapTests
     [Fact]
     public void Register_OverwritesSameOrderId()
     {
-        var map = new OrderOwnershipMap();
+        var map = new OrderRegistry();
         map.Register(100, S("a"), 7, 1, Side.Buy, 42);
         map.Register(100, S("b"), 8, 2, Side.Sell, 99);
 

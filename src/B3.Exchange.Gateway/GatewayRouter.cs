@@ -14,6 +14,12 @@ namespace B3.Exchange.Gateway;
 /// <see cref="FixpSession"/> via the <see cref="SessionRegistry"/>, and
 /// invokes the session's encoders.
 ///
+/// <para>Issue #167: the canonical per-order owner state lives in Core's
+/// per-channel <c>OrderRegistry</c>; <see cref="ChannelDispatcher"/>
+/// resolves the owning session on the dispatch thread and passes the
+/// pre-resolved <c>(SessionId, ClOrdId)</c> on every passive ER call. The
+/// Gateway no longer holds an ownership map.</para>
+///
 /// <para>If the session is no longer registered (peer disconnected
 /// between the inbound command and the engine emitting the event) the
 /// report is dropped silently. Phase 3 (Suspended sessions) will route
@@ -27,26 +33,19 @@ namespace B3.Exchange.Gateway;
 public sealed class GatewayRouter : ICoreOutbound
 {
     private readonly SessionRegistry _registry;
-    private readonly OrderOwnershipMap _ownership;
     private readonly ILogger<GatewayRouter> _logger;
 
-    public GatewayRouter(SessionRegistry registry, OrderOwnershipMap ownership, ILogger<GatewayRouter> logger)
+    public GatewayRouter(SessionRegistry registry, ILogger<GatewayRouter> logger)
     {
         ArgumentNullException.ThrowIfNull(registry);
-        ArgumentNullException.ThrowIfNull(ownership);
         ArgumentNullException.ThrowIfNull(logger);
         _registry = registry;
-        _ownership = ownership;
         _logger = logger;
     }
 
     public bool WriteExecutionReportNew(ContractsSessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e,
         ulong receivedTimeNanos = ulong.MaxValue)
     {
-        // Register ownership before sending so a passive trade emitted in
-        // the same dispatch turn (single-threaded by construction) finds the
-        // entry. Eviction lives on the cancel/full-fill paths below.
-        _ownership.Register(e.OrderId, session, clOrdIdValue, enteringFirm, e.Side, e.SecurityId);
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
         return s.WriteExecutionReportNew(e, receivedTimeNanos);
     }
@@ -58,32 +57,19 @@ public sealed class GatewayRouter : ICoreOutbound
         return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty);
     }
 
-    public bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e,
-        long leavesQty, long cumQty)
+    public bool WriteExecutionReportPassiveTrade(ContractsSessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
+        in TradeEvent e, long leavesQty, long cumQty)
     {
-        if (!_ownership.TryResolve(restingOrderId, out var owner))
-        {
-            _logger.LogTrace("dropping passive ExecReportTrade for unknown orderId {OrderId}", restingOrderId);
-            return false;
-        }
-        if (!_registry.TryGet(owner.Session, out var s)) { LogMiss(owner.Session, "ExecReportPassiveTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, owner.ClOrdId, leavesQty, cumQty);
+        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveTrade"); return false; }
+        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty);
     }
 
-    public bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e,
-        ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
+    public bool WriteExecutionReportPassiveCancel(ContractsSessionId ownerSession, ulong ownerClOrdId, long orderId,
+        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
     {
-        if (!_ownership.TryResolve(orderId, out var owner))
-        {
-            _logger.LogTrace("dropping passive ExecReportCancel for unknown orderId {OrderId}", orderId);
-            return false;
-        }
-        // Always evict — the order is gone from the book regardless of
-        // whether the routing succeeds.
-        _ownership.Evict(orderId);
-        if (!_registry.TryGet(owner.Session, out var s)) { LogMiss(owner.Session, "ExecReportPassiveCancel"); return false; }
-        ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : owner.ClOrdId;
-        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, owner.ClOrdId, receivedTimeNanos);
+        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveCancel"); return false; }
+        ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : ownerClOrdId;
+        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos);
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
@@ -101,8 +87,6 @@ public sealed class GatewayRouter : ICoreOutbound
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportReject"); return false; }
         return s.WriteExecutionReportReject(e, clOrdIdValue);
     }
-
-    public void NotifyOrderTerminal(long orderId) => _ownership.Evict(orderId);
 
     private void LogMiss(ContractsSessionId session, string kind)
     {

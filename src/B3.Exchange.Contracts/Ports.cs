@@ -40,29 +40,30 @@ public interface ICoreOutbound
 
     /// <summary>
     /// Routes an <c>ExecutionReport_Trade</c> for the resting (passive) side
-    /// of <paramref name="e"/>. The Core does not know which session owns
-    /// the resting order: implementations resolve <paramref name="restingOrderId"/>
-    /// → <c>(SessionId, ClOrdId)</c> via the Gateway-side
-    /// <c>OrderOwnershipMap</c> and forward the wire-encoded ER. When the
-    /// resting order's owner has gone away the report is dropped silently
-    /// (same behaviour as the active path).
+    /// of <paramref name="e"/>. The Core resolves the resting order's owning
+    /// session locally on the dispatch thread (via its per-channel
+    /// <c>OrderRegistry</c>) and passes the resolved
+    /// <paramref name="ownerSession"/> + <paramref name="ownerClOrdId"/>
+    /// here; the Gateway forwards the wire-encoded ER. When the resting
+    /// order's owner has gone away the report is dropped silently (same
+    /// behaviour as the active path).
     /// </summary>
-    bool WriteExecutionReportPassiveTrade(long restingOrderId, in TradeEvent e,
-        long leavesQty, long cumQty);
+    bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
+        in TradeEvent e, long leavesQty, long cumQty);
 
     /// <summary>
     /// Routes an <c>ExecutionReport_Cancel</c> for the owner of
     /// <paramref name="orderId"/> (whether the cancel was self-initiated, a
-    /// mass-cancel, or any other engine-driven cancel). The Gateway resolves
-    /// the owning session from the ownership map, sends the ER, and evicts
-    /// the entry — passing <paramref name="requesterClOrdIdOrZero"/> as the
-    /// new <c>ClOrdId</c> on the wire (with the owner's original ClOrdId
-    /// becoming <c>OrigClOrdID</c>); pass zero when the cancel was not
-    /// initiated by a request from a live session (e.g. engine-internal
-    /// cancel).
+    /// mass-cancel, or any other engine-driven cancel). The Core has already
+    /// resolved <paramref name="ownerSession"/> + <paramref name="ownerClOrdId"/>
+    /// on the dispatch thread; the Gateway sends the ER passing
+    /// <paramref name="requesterClOrdIdOrZero"/> as the new <c>ClOrdId</c>
+    /// on the wire (with the owner's original ClOrdId becoming
+    /// <c>OrigClOrdID</c>); pass zero when the cancel was not initiated by
+    /// a request from a live session (e.g. engine-internal cancel).
     /// </summary>
-    bool WriteExecutionReportPassiveCancel(long orderId, in OrderCanceledEvent e,
-        ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue);
+    bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId,
+        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
@@ -70,14 +71,6 @@ public interface ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue);
 
     bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue);
-
-    /// <summary>
-    /// Signals that <paramref name="orderId"/> has reached a terminal state
-    /// other than cancel (currently: full fill). The Gateway evicts the
-    /// owner entry; no <c>ExecutionReport</c> is emitted (the per-fill
-    /// <c>ER_Trade</c>s have already done the wire work).
-    /// </summary>
-    void NotifyOrderTerminal(long orderId);
 }
 
 /// <summary>
