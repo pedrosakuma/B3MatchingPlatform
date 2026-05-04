@@ -104,6 +104,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// <see cref="SequenceVersion"/>. Safe to read from any thread.</summary>
     public uint SequenceNumber => Volatile.Read(ref _sequenceNumber);
 
+    /// <summary>Issue #216 (Onda L · L3a): exposes the per-channel UMDF
+    /// retransmit ring (or <c>null</c> when buffering is disabled). The
+    /// future TCP retransmit responder (L3b) reads through this; tests
+    /// inspect it to verify <c>FlushPacket</c> appends.</summary>
+    public UmdfPacketRetransmitBuffer? RetransmitBuffer => _retxBuffer;
+
     /// <summary>
     /// Pending work-items in the bounded inbound channel. Snapshot value;
     /// safe to read from any thread (the underlying <see cref="System.Threading.Channels.Channel{T}"/>
@@ -123,6 +129,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly ChannelMetrics? _metrics;
     private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
     private readonly OrderRegistry _orders = new();
+    /// <summary>Issue #216 (Onda L · L3a): per-channel UMDF retransmit
+    /// ring. Populated on each <c>FlushPacket</c> for the incremental
+    /// feed only. <c>null</c> when retransmit buffering is disabled
+    /// (host config <c>umdfRetransmit.bufferSize=0</c>).</summary>
+    private readonly UmdfPacketRetransmitBuffer? _retxBuffer;
 
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
@@ -172,7 +183,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ILogger<ChannelDispatcher> logger,
         Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
         ChannelMetrics? metrics = null,
-        BoundedSessionFirmCounters? sessionFirmCounters = null)
+        BoundedSessionFirmCounters? sessionFirmCounters = null,
+        UmdfPacketRetransmitBuffer? retxBuffer = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -184,6 +196,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _tradeDate = tradeDate;
         _metrics = metrics;
         _sessionFirmCounters = sessionFirmCounters;
+        _retxBuffer = retxBuffer;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the
         // instance. No memory barrier is needed.
