@@ -143,11 +143,12 @@ public sealed class HostRouter : IInboundCommandSink
     {
         // Drop every ownership entry held for this session across every
         // channel so passive fills against its resting orders stop trying
-        // to route to a disconnected peer. The orders themselves stay on
-        // the book — they ARE the book — but ER_Trade / ER_Cancel for them
-        // will be dropped in the dispatcher's OnTrade/OnOrderCanceled when
-        // the local registry no longer resolves them (Phase 3 / #69 will
-        // replace this with routing into a Suspended-session retx ring).
+        // to route to a disconnected peer. Note: this is invoked only on
+        // **terminal** close (FixpSession.CloseLocked); Suspend does NOT
+        // reach here, so passive ERs delivered during Suspended state are
+        // routed normally to the still-registered FixpSession and buffered
+        // into its FIXP retransmit ring for replay on re-Establish (issue
+        // #217 / Onda L · L4).
         int total = 0;
         foreach (var disp in _allDispatchers)
             total += disp.EvictSessionLocal(session);
