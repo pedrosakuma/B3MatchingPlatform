@@ -9,6 +9,18 @@ namespace B3.Exchange.Matching;
 /// allocators and an <see cref="RptSeq"/> that is incremented on every emitted
 /// MBO/Trade event so the integration layer can stamp <c>RptSeq</c> on UMDF
 /// frames without separate bookkeeping.
+///
+/// <para>
+/// Threading invariant (issue #169): every public mutation/read entry point
+/// (<see cref="Submit"/>, <see cref="Cancel"/>, <see cref="Replace"/>,
+/// <see cref="MassCancel"/>, <see cref="AllocateNextRptSeq"/>,
+/// <see cref="ResetForChannelReset"/>) plus the <see cref="IMatchingEventSink"/>
+/// callbacks they trigger MUST run on a single owner thread. The
+/// <c>ChannelDispatcher</c> binds its loop thread via
+/// <see cref="BindToDispatchThread"/> on startup. In DEBUG builds, a
+/// per-call assert fires if any caller violates this. Any cross-thread
+/// invocation must be marshalled via <c>ChannelDispatcher.EnqueueXxx</c>.
+/// </para>
 /// </summary>
 public sealed class MatchingEngine
 {
@@ -39,6 +51,14 @@ public sealed class MatchingEngine
     private uint _rptSeq;
 
     private bool _dispatching;
+
+    // Single-thread invariant (issue #169). Latched on first call to any
+    // mutation/read entry point (or eagerly via BindToDispatchThread) so
+    // future call-site regressions are caught at test time. Production
+    // callers (ChannelDispatcher) bind explicitly so even the very first
+    // engine call is checked. Unit tests that exercise the engine on the
+    // xUnit thread without binding are tolerated via lazy latching.
+    private Thread? _ownerThread;
 
     public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink,
         ILogger<MatchingEngine> logger,
@@ -76,6 +96,7 @@ public sealed class MatchingEngine
     /// </summary>
     public uint AllocateNextRptSeq()
     {
+        AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("AllocateNextRptSeq called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
         return ++_rptSeq;
@@ -94,6 +115,7 @@ public sealed class MatchingEngine
     /// </summary>
     public void ResetForChannelReset()
     {
+        AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("cannot reset while a command is being dispatched");
         foreach (var book in _booksById.Values) book.Clear();
@@ -481,10 +503,48 @@ public sealed class MatchingEngine
 
     private void EnterDispatch()
     {
+        AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("MatchingEngine called reentrantly from a sink callback. Sinks must not invoke engine methods.");
         _dispatching = true;
     }
 
     private void ExitDispatch() => _dispatching = false;
+
+    /// <summary>
+    /// Eagerly binds the engine to the dispatch-loop thread. Called by
+    /// <c>ChannelDispatcher</c> on entry to its run loop so that any
+    /// off-thread engine call is caught on the very first invocation in
+    /// DEBUG builds. Subsequent calls with the same thread are no-ops;
+    /// calls from a different thread fail the assert.
+    /// Issue #169 (single-thread invariant audit).
+    /// </summary>
+    public void BindToDispatchThread(Thread thread)
+    {
+        ArgumentNullException.ThrowIfNull(thread);
+        var prior = Interlocked.CompareExchange(ref _ownerThread, thread, null);
+        System.Diagnostics.Debug.Assert(
+            prior == null || prior == thread,
+            $"MatchingEngine already bound to a different thread "
+            + $"(existing={prior?.ManagedThreadId}, new={thread.ManagedThreadId})");
+    }
+
+    /// <summary>
+    /// Asserts the calling thread owns the engine. Latches the owner
+    /// thread on first call if no explicit binding was made (so unit
+    /// tests that drive the engine directly remain consistent across
+    /// their lifetime). Compiled out in Release.
+    /// Issue #169 (single-thread invariant).
+    /// </summary>
+    [System.Diagnostics.Conditional("DEBUG")]
+    private void AssertOnOwnerThread()
+    {
+        var current = Thread.CurrentThread;
+        var owner = Interlocked.CompareExchange(ref _ownerThread, current, null);
+        System.Diagnostics.Debug.Assert(
+            owner == null || owner == current,
+            $"MatchingEngine entered off the owner thread "
+            + $"(owner={owner?.ManagedThreadId}, "
+            + $"actual={current.ManagedThreadId})");
+    }
 }

@@ -186,6 +186,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // AssertOnLoopThread() in mutation paths can enforce the
         // single-writer invariant in DEBUG builds (issue #138).
         _loopThread = Thread.CurrentThread;
+        // Issue #169: bind the matching engine eagerly so any off-thread
+        // engine call is caught on the very first invocation, not just
+        // after the first in-thread call has latched the owner.
+        _engine.BindToDispatchThread(_loopThread);
 
         // Heartbeat is recorded on every loop wakeup (whether triggered by
         // new work or by the periodic timeout) so a stuck/dead dispatch
