@@ -24,7 +24,12 @@ TCP client ──► EntryPointSession ──► HostRouter ──► ChannelDis
 * `HostRouter` dispatches each inbound command (NewOrder/Cancel/Replace) to
   the `ChannelDispatcher` whose channel owns the order's instrument.
 * Each `ChannelDispatcher` runs a single dispatch thread (the matching engine
-  is not thread-safe by design — single-threaded per channel).
+  is not thread-safe by design — single-threaded per channel). The engine is
+  bound to that thread on dispatcher startup via
+  `MatchingEngine.BindToDispatchThread`; every public engine entry point and
+  every `IMatchingEventSink` callback asserts the owner thread in DEBUG
+  builds (issue #169). Cross-thread access must go through the dispatcher's
+  `Enqueue*` methods, which post a `WorkItem` onto the inbox channel.
 * Per-command emitted events are batched into one UMDF packet (PacketHeader +
   N inc messages) before being multicast.
 * The `orderId → reply` map ensures execution reports for passive (resting)
