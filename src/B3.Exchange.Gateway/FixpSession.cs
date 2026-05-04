@@ -130,8 +130,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// <summary>Highest inbound application <c>MsgSeqNum</c> accepted on
     /// this session. Zero until the first inbound application message is
     /// processed. Used to populate <c>EstablishAck.lastIncomingSeqNo</c>
-    /// and to compute <c>EstablishReject.lastIncomingSeqNo</c>.</summary>
-    public uint LastIncomingSeqNo { get; private set; }
+    /// and to compute <c>EstablishReject.lastIncomingSeqNo</c>.
+    ///
+    /// Setter is <c>internal</c> so <see cref="ProcessEstablish"/> can
+    /// rebase it to <c>req.NextSeqNo - 1</c> when the peer signals a
+    /// non-1 starting sequence (issue #239 / FIXP §4.5.3).</summary>
+    public uint LastIncomingSeqNo { get; internal set; }
     /// <summary>Stable, transport-neutral identity of this session as seen
     /// by Core / Contracts. Routing key the Gateway uses to resolve
     /// outbound ExecutionReports back to this <see cref="FixpSession"/>.
