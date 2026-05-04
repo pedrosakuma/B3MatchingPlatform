@@ -2,7 +2,6 @@ using B3.EntryPoint.Wire;
 using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.Contracts;
-using B3.Exchange.Core;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Gateway;

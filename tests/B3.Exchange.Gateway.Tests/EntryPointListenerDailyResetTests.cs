@@ -1,7 +1,6 @@
 using B3.Exchange.Contracts;
 using System.Net;
 using System.Net.Sockets;
-using B3.Exchange.Core;
 using B3.Exchange.Gateway;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;

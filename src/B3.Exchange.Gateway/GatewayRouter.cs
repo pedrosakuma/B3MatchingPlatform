@@ -1,5 +1,4 @@
 using B3.Exchange.Contracts;
-using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 using ContractsSessionId = B3.Exchange.Contracts.SessionId;

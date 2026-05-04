@@ -1,6 +1,5 @@
 using B3.Exchange.Contracts;
 using B3.EntryPoint.Wire;
-using B3.Exchange.Core;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
