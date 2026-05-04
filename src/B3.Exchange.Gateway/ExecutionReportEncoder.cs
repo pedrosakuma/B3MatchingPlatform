@@ -58,6 +58,7 @@ internal static class ExecutionReportEncoder
     private const byte OrdTypeLimit = (byte)'2';
     private const byte OrdTypeStopLoss = (byte)'3';
     private const byte OrdTypeStopLimit = (byte)'4';
+    private const byte OrdTypeMwl = (byte)'K';
     private const byte TifDay = (byte)'0';
     private const byte TifIoc = (byte)'3';
     private const byte TifFok = (byte)'4';
@@ -74,6 +75,7 @@ internal static class ExecutionReportEncoder
         Matching.OrderType.Limit => OrdTypeLimit,
         Matching.OrderType.StopLoss => OrdTypeStopLoss,
         Matching.OrderType.StopLimit => OrdTypeStopLimit,
+        Matching.OrderType.MarketWithLeftover => OrdTypeMwl,
         _ => OrdTypeLimit,
     };
     private static byte EncodeTif(Matching.TimeInForce t) => t switch

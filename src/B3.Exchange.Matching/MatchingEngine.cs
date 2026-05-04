@@ -262,12 +262,23 @@ public sealed class MatchingEngine
                 if (cmd.PriceMantissa % rules.TickSizeMantissa != 0)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
             }
-            else // Market
+            else if (cmd.Type == OrderType.Market)
             {
                 // Market orders must be IOC or FOK. Day/Gtc/Gtd/AtClose/GoodForAuction
                 // are all resting TIFs that can't apply to a market order.
                 if (cmd.Tif != TimeInForce.IOC && cmd.Tif != TimeInForce.FOK)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketNotImmediateOrCancel, cmd.EnteredAtNanos); return; }
+            }
+            else // MarketWithLeftover (#215)
+            {
+                // MWL must be Day TIF: the unfilled remainder rests on the
+                // book as a Day Limit at the last execution price.
+                if (cmd.Tif != TimeInForce.Day)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+                // MWL never carries a Price on the wire — the resting price
+                // is derived from the last executed trade.
+                if (cmd.PriceMantissa != 0)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
             }
 
             var book = _booksById[cmd.SecurityId];
@@ -276,7 +287,7 @@ public sealed class MatchingEngine
             // if insufficient. Same crossing predicate as the actual match path.
             if (cmd.Tif == TimeInForce.FOK)
             {
-                long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: cmd.Type == OrderType.Market);
+                long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: IsMarketLike(cmd.Type));
                 if (fillable < cmd.Quantity)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.FokUnfillable, cmd.EnteredAtNanos); return; }
 
@@ -284,7 +295,7 @@ public sealed class MatchingEngine
                 // would be prevented from matching, so reject FOK as unfillable if any exist.
                 if (_stp != SelfTradePrevention.None)
                 {
-                    bool isMarketOrder = cmd.Type == OrderType.Market;
+                    bool isMarketOrder = IsMarketLike(cmd.Type);
                     foreach (var level in book.OppositeLevels(cmd.Side))
                     {
                         if (!isMarketOrder && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, cmd.PriceMantissa))
@@ -301,9 +312,10 @@ public sealed class MatchingEngine
                 }
             }
 
-            // Market order with empty opposite book: reject early — we never want a
-            // market order to be "accepted with no fills".
-            if (cmd.Type == OrderType.Market && book.BestLevel(LimitOrderBook.Opposite(cmd.Side)) is null)
+            // Market / MWL with empty opposite book: reject early — neither type
+            // should ever be "accepted with no fills" (MWL would have nothing
+            // to anchor the leftover-as-Limit price to).
+            if (IsMarketLike(cmd.Type) && book.BestLevel(LimitOrderBook.Opposite(cmd.Side)) is null)
             { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketNoLiquidity, cmd.EnteredAtNanos); return; }
 
             // #203 (MinQty subset): pre-check immediately fillable quantity
@@ -316,7 +328,7 @@ public sealed class MatchingEngine
             // through the normal aggressor path.
             if (cmd.MinQty != 0)
             {
-                long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: cmd.Type == OrderType.Market);
+                long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: IsMarketLike(cmd.Type));
                 if (fillable < (long)cmd.MinQty)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MinQtyNotMet, cmd.EnteredAtNanos); return; }
             }
@@ -543,11 +555,21 @@ public sealed class MatchingEngine
     private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
         => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++);
 
+    /// <summary>
+    /// True when the order should walk the book ignoring its own price
+    /// (Market and MarketWithLeftover #215). The two differ only in the
+    /// post-walk handling of any remainder (Market drops; MWL rests at
+    /// last-trade price).
+    /// </summary>
+    private static bool IsMarketLike(OrderType t)
+        => t == OrderType.Market || t == OrderType.MarketWithLeftover;
+
     private void ExecuteAggressorWithOrderId(NewOrderCommand cmd, InstrumentTradingRules rules,
         LimitOrderBook book, long aggressorOrderIdForTrades)
     {
         long aggressorRemaining = cmd.Quantity;
-        bool isMarket = cmd.Type == OrderType.Market;
+        bool isMarket = IsMarketLike(cmd.Type);
+        bool isMwl = cmd.Type == OrderType.MarketWithLeftover;
         long limitPx = cmd.PriceMantissa;
         bool stpAggressorCanceled = false;
         long lastTradePx = 0;
@@ -737,11 +759,22 @@ public sealed class MatchingEngine
 
             if (isMarket)
             {
-                // Market remainder → no resting (already validated MarketNoLiquidity
-                // upfront, but if the book emptied mid-walk we just stop here without
-                // further events for the aggressor — there is no resting order to
-                // cancel and we never emitted Accepted).
-                return;
+                if (isMwl && anyTrade)
+                {
+                    // #215 MWL: leftover rests as Day Limit at last-execution
+                    // price. Validation guaranteed Day TIF + Price=0 at submit
+                    // time; here we anchor the resting price to the last trade
+                    // and fall through to the standard resting code path.
+                    limitPx = lastTradePx;
+                }
+                else
+                {
+                    // Market remainder → no resting (already validated MarketNoLiquidity
+                    // upfront, but if the book emptied mid-walk we just stop here without
+                    // further events for the aggressor — there is no resting order to
+                    // cancel and we never emitted Accepted).
+                    return;
+                }
             }
 
             if (cmd.Tif == TimeInForce.IOC || cmd.Tif == TimeInForce.FOK)

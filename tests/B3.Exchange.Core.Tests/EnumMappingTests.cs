@@ -67,6 +67,7 @@ public class EnumMappingTests
     [InlineData(MatchingOrderType.Market, ContractsOrderType.Market)]
     [InlineData(MatchingOrderType.StopLoss, ContractsOrderType.StopLoss)]
     [InlineData(MatchingOrderType.StopLimit, ContractsOrderType.StopLimit)]
+    [InlineData(MatchingOrderType.MarketWithLeftover, ContractsOrderType.MarketWithLeftover)]
     public void OrderType_MatchingToContracts(MatchingOrderType matching, ContractsOrderType expected)
     {
         Assert.Equal(expected, MapOrderType(matching));
@@ -75,8 +76,8 @@ public class EnumMappingTests
     [Fact]
     public void OrderType_AllValuesCovered()
     {
-        Assert.Equal(4, Enum.GetValues<MatchingOrderType>().Length);
-        Assert.Equal(4, Enum.GetValues<ContractsOrderType>().Length);
+        Assert.Equal(5, Enum.GetValues<MatchingOrderType>().Length);
+        Assert.Equal(5, Enum.GetValues<ContractsOrderType>().Length);
         foreach (var v in Enum.GetValues<MatchingOrderType>()) _ = MapOrderType(v);
     }
 
@@ -154,6 +155,7 @@ public class EnumMappingTests
         MatchingOrderType.Market => ContractsOrderType.Market,
         MatchingOrderType.StopLoss => ContractsOrderType.StopLoss,
         MatchingOrderType.StopLimit => ContractsOrderType.StopLimit,
+        MatchingOrderType.MarketWithLeftover => ContractsOrderType.MarketWithLeftover,
         _ => throw new ArgumentOutOfRangeException(nameof(t), t, "unmapped Matching.OrderType"),
     };
 

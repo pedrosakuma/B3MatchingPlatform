@@ -182,6 +182,22 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
+    public void NewOrderSingle_AcceptsMwl()
+    {
+        // #215: MARKET_WITH_LEFTOVER_AS_LIMIT (FIX 'K') decoded with
+        // engine Price=0 (resting price derived from last trade at runtime).
+        var body = BuildNewOrderSingleV2(ordType: (byte)'K', price: PriceNull, tif: (byte)'0');
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out _);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.NotNull(cmd);
+        Assert.Equal(OrderType.MarketWithLeftover, cmd.Type);
+        Assert.Equal(0L, cmd.PriceMantissa);
+    }
+
+    [Fact]
     public void NewOrderSingle_AcceptsMaxFloor()
     {
         // #211: iceberg accepted on NewOrderSingle. The decoder forwards
@@ -223,7 +239,6 @@ public class NewOrderSingleAndReplaceDecoderTests
 
     [Theory]
     [InlineData((byte)'W')] // RLP
-    [InlineData((byte)'K')] // MARKET_WITH_LEFTOVER_AS_LIMIT
     [InlineData((byte)'P')] // PEGGED_MIDPOINT
     public void NewOrderSingle_UnsupportedOrdTypeReturnsBmr(byte ordTypeByte)
     {

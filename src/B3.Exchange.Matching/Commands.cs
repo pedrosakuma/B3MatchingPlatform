@@ -22,7 +22,7 @@ public enum Side : byte { Buy, Sell }
 /// </summary>
 public enum TimeInForce : byte { Day, IOC, FOK, Gtc, Gtd, AtClose, GoodForAuction }
 
-public enum OrderType : byte { Limit, Market, StopLoss, StopLimit }
+public enum OrderType : byte { Limit, Market, StopLoss, StopLimit, MarketWithLeftover }
 
 /// <summary>
 /// Per-instrument trading phase (gap-functional §5 / #201). The values
