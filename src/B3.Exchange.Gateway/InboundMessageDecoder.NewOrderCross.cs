@@ -96,19 +96,54 @@ internal static partial class InboundMessageDecoder
             message = "NewOrderCross requires positive OrderQty";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (crossTypeByte != 255)
+
+        // CrossType: null/255 → AllOrNone (default). Wire values 1
+        // (AllOrNone) and 4 (AgainstBook) accepted; 7/8 (VWAP /
+        // ClosingPrice — auction-tied) deferred to a future wave.
+        // Issue #218 (Onda L · L5).
+        CrossType crossTypeEnum;
+        if (crossTypeByte == 255 || crossTypeByte == (byte)CrossType.AllOrNone)
         {
-            message = "unsupported NewOrderCross CrossType (only null/AON cross supported)";
+            crossTypeEnum = CrossType.AllOrNone;
+        }
+        else if (crossTypeByte == (byte)CrossType.AgainstBook)
+        {
+            crossTypeEnum = CrossType.AgainstBook;
+        }
+        else
+        {
+            message = $"unsupported NewOrderCross CrossType={crossTypeByte} (auction-tied variants deferred)";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (crossPriByte != 255)
+
+        // CrossPrioritization: null/255 → None. Wire 0/1/2 mapped directly.
+        CrossPrioritization crossPriEnum;
+        if (crossPriByte == 255 || crossPriByte == (byte)CrossPrioritization.None)
         {
-            message = "unsupported NewOrderCross CrossPrioritization (only null supported)";
+            crossPriEnum = CrossPrioritization.None;
+        }
+        else if (crossPriByte == (byte)CrossPrioritization.BuyPrioritized
+            || crossPriByte == (byte)CrossPrioritization.SellPrioritized)
+        {
+            crossPriEnum = (CrossPrioritization)crossPriByte;
+        }
+        else
+        {
+            message = $"invalid NewOrderCross CrossPrioritization={crossPriByte}";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (maxSweepQty != 0)
+
+        // MaxSweepQty: only meaningful when CrossType == AgainstBook;
+        // otherwise it must be zero/null (defensive).
+        if (maxSweepQty > long.MaxValue)
         {
-            message = "unsupported NewOrderCross MaxSweepQty (sweep semantics not implemented)";
+            message = $"NewOrderCross MaxSweepQty={maxSweepQty} exceeds long.MaxValue";
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        long maxSweepQtySigned = (long)maxSweepQty;
+        if (crossTypeEnum != CrossType.AgainstBook && maxSweepQtySigned > 0)
+        {
+            message = "NewOrderCross MaxSweepQty requires CrossType=AgainstBook";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
 
@@ -222,7 +257,12 @@ internal static partial class InboundMessageDecoder
             Quantity: qty,
             EnteringFirm: sessionFirm,
             EnteredAtNanos: enteredAtNanos);
-        cross = new CrossOrderCommand(buy, sell, buyClOrd, sellClOrd, crossId);
+        cross = new CrossOrderCommand(buy, sell, buyClOrd, sellClOrd, crossId)
+        {
+            CrossType = crossTypeEnum,
+            CrossPrioritization = crossPriEnum,
+            MaxSweepQty = maxSweepQtySigned,
+        };
         return InboundDecodeOutcome.Success;
     }
 }

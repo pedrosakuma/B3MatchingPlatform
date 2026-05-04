@@ -143,6 +143,15 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     private ulong _currentReceivedTimeNanos = ulong.MaxValue;
 
+    /// <summary>
+    /// When non-null, the dispatcher is processing the sweep phase of a
+    /// <see cref="WorkKind.Cross"/> with <c>CrossType=AgainstBook</c>: each
+    /// <see cref="OnTrade"/> on this aggressor's side accrues into the
+    /// captured value so the loop can compute the residual qty for the
+    /// internal print phase. Issue #218 (Onda L · L5).
+    /// </summary>
+    private long? _crossSweepFilledQty;
+
     private SnapshotRotator? _snapshotRotator;
 
     private readonly CancellationTokenSource _cts = new();

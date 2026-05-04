@@ -155,6 +155,11 @@ public sealed partial class ChannelDispatcher
     public void OnTrade(in TradeEvent e)
     {
         AssertOnLoopThread();
+        // Issue #218 (Onda L · L5): when a cross sweep phase is active,
+        // accumulate the aggressor's filled qty so the loop can decide how
+        // much of the prioritized leg remains for the internal print.
+        if (_crossSweepFilledQty.HasValue)
+            _crossSweepFilledQty = _crossSweepFilledQty.Value + e.Quantity;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.TradeBlockLength);
