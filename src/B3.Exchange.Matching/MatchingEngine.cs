@@ -56,6 +56,16 @@ public sealed class MatchingEngine
     // continuous-trading behaviour.
     private readonly Dictionary<long, TradingPhase> _phaseById;
 
+    // Issue #214: per-instrument stop-order book. Stops are parked
+    // off-book waiting for a trigger trade. Buy stops fire when the
+    // last trade price is >= StopPx; sell stops fire when last trade
+    // price is <= StopPx. Triggered stops are routed via the normal
+    // matching path (Market for StopLoss, Limit for StopLimit) reusing
+    // the original OrderId so client correlation survives the trigger.
+    // The lookup-by-orderId map supports cancel of an untriggered stop.
+    private readonly Dictionary<long, List<RestingStop>> _stopsBySymbol;
+    private readonly Dictionary<long, RestingStop> _stopById;
+
     private bool _dispatching;
 
     // Single-thread invariant (issue #169). Latched on first call to any
@@ -79,12 +89,15 @@ public sealed class MatchingEngine
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
         _phaseById = new Dictionary<long, TradingPhase>();
+        _stopsBySymbol = new Dictionary<long, List<RestingStop>>();
+        _stopById = new Dictionary<long, RestingStop>();
         foreach (var i in instruments)
         {
             var rules = new InstrumentTradingRules(i);
             _rulesById.Add(i.SecurityId, rules);
             _booksById.Add(i.SecurityId, new LimitOrderBook(i.SecurityId));
             _phaseById.Add(i.SecurityId, TradingPhase.Open);
+            _stopsBySymbol.Add(i.SecurityId, new List<RestingStop>());
         }
         _logger.LogInformation("matching engine initialized with {InstrumentCount} instruments", _rulesById.Count);
     }
@@ -127,6 +140,8 @@ public sealed class MatchingEngine
         if (_dispatching)
             throw new InvalidOperationException("cannot reset while a command is being dispatched");
         foreach (var book in _booksById.Values) book.Clear();
+        foreach (var list in _stopsBySymbol.Values) list.Clear();
+        _stopById.Clear();
         _rptSeq = 0;
     }
 
@@ -213,6 +228,18 @@ public sealed class MatchingEngine
             if (cmd.MinQty != 0 && (long)cmd.MinQty > cmd.Quantity)
             { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
 
+            // Issue #214: Stop / Stop-limit. Validate StopPx + (LimitPx
+            // for StopLimit) and park off-book in the trigger book.
+            // Triggering happens post-trade in TriggerStopsAfterTrade.
+            // Stop validation is done inside SubmitStop because it has
+            // its own price/tick/band rules and cannot satisfy the
+            // Market/Limit-type validations below.
+            if (cmd.Type == OrderType.StopLoss || cmd.Type == OrderType.StopLimit)
+            {
+                SubmitStop(cmd, rules);
+                return;
+            }
+
             // #211: iceberg validation. MaxFloor in (0, Quantity], multiple
             // of lot, and only meaningful for resting limit orders. Market
             // / IOC / FOK / Gtd / AtClose / GoodForAuction would never let
@@ -294,6 +321,9 @@ public sealed class MatchingEngine
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MinQtyNotMet, cmd.EnteredAtNanos); return; }
             }
 
+            // Issue #214: stop branch handled earlier (right after MinQty
+            // range-check). Falling through here means cmd.Type is Limit
+            // or Market.
             ExecuteAggressor(cmd, rules, book);
         }
         finally { ExitDispatch(); }
@@ -306,6 +336,25 @@ public sealed class MatchingEngine
         {
             if (!_booksById.TryGetValue(cmd.SecurityId, out var book))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownInstrument, cmd.EnteredAtNanos); return; }
+
+            // Issue #214: if the OrderId is a parked stop, cancel it
+            // off-book and emit StopOrderCanceledEvent. Stops never
+            // reach the LimitOrderBook so book.TryGet won't find them.
+            if (_stopById.TryGetValue(cmd.OrderId, out var stop) && stop.SecurityId == cmd.SecurityId)
+            {
+                _stopById.Remove(cmd.OrderId);
+                _stopsBySymbol[cmd.SecurityId].Remove(stop);
+                _sink.OnStopOrderCanceled(new StopOrderCanceledEvent(
+                    SecurityId: cmd.SecurityId,
+                    OrderId: stop.OrderId,
+                    Side: stop.Side,
+                    StopPxMantissa: stop.StopPxMantissa,
+                    RemainingQuantityAtCancel: stop.Quantity,
+                    TransactTimeNanos: cmd.EnteredAtNanos,
+                    RptSeq: NextRptSeq()));
+                return;
+            }
+
             if (!book.TryGet(cmd.OrderId, out var resting))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownOrderId, cmd.EnteredAtNanos); return; }
 
@@ -492,243 +541,264 @@ public sealed class MatchingEngine
     }
 
     private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
+        => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++);
+
+    private void ExecuteAggressorWithOrderId(NewOrderCommand cmd, InstrumentTradingRules rules,
+        LimitOrderBook book, long aggressorOrderIdForTrades)
     {
         long aggressorRemaining = cmd.Quantity;
-        long aggressorOrderIdForTrades = _nextOrderId++;
         bool isMarket = cmd.Type == OrderType.Market;
         long limitPx = cmd.PriceMantissa;
         bool stpAggressorCanceled = false;
-
-        // Walk opposite levels in priority order. We snapshot the level list to a
-        // local copy (LimitOrderBook.OppositeLevels) so removing a level mid-iter
-        // is safe.
-        foreach (var level in book.OppositeLevels(cmd.Side))
+        long lastTradePx = 0;
+        bool anyTrade = false;
+        try
         {
-            if (aggressorRemaining == 0) break;
-            if (stpAggressorCanceled) break;
-            if (!isMarket && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, limitPx)) break;
 
-            // Within a level, consume FIFO from Head.
-            var maker = level.Head;
-            while (maker is not null && aggressorRemaining > 0)
+            // Walk opposite levels in priority order. We snapshot the level list to a
+            // local copy (LimitOrderBook.OppositeLevels) so removing a level mid-iter
+            // is safe.
+            foreach (var level in book.OppositeLevels(cmd.Side))
             {
-                var next = maker.Next; // capture before mutation
+                if (aggressorRemaining == 0) break;
+                if (stpAggressorCanceled) break;
+                if (!isMarket && !LimitOrderBook.PriceCrosses(cmd.Side, level.PriceMantissa, limitPx)) break;
 
-                // Self-trade prevention: maker and aggressor share EnteringFirm.
-                if (_stp != SelfTradePrevention.None && maker.EnteringFirm == cmd.EnteringFirm)
+                // Within a level, consume FIFO from Head.
+                var maker = level.Head;
+                while (maker is not null && aggressorRemaining > 0)
                 {
-                    switch (_stp)
+                    var next = maker.Next; // capture before mutation
+
+                    // Self-trade prevention: maker and aggressor share EnteringFirm.
+                    if (_stp != SelfTradePrevention.None && maker.EnteringFirm == cmd.EnteringFirm)
                     {
-                        case SelfTradePrevention.CancelResting:
-                            // Cancel the conflicting maker and continue matching
-                            // the aggressor against the next maker / level.
-                            EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
+                        switch (_stp)
+                        {
+                            case SelfTradePrevention.CancelResting:
+                                // Cancel the conflicting maker and continue matching
+                                // the aggressor against the next maker / level.
+                                EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
+                                maker = next;
+                                continue;
+                            case SelfTradePrevention.CancelBoth:
+                                EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
+                                stpAggressorCanceled = true;
+                                break;
+                            case SelfTradePrevention.CancelAggressor:
+                                stpAggressorCanceled = true;
+                                break;
+                        }
+                        break;
+                    }
+
+                    long tradeQty = Math.Min(aggressorRemaining, maker.RemainingQuantity);
+                    long tradePx = maker.PriceMantissa;
+
+                    // Determine buyer/seller by side
+                    uint buyerFirm = cmd.Side == Side.Buy ? cmd.EnteringFirm : maker.EnteringFirm;
+                    uint sellerFirm = cmd.Side == Side.Buy ? maker.EnteringFirm : cmd.EnteringFirm;
+
+                    _sink.OnTrade(new TradeEvent(
+                        SecurityId: book.SecurityId,
+                        TradeId: _nextTradeId++,
+                        PriceMantissa: tradePx,
+                        Quantity: tradeQty,
+                        AggressorSide: cmd.Side,
+                        AggressorOrderId: aggressorOrderIdForTrades,
+                        AggressorClOrdId: cmd.ClOrdId,
+                        AggressorFirm: cmd.EnteringFirm,
+                        RestingOrderId: maker.OrderId,
+                        RestingFirm: maker.EnteringFirm,
+                        TransactTimeNanos: cmd.EnteredAtNanos,
+                        RptSeq: NextRptSeq()));
+
+                    aggressorRemaining -= tradeQty;
+                    maker.RemainingQuantity -= tradeQty;
+                    level.TotalQuantity -= tradeQty;
+                    lastTradePx = tradePx;
+                    anyTrade = true;
+
+                    if (maker.RemainingQuantity == 0)
+                    {
+                        // #211: iceberg replenish — if the maker has hidden
+                        // reserve, the visible slice was just exhausted but
+                        // the order is not yet fully filled. Take a fresh
+                        // visible slice from the hidden reserve, re-insert
+                        // at the BACK of the same price level (time-priority
+                        // loss), and emit IcebergReplenishedEvent so the
+                        // sink can flush a paired Delete + Add MBO frame
+                        // for the same OrderID. The aggressor does NOT
+                        // re-cross the replenished slice in the same dispatch
+                        // (loop iterates via the pre-captured `next`), which
+                        // matches the spec's "loses time priority" guarantee.
+                        if (maker.HiddenQuantity > 0)
+                        {
+                            long newVisible = Math.Min(maker.MaxFloor, maker.HiddenQuantity);
+                            long newHidden = maker.HiddenQuantity - newVisible;
+                            var icebergSide = maker.Side;
+                            long icebergPx = maker.PriceMantissa;
+                            long icebergOid = maker.OrderId;
+                            // Atomically: remove from current spot, mutate
+                            // visible/hidden counters, re-insert at tail of
+                            // same level. The book.Remove + book.Insert pair
+                            // is correct even if this is the only order at
+                            // the level (Insert recreates the level).
+                            book.Remove(maker);
+                            maker.RemainingQuantity = newVisible;
+                            maker.HiddenQuantity = newHidden;
+                            // Reset insert timestamp to the trade time — the
+                            // replenished slice is logically a fresh entry at
+                            // the back of the queue.
+                            var refreshed = new RestingOrder
+                            {
+                                OrderId = icebergOid,
+                                ClOrdId = maker.ClOrdId,
+                                Side = icebergSide,
+                                PriceMantissa = icebergPx,
+                                EnteringFirm = maker.EnteringFirm,
+                                InsertTimestampNanos = cmd.EnteredAtNanos,
+                                RemainingQuantity = newVisible,
+                                Tif = maker.Tif,
+                                MaxFloor = maker.MaxFloor,
+                                HiddenQuantity = newHidden,
+                            };
+                            book.Insert(refreshed);
+                            uint deleteSeq = NextRptSeq();
+                            uint addSeq = NextRptSeq();
+                            _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
+                                SecurityId: book.SecurityId,
+                                OrderId: icebergOid,
+                                Side: icebergSide,
+                                PriceMantissa: icebergPx,
+                                NewVisibleQuantity: newVisible,
+                                RemainingHiddenQuantity: newHidden,
+                                InsertTimestampNanos: cmd.EnteredAtNanos,
+                                TransactTimeNanos: cmd.EnteredAtNanos,
+                                DeleteRptSeq: deleteSeq,
+                                AddRptSeq: addSeq));
                             maker = next;
                             continue;
-                        case SelfTradePrevention.CancelBoth:
-                            EmitCanceled(book, maker, cmd.EnteredAtNanos, CancelReason.SelfTradePrevention);
-                            stpAggressorCanceled = true;
-                            break;
-                        case SelfTradePrevention.CancelAggressor:
-                            stpAggressorCanceled = true;
-                            break;
-                    }
-                    break;
-                }
+                        }
 
-                long tradeQty = Math.Min(aggressorRemaining, maker.RemainingQuantity);
-                long tradePx = maker.PriceMantissa;
-
-                // Determine buyer/seller by side
-                uint buyerFirm = cmd.Side == Side.Buy ? cmd.EnteringFirm : maker.EnteringFirm;
-                uint sellerFirm = cmd.Side == Side.Buy ? maker.EnteringFirm : cmd.EnteringFirm;
-
-                _sink.OnTrade(new TradeEvent(
-                    SecurityId: book.SecurityId,
-                    TradeId: _nextTradeId++,
-                    PriceMantissa: tradePx,
-                    Quantity: tradeQty,
-                    AggressorSide: cmd.Side,
-                    AggressorOrderId: aggressorOrderIdForTrades,
-                    AggressorClOrdId: cmd.ClOrdId,
-                    AggressorFirm: cmd.EnteringFirm,
-                    RestingOrderId: maker.OrderId,
-                    RestingFirm: maker.EnteringFirm,
-                    TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: NextRptSeq()));
-
-                aggressorRemaining -= tradeQty;
-                maker.RemainingQuantity -= tradeQty;
-                level.TotalQuantity -= tradeQty;
-
-                if (maker.RemainingQuantity == 0)
-                {
-                    // #211: iceberg replenish — if the maker has hidden
-                    // reserve, the visible slice was just exhausted but
-                    // the order is not yet fully filled. Take a fresh
-                    // visible slice from the hidden reserve, re-insert
-                    // at the BACK of the same price level (time-priority
-                    // loss), and emit IcebergReplenishedEvent so the
-                    // sink can flush a paired Delete + Add MBO frame
-                    // for the same OrderID. The aggressor does NOT
-                    // re-cross the replenished slice in the same dispatch
-                    // (loop iterates via the pre-captured `next`), which
-                    // matches the spec's "loses time priority" guarantee.
-                    if (maker.HiddenQuantity > 0)
-                    {
-                        long newVisible = Math.Min(maker.MaxFloor, maker.HiddenQuantity);
-                        long newHidden = maker.HiddenQuantity - newVisible;
-                        var icebergSide = maker.Side;
-                        long icebergPx = maker.PriceMantissa;
-                        long icebergOid = maker.OrderId;
-                        // Atomically: remove from current spot, mutate
-                        // visible/hidden counters, re-insert at tail of
-                        // same level. The book.Remove + book.Insert pair
-                        // is correct even if this is the only order at
-                        // the level (Insert recreates the level).
+                        // Maker fully filled → remove + OnOrderFilled.
+                        long finalFilled = tradeQty; // For simplicity OrderFilledEvent reports
+                                                     // the LAST trade's qty; downstream cares
+                                                     // only about the delete, not the fill total.
+                        var makerSide = maker.Side;
                         book.Remove(maker);
-                        maker.RemainingQuantity = newVisible;
-                        maker.HiddenQuantity = newHidden;
-                        // Reset insert timestamp to the trade time — the
-                        // replenished slice is logically a fresh entry at
-                        // the back of the queue.
-                        var refreshed = new RestingOrder
-                        {
-                            OrderId = icebergOid,
-                            ClOrdId = maker.ClOrdId,
-                            Side = icebergSide,
-                            PriceMantissa = icebergPx,
-                            EnteringFirm = maker.EnteringFirm,
-                            InsertTimestampNanos = cmd.EnteredAtNanos,
-                            RemainingQuantity = newVisible,
-                            Tif = maker.Tif,
-                            MaxFloor = maker.MaxFloor,
-                            HiddenQuantity = newHidden,
-                        };
-                        book.Insert(refreshed);
-                        uint deleteSeq = NextRptSeq();
-                        uint addSeq = NextRptSeq();
-                        _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
+                        _sink.OnOrderFilled(new OrderFilledEvent(
                             SecurityId: book.SecurityId,
-                            OrderId: icebergOid,
-                            Side: icebergSide,
-                            PriceMantissa: icebergPx,
-                            NewVisibleQuantity: newVisible,
-                            RemainingHiddenQuantity: newHidden,
-                            InsertTimestampNanos: cmd.EnteredAtNanos,
-                            TransactTimeNanos: cmd.EnteredAtNanos,
-                            DeleteRptSeq: deleteSeq,
-                            AddRptSeq: addSeq));
-                        maker = next;
-                        continue;
-                    }
-
-                    // Maker fully filled → remove + OnOrderFilled.
-                    long finalFilled = tradeQty; // For simplicity OrderFilledEvent reports
-                                                 // the LAST trade's qty; downstream cares
-                                                 // only about the delete, not the fill total.
-                    var makerSide = maker.Side;
-                    book.Remove(maker);
-                    _sink.OnOrderFilled(new OrderFilledEvent(
-                        SecurityId: book.SecurityId,
-                        OrderId: maker.OrderId,
-                        Side: makerSide,
-                        PriceMantissa: maker.PriceMantissa,
-                        FinalFilledQuantity: finalFilled,
-                        TransactTimeNanos: cmd.EnteredAtNanos,
-                        RptSeq: NextRptSeq()));
-                    // #200: emit EmptyBook_9 if this fill drained the side.
-                    if (book.BestLevel(makerSide) is null)
-                    {
-                        _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
-                            SecurityId: book.SecurityId,
+                            OrderId: maker.OrderId,
                             Side: makerSide,
-                            TransactTimeNanos: cmd.EnteredAtNanos));
+                            PriceMantissa: maker.PriceMantissa,
+                            FinalFilledQuantity: finalFilled,
+                            TransactTimeNanos: cmd.EnteredAtNanos,
+                            RptSeq: NextRptSeq()));
+                        // #200: emit EmptyBook_9 if this fill drained the side.
+                        if (book.BestLevel(makerSide) is null)
+                        {
+                            _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
+                                SecurityId: book.SecurityId,
+                                Side: makerSide,
+                                TransactTimeNanos: cmd.EnteredAtNanos));
+                        }
                     }
+                    else
+                    {
+                        // Maker partially filled → emit OrderQuantityReduced (UPDATE).
+                        _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
+                            SecurityId: book.SecurityId,
+                            OrderId: maker.OrderId,
+                            Side: maker.Side,
+                            PriceMantissa: maker.PriceMantissa,
+                            NewRemainingQuantity: maker.RemainingQuantity,
+                            InsertTimestampNanos: maker.InsertTimestampNanos,
+                            TransactTimeNanos: cmd.EnteredAtNanos,
+                            RptSeq: NextRptSeq()));
+                    }
+                    maker = next;
                 }
-                else
-                {
-                    // Maker partially filled → emit OrderQuantityReduced (UPDATE).
-                    _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
-                        SecurityId: book.SecurityId,
-                        OrderId: maker.OrderId,
-                        Side: maker.Side,
-                        PriceMantissa: maker.PriceMantissa,
-                        NewRemainingQuantity: maker.RemainingQuantity,
-                        InsertTimestampNanos: maker.InsertTimestampNanos,
-                        TransactTimeNanos: cmd.EnteredAtNanos,
-                        RptSeq: NextRptSeq()));
-                }
-                maker = next;
             }
-        }
 
-        // Aggressor has remainder?
-        if (aggressorRemaining == 0) return;
+            // Aggressor has remainder?
+            if (aggressorRemaining == 0) return;
 
-        if (stpAggressorCanceled)
-        {
-            // STP canceled the aggressor's residual. The aggressor never rested
-            // on the book, so no MBO event is emitted (mirrors the IOC-remainder
-            // pattern). The originating session is informed via a Reject ER —
-            // any trades already executed against other firms still stand.
-            Reject(cmd.ClOrdId, cmd.SecurityId, aggressorOrderIdForTrades,
-                RejectReason.SelfTradePrevention, cmd.EnteredAtNanos);
-            return;
-        }
+            if (stpAggressorCanceled)
+            {
+                // STP canceled the aggressor's residual. The aggressor never rested
+                // on the book, so no MBO event is emitted (mirrors the IOC-remainder
+                // pattern). The originating session is informed via a Reject ER —
+                // any trades already executed against other firms still stand.
+                Reject(cmd.ClOrdId, cmd.SecurityId, aggressorOrderIdForTrades,
+                    RejectReason.SelfTradePrevention, cmd.EnteredAtNanos);
+                return;
+            }
 
-        if (isMarket)
-        {
-            // Market remainder → no resting (already validated MarketNoLiquidity
-            // upfront, but if the book emptied mid-walk we just stop here without
-            // further events for the aggressor — there is no resting order to
-            // cancel and we never emitted Accepted).
-            return;
-        }
+            if (isMarket)
+            {
+                // Market remainder → no resting (already validated MarketNoLiquidity
+                // upfront, but if the book emptied mid-walk we just stop here without
+                // further events for the aggressor — there is no resting order to
+                // cancel and we never emitted Accepted).
+                return;
+            }
 
-        if (cmd.Tif == TimeInForce.IOC || cmd.Tif == TimeInForce.FOK)
-        {
-            // FOK reaches here only via the pre-check (impossible for it to
-            // partially fill); IOC remainder is silently dropped from the book
-            // perspective — no MBO event needed for an order that never rested.
-            return;
-        }
+            if (cmd.Tif == TimeInForce.IOC || cmd.Tif == TimeInForce.FOK)
+            {
+                // FOK reaches here only via the pre-check (impossible for it to
+                // partially fill); IOC remainder is silently dropped from the book
+                // perspective — no MBO event needed for an order that never rested.
+                return;
+            }
 
-        // Day/GTC order with remainder rests on the book.
-        // Day/GTC order with remainder rests on the book. For iceberg
-        // orders (#211), expose only the visible slice on the book and
-        // hold the rest as HiddenQuantity for replenish on consumption.
-        long visible = aggressorRemaining;
-        long hidden = 0;
-        if (cmd.MaxFloor != 0 && (long)cmd.MaxFloor < aggressorRemaining)
-        {
-            visible = (long)cmd.MaxFloor;
-            hidden = aggressorRemaining - visible;
+            // Day/GTC order with remainder rests on the book.
+            // Day/GTC order with remainder rests on the book. For iceberg
+            // orders (#211), expose only the visible slice on the book and
+            // hold the rest as HiddenQuantity for replenish on consumption.
+            long visible = aggressorRemaining;
+            long hidden = 0;
+            if (cmd.MaxFloor != 0 && (long)cmd.MaxFloor < aggressorRemaining)
+            {
+                visible = (long)cmd.MaxFloor;
+                hidden = aggressorRemaining - visible;
+            }
+            var resting = new RestingOrder
+            {
+                OrderId = aggressorOrderIdForTrades,
+                ClOrdId = cmd.ClOrdId,
+                Side = cmd.Side,
+                PriceMantissa = limitPx,
+                EnteringFirm = cmd.EnteringFirm,
+                InsertTimestampNanos = cmd.EnteredAtNanos,
+                RemainingQuantity = visible,
+                Tif = cmd.Tif,
+                MaxFloor = (long)cmd.MaxFloor,
+                HiddenQuantity = hidden,
+            };
+            book.Insert(resting);
+            _sink.OnOrderAccepted(new OrderAcceptedEvent(
+                SecurityId: book.SecurityId,
+                OrderId: resting.OrderId,
+                ClOrdId: cmd.ClOrdId,
+                Side: resting.Side,
+                PriceMantissa: resting.PriceMantissa,
+                RemainingQuantity: resting.RemainingQuantity,
+                EnteringFirm: resting.EnteringFirm,
+                InsertTimestampNanos: resting.InsertTimestampNanos,
+                RptSeq: NextRptSeq()));
         }
-        var resting = new RestingOrder
+        finally
         {
-            OrderId = aggressorOrderIdForTrades,
-            ClOrdId = cmd.ClOrdId,
-            Side = cmd.Side,
-            PriceMantissa = limitPx,
-            EnteringFirm = cmd.EnteringFirm,
-            InsertTimestampNanos = cmd.EnteredAtNanos,
-            RemainingQuantity = visible,
-            Tif = cmd.Tif,
-            MaxFloor = (long)cmd.MaxFloor,
-            HiddenQuantity = hidden,
-        };
-        book.Insert(resting);
-        _sink.OnOrderAccepted(new OrderAcceptedEvent(
-            SecurityId: book.SecurityId,
-            OrderId: resting.OrderId,
-            ClOrdId: cmd.ClOrdId,
-            Side: resting.Side,
-            PriceMantissa: resting.PriceMantissa,
-            RemainingQuantity: resting.RemainingQuantity,
-            EnteringFirm: resting.EnteringFirm,
-            InsertTimestampNanos: resting.InsertTimestampNanos,
-            RptSeq: NextRptSeq()));
+            // Issue #214: after the aggressor finishes (whether it
+            // fully filled, partially rested, IOC-dropped, or got
+            // STP-cancelled), trigger any parked stops whose threshold
+            // was crossed by the trades we emitted. Triggered stops are
+            // re-routed via ExecuteAggressorWithOrderId, which itself
+            // may produce new trades and cascade further triggers.
+            if (anyTrade)
+                TriggerStopsAfterTrade(cmd.SecurityId, lastTradePx, cmd.EnteredAtNanos, rules, book);
+        }
     }
 
     private void EmitCanceled(LimitOrderBook book, RestingOrder o, ulong txn, CancelReason reason)
@@ -757,6 +827,190 @@ public sealed class MatchingEngine
                 Side: side,
                 TransactTimeNanos: txn));
         }
+    }
+
+    // ===== Issue #214: Stop / Stop-limit =====
+    //
+    // Stop orders are parked off-book in _stopsBySymbol until a trade
+    // prints at or through the stop price. On trigger, the engine
+    // re-routes the parked order through the normal aggression path
+    // (Market for StopLoss, Limit for StopLimit) reusing the parked
+    // OrderId so client correlation survives. The trigger predicate is:
+    //   * Buy stops fire when last-trade price >= StopPx
+    //   * Sell stops fire when last-trade price <= StopPx
+    //
+    // Triggering must happen post-trade-emission (so RptSeq ordering is
+    // last-trade < trigger-events) and after the per-trade book mutation
+    // (so triggered Markets see the post-fill book).
+    private sealed class RestingStop
+    {
+        public long OrderId { get; init; }
+        public required string ClOrdId { get; init; }
+        public Side Side { get; init; }
+        public OrderType StopType { get; init; }
+        public TimeInForce Tif { get; init; }
+        public long StopPxMantissa { get; init; }
+        public long LimitPriceMantissa { get; init; }
+        public long Quantity { get; init; }
+        public uint EnteringFirm { get; init; }
+        public ulong EnteredAtNanos { get; init; }
+        public long SecurityId { get; init; }
+    }
+
+    private void SubmitStop(NewOrderCommand cmd, InstrumentTradingRules rules)
+    {
+        // Stops must be Day or Gtc; IOC/FOK/AtClose/GoodForAuction make
+        // no sense for an order that may sit off-book indefinitely.
+        if (cmd.Tif != TimeInForce.Day && cmd.Tif != TimeInForce.Gtc)
+        { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+
+        // StopPx must be > 0, in band, on tick.
+        if (cmd.StopPxMantissa <= 0)
+        { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
+        if (cmd.StopPxMantissa < rules.MinPriceMantissa || cmd.StopPxMantissa > rules.MaxPriceMantissa)
+        { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
+        if (cmd.StopPxMantissa % rules.TickSizeMantissa != 0)
+        { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
+
+        // StopLimit also requires a regular limit Price; StopLoss must
+        // not carry one (it becomes a Market on trigger).
+        if (cmd.Type == OrderType.StopLimit)
+        {
+            if (cmd.PriceMantissa <= 0)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
+            if (cmd.PriceMantissa < rules.MinPriceMantissa || cmd.PriceMantissa > rules.MaxPriceMantissa)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
+            if (cmd.PriceMantissa % rules.TickSizeMantissa != 0)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
+        }
+        else // StopLoss
+        {
+            if (cmd.PriceMantissa != 0)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+        }
+
+        // MaxFloor + Stop is unsupported (iceberg of an off-book order
+        // is meaningless).
+        if (cmd.MaxFloor != 0)
+        { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+
+        long oid = _nextOrderId++;
+        var stop = new RestingStop
+        {
+            OrderId = oid,
+            ClOrdId = cmd.ClOrdId,
+            Side = cmd.Side,
+            StopType = cmd.Type,
+            Tif = cmd.Tif,
+            StopPxMantissa = cmd.StopPxMantissa,
+            LimitPriceMantissa = cmd.PriceMantissa,
+            Quantity = cmd.Quantity,
+            EnteringFirm = cmd.EnteringFirm,
+            EnteredAtNanos = cmd.EnteredAtNanos,
+            SecurityId = cmd.SecurityId,
+        };
+        _stopsBySymbol[cmd.SecurityId].Add(stop);
+        _stopById.Add(oid, stop);
+        _sink.OnStopOrderAccepted(new StopOrderAcceptedEvent(
+            SecurityId: cmd.SecurityId,
+            OrderId: oid,
+            ClOrdId: cmd.ClOrdId,
+            Side: cmd.Side,
+            StopType: cmd.Type,
+            Tif: cmd.Tif,
+            StopPxMantissa: cmd.StopPxMantissa,
+            LimitPriceMantissa: cmd.PriceMantissa,
+            Quantity: cmd.Quantity,
+            EnteringFirm: cmd.EnteringFirm,
+            InsertTimestampNanos: cmd.EnteredAtNanos,
+            RptSeq: NextRptSeq()));
+    }
+
+    /// <summary>
+    /// Called from <see cref="ExecuteAggressor"/> immediately after a
+    /// trade is emitted and the resting maker is mutated. Walks the
+    /// per-instrument stop list, collects stops whose trigger predicate
+    /// is satisfied by the supplied trade price, removes them from the
+    /// parked list, and re-routes each through the normal matching
+    /// path. The triggered order reuses the parked OrderId so client
+    /// ER_New / ER_Trade frames keep correlation. We intentionally
+    /// snapshot the to-trigger list before re-execution because each
+    /// triggered order may itself produce trades that trigger more
+    /// stops; recursion-by-natural-loop in <see cref="ExecuteAggressor"/>
+    /// handles the cascade.
+    /// </summary>
+    private void TriggerStopsAfterTrade(long securityId, long tradePxMantissa, ulong txnNanos,
+        InstrumentTradingRules rules, LimitOrderBook book)
+    {
+        if (!_stopsBySymbol.TryGetValue(securityId, out var stops) || stops.Count == 0) return;
+
+        List<RestingStop>? toFire = null;
+        for (int i = stops.Count - 1; i >= 0; i--)
+        {
+            var s = stops[i];
+            bool fires = s.Side == Side.Buy
+                ? tradePxMantissa >= s.StopPxMantissa
+                : tradePxMantissa <= s.StopPxMantissa;
+            if (!fires) continue;
+            (toFire ??= new List<RestingStop>()).Add(s);
+            stops.RemoveAt(i);
+            _stopById.Remove(s.OrderId);
+        }
+        if (toFire is null) return;
+
+        // Order matters: original parked order should win for ties. We
+        // collected in reverse, so reverse back to original insertion
+        // order before re-execution.
+        toFire.Reverse();
+        foreach (var s in toFire)
+        {
+            _sink.OnStopOrderTriggered(new StopOrderTriggeredEvent(
+                SecurityId: securityId,
+                OrderId: s.OrderId,
+                Side: s.Side,
+                StopPxMantissa: s.StopPxMantissa,
+                TriggerTradePriceMantissa: tradePxMantissa,
+                TransactTimeNanos: txnNanos,
+                RptSeq: NextRptSeq()));
+            ExecuteTriggeredStop(s, rules, book, txnNanos);
+        }
+    }
+
+    /// <summary>
+    /// Internal re-execution path for a triggered stop. Builds a
+    /// synthetic <see cref="NewOrderCommand"/> equivalent to the
+    /// triggered shape (Market IOC for StopLoss, Limit Day/Gtc for
+    /// StopLimit) and routes it through the same code path as a fresh
+    /// aggressor — except that the OrderId is pre-allocated to the
+    /// parked stop's id (preserving client correlation) and the
+    /// reentrancy guard is bypassed since we are already inside a
+    /// dispatch turn.
+    /// </summary>
+    private void ExecuteTriggeredStop(RestingStop s, InstrumentTradingRules rules,
+        LimitOrderBook book, ulong txnNanos)
+    {
+        // Build the equivalent NewOrderCommand. ClOrdId carries the
+        // original; ER_Trade / ER_New downstream will reference it.
+        var triggered = new NewOrderCommand(
+            ClOrdId: s.ClOrdId,
+            SecurityId: s.SecurityId,
+            Side: s.Side,
+            Type: s.StopType == OrderType.StopLoss ? OrderType.Market : OrderType.Limit,
+            Tif: s.StopType == OrderType.StopLoss ? TimeInForce.IOC : s.Tif,
+            PriceMantissa: s.StopType == OrderType.StopLoss ? 0L : s.LimitPriceMantissa,
+            Quantity: s.Quantity,
+            EnteringFirm: s.EnteringFirm,
+            EnteredAtNanos: txnNanos);
+
+        // Triggered StopLoss sees an empty opposite side → no fills,
+        // silently dropped. We do NOT emit MarketNoLiquidity reject
+        // here because the stop was already accepted and reporting a
+        // late reject would confuse the client; the order simply
+        // expires on trigger.
+        if (triggered.Type == OrderType.Market && book.BestLevel(LimitOrderBook.Opposite(triggered.Side)) is null)
+            return;
+
+        ExecuteAggressorWithOrderId(triggered, rules, book, s.OrderId);
     }
 
     private void Reject(string clOrdId, long securityId, long orderId, RejectReason r, ulong txn)

@@ -22,7 +22,7 @@ public enum Side : byte { Buy, Sell }
 /// </summary>
 public enum TimeInForce : byte { Day, IOC, FOK, Gtc, Gtd, AtClose, GoodForAuction }
 
-public enum OrderType : byte { Limit, Market }
+public enum OrderType : byte { Limit, Market, StopLoss, StopLimit }
 
 /// <summary>
 /// Per-instrument trading phase (gap-functional §5 / #201). The values
@@ -182,6 +182,17 @@ public sealed record NewOrderCommand(
     /// Default 0 means "not an iceberg". Issue #211.
     /// </summary>
     public ulong MaxFloor { get; init; }
+
+    /// <summary>
+    /// Optional stop trigger price (FIX StopPx). Required for
+    /// <see cref="OrderType.StopLoss"/> and <see cref="OrderType.StopLimit"/>;
+    /// must be 0 for <see cref="OrderType.Limit"/> and <see cref="OrderType.Market"/>.
+    /// Buy stops trigger when the last trade price is &gt;= StopPx; sell
+    /// stops trigger when the last trade price is &lt;= StopPx. On
+    /// trigger, a StopLoss is routed as a Market order and a StopLimit
+    /// as a Limit order at <see cref="PriceMantissa"/>. Issue #214.
+    /// </summary>
+    public long StopPxMantissa { get; init; }
 }
 
 public sealed record CancelOrderCommand(

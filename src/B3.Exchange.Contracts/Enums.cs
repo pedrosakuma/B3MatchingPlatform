@@ -21,6 +21,8 @@ public enum OrderType : byte
 {
     Market = 1,
     Limit = 2,
+    StopLoss = 3,
+    StopLimit = 4,
 }
 
 /// <summary>Time-in-force. Wire-neutral mirror of FIX tag 59.</summary>

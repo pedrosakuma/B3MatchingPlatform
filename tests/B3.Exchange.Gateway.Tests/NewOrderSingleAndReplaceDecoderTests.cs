@@ -132,9 +132,47 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
-    public void NewOrderSingle_StopPxRejectsAsUnsupported()
+    public void NewOrderSingle_StopPxOnNonStopRejectsAsUnsupported()
     {
+        // #214: StopPx on a non-stop order is still a decoder-level
+        // unsupported feature.
         var body = BuildNewOrderSingleV2(stopPx: 11_0000L);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("Stop", msg);
+    }
+
+    [Theory]
+    [InlineData((byte)'3', OrderType.StopLoss)]
+    [InlineData((byte)'4', OrderType.StopLimit)]
+    public void NewOrderSingle_AcceptsStopOrders(byte ordTypeByte, OrderType expected)
+    {
+        // #214: StopLoss/StopLimit accepted with StopPx populated. The
+        // decoder forwards StopPx to the engine; engine validates band/
+        // tick/MaxFloor/MinQty/TIF rules.
+        long pricePx = expected == OrderType.StopLimit ? 10_0000L : PriceNull;
+        var body = BuildNewOrderSingleV2(ordType: ordTypeByte, stopPx: 11_0000L,
+            price: pricePx);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.NotNull(cmd);
+        Assert.Equal(expected, cmd.Type);
+        Assert.Equal(11_0000L, cmd.StopPxMantissa);
+    }
+
+    [Theory]
+    [InlineData((byte)'3')]
+    [InlineData((byte)'4')]
+    public void NewOrderSingle_StopWithoutStopPxRejectsAsUnsupported(byte ordTypeByte)
+    {
+        // #214: Stop ord types require StopPx.
+        var body = BuildNewOrderSingleV2(ordType: ordTypeByte, stopPx: PriceNull);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
             body, 1, 0, out _, out _, out var msg);
@@ -184,8 +222,6 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Theory]
-    [InlineData((byte)'3')] // Stop
-    [InlineData((byte)'4')] // StopLimit
     [InlineData((byte)'W')] // RLP
     [InlineData((byte)'K')] // MARKET_WITH_LEFTOVER_AS_LIMIT
     [InlineData((byte)'P')] // PEGGED_MIDPOINT
