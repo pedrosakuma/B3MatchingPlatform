@@ -386,13 +386,52 @@ public sealed class MatchingEngine
             // Validate new params *before* mutating.
             if (cmd.NewQuantity <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.QuantityNonPositive, cmd.EnteredAtNanos); return; }
             if (cmd.NewQuantity % rules.LotSize != 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.QuantityNotMultipleOfLot, cmd.EnteredAtNanos); return; }
-            if (cmd.NewPriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
-            if (cmd.NewPriceMantissa < rules.MinPriceMantissa || cmd.NewPriceMantissa > rules.MaxPriceMantissa)
-            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
-            if (cmd.NewPriceMantissa % rules.TickSizeMantissa != 0)
-            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
 
-            bool priorityKept = cmd.NewPriceMantissa == resting.PriceMantissa
+            // #204: effective Type/TIF — null means "preserve original".
+            // The resting order is by construction Limit (Market never rests),
+            // so the only meaningful Type override is Limit -> Market, which
+            // turns the priority-loss path into a market aggressor.
+            var effectiveType = cmd.NewOrdType ?? OrderType.Limit;
+            var effectiveTif = cmd.NewTif ?? resting.Tif;
+
+            // Phase gating — same rules as a brand-new order. A replace that
+            // lands during a trading halt must be rejected before mutating
+            // the resting order; if the new TIF is incompatible with the
+            // current phase the replace is treated like a new order would be.
+            var phase = _phaseById[cmd.SecurityId];
+            if (effectiveTif == TimeInForce.Gtd)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.TimeInForceNotSupported, cmd.EnteredAtNanos); return; }
+            var requiredPhase = effectiveTif switch
+            {
+                TimeInForce.AtClose => TradingPhase.FinalClosingCall,
+                TimeInForce.GoodForAuction => TradingPhase.Reserved,
+                _ => TradingPhase.Open,
+            };
+            if (phase != requiredPhase)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.MarketClosed, cmd.EnteredAtNanos); return; }
+
+            // Market replace must be IOC/FOK (cannot rest); price is ignored
+            // in the aggressor path but we still validate it for Limit.
+            if (effectiveType == OrderType.Market)
+            {
+                if (effectiveTif != TimeInForce.IOC && effectiveTif != TimeInForce.FOK)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.MarketNotImmediateOrCancel, cmd.EnteredAtNanos); return; }
+            }
+            else
+            {
+                if (cmd.NewPriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
+                if (cmd.NewPriceMantissa < rules.MinPriceMantissa || cmd.NewPriceMantissa > rules.MaxPriceMantissa)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
+                if (cmd.NewPriceMantissa % rules.TickSizeMantissa != 0)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
+            }
+
+            // Priority-keep is only possible if Type/TIF are unchanged: a Type
+            // or TIF transition is by definition a logical re-entry (the order
+            // semantics differ), so we must DEL+NEW.
+            bool priorityKept = effectiveType == OrderType.Limit
+                                && effectiveTif == resting.Tif
+                                && cmd.NewPriceMantissa == resting.PriceMantissa
                                 && cmd.NewQuantity <= resting.RemainingQuantity;
 
             if (priorityKept)
@@ -420,15 +459,16 @@ public sealed class MatchingEngine
             EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.ReplaceLostPriority);
 
             // Build a synthetic NewOrderCommand for the replacement and process
-            // it through the normal aggressor path. TIF=Day so unfilled
-            // remainder rests (this matches FIX OrderCancelReplace semantics).
+            // it through the normal aggressor path. Type/TIF come from the
+            // explicit replace overrides (or the resting order's originals
+            // when omitted by the caller). Issue #204.
             var replacement = new NewOrderCommand(
                 ClOrdId: cmd.ClOrdId,
                 SecurityId: cmd.SecurityId,
                 Side: side,
-                Type: OrderType.Limit,
-                Tif: TimeInForce.Day,
-                PriceMantissa: cmd.NewPriceMantissa,
+                Type: effectiveType,
+                Tif: effectiveTif,
+                PriceMantissa: effectiveType == OrderType.Market ? 0L : cmd.NewPriceMantissa,
                 Quantity: cmd.NewQuantity,
                 EnteringFirm: resting.EnteringFirm,
                 EnteredAtNanos: cmd.EnteredAtNanos);
@@ -580,7 +620,7 @@ public sealed class MatchingEngine
             return;
         }
 
-        // Day order with remainder rests on the book.
+        // Day/GTC order with remainder rests on the book.
         var resting = new RestingOrder
         {
             OrderId = aggressorOrderIdForTrades,
@@ -590,6 +630,7 @@ public sealed class MatchingEngine
             EnteringFirm = cmd.EnteringFirm,
             InsertTimestampNanos = cmd.EnteredAtNanos,
             RemainingQuantity = aggressorRemaining,
+            Tif = cmd.Tif,
         };
         book.Insert(resting);
         _sink.OnOrderAccepted(new OrderAcceptedEvent(

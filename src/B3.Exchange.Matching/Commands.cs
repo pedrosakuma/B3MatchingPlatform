@@ -187,7 +187,25 @@ public sealed record ReplaceOrderCommand(
     long OrderId,
     long NewPriceMantissa,
     long NewQuantity,
-    ulong EnteredAtNanos);
+    ulong EnteredAtNanos)
+{
+    /// <summary>
+    /// New order type for the replacement. <c>null</c> means "preserve
+    /// the resting order's type" (always <see cref="OrderType.Limit"/>
+    /// for an order that is on the book). Setting <c>OrderType.Market</c>
+    /// turns the priority-loss path into a market aggressor that consumes
+    /// liquidity and never rests; <see cref="NewTif"/> must then be
+    /// IOC or FOK. Issue #204.
+    /// </summary>
+    public OrderType? NewOrdType { get; init; }
+
+    /// <summary>
+    /// New TIF for the replacement. <c>null</c> means "preserve the
+    /// resting order's original TIF". Issue #204 (was previously hard-
+    /// coded to <see cref="TimeInForce.Day"/>).
+    /// </summary>
+    public TimeInForce? NewTif { get; init; }
+}
 
 /// <summary>
 /// Cross order command (NewOrderCross template 106 / spec §4.6.1 / §16.1.5).

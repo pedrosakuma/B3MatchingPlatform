@@ -388,29 +388,39 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
-    public void OrderCancelReplace_MarketRejectsAsUnsupported()
+    public void OrderCancelReplace_MarketAccepted()
     {
-        var body = BuildOrderCancelReplaceV2(ordType: (byte)'1');
+        // #204: Market replace is supported; price is ignored by the engine
+        // for market orders, so the decoder zero-fills it.
+        var body = BuildOrderCancelReplaceV2(ordType: (byte)'1', tif: (byte)'3');
 
         var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
-            body, 0UL, out _, out _, out _, out var msg);
+            body, 0UL, out var cmd, out _, out _, out var msg);
 
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("Market replace", msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(OrderType.Market, cmd.NewOrdType);
+        Assert.Equal(TimeInForce.IOC, cmd.NewTif);
+        Assert.Equal(0L, cmd.NewPriceMantissa);
     }
 
     [Theory]
-    [InlineData((byte)'3')] // IOC
-    [InlineData((byte)'4')] // FOK
-    public void OrderCancelReplace_NonDayTifRejectsAsUnsupported(byte tifByte)
+    [InlineData((byte)'3', TimeInForce.IOC)]
+    [InlineData((byte)'4', TimeInForce.FOK)]
+    public void OrderCancelReplace_NonDayTifAccepted(byte tifByte, TimeInForce expected)
     {
+        // #204: every TIF the engine accepts on a NewOrderSingle is now
+        // valid on replace too. The decoder propagates it as the optional
+        // ReplaceOrderCommand.NewTif so the engine can apply it on the
+        // priority-loss re-entry path.
         var body = BuildOrderCancelReplaceV2(tif: tifByte);
 
         var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
-            body, 0UL, out _, out _, out _, out var msg);
+            body, 0UL, out var cmd, out _, out _, out var msg);
 
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("TIF", msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(expected, cmd.NewTif);
     }
 
     [Fact]
