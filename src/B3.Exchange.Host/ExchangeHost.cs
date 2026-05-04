@@ -158,7 +158,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 packetSink: sink,
                 outbound: gatewayRouter,
                 logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
-                metrics: channelMetrics);
+                metrics: channelMetrics,
+                sessionFirmCounters: _metrics.SessionFirmMessages);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
