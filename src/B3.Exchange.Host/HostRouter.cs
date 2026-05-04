@@ -1,5 +1,4 @@
 using B3.Exchange.Contracts;
-using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -14,36 +13,36 @@ namespace B3.Exchange.Host;
 /// instrument across any channel; the host owns the SecurityId → Channel
 /// routing table built at startup from per-channel instrument files.
 ///
-/// <para>This is also the integration point for the Gateway-side
-/// <see cref="OrderOwnershipMap"/>: Cancel/Replace by <c>OrigClOrdID</c>
-/// and the mass-cancel filter (spec §4.8 / #GAP-19) are resolved here
-/// against the map BEFORE the resolved command is enqueued onto a
-/// dispatcher's inbound queue. The dispatchers themselves no longer hold
-/// any per-session/per-order state (#66).</para>
+/// <para>Issue #167: per-channel <c>OrderRegistry</c> is the canonical
+/// owner of per-order routing state. Cancel/Replace by <c>OrigClOrdID</c>
+/// and the mass-cancel filter (spec §4.8 / #GAP-19) iterate the
+/// dispatchers and resolve against each channel's local registry. Session
+/// close fans an evict-session call out to every channel. The dispatchers
+/// remain the single writer for their own registry on the dispatch
+/// thread; this router only reads.</para>
 ///
 /// On unknown SecurityId or unresolvable OrigClOrdID the router synthesizes
 /// a reject ER directly back to the session via the
-/// <see cref="GatewayRouter"/> — no engine is involved.
+/// <see cref="ICoreOutbound"/> — no engine is involved.
 /// </summary>
 public sealed class HostRouter : IInboundCommandSink
 {
     private readonly IReadOnlyDictionary<long, ChannelDispatcher> _bySecId;
+    private readonly IReadOnlyList<ChannelDispatcher> _allDispatchers;
     private readonly ICoreOutbound _outbound;
-    private readonly OrderOwnershipMap _ownership;
     private readonly ILogger<HostRouter> _logger;
     private readonly Func<ulong> _nowNanos;
 
     public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, ICoreOutbound outbound,
-        OrderOwnershipMap ownership,
         ILogger<HostRouter> logger,
         Func<ulong>? nowNanos = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
-        ArgumentNullException.ThrowIfNull(ownership);
         _bySecId = routing;
+        // Distinct dispatcher set (multiple SecurityIds may share one channel).
+        _allDispatchers = routing.Values.Distinct().ToArray();
         _outbound = outbound;
-        _ownership = ownership;
         _logger = logger;
         _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
     }
@@ -101,26 +100,20 @@ public sealed class HostRouter : IInboundCommandSink
     public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
     {
         // Spec §4.8 / #GAP-19. Resolve the (session, firm, Side?, SecurityId?)
-        // filter against the Gateway-side OrderOwnershipMap, then group the
-        // matching orderIds by channel before fanning out. The dispatchers
-        // see only the resolved per-channel orderId list — no filter logic
-        // and no per-order session state lives in Core anymore (#66).
-        var matches = _ownership.FilterMassCancel(session, enteringFirm, cmd.SideFilter, cmd.SecurityId);
-        if (matches.Count == 0) return true;
-
+        // filter against each channel's local OrderRegistry (#167); group
+        // resolved orderIds by channel and fan out. Dispatchers see only
+        // the resolved per-channel orderId list — no per-order session
+        // state lives outside the owning channel.
         Dictionary<ChannelDispatcher, List<long>>? perChannel = null;
-        foreach (var (orderId, securityId) in matches)
+        foreach (var disp in _allDispatchers)
         {
-            if (!_bySecId.TryGetValue(securityId, out var disp))
-                continue; // ownership map references an instrument no longer routed; skip silently
-            (perChannel ??= new Dictionary<ChannelDispatcher, List<long>>())
-                .TryGetValue(disp, out var list);
-            if (list == null)
-            {
-                list = new List<long>();
-                perChannel[disp] = list;
-            }
-            list.Add(orderId);
+            if (cmd.SecurityId != 0 && _bySecId.TryGetValue(cmd.SecurityId, out var byId) && byId != disp)
+                continue;
+            var matches = disp.FilterMassCancelLocal(session, enteringFirm, cmd.SideFilter, cmd.SecurityId);
+            if (matches.Count == 0) continue;
+            var list = new List<long>(matches.Count);
+            foreach (var (orderId, _) in matches) list.Add(orderId);
+            (perChannel ??= new Dictionary<ChannelDispatcher, List<long>>())[disp] = list;
         }
         if (perChannel == null) return true;
 
@@ -148,24 +141,29 @@ public sealed class HostRouter : IInboundCommandSink
 
     public void OnSessionClosed(SessionId session)
     {
-        // Drop every ownership entry held for this session so passive
-        // fills against its resting orders stop trying to route to a
-        // disconnected peer. The orders themselves stay on the book —
-        // they ARE the book — but ER_Trade / ER_Cancel for them will be
-        // dropped in GatewayRouter (Phase 3 / #69 will replace this with
-        // routing into a Suspended-session retx ring).
-        int n = _ownership.EvictSession(session);
-        if (n > 0)
-            _logger.LogDebug("session {Session} closed; evicted {Count} ownership entries", session, n);
+        // Drop every ownership entry held for this session across every
+        // channel so passive fills against its resting orders stop trying
+        // to route to a disconnected peer. The orders themselves stay on
+        // the book — they ARE the book — but ER_Trade / ER_Cancel for them
+        // will be dropped in the dispatcher's OnTrade/OnOrderCanceled when
+        // the local registry no longer resolves them (Phase 3 / #69 will
+        // replace this with routing into a Suspended-session retx ring).
+        int total = 0;
+        foreach (var disp in _allDispatchers)
+            total += disp.EvictSessionLocal(session);
+        if (total > 0)
+            _logger.LogDebug("session {Session} closed; evicted {Count} ownership entries", session, total);
     }
 
     private CancelOrderCommand ResolveOrderIdIfNeeded(in CancelOrderCommand cmd, uint firm, ulong origClOrdId, out bool ok)
     {
         if (cmd.OrderId != 0) { ok = true; return cmd; }
-        if (_ownership.TryResolveByClOrdId(firm, origClOrdId, out var orderId))
+        if (TryResolveAcrossChannels(firm, origClOrdId, out var orderId, out var securityId))
         {
             ok = true;
-            return cmd with { OrderId = orderId };
+            // Stamp the resolved SecurityId so downstream dispatch finds the
+            // owning channel even when the client didn't send one.
+            return cmd with { OrderId = orderId, SecurityId = securityId };
         }
         ok = false;
         return cmd;
@@ -174,13 +172,29 @@ public sealed class HostRouter : IInboundCommandSink
     private ReplaceOrderCommand ResolveOrderIdIfNeeded(in ReplaceOrderCommand cmd, uint firm, ulong origClOrdId, out bool ok)
     {
         if (cmd.OrderId != 0) { ok = true; return cmd; }
-        if (_ownership.TryResolveByClOrdId(firm, origClOrdId, out var orderId))
+        if (TryResolveAcrossChannels(firm, origClOrdId, out var orderId, out var securityId))
         {
             ok = true;
-            return cmd with { OrderId = orderId };
+            return cmd with { OrderId = orderId, SecurityId = securityId };
         }
         ok = false;
         return cmd;
+    }
+
+    private bool TryResolveAcrossChannels(uint firm, ulong origClOrdId, out long orderId, out long securityId)
+    {
+        // ClOrdId is unique per (firm) but its owning channel is unknown
+        // here; iterate the (typically small) dispatcher set. The first
+        // hit wins — registries are partitioned by SecurityId so collisions
+        // are not expected in practice.
+        foreach (var disp in _allDispatchers)
+        {
+            if (disp.TryResolveByClOrdId(firm, origClOrdId, out orderId, out securityId))
+                return true;
+        }
+        orderId = 0;
+        securityId = 0;
+        return false;
     }
 
     private void RejectUnknownInstrument(long secId, SessionId session, ulong clOrdIdValue)

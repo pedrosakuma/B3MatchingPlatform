@@ -57,7 +57,8 @@ namespace B3.Exchange.Core;
 /// or buffer state is mutated from the producer thread.</description></item>
 /// <item><description><b>The dispatch loop thread</b> (the single
 /// <see cref="Thread"/> spun up by <see cref="Start"/>) is the sole mutator of
-/// engine state, the packet buffer, the <c>_clOrdId</c> index, and the
+/// engine state, the packet buffer, the per-channel <c>OrderRegistry</c>,
+/// and the
 /// <see cref="SequenceNumber"/> / <see cref="SequenceVersion"/> counters.
 /// Every mutation path asserts <c>Thread.CurrentThread == _loopThread</c>
 /// in DEBUG builds via <c>AssertOnLoopThread</c>.</description></item>
@@ -121,6 +122,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
     private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
+    private readonly OrderRegistry _orders = new();
 
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;

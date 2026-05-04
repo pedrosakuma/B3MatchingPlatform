@@ -29,6 +29,11 @@ public sealed partial class ChannelDispatcher
 
         if (_hasCurrentSession)
         {
+            // Issue #167: register canonical order-state on the dispatch
+            // thread (single writer) BEFORE emitting the ER so any passive
+            // trade fired in the same dispatch turn can resolve owner ↦
+            // session locally.
+            _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
         }
@@ -67,12 +72,17 @@ public sealed partial class ChannelDispatcher
             e.SecurityId, e.OrderId, entryType, e.RemainingQuantityAtCancel, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        // Gateway resolves OrderId → owning session via OrderOwnershipMap
-        // and evicts the entry. Pass the active session's ClOrdId (if any)
-        // so the wire ER carries the requester's id while OrigClOrdID
-        // points to the owner's original ClOrdID.
-        _outbound.WriteExecutionReportPassiveCancel(e.OrderId, e, _currentClOrdId, _currentReceivedTimeNanos);
-        _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
+        // Issue #167: resolve owner locally on the dispatch thread, then
+        // evict the canonical entry. Pass the active session's ClOrdId (if
+        // any) so the wire ER carries the requester's id while
+        // OrigClOrdID points to the owner's original ClOrdID.
+        if (_orders.TryResolve(e.OrderId, out var owner))
+        {
+            _orders.Evict(e.OrderId);
+            _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
+                _currentClOrdId, _currentReceivedTimeNanos);
+            _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
+        }
     }
 
     public void OnOrderFilled(in OrderFilledEvent e)
@@ -90,9 +100,10 @@ public sealed partial class ChannelDispatcher
             e.SecurityId, e.OrderId, entryType, e.FinalFilledQuantity, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
         Commit(n);
 
-        // Tell the Gateway to release the ownership entry — no wire ER here
-        // (the per-trade ER_Trade frames have already covered the fills).
-        _outbound.NotifyOrderTerminal(e.OrderId);
+        // Tell the canonical registry the order has reached terminal state
+        // — no wire ER here (the per-trade ER_Trade frames have already
+        // covered the fills).
+        _orders.Evict(e.OrderId);
     }
 
     public void OnTrade(in TradeEvent e)
@@ -119,10 +130,16 @@ public sealed partial class ChannelDispatcher
                 leavesQty: 0, cumQty: e.Quantity);
             _metrics?.IncExecutionReport(ExecutionReportKind.Trade);
         }
-        // ER_Trade for the resting side: Gateway resolves owner via the
-        // OrderOwnershipMap.
-        _outbound.WriteExecutionReportPassiveTrade(e.RestingOrderId, e, leavesQty: 0, cumQty: e.Quantity);
-        _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
+        // ER_Trade for the resting side: resolve owner locally on the
+        // dispatch thread (#167) and pass pre-resolved (session, clOrdId)
+        // to the Gateway. If the owner has no live session entry the
+        // Gateway drops at SessionRegistry.TryGet.
+        if (_orders.TryResolve(e.RestingOrderId, out var owner))
+        {
+            _outbound.WriteExecutionReportPassiveTrade(owner.Session, owner.ClOrdId, e.RestingOrderId,
+                e, leavesQty: 0, cumQty: e.Quantity);
+            _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
+        }
     }
 
     public void OnReject(in B3.Exchange.Matching.RejectEvent e)
