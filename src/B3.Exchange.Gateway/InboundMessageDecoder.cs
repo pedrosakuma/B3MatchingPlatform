@@ -19,6 +19,12 @@ namespace B3.Exchange.Gateway;
 internal static partial class InboundMessageDecoder
 {
     private const byte RoutingInstructionNull = 255;
+    // #241: B3.EntryPoint.Client 0.8.0 has no public surface to set
+    // RoutingInstruction, so it always emits the .NET enum default (0).
+    // 0 is not one of the schema's defined non-null values (1..4) and
+    // is treated here as synonymous with NULL — i.e. "no special
+    // routing", which is exactly what we already do for the NULL byte.
+    private const byte RoutingInstructionDefault = 0;
     private const byte TimeInForceOptionalNull = 0; // schema null = '\0'
 
     private const long PriceNull = long.MinValue;

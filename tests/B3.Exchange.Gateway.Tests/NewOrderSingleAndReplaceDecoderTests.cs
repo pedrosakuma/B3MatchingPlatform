@@ -237,6 +237,46 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Contains("RoutingInstruction", msg);
     }
 
+    /// <summary>
+    /// #241: B3.EntryPoint.Client 0.8.0 has no public surface to set
+    /// RoutingInstruction so it always emits the .NET enum default 0.
+    /// 0 is not a schema-defined non-null value (1..4) and must be
+    /// treated as synonymous with NULL — accept silently, do not reject.
+    /// </summary>
+    [Theory]
+    [InlineData((byte)0)]   // EPC 0.8.0 SDK default
+    [InlineData((byte)255)] // explicit NULL
+    public void NewOrderSingle_RoutingInstructionDefaultOrNull_IsAccepted(byte routing)
+    {
+        var body = BuildNewOrderSingleV2(routing: routing);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+    }
+
+    /// <summary>
+    /// Same default-vs-null acceptance for the Cancel/Replace path —
+    /// EPC 0.8.0's Replace surface has the same gap as the new-order
+    /// surface, so a Replace on an existing order also carries
+    /// routing=0.
+    /// </summary>
+    [Theory]
+    [InlineData((byte)0)]
+    [InlineData((byte)255)]
+    public void OrderCancelReplace_RoutingInstructionDefaultOrNull_IsAccepted(byte routing)
+    {
+        var body = BuildOrderCancelReplaceV2(routing: routing);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 1, out _, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+    }
+
     [Theory]
     [InlineData((byte)'W')] // RLP
     [InlineData((byte)'P')] // PEGGED_MIDPOINT
