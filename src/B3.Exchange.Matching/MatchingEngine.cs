@@ -189,6 +189,18 @@ public sealed class MatchingEngine
         AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("SetTradingPhase called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        return ApplyTradingPhase(securityId, phase, txnNanos);
+    }
+
+    /// <summary>
+    /// Internal phase transition used by both <see cref="SetTradingPhase"/>
+    /// and <see cref="UncrossAuction"/>. Skips the dispatch-guard checks
+    /// because the caller already validated entry conditions; emits one
+    /// <see cref="TradingPhaseChangedEvent"/> if the new phase differs from
+    /// the current.
+    /// </summary>
+    private bool ApplyTradingPhase(long securityId, TradingPhase phase, ulong txnNanos)
+    {
         if (!_phaseById.TryGetValue(securityId, out var current))
             throw new KeyNotFoundException($"unknown securityId {securityId}");
         if (current == phase) return false;
@@ -199,6 +211,235 @@ public sealed class MatchingEngine
             TransactTimeNanos: txnNanos,
             RptSeq: ++_rptSeq));
         return true;
+    }
+
+    /// <summary>
+    /// Operator-issued auction uncross (gap-functional §6 / Onda M ·
+    /// M3 / #230). Drains crossing volume at the single Theoretical
+    /// Opening Price computed from the current resting book, emits one
+    /// <see cref="TradeEvent"/> per matched pair (deterministic
+    /// aggressor-side: order with the later
+    /// <c>InsertTimestampNanos</c>; tie → buy side), then transitions
+    /// the trading phase to <paramref name="targetPhase"/>.
+    /// <para>
+    /// Required current phase / target combinations:
+    /// <list type="bullet">
+    ///   <item><see cref="TradingPhase.Reserved"/> →
+    ///     <see cref="TradingPhase.Open"/></item>
+    ///   <item><see cref="TradingPhase.FinalClosingCall"/> →
+    ///     <see cref="TradingPhase.Close"/></item>
+    /// </list>
+    /// Any other source/target throws
+    /// <see cref="InvalidOperationException"/>.
+    /// </para>
+    /// <para>
+    /// Iceberg makers (<see cref="MaxFloor"/> &gt; 0) participate with
+    /// their visible slice only — the hidden reserve is invisible to
+    /// the TOP computation (consistent with continuous matching). When
+    /// a visible slice is fully drained but hidden remains, the
+    /// existing replenishment path fires and the refreshed slice goes
+    /// to the back of the level (no double-trade in the same uncross).
+    /// </para>
+    /// <para>
+    /// Returns <c>true</c> if any trade printed, <c>false</c> if the
+    /// book had no crossing.
+    /// </para>
+    /// </summary>
+    public bool UncrossAuction(long securityId, TradingPhase targetPhase, ulong txnNanos)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("UncrossAuction called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        if (!_phaseById.TryGetValue(securityId, out var current))
+            throw new KeyNotFoundException($"unknown securityId {securityId}");
+
+        bool fromOpening = current == TradingPhase.Reserved && targetPhase == TradingPhase.Open;
+        bool fromClosing = current == TradingPhase.FinalClosingCall && targetPhase == TradingPhase.Close;
+        if (!fromOpening && !fromClosing)
+        {
+            throw new InvalidOperationException(
+                $"UncrossAuction invalid transition: {current} → {targetPhase} (allowed: Reserved→Open, FinalClosingCall→Close)");
+        }
+        if (!_rulesById.TryGetValue(securityId, out var rules))
+            throw new KeyNotFoundException($"unknown securityId rules {securityId}");
+        if (!_booksById.TryGetValue(securityId, out var book))
+            throw new KeyNotFoundException($"unknown securityId book {securityId}");
+
+        var topState = ComputeAuctionTop(book);
+        bool anyTrade = false;
+        if (topState.HasTop)
+        {
+            anyTrade = DrainAtTopPrice(book, topState.TopPriceMantissa, txnNanos);
+        }
+
+        // M2 hook: the drain mutated the book — recompute and emit a
+        // final TheoreticalOpeningPrice/Imbalance frame (typically
+        // HasTop=false now since the crossing volume was consumed).
+        // We invoke this BEFORE the phase transition so consumers see
+        // the auction state collapse to "no crossing" immediately
+        // before the SecurityStatus phase change.
+        var post = ComputeAuctionTop(book);
+        if (!_auctionTopById.TryGetValue(securityId, out var prev) || prev != post)
+        {
+            _auctionTopById[securityId] = post;
+            _sink.OnAuctionTopChanged(new AuctionTopChangedEvent(
+                SecurityId: securityId,
+                HasTop: post.HasTop,
+                TopPriceMantissa: post.TopPriceMantissa,
+                TopQuantity: post.TopQuantity,
+                HasImbalance: post.HasImbalance,
+                ImbalanceSide: post.ImbalanceSide,
+                ImbalanceQuantity: post.ImbalanceQuantity,
+                TransactTimeNanos: txnNanos,
+                RptSeq: ++_rptSeq));
+        }
+
+        ApplyTradingPhase(securityId, targetPhase, txnNanos);
+        return anyTrade;
+    }
+
+    /// <summary>
+    /// Walks the buy and sell sides best-first, pairing head orders
+    /// at <paramref name="topPrice"/> until one side runs out (or no
+    /// further crossing exists at that level). One
+    /// <see cref="TradeEvent"/> per pair; iceberg replenishment runs
+    /// in-place. Returns <c>true</c> if at least one trade printed.
+    /// </summary>
+    private bool DrainAtTopPrice(LimitOrderBook book, long topPrice, ulong txnNanos)
+    {
+        bool anyTrade = false;
+        while (true)
+        {
+            var bidLevel = book.BestLevel(Side.Buy);
+            var askLevel = book.BestLevel(Side.Sell);
+            if (bidLevel is null || askLevel is null) break;
+            // Only orders at prices that meet/exceed TOP participate.
+            if (bidLevel.PriceMantissa < topPrice) break;
+            if (askLevel.PriceMantissa > topPrice) break;
+            var buy = bidLevel.Head;
+            var sell = askLevel.Head;
+            if (buy is null || sell is null) break;
+
+            long tradeQty = Math.Min(buy.RemainingQuantity, sell.RemainingQuantity);
+
+            // Deterministic aggressor side: order with the later (larger)
+            // InsertTimestampNanos is the "younger" side and is recorded
+            // as the aggressor; equal timestamps tiebreak to Buy.
+            bool buyIsYounger = buy.InsertTimestampNanos > sell.InsertTimestampNanos
+                || (buy.InsertTimestampNanos == sell.InsertTimestampNanos);
+            var aggressor = buyIsYounger ? buy : sell;
+            var maker = buyIsYounger ? sell : buy;
+
+            _sink.OnTrade(new TradeEvent(
+                SecurityId: book.SecurityId,
+                TradeId: _nextTradeId++,
+                PriceMantissa: topPrice,
+                Quantity: tradeQty,
+                AggressorSide: aggressor.Side,
+                AggressorOrderId: aggressor.OrderId,
+                AggressorClOrdId: aggressor.ClOrdId,
+                AggressorFirm: aggressor.EnteringFirm,
+                RestingOrderId: maker.OrderId,
+                RestingFirm: maker.EnteringFirm,
+                TransactTimeNanos: txnNanos,
+                RptSeq: NextRptSeq()));
+            anyTrade = true;
+
+            buy.RemainingQuantity -= tradeQty;
+            sell.RemainingQuantity -= tradeQty;
+            bidLevel.TotalQuantity -= tradeQty;
+            askLevel.TotalQuantity -= tradeQty;
+
+            // Apply post-trade state to each side: full → fill (with
+            // iceberg replenish), partial → quantity-reduced UPDATE.
+            FinalizeUncrossSide(book, buy, tradeQty, txnNanos);
+            FinalizeUncrossSide(book, sell, tradeQty, txnNanos);
+        }
+        return anyTrade;
+    }
+
+    /// <summary>
+    /// Post-trade state machine for one side of an uncross pair.
+    /// Mirrors the relevant tail of
+    /// <see cref="ExecuteAggressorWithOrderId"/>: full fill emits
+    /// <see cref="OrderFilledEvent"/> (and triggers iceberg replenish
+    /// if hidden reserve remains); partial fill emits
+    /// <see cref="OrderQuantityReducedEvent"/>; empty-book emits
+    /// <see cref="OrderBookSideEmptyEvent"/> on full drain.
+    /// </summary>
+    private void FinalizeUncrossSide(LimitOrderBook book, RestingOrder o, long lastTradeQty, ulong txnNanos)
+    {
+        if (o.RemainingQuantity > 0)
+        {
+            _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
+                SecurityId: book.SecurityId,
+                OrderId: o.OrderId,
+                Side: o.Side,
+                PriceMantissa: o.PriceMantissa,
+                NewRemainingQuantity: o.RemainingQuantity,
+                InsertTimestampNanos: o.InsertTimestampNanos,
+                TransactTimeNanos: txnNanos,
+                RptSeq: NextRptSeq()));
+            return;
+        }
+
+        // Iceberg with hidden reserve: replenish, re-insert at back.
+        // (Same semantics as the continuous-matching branch.)
+        if (o.HiddenQuantity > 0)
+        {
+            long newVisible = Math.Min(o.MaxFloor, o.HiddenQuantity);
+            long newHidden = o.HiddenQuantity - newVisible;
+            var icebergSide = o.Side;
+            long icebergPx = o.PriceMantissa;
+            long icebergOid = o.OrderId;
+            book.Remove(o);
+            var refreshed = new RestingOrder
+            {
+                OrderId = icebergOid,
+                ClOrdId = o.ClOrdId,
+                Side = icebergSide,
+                PriceMantissa = icebergPx,
+                EnteringFirm = o.EnteringFirm,
+                InsertTimestampNanos = txnNanos,
+                RemainingQuantity = newVisible,
+                Tif = o.Tif,
+                MaxFloor = o.MaxFloor,
+                HiddenQuantity = newHidden,
+            };
+            book.Insert(refreshed);
+            uint deleteSeq = NextRptSeq();
+            uint addSeq = NextRptSeq();
+            _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
+                SecurityId: book.SecurityId,
+                OrderId: icebergOid,
+                Side: icebergSide,
+                PriceMantissa: icebergPx,
+                NewVisibleQuantity: newVisible,
+                RemainingHiddenQuantity: newHidden,
+                InsertTimestampNanos: txnNanos,
+                TransactTimeNanos: txnNanos,
+                DeleteRptSeq: deleteSeq,
+                AddRptSeq: addSeq));
+            return;
+        }
+
+        var side = o.Side;
+        book.Remove(o);
+        _sink.OnOrderFilled(new OrderFilledEvent(
+            SecurityId: book.SecurityId,
+            OrderId: o.OrderId,
+            Side: side,
+            PriceMantissa: o.PriceMantissa,
+            FinalFilledQuantity: lastTradeQty,
+            TransactTimeNanos: txnNanos,
+            RptSeq: NextRptSeq()));
+        if (book.BestLevel(side) is null)
+        {
+            _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
+                SecurityId: book.SecurityId,
+                Side: side,
+                TransactTimeNanos: txnNanos));
+        }
     }
 
     public void Submit(NewOrderCommand cmd)
