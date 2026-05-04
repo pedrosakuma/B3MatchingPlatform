@@ -14,6 +14,15 @@ internal sealed class RestingOrder
     public required uint EnteringFirm { get; init; }
     public required ulong InsertTimestampNanos { get; init; }
 
+    /// <summary>
+    /// TIF the order was originally accepted with (Day or Gtc — the only
+    /// TIFs that can rest). Tracked so a subsequent
+    /// <see cref="ReplaceOrderCommand"/> that omits TIF on the wire
+    /// preserves the resting order's original TIF instead of silently
+    /// downgrading to <see cref="TimeInForce.Day"/>. Issue #204.
+    /// </summary>
+    public TimeInForce Tif { get; init; } = TimeInForce.Day;
+
     public long RemainingQuantity;
     public PriceLevel? Level;
     public RestingOrder? Prev;

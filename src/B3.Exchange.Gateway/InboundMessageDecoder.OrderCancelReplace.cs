@@ -71,42 +71,28 @@ internal static partial class InboundMessageDecoder
         if (!TryClassifyOrdType(ordTypeByte, out var ordType, out var ordTypeUnsupported))
         {
             message = ordTypeUnsupported is not null
-                ? $"OrdType={ordTypeByte:X2} not supported (only Limit on replace)"
+                ? $"OrdType={ordTypeByte:X2} not supported (only Market, Limit)"
                 : $"invalid OrdType={ordTypeByte}";
             return ordTypeUnsupported is not null
                 ? InboundDecodeOutcome.UnsupportedFeature
                 : InboundDecodeOutcome.DecodeError;
         }
-        // Replace path can only carry through Limit semantics — the
-        // engine's ReplaceOrderCommand has no Type field and reuses the
-        // resting order's existing type. Reject Market replace requests
-        // explicitly so we don't silently lie about what we did.
-        if (ordType != OrderType.Limit)
-        {
-            message = "Market replace not supported (only Limit replace)";
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
-        // TimeInForce on this template is optional in the schema (null =
-        // '\0'), meaning "do not change". Anything else than null or Day
-        // would request a TIF transition the engine cannot perform on
-        // a resting order, so reject with BMR rather than silently
-        // accepting and applying the wrong semantics.
+        // #204: TimeInForce on this template is optional; absence means
+        // "preserve the resting order's original TIF". When present, any
+        // value the engine accepts on a NewOrderSingle is allowed here.
+        TimeInForce? newTif = null;
         if (tifByte != TimeInForceOptionalNull)
         {
-            if (!TryClassifyTif(tifByte, out var tif, out var tifUnsupported))
+            if (!TryClassifyTif(tifByte, out var tifValue, out var tifUnsupported))
             {
                 message = tifUnsupported is not null
-                    ? $"TimeInForce={(char)tifByte} not supported on replace (omit or use Day)"
+                    ? $"TimeInForce={(char)tifByte} not supported"
                     : $"invalid TimeInForce={tifByte}";
                 return tifUnsupported is not null
                     ? InboundDecodeOutcome.UnsupportedFeature
                     : InboundDecodeOutcome.DecodeError;
             }
-            if (tif != TimeInForce.Day)
-            {
-                message = "TIF change on replace not supported (omit or use Day)";
-                return InboundDecodeOutcome.UnsupportedFeature;
-            }
+            newTif = tifValue;
         }
         if (stopPx != PriceNull)
         {
@@ -148,19 +134,29 @@ internal static partial class InboundMessageDecoder
             message = "OrderCancelReplaceRequest requires either OrderID or OrigClOrdID";
             return InboundDecodeOutcome.DecodeError;
         }
-        if (priceMantissa == PriceNull)
+        // Limit replace requires a price; Market replace ignores price (the
+        // engine zero-fills it before processing).
+        if (ordType == OrderType.Limit && priceMantissa == PriceNull)
         {
             message = "OrderCancelReplaceRequest requires Price (replace cannot remove price)";
             return InboundDecodeOutcome.DecodeError;
         }
 
+        long enginePrice = ordType == OrderType.Market
+            ? 0L
+            : priceMantissa;
+
         cmd = new ReplaceOrderCommand(
             ClOrdId: clOrdId.ToString(),
             SecurityId: secId,
             OrderId: (long)orderId,
-            NewPriceMantissa: priceMantissa,
+            NewPriceMantissa: enginePrice,
             NewQuantity: qty,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            NewOrdType = ordType,
+            NewTif = newTif,
+        };
         return InboundDecodeOutcome.Success;
     }
 }
