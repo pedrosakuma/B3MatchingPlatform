@@ -203,6 +203,23 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidRetransmitRequest:
                 ProcessAndEnqueueRetransmitRequest(fixedBlock);
                 return true;
+            case EntryPointFrameReader.TidTerminate:
+                {
+                    // Spec §4.5.4: peer-initiated graceful logout. Echo
+                    // Terminate(FINISHED) back per the symmetric handshake
+                    // requirement and close the transport. The state
+                    // machine accepts Terminate from any state
+                    // (Idle/Negotiated/Established/Suspended).
+                    string reason = "peer-terminate";
+                    if (EntryPointFixpFrameCodec.TryDecodeTerminate(fixedBlock, out var tm))
+                    {
+                        reason = $"peer-terminate:code={tm.TerminationCode}";
+                    }
+                    ApplyTransition(FixpEvent.Terminate);
+                    await TerminateAndCloseAsync(
+                        SessionRejectEncoder.TerminationCode.Finished, reason).ConfigureAwait(false);
+                    return false;
+                }
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
