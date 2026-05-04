@@ -197,7 +197,7 @@ public class EpcInteropTests : IAsyncLifetime
         // hardcodes OrigClOrdID = null (SDK bug, not gateway).
     }
 
-    [Fact(Skip = "Blocked by #252 — OrderCancelReplaceRequest (template 104) BusinessReject against EPC SDK 0.14.0 defaults")]
+    [Fact(Skip = "EPC SDK 0.14.0 bug: OrderCancelReplace encoder writes StopPx at offset 84 which overwrites OrigClOrdID (also at offset 84 per the OrderCancelReplaceRequestData struct). The encoder's hand-written explicit offsets for StopPx/MinQty/MaxFloor/AccountType/ExpireDate are all -8 from the struct's declared FieldOffsets. As a result OrigClOrdID never reaches the wire and the gateway correctly rejects 'requires either OrderID or OrigClOrdID'. Tracked by #252; re-enable when the SDK ships a fix or our gateway gets a OrigClOrdID-via-RAM-clobber heuristic.")]
     public async Task NewOrderSingleV6_Submit_Replace_Cancel_RoundTrips()
     {
         // Drives template 102 (NewOrderSingle V6) + template 104
@@ -244,7 +244,7 @@ public class EpcInteropTests : IAsyncLifetime
             OrderType = OrderType.Limit,
             TimeInForce = TimeInForce.Day,
             OrderQty = 100,
-            Price = 31.40m,
+            Price = 31.50m,
         }, cts.Token);
 
         await WaitFor(events, l => l.OfType<OrderModified>().Any(), cts.Token);
