@@ -1,0 +1,15 @@
+[
+  // Synthetic derivatives sample — token instruments to exercise the
+  // multi-channel-group dispatch path end-to-end (#225). NOT real B3
+  // contract specs; purely placeholders. SecurityIDs use the high-bit
+  // 901xxx prefix to stay disjoint from instruments-eqt.json (900xxx).
+  { "symbol": "DOLF99", "securityId": 901000000001, "tickSize": "0.5",
+    "lotSize": 1, "minPx": "0.5", "maxPx": "999999.5",
+    "currency": "BRL", "isin": "BRDOLF99F2026", "securityType": "FUT" },
+  { "symbol": "INDF99", "securityId": 901000000002, "tickSize": "5",
+    "lotSize": 1, "minPx": "5", "maxPx": "9999995",
+    "currency": "BRL", "isin": "BRINDF99F2026", "securityType": "FUT" },
+  { "symbol": "DI1F99", "securityId": 901000000003, "tickSize": "0.001",
+    "lotSize": 1, "minPx": "0.001", "maxPx": "999.999",
+    "currency": "BRL", "isin": "BRDI1F99F2026", "securityType": "FUT" }
+]

@@ -82,6 +82,33 @@
         "ttl": 1,
         "cadenceMs": 5000
       }
+    },
+    // Second channel group (DRV) — exercises the multi-group UMDF
+    // dispatch path end-to-end (#225). Real B3 always publishes at
+    // least EQT + DRV side-by-side; mirror that shape here so consumers
+    // can validate per-group ring + cross-group fan-in. The synthetic
+    // instruments under config/instruments-drv.json are placeholders.
+    {
+      "channelNumber": 72,
+      "incrementalGroup": "224.0.20.72",
+      "incrementalPort": 30072,
+      "ttl": 1,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-drv.json",
+      "snapshot": {
+        "group": "224.0.20.172",
+        "port": 30172,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 172,
+        "group": "224.0.21.72",
+        "port": 31072,
+        "ttl": 1,
+        "cadenceMs": 5000
+      }
     }
   ]
 }

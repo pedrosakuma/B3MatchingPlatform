@@ -53,6 +53,30 @@
         "port": 31084,
         "cadenceMs": 5000
       }
+    },
+    // Second channel group (DRV, ch 72) — mirrors the EQT shape on a
+    // distinct port range so consumers can validate multi-group
+    // dispatch over the bridge unicast wire (#225). Re-uses the same
+    // unicast hostname.
+    {
+      "channelNumber": 72,
+      "transport": "unicast",
+      "incrementalGroup": "marketdata",
+      "incrementalPort": 30072,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-drv.json",
+      "snapshot": {
+        "group": "marketdata",
+        "port": 30172,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 172,
+        "group": "marketdata",
+        "port": 31072,
+        "cadenceMs": 5000
+      }
     }
   ]
 }
