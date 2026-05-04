@@ -249,6 +249,8 @@ internal sealed class FixpOutboundEncoder
         RejectReason.SelfTradePrevention => 0u,
         RejectReason.MarketClosed => 13u,
         RejectReason.TimeInForceNotSupported => 11u,
+        RejectReason.MinQtyNotMet => 0u,
+        RejectReason.InvalidField => 11u,
         _ => 0u,
     };
 }

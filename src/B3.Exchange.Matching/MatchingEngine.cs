@@ -208,6 +208,11 @@ public sealed class MatchingEngine
             if (cmd.Quantity <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.QuantityNonPositive, cmd.EnteredAtNanos); return; }
             if (cmd.Quantity % rules.LotSize != 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.QuantityNotMultipleOfLot, cmd.EnteredAtNanos); return; }
 
+            // #203 (MinQty subset): MinQty must be in (0, Quantity]. Zero
+            // means "no minimum-fill constraint" and is the legacy path.
+            if (cmd.MinQty != 0 && (long)cmd.MinQty > cmd.Quantity)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+
             if (cmd.Type == OrderType.Limit)
             {
                 if (cmd.PriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
@@ -259,6 +264,21 @@ public sealed class MatchingEngine
             // market order to be "accepted with no fills".
             if (cmd.Type == OrderType.Market && book.BestLevel(LimitOrderBook.Opposite(cmd.Side)) is null)
             { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketNoLiquidity, cmd.EnteredAtNanos); return; }
+
+            // #203 (MinQty subset): pre-check immediately fillable quantity
+            // against the opposite side. Same crossing predicate as FOK but
+            // the threshold is MinQty instead of full Quantity. Any residual
+            // (Quantity - filled) is allowed to rest if TIF permits. STP
+            // self-trade exclusion is intentionally not factored in here:
+            // MinQty is a venue-level liquidity guard expressed against the
+            // book, and a separate STP cancel will surface to the client
+            // through the normal aggressor path.
+            if (cmd.MinQty != 0)
+            {
+                long fillable = book.FillableQuantityAgainst(cmd.Side, cmd.PriceMantissa, isMarket: cmd.Type == OrderType.Market);
+                if (fillable < (long)cmd.MinQty)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MinQtyNotMet, cmd.EnteredAtNanos); return; }
+            }
 
             ExecuteAggressor(cmd, rules, book);
         }
