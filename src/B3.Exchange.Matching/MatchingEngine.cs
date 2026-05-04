@@ -267,9 +267,26 @@ public sealed class MatchingEngine
 
         var topState = ComputeAuctionTop(book);
         bool anyTrade = false;
+        long clearedQty = 0;
         if (topState.HasTop)
         {
-            anyTrade = DrainAtTopPrice(book, topState.TopPriceMantissa, txnNanos);
+            anyTrade = DrainAtTopPrice(book, topState.TopPriceMantissa, txnNanos, out clearedQty);
+        }
+
+        // M4 (issue #231): emit a single OpeningPrice/ClosingPrice
+        // print before the post-drain TOP recomputation. Only fired
+        // when at least one trade printed — there is no "empty"
+        // auction print on the wire. The integration sink picks the
+        // UMDF template based on Kind.
+        if (anyTrade)
+        {
+            _sink.OnAuctionPrint(new AuctionPrintEvent(
+                SecurityId: securityId,
+                Kind: fromOpening ? AuctionPrintKind.Opening : AuctionPrintKind.Closing,
+                PriceMantissa: topState.TopPriceMantissa,
+                ClearedQuantity: clearedQty,
+                TransactTimeNanos: txnNanos,
+                RptSeq: NextRptSeq()));
         }
 
         // M2 hook: the drain mutated the book — recompute and emit a
@@ -305,9 +322,10 @@ public sealed class MatchingEngine
     /// <see cref="TradeEvent"/> per pair; iceberg replenishment runs
     /// in-place. Returns <c>true</c> if at least one trade printed.
     /// </summary>
-    private bool DrainAtTopPrice(LimitOrderBook book, long topPrice, ulong txnNanos)
+    private bool DrainAtTopPrice(LimitOrderBook book, long topPrice, ulong txnNanos, out long clearedQuantity)
     {
         bool anyTrade = false;
+        clearedQuantity = 0;
         while (true)
         {
             var bidLevel = book.BestLevel(Side.Buy);
@@ -344,6 +362,7 @@ public sealed class MatchingEngine
                 TransactTimeNanos: txnNanos,
                 RptSeq: NextRptSeq()));
             anyTrade = true;
+            clearedQuantity += tradeQty;
 
             buy.RemainingQuantity -= tradeQty;
             sell.RemainingQuantity -= tradeQty;

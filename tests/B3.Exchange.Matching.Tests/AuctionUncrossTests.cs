@@ -181,4 +181,77 @@ public class AuctionUncrossTests
         var trade = Assert.Single(sink.Trades);
         Assert.Equal(Side.Sell, trade.AggressorSide);
     }
+
+    // ---------------- Onda M · M4 (issue #231) — auction prints ----------------
+
+    /// <summary>
+    /// Reserved → Open uncross that prints emits exactly one
+    /// <c>AuctionPrintEvent</c> with <c>Kind=Opening</c>, the cleared
+    /// price (auction TOP), and total cleared volume.
+    /// </summary>
+    [Fact]
+    public void Uncross_OpeningWithCrossing_EmitsSingleOpeningPrint()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 5000);
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.05m), 200, 11, 6000));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.00m), 200, 12, 6001));
+        sink.Clear();
+
+        eng.UncrossAuction(PetrSecId, TradingPhase.Open, 7000);
+
+        var print = Assert.Single(sink.AuctionPrints);
+        Assert.Equal(AuctionPrintKind.Opening, print.Kind);
+        Assert.Equal(PetrSecId, print.SecurityId);
+        Assert.Equal(200L, print.ClearedQuantity);
+        Assert.Equal(7000UL, print.TransactTimeNanos);
+        // Same TOP-tiebreak rule as M3 trade-price: lowest crossing price.
+        Assert.Equal(Px(10.00m), print.PriceMantissa);
+    }
+
+    /// <summary>
+    /// FinalClosingCall → Close uncross that prints emits a
+    /// <c>Kind=Closing</c> event with cleared volume aggregated across
+    /// all trades in the uncross.
+    /// </summary>
+    [Fact]
+    public void Uncross_ClosingWithCrossing_EmitsSingleClosingPrint_AggregatesVolume()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.FinalClosingCall, 5000);
+        // Two buy makers, two sell makers — uncross drains all four.
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10.05m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("b2", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10.05m), 200, 11, 6001));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.AtClose, Px(10.00m), 100, 12, 6002));
+        eng.Submit(new NewOrderCommand("s2", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.AtClose, Px(10.00m), 200, 12, 6003));
+        sink.Clear();
+
+        eng.UncrossAuction(PetrSecId, TradingPhase.Close, 7000);
+
+        var print = Assert.Single(sink.AuctionPrints);
+        Assert.Equal(AuctionPrintKind.Closing, print.Kind);
+        Assert.Equal(300L, print.ClearedQuantity);
+        Assert.Equal(Px(10.00m), print.PriceMantissa);
+    }
+
+    /// <summary>
+    /// Uncross with no crossing in the book emits NO auction print —
+    /// "no print on no trade". Phase still transitions.
+    /// </summary>
+    [Fact]
+    public void Uncross_NoCrossing_EmitsNoAuctionPrint()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 5000);
+        // Bid below ask — no crossing.
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(9.95m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.05m), 100, 12, 6001));
+        sink.Clear();
+
+        bool any = eng.UncrossAuction(PetrSecId, TradingPhase.Open, 7000);
+
+        Assert.False(any);
+        Assert.Empty(sink.AuctionPrints);
+        Assert.Equal(TradingPhase.Open, eng.GetTradingPhase(PetrSecId));
+    }
 }

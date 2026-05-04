@@ -714,6 +714,99 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// <c>OpenCloseSettlFlag.DAILY</c> = 0 — schema enum value (byte 0,
+    /// NOT the ASCII digit '0'). Used for OpeningPrice_15 (daily-open)
+    /// and ClosingPrice_17 (daily-close).
+    /// </summary>
+    public const byte OpenCloseSettlFlagDaily = 0;
+
+    /// <summary>
+    /// Writes <c>OpeningPrice_15</c> (V16). Returns total bytes.
+    /// Emitted exactly once per opening uncross that printed at least
+    /// one trade (Onda M4 / issue #231). The ECP's <c>NetChgPrevDay</c>
+    /// is always written as NULL (long.MinValue) — net-change vs the
+    /// previous-day close is a downstream concern.
+    /// </summary>
+    public static int WriteOpeningPriceFrame(
+        Span<byte> dst,
+        long securityId,
+        long priceMantissa,
+        ushort tradeDate,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.OpeningPriceBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.OpeningPrice_15Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.OpeningPriceBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator overlays SecurityExchange at offset 8 — left zeroed.
+        body[WireOffsets.OpeningPriceBodyMdUpdateActionOffset] = 0; // NEW
+        body[WireOffsets.OpeningPriceBodyOpenCloseSettlFlagOffset] = OpenCloseSettlFlagDaily;
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodyMdEntryPxOffset, 8), in priceMantissa);
+        long netChgNull = long.MinValue;
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodyNetChgPrevDayOffset, 8), in netChgNull);
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodyTradeDateOffset, 2), in tradeDate);
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.OpeningPriceBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
+    /// <summary>
+    /// Writes <c>ClosingPrice_17</c> (V16). Returns total bytes.
+    /// Emitted exactly once per closing-call uncross that printed at
+    /// least one trade (Onda M4 / issue #231). <c>LastTradeDate</c> is
+    /// written as NULL — it is informational metadata for cases where
+    /// the close carries forward a price from a previous trading day,
+    /// which the simulator does not currently model.
+    /// </summary>
+    public static int WriteClosingPriceFrame(
+        Span<byte> dst,
+        long securityId,
+        long priceMantissa,
+        ushort tradeDate,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.ClosingPriceBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.ClosingPrice_17Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.ClosingPriceBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator overlays SecurityExchange at offset 8 — left zeroed.
+        body[WireOffsets.ClosingPriceBodyOpenCloseSettlFlagOffset] = OpenCloseSettlFlagDaily;
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodyMdEntryPxOffset, 8), in priceMantissa);
+        ushort lastTradeDateNull = 0;
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodyLastTradeDateOffset, 2), in lastTradeDateNull);
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodyTradeDateOffset, 2), in tradeDate);
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.ClosingPriceBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

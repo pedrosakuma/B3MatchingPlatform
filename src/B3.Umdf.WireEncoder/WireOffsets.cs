@@ -199,6 +199,44 @@ public static class WireOffsets
     public const int AuctionImbalanceBodyMdEntryTimestampOffset = 20;
     public const int AuctionImbalanceBodyRptSeqOffset = 28;
 
+    // ---- OpeningPrice_15 (V16) — Onda M4 / issue #231 ----
+    // Body layout (BLOCK_LENGTH=44, but only 42 declared bytes; the trailing
+    // 2 bytes are SBE alignment padding written as zero): securityID@0
+    // (long); securityExchange@8 shares offset with matchEventIndicator@8
+    // (byte); mDUpdateAction@9 (byte, NEW=0); openCloseSettlFlag@10
+    // (byte, '0'=DailyOpen); mDEntryPx@12 (long mantissa, /10000);
+    // netChgPrevDay@20 (long PriceOffset8Optional, long.MinValue = NULL);
+    // tradeDate@28 (ushort LocalMktDate); mDEntryTimestamp@30 (ulong nanos);
+    // rptSeq@38 (uint, 0 = NULL).
+    public const int OpeningPriceBlockLength = 44;
+    public const int OpeningPriceBodySecurityIdOffset = 0;
+    public const int OpeningPriceBodyMatchEventIndicatorOffset = 8;
+    public const int OpeningPriceBodyMdUpdateActionOffset = 9;
+    public const int OpeningPriceBodyOpenCloseSettlFlagOffset = 10;
+    public const int OpeningPriceBodyMdEntryPxOffset = 12;
+    public const int OpeningPriceBodyNetChgPrevDayOffset = 20;
+    public const int OpeningPriceBodyTradeDateOffset = 28;
+    public const int OpeningPriceBodyMdEntryTimestampOffset = 30;
+    public const int OpeningPriceBodyRptSeqOffset = 38;
+
+    // ---- ClosingPrice_17 (V16) — Onda M4 / issue #231 ----
+    // Body layout (BLOCK_LENGTH=MESSAGE_SIZE=36): securityID@0 (long);
+    // securityExchange@8 shares offset with matchEventIndicator@8 (byte);
+    // openCloseSettlFlag@9 (byte, '0'=DailyClose); mDEntryPx@12 (long
+    // Price8 mantissa, /10000); lastTradeDate@20 (ushort, 0 = NULL);
+    // tradeDate@22 (ushort LocalMktDate); mDEntryTimestamp@24 (ulong nanos);
+    // rptSeq@32 (uint, 0 = NULL). Note: ClosingPrice_17's MDUpdateAction is
+    // a constant in the schema (NEW), so it is NOT in the body.
+    public const int ClosingPriceBlockLength = 36;
+    public const int ClosingPriceBodySecurityIdOffset = 0;
+    public const int ClosingPriceBodyMatchEventIndicatorOffset = 8;
+    public const int ClosingPriceBodyOpenCloseSettlFlagOffset = 9;
+    public const int ClosingPriceBodyMdEntryPxOffset = 12;
+    public const int ClosingPriceBodyLastTradeDateOffset = 20;
+    public const int ClosingPriceBodyTradeDateOffset = 22;
+    public const int ClosingPriceBodyMdEntryTimestampOffset = 24;
+    public const int ClosingPriceBodyRptSeqOffset = 32;
+
     // ---- ChannelReset_11 (V16) ----
     // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
     // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then

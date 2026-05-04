@@ -196,6 +196,38 @@ public readonly record struct AuctionTopChangedEvent(
     uint RptSeq);
 
 /// <summary>
+/// Distinguishes the two auction-print kinds emitted by
+/// <see cref="MatchingEngine.UncrossAuction"/>: an opening uncross
+/// (Reserved → Open) yields <see cref="Opening"/>; a closing-call
+/// uncross (FinalClosingCall → Close) yields <see cref="Closing"/>.
+/// Issue #231 / Onda M4.
+/// </summary>
+public enum AuctionPrintKind : byte
+{
+    Opening = 0,
+    Closing = 1,
+}
+
+/// <summary>
+/// Fired exactly once per <see cref="MatchingEngine.UncrossAuction"/>
+/// call that printed at least one trade. Carries the cleared price
+/// (auction TOP) and total cleared volume across all uncross trades
+/// in this call. The integration layer fans out to UMDF
+/// <c>OpeningPrice_15</c> (kind=Opening) or <c>ClosingPrice_17</c>
+/// (kind=Closing). If the uncross drained no volume (no crossing in
+/// the book at TOP, or no TOP at all), no event is emitted — there
+/// is no "no-trade" auction print on the wire. Issue #231 / Onda M4.
+/// </summary>
+public readonly record struct AuctionPrintEvent(
+    long SecurityId,
+    AuctionPrintKind Kind,
+    long PriceMantissa,
+    long ClearedQuantity,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+
+/// <summary>
 /// Fired when a stop order (StopLoss or StopLimit) is accepted by the
 /// engine and parked off-book in the per-instrument trigger book.
 /// Issue #214. Carries the original order parameters so the integration
@@ -336,4 +368,13 @@ public interface IMatchingEventSink
     /// <c>TheoreticalOpeningPrice_16</c> + <c>AuctionImbalance_19</c>.
     /// </summary>
     void OnAuctionTopChanged(in AuctionTopChangedEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted exactly once per successful auction
+    /// uncross (issue #231 / Onda M4). Default no-op; production sink
+    /// fans out to UMDF <c>OpeningPrice_15</c> for an opening uncross
+    /// or <c>ClosingPrice_17</c> for a closing-call uncross. Skipped
+    /// when the uncross drained no volume.
+    /// </summary>
+    void OnAuctionPrint(in AuctionPrintEvent e) { }
 }

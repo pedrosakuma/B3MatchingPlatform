@@ -464,6 +464,53 @@ public class UmdfWireEncoderTests
         Assert.Null(rdr.Data.MDEntrySize);
     }
 
+    // ---- Onda M4 (issue #231) — OpeningPrice_15 / ClosingPrice_17 ----
+
+    [Fact]
+    public void OpeningPrice_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteOpeningPriceFrame(buf,
+            securityId: 900_000_000_001L,
+            priceMantissa: 100_500L,
+            tradeDate: 9000,
+            mdEntryTimestampNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 7);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.OpeningPriceBlockLength, n);
+        Assert.True(OpeningPrice_15Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.OpeningPriceBlockLength), out var rdr));
+        Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID);
+        Assert.Equal(MDUpdateAction.NEW, rdr.Data.MDUpdateAction);
+        Assert.Equal(OpenCloseSettlFlag.DAILY, rdr.Data.OpenCloseSettlFlag);
+        Assert.Equal(100_500L, rdr.Data.MDEntryPx.Mantissa);
+        Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
+        Assert.Equal(7u, rdr.Data.RptSeq);
+        // NetChgPrevDay always written as NULL (long.MinValue).
+        Assert.Null(rdr.Data.NetChgPrevDay.Mantissa);
+    }
+
+    [Fact]
+    public void ClosingPrice_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteClosingPriceFrame(buf,
+            securityId: 900_000_000_002L,
+            priceMantissa: 99_750L,
+            tradeDate: 9001,
+            mdEntryTimestampNanos: 1_700_000_000_000_000_001UL,
+            rptSeq: 8);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.ClosingPriceBlockLength, n);
+        Assert.True(ClosingPrice_17Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.ClosingPriceBlockLength), out var rdr));
+        Assert.Equal(900_000_000_002L, (long)(ulong)rdr.Data.SecurityID);
+        Assert.Equal(OpenCloseSettlFlag.DAILY, rdr.Data.OpenCloseSettlFlag);
+        Assert.Equal(99_750L, rdr.Data.MDEntryPx.Mantissa);
+        Assert.Equal((ushort)9001, rdr.Data.TradeDate.Value);
+        Assert.Equal(8u, rdr.Data.RptSeq);
+        // LastTradeDate always written as NULL.
+        Assert.Null(rdr.Data.LastTradeDate);
+    }
+
     [Fact]
     public void Encoder_ThrowsOnSmallBuffer()
     {

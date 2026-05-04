@@ -142,6 +142,47 @@ public sealed partial class ChannelDispatcher
         Commit(nImb);
     }
 
+    /// <summary>
+    /// Onda M4 / issue #231: emits a single <c>OpeningPrice_15</c> or
+    /// <c>ClosingPrice_17</c> frame per uncross. The dispatcher injects
+    /// the configured <c>_tradeDate</c> (kept off the matching event so
+    /// the engine doesn't need calendar awareness), mirroring the
+    /// pattern used by <see cref="OnAuctionTopChanged"/>.
+    /// </summary>
+    public void OnAuctionPrint(in AuctionPrintEvent e)
+    {
+        AssertOnLoopThread();
+
+        if (e.Kind == AuctionPrintKind.Opening)
+        {
+            var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+                + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+                + B3.Umdf.WireEncoder.WireOffsets.OpeningPriceBlockLength);
+            int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOpeningPriceFrame(
+                dst,
+                securityId: e.SecurityId,
+                priceMantissa: e.PriceMantissa,
+                tradeDate: _tradeDate,
+                mdEntryTimestampNanos: e.TransactTimeNanos,
+                rptSeq: e.RptSeq);
+            Commit(n);
+        }
+        else
+        {
+            var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+                + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+                + B3.Umdf.WireEncoder.WireOffsets.ClosingPriceBlockLength);
+            int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteClosingPriceFrame(
+                dst,
+                securityId: e.SecurityId,
+                priceMantissa: e.PriceMantissa,
+                tradeDate: _tradeDate,
+                mdEntryTimestampNanos: e.TransactTimeNanos,
+                rptSeq: e.RptSeq);
+            Commit(n);
+        }
+    }
+
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
         AssertOnLoopThread();
