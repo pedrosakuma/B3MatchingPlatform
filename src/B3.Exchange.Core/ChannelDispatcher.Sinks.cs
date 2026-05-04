@@ -59,6 +59,37 @@ public sealed partial class ChannelDispatcher
         Commit(n);
     }
 
+    public void OnOrderModified(in OrderModifiedEvent e)
+    {
+        AssertOnLoopThread();
+        // Issue #251: priority-kept Replace acknowledgment. The UMDF
+        // UPDATE frame was already buffered by OnOrderQuantityReduced
+        // earlier in this same dispatch turn; here we only emit the
+        // per-session ER_Modify back to the requester.
+        if (!_hasCurrentSession) return;
+        if (!_orders.TryResolve(e.OrderId, out var owner)) return;
+
+        // ClOrdID = requester's new id; OrigClOrdID = owner's previous
+        // ClOrdID (the one identifying the order before this Replace).
+        ulong newClOrdId = _currentClOrdId;
+        ulong origClOrdId = owner.ClOrdId;
+        _outbound.WriteExecutionReportModify(_currentSession,
+            e.SecurityId, e.OrderId,
+            clOrdIdValue: newClOrdId, origClOrdIdValue: origClOrdId,
+            side: e.Side, newPriceMantissa: e.NewPriceMantissa,
+            newRemainingQty: e.NewRemainingQuantity,
+            transactTimeNanos: e.TransactTimeNanos, rptSeq: e.RptSeq,
+            receivedTimeNanos: _currentReceivedTimeNanos);
+        _metrics?.IncExecutionReport(ExecutionReportKind.Replace);
+
+        // Refresh the canonical (Firm, ClOrdID) → OrderId index so
+        // subsequent Cancel/Modify by OrigClOrdID = newClOrdId resolve
+        // to this order. Owner stays unchanged; only the ClOrdID
+        // identity is rotated.
+        if (newClOrdId != 0 && newClOrdId != origClOrdId)
+            _orders.Reregister(e.OrderId, newClOrdId);
+    }
+
     public void OnOrderBookSideEmpty(in OrderBookSideEmptyEvent e)
     {
         AssertOnLoopThread();
