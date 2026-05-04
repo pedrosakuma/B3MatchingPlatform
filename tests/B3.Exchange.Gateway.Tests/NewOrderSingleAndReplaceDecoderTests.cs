@@ -567,4 +567,105 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
         Assert.Contains("ExpireDate", msg);
     }
+
+    // ---------------- #238: V6 trailer (StrategyID + TradingSubAccount) ----------------
+
+    private static byte[] BuildNewOrderSingleV6(
+        int strategyId = 0, uint tradingSubAccount = 0)
+    {
+        var v2 = BuildNewOrderSingleV2();
+        // V6 root is 133 bytes: V2 root (125) + strategyID(int32) + tradingSubAccount(uint32).
+        var body = new byte[133];
+        v2.CopyTo(body, 0);
+        Span<byte> s = body;
+        MemoryMarshal.Write(s.Slice(125, 4), in strategyId);
+        MemoryMarshal.Write(s.Slice(129, 4), in tradingSubAccount);
+        return body;
+    }
+
+    private static byte[] BuildOrderCancelReplaceV6(
+        int strategyId = 0, uint tradingSubAccount = 0)
+    {
+        var v2 = BuildOrderCancelReplaceV2();
+        var body = new byte[150];
+        v2.CopyTo(body, 0);
+        Span<byte> s = body;
+        MemoryMarshal.Write(s.Slice(142, 4), in strategyId);
+        MemoryMarshal.Write(s.Slice(146, 4), in tradingSubAccount);
+        return body;
+    }
+
+    [Fact]
+    public void NewOrderSingle_V6_NullTrailer_HappyPath()
+    {
+        var body = BuildNewOrderSingleV6();
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 7, 1_000_000UL, out var cmd, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(OrderType.Limit, cmd.Type);
+    }
+
+    [Fact]
+    public void NewOrderSingle_V6_StrategyID_Rejected()
+    {
+        var body = BuildNewOrderSingleV6(strategyId: 42);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 7, 1_000_000UL, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("StrategyID", msg);
+    }
+
+    [Fact]
+    public void NewOrderSingle_V6_TradingSubAccount_Rejected()
+    {
+        var body = BuildNewOrderSingleV6(tradingSubAccount: 99u);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 7, 1_000_000UL, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("TradingSubAccount", msg);
+    }
+
+    [Fact]
+    public void OrderCancelReplace_V6_NullTrailer_HappyPath()
+    {
+        var body = BuildOrderCancelReplaceV6();
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out var cmd, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(42L, cmd.OrderId);
+    }
+
+    [Fact]
+    public void OrderCancelReplace_V6_StrategyID_Rejected()
+    {
+        var body = BuildOrderCancelReplaceV6(strategyId: 7);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out _, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("StrategyID", msg);
+    }
+
+    [Fact]
+    public void OrderCancelReplace_V6_TradingSubAccount_Rejected()
+    {
+        var body = BuildOrderCancelReplaceV6(tradingSubAccount: 12345u);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out _, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("TradingSubAccount", msg);
+    }
 }

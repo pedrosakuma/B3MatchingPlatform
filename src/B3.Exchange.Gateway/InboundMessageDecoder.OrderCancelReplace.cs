@@ -26,7 +26,13 @@ internal static partial class InboundMessageDecoder
         public const int MinQty = 100;            // ulong (0 == null)
         public const int MaxFloor = 108;          // ulong (0 == null)
         public const int ExpireDate = 122;        // ushort (0 == null)
+        // V6 trailer (BlockLength=150). Same semantics as
+        // NewOrderSingle's trailer — see issue #238.
+        public const int StrategyID = 142;        // int32 (0 == null)
+        public const int TradingSubAccount = 146; // uint32 (0 == null)
     }
+
+    private const int OrderCancelReplaceV2BodySize = 142;
 
     /// <summary>
     /// Decodes an OrderCancelReplaceRequestV2 (id=104) body for #GAP-15.
@@ -128,6 +134,22 @@ internal static partial class InboundMessageDecoder
         {
             message = "ExpireDate not supported (only Day/IOC/FOK)";
             return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        // #238: V6 trailer reject — see NewOrderSingle decoder.
+        if (body.Length > OrderCancelReplaceV2BodySize)
+        {
+            int strategyId = MemoryMarshal.Read<int>(body.Slice(OrderCancelReplaceOffsets.StrategyID, 4));
+            uint tradingSubAccount = MemoryMarshal.Read<uint>(body.Slice(OrderCancelReplaceOffsets.TradingSubAccount, 4));
+            if (strategyId != 0)
+            {
+                message = $"StrategyID={strategyId} not supported";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
+            if (tradingSubAccount != 0)
+            {
+                message = $"TradingSubAccount={tradingSubAccount} not supported";
+                return InboundDecodeOutcome.UnsupportedFeature;
+            }
         }
         if (orderId == 0 && origClOrdId == 0)
         {

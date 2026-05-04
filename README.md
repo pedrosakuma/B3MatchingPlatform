@@ -122,6 +122,38 @@ EntryPoint TCP listener (default port 9876).
 official B3 SBE schemas. The same files exist in `SbeB3UmdfConsumer`; keep
 them in sync when upgrading.
 
+### Inbound EntryPoint compatibility matrix
+
+The exchange parses the inbound SBE templates listed below. Any version
+not listed is rejected at the FIXP frame layer with `UnsupportedSchema` /
+`UnsupportedTemplate` and the session is terminated (`DECODING_ERROR`).
+See `B3.EntryPoint.Wire.EntryPointFrameReader.ExpectedInboundBlockLength`
+for the source of truth.
+
+| Template | ID | Versions accepted | Block size | Notes |
+|---|---:|---|---:|---|
+| `Negotiate` | 100 | V0 | 28 | FIXP session establishment. |
+| `Establish` | 101 | V0 | 42 | FIXP session establishment. |
+| `Terminate` | 102 | V0 | 13 | Peer-initiated graceful logout. |
+| `RetransmitRequest` | 103 | V0 | 20 | FIXP retransmission. |
+| `Sequence` | 104 | V0 | 4 | FIXP heartbeat / seq sync. |
+| `SimpleNewOrder` | 100 | V2, **V6** | 82 | V6 has the same wire layout as V2; SDK 0.8.0 stamps version=6 (issue #236 / #239). |
+| `SimpleModifyOrder` | 101 | V2, **V6** | 98 | Same as above. |
+| `NewOrderSingle` | 102 | V2 (125 B), **V6 (133 B)** | 125 / 133 | V6 appends `strategyID@125` (int32) and `tradingSubAccount@129` (uint32). Both fields are decoded; non-null values produce `BusinessMessageReject(33003)` because the engine has no strategy / sub-account routing (issue #238). |
+| `OrderCancelReplaceRequest` | 104 | V2 (142 B), **V6 (150 B)** | 142 / 150 | Same +8 trailer (`strategyID@142`, `tradingSubAccount@146`) and same reject-if-non-null policy. |
+| `OrderCancelRequest` | 105 | V6 (root version=0) | 76 | Native V6 layout; no V2 ancestor. |
+| `NewOrderCross` | 106 | V6 | 84 + group + varData | Native V6. |
+| `OrderMassActionRequest` | 701 | V6 | 52 | Native V6. |
+
+**Convention:** when an SDK bumps the schema version stamp **without**
+changing the wire layout, both versions are added to
+`ExpectedInboundBlockLength` with the same expected size. When the V6
+revision **adds** trailing optional fields (additive-only), the new
+larger size is added as a separate row and the decoder is updated to
+read or reject the trailer based on `body.Length`. We deliberately do
+**not** wildcard `blockLength &gt;= V2_size` — the explicit table
+catches accidental schema regressions in upstream consumers.
+
 ## License
 
 MIT — see `LICENSE`.

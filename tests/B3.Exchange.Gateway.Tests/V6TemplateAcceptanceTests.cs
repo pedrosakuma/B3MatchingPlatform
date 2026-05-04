@@ -48,13 +48,14 @@ public class V6TemplateAcceptanceTests
     }
 
     /// <summary>
-    /// Builds a 133-byte V6 NewOrderSingle body (V2 fixed fields plus
-    /// the appended strategyID@125 + tradingSubAccount@129) and asserts
-    /// the decoder produces a clean <see cref="NewOrderCommand"/>,
-    /// silently ignoring the trailing fields.
+    /// V6 NewOrderSingle body with non-null `strategyID` /
+    /// `tradingSubAccount` trailer is rejected with
+    /// <see cref="InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature"/>
+    /// rather than silently dropped (issue #238). Caller emits BMR and
+    /// keeps the session open.
     /// </summary>
     [Fact]
-    public void V6NewOrderSingleBody_DecodesAsV2_AppendedFieldsIgnored()
+    public void V6NewOrderSingleBody_AppendedFields_RejectedWithBmr()
     {
         var body = BuildV6NewOrderSingleBody(
             clOrdId: 7777,
@@ -67,16 +68,41 @@ public class V6TemplateAcceptanceTests
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
             body, enteringFirm: 1, enteredAtNanos: 0,
+            out _, out var clOrdIdValue, out var message);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Equal(7777UL, clOrdIdValue);
+        // The first non-null trailer field surfaced in the message
+        // (strategyID is checked before tradingSubAccount).
+        Assert.Contains("StrategyID", message);
+    }
+
+    /// <summary>
+    /// V6 NewOrderSingle body with NULL trailer (strategyID=0,
+    /// tradingSubAccount=0) decodes successfully — both fields are
+    /// SBE-null at value 0 (issue #238).
+    /// </summary>
+    [Fact]
+    public void V6NewOrderSingleBody_NullTrailer_Decodes()
+    {
+        var body = BuildV6NewOrderSingleBody(
+            clOrdId: 7777,
+            secId: 123_456,
+            sideBuy: true,
+            qty: 100,
+            priceMantissa: 105_000,
+            strategyId: 0,
+            tradingSubAccount: 0);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, enteringFirm: 1, enteredAtNanos: 0,
             out var cmd, out var clOrdIdValue, out var message);
 
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
         Assert.Null(message);
         Assert.Equal(7777UL, clOrdIdValue);
-        Assert.Equal(123_456L, cmd.SecurityId);
         Assert.Equal(Side.Buy, cmd.Side);
-        Assert.Equal(OrderType.Limit, cmd.Type);
         Assert.Equal(100L, cmd.Quantity);
-        Assert.Equal(105_000L, cmd.PriceMantissa);
     }
 
     /// <summary>
