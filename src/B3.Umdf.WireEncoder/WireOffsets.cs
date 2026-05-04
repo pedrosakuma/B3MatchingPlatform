@@ -98,6 +98,19 @@ public static class WireOffsets
     public const int TradeBustBodyTransactTimeOffset = 36;
     public const int TradeBustBodyRptSeqOffset = 44;
 
+    // ---- MassDeleteOrders_MBO_52 (V16) ----
+    // Body layout (BLOCK_LENGTH=28): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); mDUpdateAction@9
+    // (always DELETE_THRU); mDEntryType@10 (BID or OFFER); transactTime@16
+    // (ulong nanos); rptSeq@24 (uint, 0 = NULL).
+    public const int MassDeleteOrdersBlockLength = 28;
+    public const int MassDeleteOrdersBodySecurityIdOffset = 0;
+    public const int MassDeleteOrdersBodyMatchEventIndicatorOffset = 8;
+    public const int MassDeleteOrdersBodyMdUpdateActionOffset = 9;
+    public const int MassDeleteOrdersBodyMdEntryTypeOffset = 10;
+    public const int MassDeleteOrdersBodyTransactTimeOffset = 16;
+    public const int MassDeleteOrdersBodyRptSeqOffset = 24;
+
     // ---- ChannelReset_11 (V16) ----
     // Body: MatchEventIndicator @0 (4 bytes — UMDF wire treats the bitset as
     // a 4-byte block, see schema offset="4" on MDEntryTimestamp), then

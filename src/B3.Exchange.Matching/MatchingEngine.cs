@@ -233,6 +233,39 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            // First pass — group target orderIds by (SecurityId, Side) so we
+            // can emit one OrderMassCanceledEvent summary per group BEFORE
+            // the per-order cancels (UMDF MassDeleteOrders_MBO_52, gap #8).
+            // Orders that no longer resolve are silently dropped, matching
+            // the second-pass behaviour below. We use a small dictionary
+            // since the typical mass-cancel touches O(10) groups.
+            Dictionary<(long securityId, Side side), int>? groups = null;
+            foreach (var orderId in orderIds)
+            {
+                foreach (var book in _booksById.Values)
+                {
+                    if (book.TryGet(orderId, out var resting))
+                    {
+                        groups ??= new Dictionary<(long, Side), int>();
+                        var key = (book.SecurityId, resting.Side);
+                        groups[key] = groups.TryGetValue(key, out var c) ? c + 1 : 1;
+                        break;
+                    }
+                }
+            }
+            if (groups is not null)
+            {
+                foreach (var kv in groups)
+                {
+                    _sink.OnOrderMassCanceled(new OrderMassCanceledEvent(
+                        SecurityId: kv.Key.securityId,
+                        Side: kv.Key.side,
+                        CancelledCount: kv.Value,
+                        TransactTimeNanos: enteredAtNanos,
+                        RptSeq: NextRptSeq()));
+                }
+            }
+
             int cancelled = 0;
             foreach (var orderId in orderIds)
             {
