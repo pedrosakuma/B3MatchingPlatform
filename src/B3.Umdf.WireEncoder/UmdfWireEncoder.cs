@@ -511,6 +511,98 @@ public static class UmdfWireEncoder
         return total;
     }
 
+    /// <summary>
+    /// Writes <c>SecurityStatus_3</c> (V16). Returns total bytes. Emitted
+    /// when an instrument's trading phase transitions
+    /// (gap-functional §5 / #201). <paramref name="securityTradingEvent"/>
+    /// is optional (255 = NULL); <paramref name="rptSeq"/> 0 indicates
+    /// NULL on the wire but production callers should always pass the
+    /// engine-allocated sequence so consumers can detect gaps.
+    /// </summary>
+    public static int WriteSecurityStatusFrame(
+        Span<byte> dst,
+        long securityId,
+        byte tradingSessionId,
+        byte securityTradingStatus,
+        byte securityTradingEvent,
+        ushort tradeDate,
+        ulong tradSesOpenTimeNanos,
+        ulong transactTimeNanos,
+        uint rptSeq)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.SecurityStatus_3Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.SecurityStatusBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodySecurityIdOffset, 8), in securityId);
+        // MatchEventIndicator overlays SecurityExchange at offset 8 (1 byte).
+        // Leave at 0 (no flags set).
+        body[WireOffsets.SecurityStatusBodyTradingSessionIdOffset] = tradingSessionId;
+        body[WireOffsets.SecurityStatusBodySecurityTradingStatusOffset] = securityTradingStatus;
+        body[WireOffsets.SecurityStatusBodySecurityTradingEventOffset] = securityTradingEvent;
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyTradeDateOffset, 2), in tradeDate);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyTradSesOpenTimeOffset, 8), in tradSesOpenTimeNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyTransactTimeOffset, 8), in transactTimeNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
+    /// <summary>
+    /// Writes <c>SecurityGroupPhase_10</c> (V16). Returns total bytes.
+    /// Emitted when a security group's phase transitions
+    /// (gap-functional §5 / #201). <paramref name="securityGroup"/> is an
+    /// 8-byte ASCII identifier left-padded with NUL.
+    /// </summary>
+    public static int WriteSecurityGroupPhaseFrame(
+        Span<byte> dst,
+        ReadOnlySpan<byte> securityGroup,
+        byte tradingSessionId,
+        byte tradingSessionSubId,
+        byte securityTradingEvent,
+        ushort tradeDate,
+        ulong tradSesOpenTimeNanos,
+        ulong transactTimeNanos)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityGroupPhaseBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.SecurityGroupPhase_10Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.SecurityGroupPhaseBlockLength);
+        body.Clear();
+
+        var groupSlice = body.Slice(
+            WireOffsets.SecurityGroupPhaseBodySecurityGroupOffset,
+            WireOffsets.SecurityGroupPhaseBodySecurityGroupLength);
+        var copyLen = Math.Min(securityGroup.Length, groupSlice.Length);
+        if (copyLen > 0) securityGroup[..copyLen].CopyTo(groupSlice);
+        body[WireOffsets.SecurityGroupPhaseBodyTradingSessionIdOffset] = tradingSessionId;
+        body[WireOffsets.SecurityGroupPhaseBodyTradingSessionSubIdOffset] = tradingSessionSubId;
+        body[WireOffsets.SecurityGroupPhaseBodySecurityTradingEventOffset] = securityTradingEvent;
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityGroupPhaseBodyTradeDateOffset, 2), in tradeDate);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityGroupPhaseBodyTradSesOpenTimeOffset, 8), in tradSesOpenTimeNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecurityGroupPhaseBodyTransactTimeOffset, 8), in transactTimeNanos);
+
+        return total;
+    }
+
     private static void WriteFramingHeader(Span<byte> dst, int totalFrameLength)
     {
         ushort messageLength = checked((ushort)totalFrameLength);

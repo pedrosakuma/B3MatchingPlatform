@@ -42,7 +42,7 @@ public class MapRejectReasonTests
         {
             // Should not throw and must return one of the documented wire codes.
             uint code = FixpSession.MapRejectReason(r);
-            Assert.Contains(code, new uint[] { 0u, 1u, 3u, 5u, 11u });
+            Assert.Contains(code, new uint[] { 0u, 1u, 3u, 5u, 11u, 13u });
         }
     }
 }

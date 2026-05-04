@@ -50,6 +50,12 @@ public sealed class MatchingEngine
     private uint _nextTradeId = 1;
     private uint _rptSeq;
 
+    // Per-instrument trading phase (gap-functional §5 / issue #201).
+    // Defaults to Open for every loaded instrument so existing tests and
+    // operators that never call SetTradingPhase keep observing the
+    // continuous-trading behaviour.
+    private readonly Dictionary<long, TradingPhase> _phaseById;
+
     private bool _dispatching;
 
     // Single-thread invariant (issue #169). Latched on first call to any
@@ -72,11 +78,13 @@ public sealed class MatchingEngine
         _stp = selfTradePrevention;
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
+        _phaseById = new Dictionary<long, TradingPhase>();
         foreach (var i in instruments)
         {
             var rules = new InstrumentTradingRules(i);
             _rulesById.Add(i.SecurityId, rules);
             _booksById.Add(i.SecurityId, new LimitOrderBook(i.SecurityId));
+            _phaseById.Add(i.SecurityId, TradingPhase.Open);
         }
         _logger.LogInformation("matching engine initialized with {InstrumentCount} instruments", _rulesById.Count);
     }
@@ -131,6 +139,37 @@ public sealed class MatchingEngine
 
     public int OrderCount(long securityId) => _booksById[securityId].OrderCount;
 
+    /// <summary>
+    /// Current trading phase for the supplied security. Throws
+    /// <see cref="KeyNotFoundException"/> if the security is unknown.
+    /// </summary>
+    public TradingPhase GetTradingPhase(long securityId) => _phaseById[securityId];
+
+    /// <summary>
+    /// Operator-issued trading-phase transition for a single instrument
+    /// (gap-functional §5 / #201). Idempotent: a no-op transition emits no
+    /// event. Otherwise the engine emits a <see cref="TradingPhaseChangedEvent"/>
+    /// (consuming one <c>RptSeq</c>) which the integration layer translates
+    /// into a UMDF <c>SecurityStatus_3</c> frame. Must be invoked from the
+    /// dispatch thread; cannot run mid-dispatch.
+    /// </summary>
+    public bool SetTradingPhase(long securityId, TradingPhase phase, ulong txnNanos)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("SetTradingPhase called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        if (!_phaseById.TryGetValue(securityId, out var current))
+            throw new KeyNotFoundException($"unknown securityId {securityId}");
+        if (current == phase) return false;
+        _phaseById[securityId] = phase;
+        _sink.OnTradingPhaseChanged(new TradingPhaseChangedEvent(
+            SecurityId: securityId,
+            Phase: phase,
+            TransactTimeNanos: txnNanos,
+            RptSeq: ++_rptSeq));
+        return true;
+    }
+
     public void Submit(NewOrderCommand cmd)
     {
         EnterDispatch();
@@ -139,6 +178,14 @@ public sealed class MatchingEngine
             if (!_rulesById.TryGetValue(cmd.SecurityId, out var rules))
             {
                 Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.UnknownInstrument, cmd.EnteredAtNanos);
+                return;
+            }
+
+            // #201: trading-phase gating. Only OPEN accepts new orders;
+            // RESERVED (auction) acceptance lands with the auctions wave.
+            if (_phaseById[cmd.SecurityId] != TradingPhase.Open)
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketClosed, cmd.EnteredAtNanos);
                 return;
             }
 

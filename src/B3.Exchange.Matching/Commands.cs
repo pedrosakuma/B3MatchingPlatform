@@ -7,6 +7,28 @@ public enum TimeInForce : byte { Day, IOC, FOK }
 public enum OrderType : byte { Limit, Market }
 
 /// <summary>
+/// Per-instrument trading phase (gap-functional §5 / #201). The values
+/// map directly to the SBE <c>SecurityTradingStatus</c> enum used in
+/// UMDF <c>SecurityStatus_3</c> so the integration layer can encode
+/// without translation.
+/// </summary>
+public enum TradingPhase : byte
+{
+    /// <summary>Trading halt (PAUSE = 2 in UMDF).</summary>
+    Pause = 2,
+    /// <summary>Closed; no orders accepted (CLOSE = 4 in UMDF).</summary>
+    Close = 4,
+    /// <summary>Continuous trading (OPEN = 17 in UMDF).</summary>
+    Open = 17,
+    /// <summary>Forbidden / unavailable for trading (FORBIDDEN = 18 in UMDF).</summary>
+    Forbidden = 18,
+    /// <summary>Pre-open / Reserved auction phase (RESERVED = 21 in UMDF).</summary>
+    Reserved = 21,
+    /// <summary>Final closing call (FINAL_CLOSING_CALL = 101 in UMDF).</summary>
+    FinalClosingCall = 101,
+}
+
+/// <summary>
 /// Reasons a matching command can be rejected. Some rejects occur before any state change;
 /// others (e.g., <see cref="SelfTradePrevention"/>) may occur after fills against other firms.
 /// </summary>
@@ -28,6 +50,10 @@ public enum RejectReason : byte
     /// <see cref="SelfTradePrevention"/> policy is configured to cancel the
     /// aggressor's residual quantity.</summary>
     SelfTradePrevention,
+    /// <summary>Submitted while the instrument's <see cref="TradingPhase"/>
+    /// disallows new orders (anything other than <see cref="TradingPhase.Open"/>).
+    /// Gap-functional §5 / issue #201.</summary>
+    MarketClosed,
 }
 
 /// <summary>

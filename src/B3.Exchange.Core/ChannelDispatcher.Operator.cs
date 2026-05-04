@@ -131,4 +131,32 @@ public sealed partial class ChannelDispatcher
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorTradeBust, default, 0, false,
             0, 0, null, null, null, null,
             TradeBust: new OperatorTradeBust(securityId, priceMantissa, size, tradeId, tradeDate)));
+
+    /// <summary>
+    /// Operator command (gap-functional §5 / issue #201): transitions the
+    /// supplied instrument to the requested <see cref="TradingPhase"/>. The
+    /// transition is applied on the dispatch thread; if it changes the
+    /// current phase the engine emits a <c>TradingPhaseChangedEvent</c>
+    /// which is published as a <c>SecurityStatus_3</c> frame on the
+    /// incremental channel under the current <c>SequenceVersion</c>.
+    /// Idempotent: a no-op transition emits no frame. Returns <c>false</c>
+    /// if the inbound queue is full. Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorSetTradingPhase(long securityId, B3.Exchange.Matching.TradingPhase phase)
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSetTradingPhase, default, 0, false,
+            0, 0, null, null, null, null,
+            TradingPhase: new OperatorTradingPhase(securityId, phase)));
+
+    private void ProcessSetTradingPhase(OperatorTradingPhase op)
+    {
+        AssertOnLoopThread();
+        // The engine emits the TradingPhaseChangedEvent inline (if the
+        // transition is non-trivial); the sink writes a SecurityStatus_3
+        // frame into the per-command packet buffer. Flush it as a
+        // single-message packet so consumers see the status update
+        // immediately, mirroring the trade-bust pattern.
+        _packetWritten = 0;
+        _engine.SetTradingPhase(op.SecurityId, op.Phase, _nowNanos());
+        if (_packetWritten > 0) FlushPacket();
+    }
 }
