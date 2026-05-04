@@ -255,6 +255,40 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void Sequence_Roundtrip()
+    {
+        var buf = new byte[64];
+        int n = UmdfWireEncoder.WriteSequenceFrame(buf, nextSeqNo: 12345);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SequenceBlockLength, n);
+        Assert.True(Sequence_2Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.SequenceBlockLength), out var rdr));
+        Assert.Equal(12345u, (uint)rdr.Data.NextSeqNo.Value);
+    }
+
+    [Fact]
+    public void SequenceReset_Roundtrip_BodyEmpty()
+    {
+        var buf = new byte[64];
+        int n = UmdfWireEncoder.WriteSequenceResetFrame(buf);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize, n);
+        Assert.True(SequenceReset_1Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.SequenceResetBlockLength), out _));
+    }
+
+    [Fact]
+    public void EmptyBook_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteEmptyBookFrame(buf,
+            securityId: 4242L, mdEntryTimestampNanos: 1_700_000_000_000_000_000UL);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.EmptyBookBlockLength, n);
+        Assert.True(EmptyBook_9Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.EmptyBookBlockLength), out var rdr));
+        Assert.Equal(4242L, (long)rdr.Data.SecurityID.Value);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.MDEntryTimestamp.Time);
+    }
+
+    [Fact]
     public void MassDeleteOrders_Roundtrip()
     {
         var buf = new byte[80];

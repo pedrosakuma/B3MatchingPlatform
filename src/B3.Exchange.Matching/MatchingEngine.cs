@@ -429,15 +429,24 @@ public sealed class MatchingEngine
                     long finalFilled = tradeQty; // For simplicity OrderFilledEvent reports
                                                  // the LAST trade's qty; downstream cares
                                                  // only about the delete, not the fill total.
+                    var makerSide = maker.Side;
                     book.Remove(maker);
                     _sink.OnOrderFilled(new OrderFilledEvent(
                         SecurityId: book.SecurityId,
                         OrderId: maker.OrderId,
-                        Side: maker.Side,
+                        Side: makerSide,
                         PriceMantissa: maker.PriceMantissa,
                         FinalFilledQuantity: finalFilled,
                         TransactTimeNanos: cmd.EnteredAtNanos,
                         RptSeq: NextRptSeq()));
+                    // #200: emit EmptyBook_9 if this fill drained the side.
+                    if (book.BestLevel(makerSide) is null)
+                    {
+                        _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
+                            SecurityId: book.SecurityId,
+                            Side: makerSide,
+                            TransactTimeNanos: cmd.EnteredAtNanos));
+                    }
                 }
                 else
                 {
@@ -527,6 +536,16 @@ public sealed class MatchingEngine
             TransactTimeNanos: txn,
             Reason: reason,
             RptSeq: NextRptSeq()));
+        // #200: when this cancel emptied the side, publish EmptyBook_9 so
+        // recovery consumers can drop their per-side state without waiting
+        // for the next snapshot rotation.
+        if (book.BestLevel(side) is null)
+        {
+            _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
+                SecurityId: book.SecurityId,
+                Side: side,
+                TransactTimeNanos: txn));
+        }
     }
 
     private void Reject(string clOrdId, long securityId, long orderId, RejectReason r, ulong txn)
