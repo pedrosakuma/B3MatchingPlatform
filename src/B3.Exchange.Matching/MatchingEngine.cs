@@ -181,9 +181,24 @@ public sealed class MatchingEngine
                 return;
             }
 
-            // #201: trading-phase gating. Only OPEN accepts new orders;
-            // RESERVED (auction) acceptance lands with the auctions wave.
-            if (_phaseById[cmd.SecurityId] != TradingPhase.Open)
+            // #201: trading-phase gating combined with #202 TIF semantics.
+            // Day/IOC/FOK/GTC require Open. AtClose requires FinalClosingCall.
+            // GoodForAuction requires Reserved (pre-open auction). GTD is
+            // wire-accepted but not yet implementable in the engine — the
+            // ExpireDate is not plumbed through NewOrderCommand yet.
+            var phase = _phaseById[cmd.SecurityId];
+            if (cmd.Tif == TimeInForce.Gtd)
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.TimeInForceNotSupported, cmd.EnteredAtNanos);
+                return;
+            }
+            var requiredPhase = cmd.Tif switch
+            {
+                TimeInForce.AtClose => TradingPhase.FinalClosingCall,
+                TimeInForce.GoodForAuction => TradingPhase.Reserved,
+                _ => TradingPhase.Open,
+            };
+            if (phase != requiredPhase)
             {
                 Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketClosed, cmd.EnteredAtNanos);
                 return;
@@ -203,7 +218,9 @@ public sealed class MatchingEngine
             }
             else // Market
             {
-                if (cmd.Tif == TimeInForce.Day)
+                // Market orders must be IOC or FOK. Day/Gtc/Gtd/AtClose/GoodForAuction
+                // are all resting TIFs that can't apply to a market order.
+                if (cmd.Tif != TimeInForce.IOC && cmd.Tif != TimeInForce.FOK)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MarketNotImmediateOrCancel, cmd.EnteredAtNanos); return; }
             }
 

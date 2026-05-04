@@ -103,6 +103,10 @@ public class NewOrderSingleAndReplaceDecoderTests
     [InlineData((byte)'0', TimeInForce.Day)]
     [InlineData((byte)'3', TimeInForce.IOC)]
     [InlineData((byte)'4', TimeInForce.FOK)]
+    [InlineData((byte)'1', TimeInForce.Gtc)]
+    [InlineData((byte)'6', TimeInForce.Gtd)]
+    [InlineData((byte)'7', TimeInForce.AtClose)]
+    [InlineData((byte)'A', TimeInForce.GoodForAuction)]
     public void NewOrderSingle_AcceptsSupportedTif(byte tifByte, TimeInForce expected)
     {
         var body = BuildNewOrderSingleV2(tif: tifByte);
@@ -192,21 +196,9 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Contains("OrdType", msg);
     }
 
-    [Theory]
-    [InlineData((byte)'1')] // GTC
-    [InlineData((byte)'6')] // GTD
-    [InlineData((byte)'7')] // AtTheClose
-    [InlineData((byte)'A')] // GoodForAuction
-    public void NewOrderSingle_UnsupportedTifReturnsBmr(byte tifByte)
-    {
-        var body = BuildNewOrderSingleV2(tif: tifByte);
-
-        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-            body, 1, 0, out _, out _, out var msg);
-
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("TimeInForce", msg);
-    }
+    // GTC/GTD/AtTheClose/GoodForAuction are all decoder-accepted now (#202).
+    // Engine-side semantic gating (GTD plumbing, phase enforcement) is
+    // covered by MatchingEngine tests rather than the decoder.
 
     [Theory]
     [InlineData((byte)'5')] // not in schema

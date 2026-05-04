@@ -2,7 +2,25 @@ namespace B3.Exchange.Matching;
 
 public enum Side : byte { Buy, Sell }
 
-public enum TimeInForce : byte { Day, IOC, FOK }
+/// <summary>
+/// TimeInForce values supported by the matching engine. Wire mapping
+/// lives in the gateway decoder; semantic implications:
+/// <list type="bullet">
+///   <item><c>Day</c>: rests until end of day (no daily-reset operator
+///   command exists yet, so behaves as if persistent).</item>
+///   <item><c>IOC</c>/<c>FOK</c>: marketable-only; remainder is cancelled.</item>
+///   <item><c>Gtc</c>: persistent across hypothetical daily-resets. Currently
+///   identical to <c>Day</c> until the daily-reset operator command lands.</item>
+///   <item><c>Gtd</c>: rejected with <see cref="RejectReason.TimeInForceNotSupported"/>
+///   until the wire path plumbs <c>ExpireDate</c> through
+///   <see cref="NewOrderCommand"/>.</item>
+///   <item><c>AtClose</c>: only accepted while the instrument is in
+///   <see cref="TradingPhase.FinalClosingCall"/>.</item>
+///   <item><c>GoodForAuction</c>: only accepted while the instrument is in
+///   <see cref="TradingPhase.Reserved"/> (pre-open / auction).</item>
+/// </list>
+/// </summary>
+public enum TimeInForce : byte { Day, IOC, FOK, Gtc, Gtd, AtClose, GoodForAuction }
 
 public enum OrderType : byte { Limit, Market }
 
@@ -50,10 +68,15 @@ public enum RejectReason : byte
     /// <see cref="SelfTradePrevention"/> policy is configured to cancel the
     /// aggressor's residual quantity.</summary>
     SelfTradePrevention,
-    /// <summary>Submitted while the instrument's <see cref="TradingPhase"/>
-    /// disallows new orders (anything other than <see cref="TradingPhase.Open"/>).
-    /// Gap-functional §5 / issue #201.</summary>
+    /// <summary>The instrument's current <see cref="TradingPhase"/>
+    /// disallows new orders for the requested
+    /// <see cref="TimeInForce"/>. Issue #201.</summary>
     MarketClosed,
+    /// <summary>The requested <see cref="TimeInForce"/> is wire-valid but
+    /// not yet implemented in the matching engine (e.g. <c>Gtd</c> until
+    /// <c>ExpireDate</c> is plumbed through the inbound command).
+    /// Issue #202.</summary>
+    TimeInForceNotSupported,
 }
 
 /// <summary>

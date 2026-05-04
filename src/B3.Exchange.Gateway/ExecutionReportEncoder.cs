@@ -59,6 +59,10 @@ internal static class ExecutionReportEncoder
     private const byte TifDay = (byte)'0';
     private const byte TifIoc = (byte)'3';
     private const byte TifFok = (byte)'4';
+    private const byte TifGtc = (byte)'1';
+    private const byte TifGtd = (byte)'6';
+    private const byte TifAtClose = (byte)'7';
+    private const byte TifGoodForAuction = (byte)'A';
     private const byte ExecTypeTrade = (byte)'F';
 
     private static byte EncodeSide(Matching.Side s) => s == Matching.Side.Buy ? SideBuy : SideSell;
@@ -68,6 +72,10 @@ internal static class ExecutionReportEncoder
         Matching.TimeInForce.Day => TifDay,
         Matching.TimeInForce.IOC => TifIoc,
         Matching.TimeInForce.FOK => TifFok,
+        Matching.TimeInForce.Gtc => TifGtc,
+        Matching.TimeInForce.Gtd => TifGtd,
+        Matching.TimeInForce.AtClose => TifAtClose,
+        Matching.TimeInForce.GoodForAuction => TifGoodForAuction,
         _ => 0,
     };
 
