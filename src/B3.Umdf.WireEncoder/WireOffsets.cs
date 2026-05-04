@@ -187,5 +187,13 @@ public static class WireOffsets
     // SecDef body emits three empty repeating-group headers
     // (NoUnderlyings, NoLegs, NoInstrAttribs) so consumer ReadGroups paths stay safe.
     public const int GroupSizeEncodingSize = 3;
-    public const int SecDefBodyTotal = SecDefBlockLength + GroupSizeEncodingSize * 3;
+    // Trailing var-data section: TextEncoding 'securityDesc' (uint8 length
+    // prefix + 0..250 UTF-8 bytes). Required by the consumer's generated
+    // SecurityDefinition_12DataReader — when omitted, TextEncoding.Create
+    // reads the next frame's first byte as the length and the slice runs
+    // past the SBE message boundary (issue #222). We always emit length=0
+    // (empty description) so the prefix is present even when no text is
+    // attached.
+    public const int SecDefSecurityDescLengthSize = 1;
+    public const int SecDefBodyTotal = SecDefBlockLength + GroupSizeEncodingSize * 3 + SecDefSecurityDescLengthSize;
 }
