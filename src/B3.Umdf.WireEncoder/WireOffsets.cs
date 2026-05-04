@@ -98,6 +98,25 @@ public static class WireOffsets
     public const int TradeBustBodyTransactTimeOffset = 36;
     public const int TradeBustBodyRptSeqOffset = 44;
 
+    // ---- Sequence_2 (V16) ----
+    // Body layout (BLOCK_LENGTH=4): nextSeqNo@0 (uint).
+    public const int SequenceBlockLength = 4;
+    public const int SequenceBodyNextSeqNoOffset = 0;
+
+    // ---- SequenceReset_1 (V16) ----
+    // Body has no fields (BLOCK_LENGTH=0).
+    public const int SequenceResetBlockLength = 0;
+
+    // ---- EmptyBook_9 (V16) ----
+    // Body layout (BLOCK_LENGTH=20): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); mDEntryTimestamp@12
+    // (ulong nanos). The MDUpdateAction (NEW) and MDEntryType (EMPTY_BOOK)
+    // are template-level constants — not encoded into the body.
+    public const int EmptyBookBlockLength = 20;
+    public const int EmptyBookBodySecurityIdOffset = 0;
+    public const int EmptyBookBodyMatchEventIndicatorOffset = 8;
+    public const int EmptyBookBodyMdEntryTimestampOffset = 12;
+
     // ---- MassDeleteOrders_MBO_52 (V16) ----
     // Body layout (BLOCK_LENGTH=28): securityID@0 (long); securityExchange@8
     // shares offset with matchEventIndicator@8 (byte); mDUpdateAction@9

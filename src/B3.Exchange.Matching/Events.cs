@@ -92,6 +92,19 @@ public readonly record struct RejectEvent(
     ulong TransactTimeNanos);
 
 /// <summary>
+/// Fired when a book side that had at least one resting order becomes
+/// empty as a result of an order cancel/fill in the same dispatch turn.
+/// The integration layer translates this to the UMDF
+/// <c>EmptyBook_9</c> frame (gap-functional §22 / #200). Carries no
+/// <c>RptSeq</c> because the spec uses <c>EmptyBook_9</c> as a
+/// boundary marker, not a per-instrument sequenced event.
+/// </summary>
+public readonly record struct OrderBookSideEmptyEvent(
+    long SecurityId,
+    Side Side,
+    ulong TransactTimeNanos);
+
+/// <summary>
 /// Fired ONCE per (SecurityID, Side) pair touched by a single
 /// <see cref="MatchingEngine.MassCancel"/> invocation, BEFORE the per-order
 /// <see cref="OrderCanceledEvent"/>s for the same group. The integration
@@ -129,4 +142,11 @@ public interface IMatchingEventSink
     /// overrides it to emit the UMDF <c>MassDeleteOrders_MBO_52</c> frame.
     /// </summary>
     void OnOrderMassCanceled(in OrderMassCanceledEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted when a book side empties out after a cancel
+    /// or fill. Default is a no-op so legacy sinks compile; the production
+    /// <c>ChannelDispatcher</c> overrides it to emit <c>EmptyBook_9</c>.
+    /// </summary>
+    void OnOrderBookSideEmpty(in OrderBookSideEmptyEvent e) { }
 }

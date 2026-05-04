@@ -400,6 +400,78 @@ public static class UmdfWireEncoder
     }
 
     /// <summary>
+    /// Writes <c>Sequence_2</c> (V16). Returns total bytes. Used as an
+    /// idle/heartbeat marker that carries the next expected incremental
+    /// sequence number (gap-functional #22 / #200).
+    /// </summary>
+    public static int WriteSequenceFrame(Span<byte> dst, uint nextSeqNo)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SequenceBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.Sequence_2Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.SequenceBlockLength);
+        body.Clear();
+        MemoryMarshal.Write(body.Slice(WireOffsets.SequenceBodyNextSeqNoOffset, 4), in nextSeqNo);
+        return total;
+    }
+
+    /// <summary>
+    /// Writes <c>SequenceReset_1</c> (V16). Returns total bytes. Marks the
+    /// start of an instrument-replay or snapshot-recovery loop (the
+    /// schema fixes <c>NewSeqNo=1</c> as a constant; the message has no
+    /// body fields).
+    /// </summary>
+    public static int WriteSequenceResetFrame(Span<byte> dst)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SequenceResetBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.SequenceReset_1Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+        return total;
+    }
+
+    /// <summary>
+    /// Writes <c>EmptyBook_9</c> (V16). Returns total bytes. Emitted when
+    /// a previously-populated book side becomes empty after a cancel /
+    /// fill (gap-functional #22). The MDUpdateAction (NEW) and
+    /// MDEntryType (EMPTY_BOOK) are template-level constants per schema.
+    /// </summary>
+    public static int WriteEmptyBookFrame(
+        Span<byte> dst,
+        long securityId,
+        ulong mdEntryTimestampNanos)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.EmptyBookBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.EmptyBook_9Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.EmptyBookBlockLength);
+        body.Clear();
+        MemoryMarshal.Write(body.Slice(WireOffsets.EmptyBookBodySecurityIdOffset, 8), in securityId);
+        MemoryMarshal.Write(body.Slice(WireOffsets.EmptyBookBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        return total;
+    }
+
+    /// <summary>
     /// Writes <c>MassDeleteOrders_MBO_52</c> (V16). Returns total bytes.
     /// Emitted once per (SecurityID, Side) at the start of a mass-cancel
     /// operation as an atomic boundary marker (gap-functional #8 / #199).
