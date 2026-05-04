@@ -18,7 +18,7 @@ public class EmptyBookSideTests
         var oid = sink.Accepted.Single().OrderId;
         sink.Clear();
 
-        eng.Cancel(new CancelOrderCommand("c1", PetrSecId, oid, 11, 2000));
+        eng.Cancel(new CancelOrderCommand("c1", PetrSecId, oid, 2000));
 
         Assert.Single(sink.Canceled);
         var ev = Assert.Single(sink.BookSideEmpty);
@@ -36,7 +36,7 @@ public class EmptyBookSideTests
         var firstOid = sink.Accepted[0].OrderId;
         sink.Clear();
 
-        eng.Cancel(new CancelOrderCommand("c1", PetrSecId, firstOid, 11, 2000));
+        eng.Cancel(new CancelOrderCommand("c1", PetrSecId, firstOid, 2000));
 
         Assert.Single(sink.Canceled);
         Assert.Empty(sink.BookSideEmpty);
