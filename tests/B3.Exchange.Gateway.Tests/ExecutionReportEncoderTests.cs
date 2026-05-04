@@ -20,12 +20,12 @@ public class ExecutionReportEncoderTests
             orderQty: 10, priceMantissa: 12_3450L);
 
         Assert.Equal(ExecutionReportEncoder.ExecReportNewTotal, n);
-        // SBE header at offset SOFH(4)..SOFH+8: BlockLength=172, TemplateId=200, SchemaId=1, Version=3 (#49 / #GAP-11)
+        // SBE header at offset SOFH(4)..SOFH+8: BlockLength=176, TemplateId=200, SchemaId=1, Version=6 (#248)
         var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
         Assert.Equal((ushort)ExecutionReportEncoder.ExecReportNewBlock, MemoryMarshal.Read<ushort>(hdr.Slice(0, 2)));
         Assert.Equal((ushort)EntryPointFrameReader.TidExecutionReportNew, MemoryMarshal.Read<ushort>(hdr.Slice(2, 2)));
         Assert.Equal((ushort)1, MemoryMarshal.Read<ushort>(hdr.Slice(4, 2)));
-        Assert.Equal((ushort)3, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+        Assert.Equal((ushort)6, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
 
         var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal((uint)42, MemoryMarshal.Read<uint>(body.Slice(0, 4)));        // SessionId
@@ -223,5 +223,112 @@ public class ExecutionReportEncoderTests
             cumQty: 0, orderQty: 100, priceMantissa: 100_0000L);
         var bodyNull = bufNull.AsSpan(EntryPointFrameReader.WireHeaderSize);
         Assert.Equal(ulong.MaxValue, MemoryMarshal.Read<ulong>(bodyNull.Slice(156, 8)));
+    }
+
+    // ====== #248: ER encoders bumped to V6 schema layout ======
+    //
+    // The B3.EntryPoint.Client SDK's InboundDecoder hard-casts inbound
+    // payloads to the latest schema struct via MemoryMarshal.AsRef and
+    // ignores the SBE header `version` field, so any payload smaller than
+    // the V6 BlockLength tears down the inbound loop. These tests lock the
+    // V6 BlockLengths + the new trailing-field null sentinels.
+
+    [Fact]
+    public void EncodeNew_V6BlockLength_TradingSubAccountNull()
+    {
+        Assert.Equal(176, ExecutionReportEncoder.ExecReportNewBlock);
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, secondaryOrderId: 0,
+            securityId: 1, orderId: 1, execId: 0, transactTimeNanos: 0,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 100_0000L);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(168, 4))); // StrategyID null
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(172, 4))); // TradingSubAccount null
+    }
+
+    [Fact]
+    public void EncodeModify_V6BlockLength_ExecRestatementReasonAndTradingSubAccountNull()
+    {
+        Assert.Equal(188, ExecutionReportEncoder.ExecReportModifyBlock);
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)255, body[178]);                            // MmProtectionReset null
+        Assert.Equal((byte)255, body[179]);                            // ExecRestatementReason null (V6 inserted)
+        Assert.Equal(0, MemoryMarshal.Read<int>(body.Slice(180, 4)));  // StrategyID null
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(184, 4))); // TradingSubAccount null
+    }
+
+    [Fact]
+    public void EncodeCancel_V6Header_VersionIs6()
+    {
+        Assert.Equal(182, ExecutionReportEncoder.ExecReportCancelBlock);
+        var buf = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 1, origClOrdIdValue: 0, secondaryOrderId: 0,
+            securityId: 7, orderId: 1, execId: 0, transactTimeNanos: 0,
+            cumQty: 0, orderQty: 100, priceMantissa: 100_0000L);
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
+        Assert.Equal((ushort)6, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+    }
+
+    [Fact]
+    public void EncodeTrade_V6BlockLength_TrailingNulls()
+    {
+        Assert.Equal(174, ExecutionReportEncoder.ExecReportTradeBlock);
+        var buf = new byte[ExecutionReportEncoder.ExecReportTradeTotal];
+        ExecutionReportEncoder.EncodeExecReportTrade(buf,
+            sessionId: 1, msgSeqNum: 2, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 77, secondaryOrderId: 0,
+            securityId: 999, orderId: 1234,
+            lastQty: 5, lastPxMantissa: 50_0000L,
+            execId: 10UL, transactTimeNanos: 0UL,
+            leavesQty: 0, cumQty: 5,
+            aggressor: true, tradeId: 4242, contraBroker: 8,
+            tradeDate: 19000, orderQty: 5);
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
+        Assert.Equal((ushort)6, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)255, body[154]);                            // TradingSessionID null
+        Assert.Equal((byte)255, body[155]);                            // TradingSessionSubID null
+        Assert.Equal((byte)255, body[156]);                            // SecurityTradingStatus null
+        Assert.Equal((byte)255, body[157]);                            // CrossType null
+        Assert.Equal((byte)255, body[158]);                            // CrossPrioritization null
+        Assert.Equal(0, MemoryMarshal.Read<int>(body.Slice(160, 4)));  // StrategyID null
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(170, 4))); // TradingSubAccount null
+    }
+
+    [Fact]
+    public void EncodeReject_V6BlockLength_ReceivedTimeAndTrailingNulls()
+    {
+        Assert.Equal(164, ExecutionReportEncoder.ExecReportRejectBlock);
+        const ulong received = 1_700_000_000_999_999_999UL;
+        var buf = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
+        ExecutionReportEncoder.EncodeExecReportReject(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            clOrdIdValue: 7, origClOrdIdValue: 0, securityId: 333, orderIdOrZero: 0,
+            rejectReason: 5u, transactTimeNanos: 0UL, receivedTimeNanos: received);
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
+        Assert.Equal((ushort)6, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(received, MemoryMarshal.Read<ulong>(body.Slice(138, 8))); // ReceivedTime
+        Assert.Equal(0, MemoryMarshal.Read<int>(body.Slice(156, 4)));          // StrategyID null
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(160, 4)));        // TradingSubAccount null
+
+        var bufNull = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
+        ExecutionReportEncoder.EncodeExecReportReject(bufNull,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            clOrdIdValue: 7, origClOrdIdValue: 0, securityId: 333, orderIdOrZero: 0,
+            rejectReason: 5u, transactTimeNanos: 0UL);
+        var bodyNullR = bufNull.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(ulong.MaxValue, MemoryMarshal.Read<ulong>(bodyNullR.Slice(138, 8)));
     }
 }

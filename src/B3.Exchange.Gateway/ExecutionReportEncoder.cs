@@ -25,20 +25,36 @@ internal static class ExecutionReportEncoder
     private const ulong UTCTimestampNullValue = ulong.MaxValue;
     private const long PriceNullMantissa = long.MinValue;
 
-    // ER_New / ER_Modify / ER_Cancel are encoded against the **V3** schema so the
-    // optional `receivedTime` (tag 35544) field is wire-addressable (#GAP-11 / #49).
-    // Block lengths and trailing field offsets verified against the generated
-    // `B3.Entrypoint.Fixp.Sbe.V6.V3` structs:
-    //   ER_New    BLOCK_LENGTH = 172  receivedTime@144  + crossType@162 / crossPriori@163 / mmProtReset@164 nulls
-    //   ER_Modify BLOCK_LENGTH = 183  receivedTime@160  + mmProtReset@178 null
-    //   ER_Cancel BLOCK_LENGTH = 182  receivedTime@156  (no non-zero trailing nulls)
-    // ER_Trade and ER_Reject continue to ride the V2 schema; #49 explicitly
-    // scopes to ER_New/Modify/Cancel.
-    public const int ExecReportNewBlock = 172;
-    public const int ExecReportModifyBlock = 183;
+    // All ExecutionReport_* templates are encoded against the **V6** schema
+    // (#248). The published `B3.EntryPoint.Client` SDK's InboundDecoder
+    // ignores the SBE header `version` field and hard-casts payloads to the
+    // latest schema struct via `MemoryMarshal.AsRef<…>` — anything smaller
+    // than the V6 BlockLength trips an ArgumentOutOfRangeException and
+    // tears down the inbound loop. Bumping every encoder to V6 keeps us
+    // compatible with the partner library while remaining backwards-readable
+    // by older consumers (BlockLength only grows; trailing fields use SBE
+    // null sentinels).
+    //
+    // BlockLengths and trailing field offsets verified against the generated
+    // `B3.Entrypoint.Fixp.Sbe.V6.{ExecutionReport_*Data}` structs:
+    //   ER_New    BLOCK_LENGTH = 176  receivedTime@144 + crossType@162 / crossPriori@163 /
+    //                                 mmProtReset@164 nulls + tradingSubAccount@172=0
+    //   ER_Modify BLOCK_LENGTH = 188  receivedTime@160 + mmProtReset@178 +
+    //                                 execRestatementReason@179 nulls + strategyID@180 /
+    //                                 tradingSubAccount@184 = 0
+    //   ER_Cancel BLOCK_LENGTH = 182  receivedTime@156 (no non-zero trailing nulls)
+    //   ER_Trade  BLOCK_LENGTH = 174  V6 trailing nulls at @154 (tradingSessionID),
+    //                                 @155 (tradingSessionSubID), @156 (securityTradingStatus),
+    //                                 @157 (crossType), @158 (crossPrioritization);
+    //                                 strategyID@160 / impliedEventID@164 /
+    //                                 tradingSubAccount@170 = 0
+    //   ER_Reject BLOCK_LENGTH = 164  receivedTime@138 + ordTagID/investorID/strategyID/
+    //                                 tradingSubAccount tail (all zero nulls)
+    public const int ExecReportNewBlock = 176;
+    public const int ExecReportModifyBlock = 188;
     public const int ExecReportCancelBlock = 182;
-    public const int ExecReportTradeBlock = 154;
-    public const int ExecReportRejectBlock = 138;
+    public const int ExecReportTradeBlock = 174;
+    public const int ExecReportRejectBlock = 164;
 
     public const int ExecReportNewTotal = HeaderSize + ExecReportNewBlock;
     public const int ExecReportModifyTotal = HeaderSize + ExecReportModifyBlock;
@@ -110,7 +126,7 @@ internal static class ExecutionReportEncoder
     {
         if (dst.Length < ExecReportNewTotal) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportNewTotal,
-            ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 3);
+            ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportNewBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -138,6 +154,8 @@ internal static class ExecutionReportEncoder
         body[162] = 255;                                                    // CrossType null
         body[163] = 255;                                                    // CrossPrioritization null
         body[164] = 255;                                                    // MmProtectionReset null
+        // V6 trailing field: tradingSubAccount@172 (uint, null=0) — covered
+        // by body.Clear() above. strategyID@168 (int, null=0) ditto.
         return ExecReportNewTotal;
     }
 
@@ -150,7 +168,7 @@ internal static class ExecutionReportEncoder
     {
         if (dst.Length < ExecReportModifyTotal) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportModifyTotal,
-            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 3);
+            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportModifyBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -174,10 +192,15 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(120, 8), in orderQty);
         MemoryMarshal.Write(body.Slice(128, 8), in priceMantissa);
         MemoryMarshal.Write(body.Slice(136, 8), in nullPx);                 // StopPx
-        // V3 trailing fields: receivedTime@160 + mmProtectionReset@178 null sentinel.
+        // V6 trailing fields: receivedTime@160 + mmProtectionReset@178 +
+        // execRestatementReason@179 (was strategyID@179 in V3 — V6 inserts
+        // execRestatementReason here and shifts strategyID/tradingSubAccount).
         MemoryMarshal.Write(body.Slice(160, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
-        // ordTagID@171 null=0 already, investorID@172 null=zeros already, strategyID@179 null=0 already.
+        // ordTagID@171 null=0 already, investorID@172 null=zeros already.
         body[178] = 255;                                                    // MmProtectionReset null
+        body[179] = 255;                                                    // ExecRestatementReason null
+        // strategyID@180 (int, null=0) and tradingSubAccount@184 (uint,
+        // null=0) covered by body.Clear() above.
         return ExecReportModifyTotal;
     }
 
@@ -190,7 +213,7 @@ internal static class ExecutionReportEncoder
     {
         if (dst.Length < ExecReportCancelTotal) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportCancelTotal,
-            ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 3);
+            ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportCancelBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -229,7 +252,7 @@ internal static class ExecutionReportEncoder
     {
         if (dst.Length < ExecReportTradeTotal) throw new ArgumentException("buffer too small for ER_Trade", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportTradeTotal,
-            ExecReportTradeBlock, EntryPointFrameReader.TidExecutionReportTrade, version: 2);
+            ExecReportTradeBlock, EntryPointFrameReader.TidExecutionReportTrade, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportTradeBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -254,17 +277,27 @@ internal static class ExecutionReportEncoder
         ushort crossedNull = 65535;
         MemoryMarshal.Write(body.Slice(144, 2), in crossedNull);            // CrossedIndicator null
         MemoryMarshal.Write(body.Slice(146, 8), in orderQty);
+        // V6 trailing fields (offsets 154..174):
+        body[154] = 255;                                                    // TradingSessionID null
+        body[155] = 255;                                                    // TradingSessionSubID null
+        body[156] = 255;                                                    // SecurityTradingStatus null
+        body[157] = 255;                                                    // CrossType null
+        body[158] = 255;                                                    // CrossPrioritization null
+        // strategyID@160 (int, null=0), impliedEventID@164 (6 bytes; eventID
+        // and noRelatedTrades both null=0) and tradingSubAccount@170 (uint,
+        // null=0) are covered by body.Clear() above.
         return ExecReportTradeTotal;
     }
 
     public static int EncodeExecReportReject(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         ulong clOrdIdValue, ulong origClOrdIdValue, long securityId, long orderIdOrZero,
-        uint rejectReason, ulong transactTimeNanos)
+        uint rejectReason, ulong transactTimeNanos,
+        ulong receivedTimeNanos = UTCTimestampNullValue)
     {
         if (dst.Length < ExecReportRejectTotal) throw new ArgumentException("buffer too small for ER_Reject", nameof(dst));
         EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportRejectTotal,
-            ExecReportRejectBlock, EntryPointFrameReader.TidExecutionReportReject, version: 2);
+            ExecReportRejectBlock, EntryPointFrameReader.TidExecutionReportReject, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportRejectBlock);
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
@@ -290,6 +323,13 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(104, 8), in nullPx);                 // StopPx null
         ushort crossedNull = 65535;
         MemoryMarshal.Write(body.Slice(136, 2), in crossedNull);            // CrossedIndicator null
+        // V6 trailing fields: receivedTime@138 (UTCTimestampNanosOptional,
+        // 8-byte mantissa null=ulong.MaxValue; trailing precision/unit/epoch
+        // bytes default to 0 and the SDK gates on the mantissa); ordTagID@149
+        // (byte null=0), investorID@150 (6 bytes null=zeros), strategyID@156
+        // (int null=0), tradingSubAccount@160 (uint null=0) — all covered
+        // by body.Clear() above.
+        MemoryMarshal.Write(body.Slice(138, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
         return ExecReportRejectTotal;
     }
 }

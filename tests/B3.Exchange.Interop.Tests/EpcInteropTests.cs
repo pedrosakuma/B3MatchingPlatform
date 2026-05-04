@@ -144,7 +144,7 @@ public class EpcInteropTests : IAsyncLifetime
         return collected;
     }
 
-    [Fact(Skip = "Blocked by #248 — gateway ER schema version mismatch (EPC SDK reads V5/V6 layout, gateway emits V3)")]
+    [Fact]
     public async Task SimpleNewOrder_Submit_Cancel_RoundTrips()
     {
         var sessionVerId = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -192,10 +192,12 @@ public class EpcInteropTests : IAsyncLifetime
         await pump;
 
         Assert.Contains(events, e => e is OrderAccepted oa && oa.ClOrdID.Value == 1);
-        Assert.Contains(events, e => e is OrderCancelled oc && oc.OrigClOrdID?.Value == 1);
+        Assert.Contains(events, e => e is OrderCancelled oc && oc.ClOrdID.Value == 2);
+        // Note: cannot assert OrigClOrdID — EPC SDK 0.14.0 DecodeCancel
+        // hardcodes OrigClOrdID = null (SDK bug, not gateway).
     }
 
-    [Fact(Skip = "Blocked by #248 — gateway ER schema version mismatch (EPC SDK reads V5/V6 layout, gateway emits V3)")]
+    [Fact(Skip = "Blocked by #252 — OrderCancelReplaceRequest (template 104) BusinessReject against EPC SDK 0.14.0 defaults")]
     public async Task NewOrderSingleV6_Submit_Replace_Cancel_RoundTrips()
     {
         // Drives template 102 (NewOrderSingle V6) + template 104
@@ -241,7 +243,7 @@ public class EpcInteropTests : IAsyncLifetime
             Side = Side.Buy,
             OrderType = OrderType.Limit,
             TimeInForce = TimeInForce.Day,
-            OrderQty = 150,
+            OrderQty = 100,
             Price = 31.40m,
         }, cts.Token);
 
@@ -265,7 +267,7 @@ public class EpcInteropTests : IAsyncLifetime
         Assert.Contains(events, e => e is OrderCancelled);
     }
 
-    [Fact(Skip = "Blocked by #248 — gateway ER schema version mismatch (EPC SDK reads V5/V6 layout, gateway emits V3)")]
+    [Fact(Skip = "Blocked by #251 — gateway does not emit ER_Modify on priority-kept Replace")]
     public async Task SimpleModify_Submit_Modify_RoundTrips()
     {
         var sessionVerId = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -307,7 +309,7 @@ public class EpcInteropTests : IAsyncLifetime
             Side = Side.Buy,
             OrderType = SimpleOrderType.Limit,
             TimeInForce = SimpleTimeInForce.Day,
-            OrderQty = 80,
+            OrderQty = 200,
             Price = 31.95m,
         }, cts.Token);
 
@@ -319,7 +321,7 @@ public class EpcInteropTests : IAsyncLifetime
         Assert.Contains(events, e => e is OrderModified om && om.ClOrdID.Value == 21);
     }
 
-    [Fact(Skip = "Blocked by #248 — gateway ER schema version mismatch (EPC SDK reads V5/V6 layout, gateway emits V3)")]
+    [Fact]
     public async Task MassAction_CancelAllOrdersForSession_AffectsRestingOrders()
     {
         var sessionVerId = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -349,7 +351,7 @@ public class EpcInteropTests : IAsyncLifetime
                 Side = Side.Buy,
                 OrderType = SimpleOrderType.Limit,
                 TimeInForce = SimpleTimeInForce.Day,
-                OrderQty = 50,
+                OrderQty = 100,
                 Price = 31.00m + (decimal)(i - 30) * 0.01m,
             }, cts.Token);
         }
@@ -370,7 +372,7 @@ public class EpcInteropTests : IAsyncLifetime
         await pump;
     }
 
-    [Fact(Skip = "Blocked by #248 — gateway ER schema version mismatch (EPC SDK reads V5/V6 layout, gateway emits V3)")]
+    [Fact(Skip = "Blocked by #253 — FIXP reconnect with EPC SDK ReconnectAsync — second order not delivered after reconnect")]
     public async Task Reconnect_WithNonZeroNextSeqNo_DoesNotTriggerNotApplied()
     {
         // Regression for #239(b): client reconnecting with NextSeqNo > 1
@@ -420,7 +422,7 @@ public class EpcInteropTests : IAsyncLifetime
             // Reconnect on the same EntryPointClient instance: the SDK
             // re-establishes with the next outbound seq it has been
             // tracking (must be > 1 since we already sent one frame).
-            await client.ReconnectAsync(0u, cts.Token);
+            await client.ReconnectAsync(sessionVerId + 1u, cts.Token);
 
             await client.SubmitSimpleAsync(new SimpleNewOrderRequest
             {
