@@ -369,6 +369,21 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _packetWritten = 0;
         bool succeeded = false;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
+        // Issue #175: open engine.process as a child of the dispatch.enqueue
+        // span captured at enqueue time. The dispatch loop crosses thread
+        // boundaries from the gateway IO thread, so propagation must be
+        // explicit — Activity.Current would not carry the context here.
+        using var engineSpan = ExchangeTelemetry.Source.StartActivity(
+            ExchangeTelemetry.SpanEngineProcess,
+            System.Diagnostics.ActivityKind.Internal,
+            item.ParentContext);
+        if (engineSpan is not null)
+        {
+            engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+            engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, item.Kind.ToString());
+            if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
+            if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+        }
         try
         {
             switch (item.Kind)
@@ -464,7 +479,17 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             if (succeeded)
             {
                 long flushStart = engineEnd;
-                FlushPacket();
+                using (var flushSpan = ExchangeTelemetry.Source.StartActivity(
+                    ExchangeTelemetry.SpanOutboundEmit,
+                    System.Diagnostics.ActivityKind.Producer))
+                {
+                    if (flushSpan is not null)
+                        flushSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+                    int bytes = _packetWritten;
+                    FlushPacket();
+                    if (flushSpan is not null)
+                        flushSpan.SetTag(ExchangeTelemetry.TagBytes, bytes);
+                }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
             }
@@ -567,41 +592,80 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     // ====== IInboundCommandSink ======
 
+    /// <summary>
+    /// Issue #175: starts the <c>dispatch.enqueue</c> span. Returns
+    /// <c>null</c> when no listener is subscribed (zero-overhead path so
+    /// uninstrumented hosts pay nothing). Tags carry enough context for
+    /// trace consumers to correlate with metrics & logs without joining
+    /// against another store.
+    /// </summary>
+    private System.Diagnostics.Activity? StartEnqueueSpan(
+        WorkKind kind, SessionId session, uint enteringFirm, ulong clOrdId, long securityId)
+    {
+        var act = ExchangeTelemetry.Source.StartActivity(
+            ExchangeTelemetry.SpanDispatchEnqueue,
+            System.Diagnostics.ActivityKind.Producer);
+        if (act is null) return null;
+        act.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+        act.SetTag(ExchangeTelemetry.TagSession, session.Value);
+        act.SetTag(ExchangeTelemetry.TagFirm, (long)enteringFirm);
+        act.SetTag(ExchangeTelemetry.TagWorkKind, kind.ToString());
+        if (clOrdId != 0) act.SetTag(ExchangeTelemetry.TagClOrdId, (long)clOrdId);
+        if (securityId != 0) act.SetTag(ExchangeTelemetry.TagSecurityId, securityId);
+        return act;
+    }
+
     public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
+        using var act = StartEnqueueSpan(WorkKind.New, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
+        var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
-            clOrdIdValue, 0, cmd, null, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
+            clOrdIdValue, 0, cmd, null, null, null,
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
         { _metrics?.IncInboundMessage(InboundMessageKind.New); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.New);
+        act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");
         return false;
     }
 
     public bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
+        using var act = StartEnqueueSpan(WorkKind.Cancel, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
+        var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, cmd, null, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
+            clOrdIdValue, origClOrdIdValue, null, cmd, null, null,
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
         { _metrics?.IncInboundMessage(InboundMessageKind.Cancel); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cancel);
+        act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");
         return false;
     }
 
     public bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
+        using var act = StartEnqueueSpan(WorkKind.Replace, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
+        var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,
-            clOrdIdValue, origClOrdIdValue, null, null, cmd, null, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
+            clOrdIdValue, origClOrdIdValue, null, null, cmd, null,
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
         { _metrics?.IncInboundMessage(InboundMessageKind.Replace); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Replace);
+        act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");
         return false;
     }
 
     public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
+        using var act = StartEnqueueSpan(WorkKind.Cross, session, enteringFirm, cmd.BuyClOrdIdValue, cmd.Buy.SecurityId);
+        var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
-            cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
+            cmd.BuyClOrdIdValue, cmd.SellClOrdIdValue, null, null, null, cmd,
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
         { _metrics?.IncInboundMessage(InboundMessageKind.Cross); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.Cross);
+        act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");
         return false;
     }
 
@@ -632,10 +696,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     {
         if (orderIds == null || orderIds.Count == 0) return true;
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
+        using var act = StartEnqueueSpan(WorkKind.MassCancel, session, enteringFirm, 0, securityId: 0);
+        var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
-            0, 0, null, null, null, null, mc, EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp())))
+            0, 0, null, null, null, null, mc,
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
         { _metrics?.IncInboundMessage(InboundMessageKind.MassCancel); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
+        act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");
         return false;
     }
 
@@ -933,7 +1001,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         CrossOrderCommand? Cross,
         ResolvedMassCancel? MassCancel = null,
         OperatorTradeBust? TradeBust = null,
-        long EnqueueTicks = 0);
+        long EnqueueTicks = 0,
+        System.Diagnostics.ActivityContext ParentContext = default);
 
     /// <summary>
     /// Per-channel mass-cancel payload after gateway-side resolution: a

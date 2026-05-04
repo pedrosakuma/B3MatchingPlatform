@@ -20,6 +20,21 @@ public sealed partial class FixpSession
 {
     private async Task<bool> DispatchInboundAsync(EntryPointFrameReader.FrameInfo info, byte[] bodyBuf, int bodyLength)
     {
+        // Issue #175: open the root span for this inbound frame. All
+        // downstream spans (dispatch.enqueue, engine.process,
+        // outbound.emit) attach as descendants via Activity.Current
+        // propagation + the explicit ParentContext stamped on each
+        // WorkItem. SpanKind.Server because the gateway is the entry
+        // point of the request from the client's POV.
+        using var decodeSpan = ExchangeTelemetry.Source.StartActivity(
+            ExchangeTelemetry.SpanGatewayDecode,
+            System.Diagnostics.ActivityKind.Server);
+        if (decodeSpan is not null)
+        {
+            decodeSpan.SetTag(ExchangeTelemetry.TagSession, ConnectionId);
+            decodeSpan.SetTag(ExchangeTelemetry.TagTemplate, (int)info.TemplateId);
+        }
+
         ulong now = _nowNanos();
         _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} blockLength={BlockLength} varDataLength={VarDataLength}",
             ConnectionId, info.TemplateId, info.BlockLength, info.VarDataLength);
