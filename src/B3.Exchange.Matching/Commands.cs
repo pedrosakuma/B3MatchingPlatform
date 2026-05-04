@@ -132,6 +132,11 @@ public enum CancelReason : byte
     /// <summary>Resting order cancelled by an OrderMassActionRequest
     /// (template 701 → ER_Cancel; spec §4.8 / #GAP-19).</summary>
     MassCancel,
+    /// <summary>Resting <see cref="TimeInForce.GoodForAuction"/> or
+    /// <see cref="TimeInForce.AtClose"/> order that did not participate
+    /// in the uncross is removed when the auction phase resolves.
+    /// Issue #232 / Onda M5.</summary>
+    AuctionExpired,
 }
 
 /// <summary>

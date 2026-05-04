@@ -49,7 +49,11 @@ public class AuctionUncrossTests
         Assert.Single(sink.Filled);
         Assert.Single(sink.QtyReduced);
         Assert.Equal(200, sink.QtyReduced[0].NewRemainingQuantity);
-        Assert.Equal(1, eng.OrderCount(PetrSecId));
+        // M5 (#232): GoodForAuction residual that did not fully fill at
+        // the uncross is expired before the phase transitions to Open.
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+        var expired = Assert.Single(sink.Canceled);
+        Assert.Equal(CancelReason.AuctionExpired, expired.Reason);
     }
 
     [Fact]
@@ -92,7 +96,11 @@ public class AuctionUncrossTests
         Assert.False(any);
         Assert.Empty(sink.Trades);
         Assert.Equal(TradingPhase.Open, eng.GetTradingPhase(PetrSecId));
-        Assert.Equal(1, eng.OrderCount(PetrSecId)); // Buy survives.
+        // M5 (#232): GoodForAuction order that did not participate in
+        // any uncross trade is expired on the phase transition.
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+        var expired = Assert.Single(sink.Canceled);
+        Assert.Equal(CancelReason.AuctionExpired, expired.Reason);
     }
 
     [Fact]
@@ -253,5 +261,110 @@ public class AuctionUncrossTests
         Assert.False(any);
         Assert.Empty(sink.AuctionPrints);
         Assert.Equal(TradingPhase.Open, eng.GetTradingPhase(PetrSecId));
+    }
+
+    // ─── Onda M · M5 (issue #232) ─────────────────────────────────────
+    // Survivors of an auction call that did not match must NOT carry
+    // over into the continuous phase: GoodForAuction expires after the
+    // opening uncross, AtClose after the closing uncross.
+
+    /// <summary>
+    /// Multiple unfilled GoodForAuction orders all expire when Reserved
+    /// → Open. Each emits an OrderCanceledEvent with reason
+    /// AuctionExpired. Book is empty before phase flips.
+    /// </summary>
+    [Fact]
+    public void Uncross_Opening_ExpiresAllUnfilledGoodForAuction()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 5000);
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(9.95m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("b2", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(9.90m), 200, 11, 6001));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.10m), 100, 12, 6002));
+        sink.Clear();
+
+        bool any = eng.UncrossAuction(PetrSecId, TradingPhase.Open, 7000);
+
+        Assert.False(any);
+        Assert.Empty(sink.Trades);
+        Assert.Equal(3, sink.Canceled.Count);
+        Assert.All(sink.Canceled, c => Assert.Equal(CancelReason.AuctionExpired, c.Reason));
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+        Assert.Equal(TradingPhase.Open, eng.GetTradingPhase(PetrSecId));
+    }
+
+    /// <summary>
+    /// Closing-call analogue: AtClose survivors expire on Final →
+    /// Close transition. GoodForAuction left over from a previous
+    /// opening would have already been cleared, so this test only
+    /// exercises AtClose.
+    /// </summary>
+    [Fact]
+    public void Uncross_Closing_ExpiresAllUnfilledAtClose()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.FinalClosingCall, 5000);
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(9.95m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.AtClose, Px(10.05m), 100, 12, 6001));
+        sink.Clear();
+
+        bool any = eng.UncrossAuction(PetrSecId, TradingPhase.Close, 7000);
+
+        Assert.False(any);
+        Assert.Empty(sink.Trades);
+        Assert.Equal(2, sink.Canceled.Count);
+        Assert.All(sink.Canceled, c => Assert.Equal(CancelReason.AuctionExpired, c.Reason));
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+        Assert.Equal(TradingPhase.Close, eng.GetTradingPhase(PetrSecId));
+    }
+
+    /// <summary>
+    /// Fully-filled GoodForAuction orders must not be double-cancelled:
+    /// they have already been removed from the book by the drain.
+    /// Asserts no AuctionExpired event is emitted for either side.
+    /// </summary>
+    [Fact]
+    public void Uncross_Opening_FullyFilledGoodForAuction_NotDoubleCanceled()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 5000);
+        eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.05m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10.00m), 100, 12, 6001));
+        sink.Clear();
+
+        bool any = eng.UncrossAuction(PetrSecId, TradingPhase.Open, 7000);
+
+        Assert.True(any);
+        Assert.Single(sink.Trades);
+        Assert.Empty(sink.Canceled);
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+    }
+
+    /// <summary>
+    /// Mixed-TIF scenario: Day orders submitted in continuous Open
+    /// then carried into a Reserved auction call (operator-driven phase
+    /// transition) survive the uncross, while GoodForAuction siblings
+    /// expire. Pins the "do not over-expire" invariant: only
+    /// auction-bound TIFs are touched by the M5 sweep.
+    /// </summary>
+    [Fact]
+    public void Uncross_Opening_DayOrders_SurviveIntoContinuous()
+    {
+        var eng = NewEngine(out var sink);
+        // Day order submitted in Open (TIF gate accepts Day in Open).
+        eng.Submit(new NewOrderCommand("d1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.95m), 100, 11, 5500));
+        // Operator transitions to Reserved (intraday auction call).
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 5800);
+        // Auction-only sibling joins during Reserved.
+        eng.Submit(new NewOrderCommand("a1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(9.90m), 100, 11, 6001));
+        sink.Clear();
+
+        eng.UncrossAuction(PetrSecId, TradingPhase.Open, 7000);
+
+        // Only the GoodForAuction order is expired.
+        var expired = Assert.Single(sink.Canceled);
+        Assert.Equal(CancelReason.AuctionExpired, expired.Reason);
+        // Day order survives.
+        Assert.Equal(1, eng.OrderCount(PetrSecId));
     }
 }

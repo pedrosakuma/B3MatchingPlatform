@@ -289,6 +289,24 @@ public sealed class MatchingEngine
                 RptSeq: NextRptSeq()));
         }
 
+        // M5 (issue #232): expire any survivor whose TIF was bound to
+        // the auction phase we are leaving. GoodForAuction lives in
+        // Reserved only; AtClose lives in FinalClosingCall only.
+        // Anything left on the book after the drain is, by definition,
+        // unfilled and must NOT carry over into the continuous phase.
+        // Day / Gtc / Gtd survive the transition unchanged.
+        // Snapshot first (the cancel mutates _byOrderId) then iterate.
+        var expiringTif = fromOpening
+            ? TimeInForce.GoodForAuction
+            : TimeInForce.AtClose;
+        foreach (var resting in book.SnapshotOrders())
+        {
+            if (resting.Tif == expiringTif)
+            {
+                EmitCanceled(book, resting, txnNanos, CancelReason.AuctionExpired);
+            }
+        }
+
         // M2 hook: the drain mutated the book — recompute and emit a
         // final TheoreticalOpeningPrice/Imbalance frame (typically
         // HasTop=false now since the crossing volume was consumed).

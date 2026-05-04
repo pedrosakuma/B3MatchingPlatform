@@ -118,6 +118,15 @@ internal sealed class LimitOrderBook
 
     public bool TryGet(long orderId, out RestingOrder order) => _byOrderId.TryGetValue(orderId, out order!);
 
+    /// <summary>
+    /// Snapshot of all resting orders, taken eagerly so callers can mutate
+    /// the book (cancel orders) while iterating. Used by the auction
+    /// expiration sweep in <see cref="MatchingEngine.UncrossAuction"/> to
+    /// find <see cref="TimeInForce.GoodForAuction"/> /
+    /// <see cref="TimeInForce.AtClose"/> survivors. Issue #232 / Onda M5.
+    /// </summary>
+    public IReadOnlyList<RestingOrder> SnapshotOrders() => _byOrderId.Values.ToList();
+
     private SortedDictionary<long, PriceLevel> SideMap(Side side) => side == Side.Buy ? _bids : _asks;
 
     public void Insert(RestingOrder o)
