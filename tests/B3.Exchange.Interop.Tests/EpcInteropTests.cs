@@ -197,7 +197,7 @@ public class EpcInteropTests : IAsyncLifetime
         // hardcodes OrigClOrdID = null (SDK bug, not gateway).
     }
 
-    [Fact(Skip = "EPC SDK 0.14.0 bug: OrderCancelReplace encoder writes StopPx at offset 84 which overwrites OrigClOrdID (also at offset 84 per the OrderCancelReplaceRequestData struct). The encoder's hand-written explicit offsets for StopPx/MinQty/MaxFloor/AccountType/ExpireDate are all -8 from the struct's declared FieldOffsets. As a result OrigClOrdID never reaches the wire and the gateway correctly rejects 'requires either OrderID or OrigClOrdID'. Tracked by #252; re-enable when the SDK ships a fix or our gateway gets a OrigClOrdID-via-RAM-clobber heuristic.")]
+    [Fact]
     public async Task NewOrderSingleV6_Submit_Replace_Cancel_RoundTrips()
     {
         // Drives template 102 (NewOrderSingle V6) + template 104
@@ -374,7 +374,7 @@ public class EpcInteropTests : IAsyncLifetime
         await pump;
     }
 
-    [Fact(Skip = "EPC SDK 0.14.0 bug: FixpClientSession.RunInboundLoopAsync calls _eventWriter.TryComplete() when it receives a Terminate frame (case 7), but _eventWriter is the shared EntryPointClient._events channel — completing it permanently. EntryPointClient.ReconnectAsync sends Terminate to the prior session, which closes _events; the new session's inbound loop then faults on the next WriteAsync with 'The channel has been closed' and the test never observes the second order's ExecutionReport. The gateway behaves correctly: host logs confirm the second SimpleNewOrder is processed and its ER is sent on the wire — only the client-side event surface is broken across reconnects. Tracked by #253; re-enable when SDK 0.14.1+ scopes the writer per-session.")]
+    [Fact]
     public async Task Reconnect_WithNonZeroNextSeqNo_DoesNotTriggerNotApplied()
     {
         // Regression for #239(b): client reconnecting with NextSeqNo > 1
