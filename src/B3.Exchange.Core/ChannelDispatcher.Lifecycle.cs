@@ -30,6 +30,12 @@ public sealed partial class ChannelDispatcher
         // after the first in-thread call has latched the owner.
         _engine.BindToDispatchThread(_loopThread);
 
+        // Issue #260: rehydrate from disk (if a persister is wired) on the
+        // loop thread so the engine's owner-thread invariant is satisfied
+        // and CaptureState/RestoreState see the same Thread identity as
+        // every subsequent ProcessOne.
+        LoadPersistedStateOnLoopThread();
+
         // Heartbeat is recorded on every loop wakeup (whether triggered by
         // new work or by the periodic timeout) so a stuck/dead dispatch
         // thread is detected by /health/live within HeartbeatInterval +

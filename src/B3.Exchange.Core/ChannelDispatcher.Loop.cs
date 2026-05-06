@@ -35,18 +35,32 @@ public sealed partial class ChannelDispatcher
         if (item.Kind == WorkKind.OperatorBumpVersion)
         {
             ProcessBumpVersion();
+            // Issue #260 follow-up (review feedback on PR #261): operator
+            // BumpVersion publishes ChannelReset_11 and clears engine
+            // state. Persist post-flush so a crash after the reset cannot
+            // resurrect the pre-reset book on next boot.
+            OnAfterCommandFlushed();
             return;
         }
 
         if (item.Kind == WorkKind.OperatorTradeBust)
         {
             ProcessTradeBust(item.TradeBust!);
+            // Persist after publishing TradeBust_57 so the consumed RptSeq
+            // (engine.AllocateNextRptSeq) survives restart — otherwise a
+            // restart would re-issue the same RptSeq for a different event.
+            OnAfterCommandFlushed();
             return;
         }
 
         if (item.Kind == WorkKind.OperatorSetTradingPhase)
         {
             ProcessSetTradingPhase(item.TradingPhase!);
+            // Persist after the phase mutation so the engine's per-symbol
+            // _phaseById map (captured into EngineStateSnapshot.Phases)
+            // and any RptSeq advance from SecurityStatus_3 emission
+            // survive restart.
+            OnAfterCommandFlushed();
             return;
         }
 
@@ -248,6 +262,11 @@ public sealed partial class ChannelDispatcher
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
+                // Issue #260: persist post-flush so any consumer-visible
+                // event corresponds to a durable snapshot on disk before
+                // the next command is observed. Best-effort: failures are
+                // logged and swallowed by the helper.
+                OnAfterCommandFlushed();
             }
             else
             {

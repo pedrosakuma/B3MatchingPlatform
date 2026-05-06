@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\B3.Exchange.Contracts\B3.Exchange.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Core\B3.Exchange.Core.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.Persistence\B3.Exchange.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

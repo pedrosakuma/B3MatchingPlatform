@@ -192,6 +192,22 @@ Exposes:
   30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
   `snapshot` block to publish only the incremental feed (no bootstrap for
   mid-session consumers).
+* `persistence` *(optional, per channel — issue #260)* — enables order
+  book + counter persistence so a restart resumes with the live working
+  book, RptSeq, and order/trade-id allocators intact. When present, the
+  dispatcher writes an atomic JSON snapshot to
+  `{dataDir}/channel-{N}.snapshot` after every command flush and reloads
+  it on the dispatch loop's first turn.
+  * `dataDir` — directory holding the per-channel snapshot file. The host
+    creates it if missing. Mount a durable volume here in container
+    deployments (e.g. `/var/lib/b3matching` — see Dockerfile).
+  * Limitations *(out of scope for this PR; tracked separately)*: stop
+    orders, auction-top throttling state, the UMDF retransmit ring,
+    snapshot-rotator cursor, and FIXP session counters are not persisted.
+    Resting `OrderRegistry` ownership is restored as-is — passive fills
+    that arrive while the original session is still away are dropped on
+    the floor as before. Omit the `persistence` block to keep the legacy
+    stateless boot.
 
 ## Operability endpoints
 
