@@ -68,6 +68,18 @@ public sealed class ChannelMetrics
     public LatencyHistogram OutboundEmit { get; } = new();
     public LatencyHistogram InboundDecode { get; } = new();
 
+    // Issue #265: persistence observability. Snapshot writes are sampled
+    // on the dispatch thread (in OnAfterCommandFlushed); the load path
+    // observes once per channel boot.
+    public LatencyHistogram SnapshotWrite { get; } = new();
+    public LatencyHistogram SnapshotLoad { get; } = new();
+    private long _snapshotSavesOk;
+    private long _snapshotSaveFailures;
+    private long _snapshotValidationFailures;
+    private long _snapshotRestoreFailures;
+    private long _snapshotLastSizeBytes;
+    private long _snapshotLastSuccessUnixMs;
+
     // Issue #174: throughput counters — per-channel, labelled by a small
     // bounded set (msg_type / exec_type / feed). Indexed by the enum's
     // numeric value so increments are a single Interlocked op.
@@ -143,6 +155,22 @@ public sealed class ChannelMetrics
     public void IncPublishErrorSocketError() => Interlocked.Increment(ref _publishErrors);
     public void IncPublishErrorHostUnreachable() => Interlocked.Increment(ref _publishErrorsHostUnreachable);
     public void IncPublishErrorMessageTooLarge() => Interlocked.Increment(ref _publishErrorsMessageTooLarge);
+
+    // Issue #265: persistence counters/gauges. Updated on the dispatch
+    // thread; read lock-free by the metrics scrape.
+    public long SnapshotSavesOk => Interlocked.Read(ref _snapshotSavesOk);
+    public long SnapshotSaveFailures => Interlocked.Read(ref _snapshotSaveFailures);
+    public long SnapshotValidationFailures => Interlocked.Read(ref _snapshotValidationFailures);
+    public long SnapshotRestoreFailures => Interlocked.Read(ref _snapshotRestoreFailures);
+    public long SnapshotLastSizeBytes => Interlocked.Read(ref _snapshotLastSizeBytes);
+    public long SnapshotLastSuccessUnixMs => Interlocked.Read(ref _snapshotLastSuccessUnixMs);
+
+    public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
+    public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
+    public void IncSnapshotValidationFailure() => Interlocked.Increment(ref _snapshotValidationFailures);
+    public void IncSnapshotRestoreFailure() => Interlocked.Increment(ref _snapshotRestoreFailures);
+    public void SetSnapshotLastSizeBytes(long bytes) => Interlocked.Exchange(ref _snapshotLastSizeBytes, bytes);
+    public void SetSnapshotLastSuccessUnixMs(long unixMs) => Interlocked.Exchange(ref _snapshotLastSuccessUnixMs, unixMs);
 
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
@@ -385,6 +413,32 @@ public sealed class MetricsRegistry
         EmitHistogram(sb, "exch_outbound_emit_seconds",
             "Latency to flush the per-command UMDF packet to the outbound sink (engine exit → packet sink return), in seconds.",
             channels, c => c.OutboundEmit);
+
+        // Issue #265: persistence (snapshot) observability.
+        EmitHistogram(sb, "exch_snapshot_write_seconds",
+            "Wall-clock duration of a single channel snapshot write (capture + serialize + atomic file write + fsync), in seconds. Sampled in OnAfterCommandFlushed; one observation per command.",
+            channels, c => c.SnapshotWrite);
+        EmitHistogram(sb, "exch_snapshot_load_seconds",
+            "Wall-clock duration of the boot-time snapshot load (TryLoad + RestoreChannelState), in seconds. One observation per channel start.",
+            channels, c => c.SnapshotLoad);
+        EmitCounter(sb, "exch_snapshot_saves_total",
+            "Total successful snapshot persists for this channel (issue #265).",
+            channels, c => c.SnapshotSavesOk);
+        EmitCounter(sb, "exch_snapshot_save_failures_total",
+            "Total snapshot persists that threw (typically I/O errors). The dispatcher logs and continues; a non-zero rate means the durability guarantee is degraded.",
+            channels, c => c.SnapshotSaveFailures);
+        EmitCounter(sb, "exch_snapshot_validation_failures_total",
+            "Total boot-time snapshots rejected by ValidateSnapshotStructure (orphan owners, duplicate orderId, malformed stop, etc.). Each increment fails the channel closed and requires operator action.",
+            channels, c => c.SnapshotValidationFailures);
+        EmitCounter(sb, "exch_snapshot_restore_failures_total",
+            "Total boot-time snapshots that passed structural validation but failed during MatchingEngine.RestoreState or registry rebuild. Each increment fails the channel closed.",
+            channels, c => c.SnapshotRestoreFailures);
+        EmitGauge(sb, "exch_snapshot_last_size_bytes",
+            "Size in bytes of the most recently persisted snapshot for this channel, or 0 if none have been written yet.",
+            channels, c => c.SnapshotLastSizeBytes);
+        EmitGauge(sb, "exch_snapshot_last_success_unixms",
+            "Unix time (milliseconds) of the most recent successful snapshot persist; 0 if no snapshot has been persisted yet. Use with rate(now() - this) for staleness alerts.",
+            channels, c => c.SnapshotLastSuccessUnixMs);
 
         // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
         // exec_type ≤ 7, feed = 3) — safe to ship per-channel.

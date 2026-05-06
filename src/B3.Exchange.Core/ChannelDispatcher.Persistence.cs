@@ -203,24 +203,43 @@ public sealed partial class ChannelDispatcher
     {
         if (_persister is null) return;
         ChannelStateSnapshot? snapshot;
+        var loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             snapshot = _persister.TryLoad(ChannelNumber);
         }
         catch (Exception ex)
         {
+            _metrics?.IncSnapshotRestoreFailure();
             _logger.LogError(ex,
                 "channel {ChannelNumber}: persister TryLoad threw — failing channel closed",
                 ChannelNumber);
             throw;
         }
-        if (snapshot is null) return;
+        if (snapshot is null)
+        {
+            _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
+            return;
+        }
         try
         {
             RestoreChannelState(snapshot);
+            _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // ValidateSnapshotStructure rejects → bump the validation
+            // counter so operators can alert on "snapshot rejected"
+            // independently of generic IO/restore failures.
+            _metrics?.IncSnapshotValidationFailure();
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: snapshot structural validation failed — failing channel closed (snapshot must be repaired or removed)",
+                ChannelNumber);
+            throw;
         }
         catch (Exception ex)
         {
+            _metrics?.IncSnapshotRestoreFailure();
             _logger.LogError(ex,
                 "channel {ChannelNumber}: RestoreChannelState failed — failing channel closed (snapshot must be repaired or removed)",
                 ChannelNumber);
@@ -237,13 +256,23 @@ public sealed partial class ChannelDispatcher
     private void OnAfterCommandFlushed()
     {
         if (_persister is null) return;
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             var snap = CaptureChannelState();
-            _persister.Save(snap);
+            var bytes = _persister.Save(snap);
+            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            if (_metrics is { } m)
+            {
+                m.SnapshotWrite.ObserveTicks(elapsed);
+                m.IncSnapshotSaveOk();
+                if (bytes > 0) m.SetSnapshotLastSizeBytes(bytes);
+                m.SetSnapshotLastSuccessUnixMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            }
         }
         catch (Exception ex)
         {
+            _metrics?.IncSnapshotSaveFailure();
             _metrics?.IncDispatcherCrashes();
             _logger.LogError(ex, "channel {ChannelNumber}: persister Save failed", ChannelNumber);
         }
