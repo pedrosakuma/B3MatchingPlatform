@@ -32,6 +32,7 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ChannelMetrics? _metrics;
     private readonly byte _channelNumber;
+    private readonly Action<ChannelStateSnapshot>? _onSaved;
     private readonly SemaphoreSlim _signal = new(0, 1);
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _writerTask;
@@ -46,12 +47,14 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
         byte channelNumber,
         IChannelStatePersister persister,
         ILogger logger,
-        ChannelMetrics? metrics = null)
+        ChannelMetrics? metrics = null,
+        Action<ChannelStateSnapshot>? onSaved = null)
     {
         _channelNumber = channelNumber;
         _persister = persister;
         _logger = logger;
         _metrics = metrics;
+        _onSaved = onSaved;
         // The writer is a long-lived background task; LongRunning hints
         // the scheduler to use a dedicated thread instead of a
         // ThreadPool slot, since this task spends most of its life
@@ -119,6 +122,20 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
                 m.IncSnapshotSaveOk();
                 if (bytes > 0) m.SetSnapshotLastSizeBytes(bytes);
                 m.SetSnapshotLastSuccessUnixMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            }
+            // Issue #269: invoke optional post-save callback so the
+            // dispatcher can truncate the WAL on the writer thread,
+            // guaranteeing the WAL is only ever truncated after a
+            // durable snapshot exists on disk.
+            if (_onSaved is { } cb)
+            {
+                try { cb(snap); }
+                catch (Exception cbEx)
+                {
+                    _logger.LogError(cbEx,
+                        "channel {ChannelNumber}: background snapshot writer onSaved callback threw",
+                        _channelNumber);
+                }
             }
         }
         catch (Exception ex)

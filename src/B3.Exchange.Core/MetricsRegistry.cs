@@ -171,6 +171,29 @@ public sealed class ChannelMetrics
     public long SnapshotDroppedByBackpressure => Interlocked.Read(ref _snapshotDroppedByBackpressure);
     public void IncSnapshotDroppedByBackpressure() => Interlocked.Increment(ref _snapshotDroppedByBackpressure);
 
+    // Issue #269: Write-Ahead Log counters. Updated on the dispatch
+    // thread (Append, Truncate) and on the background writer thread
+    // when async-writer mode triggers truncation post-Save. Read
+    // lock-free by the metrics scrape.
+    private long _walAppends;
+    private long _walBytesAppended;
+    private long _walTruncations;
+    private long _walReplays;
+    public long WalAppends => Interlocked.Read(ref _walAppends);
+    public long WalBytesAppended => Interlocked.Read(ref _walBytesAppended);
+    public long WalTruncations => Interlocked.Read(ref _walTruncations);
+    public long WalReplays => Interlocked.Read(ref _walReplays);
+    public void IncWalAppend(long bytes)
+    {
+        Interlocked.Increment(ref _walAppends);
+        if (bytes > 0) Interlocked.Add(ref _walBytesAppended, bytes);
+    }
+    public void IncWalTruncation() => Interlocked.Increment(ref _walTruncations);
+    public void AddWalReplays(long count)
+    {
+        if (count > 0) Interlocked.Add(ref _walReplays, count);
+    }
+
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
     public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
     public void IncSnapshotValidationFailure() => Interlocked.Increment(ref _snapshotValidationFailures);
@@ -451,6 +474,23 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_snapshot_dropped_by_backpressure_total",
             "Total snapshots that the BackgroundSnapshotWriter (issue #268) discarded because a newer snapshot was submitted before the previous one had been written. Last-write-wins semantics preserve correctness — each snapshot is a complete state image — but a high rate indicates the writer cannot keep up with the loop and RPO is degraded.",
             channels, c => c.SnapshotDroppedByBackpressure);
+
+        // Issue #269: Write-Ahead Log counters. Append rate equals the
+        // accepted state-mutating command rate when the WAL is enabled;
+        // truncations equal successful snapshot persists; replays count
+        // WAL records consumed at boot recovery.
+        EmitCounter(sb, "exch_wal_appends_total",
+            "Total Write-Ahead Log records appended on this channel. Equals the accepted state-mutating command rate (NewOrder/Cancel/Replace) while WAL is enabled.",
+            channels, c => c.WalAppends);
+        EmitCounter(sb, "exch_wal_bytes_appended_total",
+            "Total bytes appended to the Write-Ahead Log on this channel (sum of JSON-Lines record lengths including newline terminators).",
+            channels, c => c.WalBytesAppended);
+        EmitCounter(sb, "exch_wal_truncations_total",
+            "Total Write-Ahead Log truncations on this channel. Each successful snapshot persist truncates the WAL so it only contains records not yet reflected in the snapshot.",
+            channels, c => c.WalTruncations);
+        EmitCounter(sb, "exch_wal_replays_total",
+            "Total WAL records replayed at boot to bring this channel up to the most-recently-acknowledged command. Non-zero only on the boot following an unclean shutdown.",
+            channels, c => c.WalReplays);
 
         // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
         // exec_type ≤ 7, feed = 3) — safe to ship per-channel.

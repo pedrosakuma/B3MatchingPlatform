@@ -81,6 +81,16 @@ public sealed partial class ChannelDispatcher
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
+        // Issue #269: write-ahead the command before the engine
+        // observes it. Only New/Cancel/Replace are durable today;
+        // operator commands force-snapshot post-flush so the
+        // resulting state is captured directly. _lastAppliedSeq is
+        // advanced by WalAppendIfEnabled regardless, including in
+        // replay mode, so the on-loop counter stays consistent.
+        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
+        {
+            WalAppendIfEnabled(in item);
+        }
         bool succeeded = false;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue

@@ -292,6 +292,39 @@ public sealed class PersistenceConfig
     /// when absent or zero.
     /// </summary>
     [JsonPropertyName("generations")] public int Generations { get; set; }
+
+    /// <summary>
+    /// Issue #269: optional Write-Ahead Log between snapshots. When
+    /// <see cref="WalConfig.Enabled"/> is <c>true</c> the dispatcher
+    /// appends one record per state-mutating command before the engine
+    /// observes it and replays the surviving records on cold start —
+    /// closing the gap between the most-recent snapshot and an
+    /// unclean shutdown. Off by default so existing deployments keep
+    /// the snapshot-only behaviour (and pay no per-command file IO).
+    /// </summary>
+    [JsonPropertyName("wal")] public WalConfig? Wal { get; set; }
+}
+
+/// <summary>
+/// JSON projection of the per-channel Write-Ahead Log settings
+/// (issue #269). The WAL file lives in the same
+/// <see cref="PersistenceConfig.DataDir"/> as the snapshot files
+/// (named <c>channel-{N}.wal</c>); a successful snapshot persist
+/// truncates it.
+/// </summary>
+public sealed class WalConfig
+{
+    /// <summary>Master switch. <c>false</c> ⇒ no WAL file is opened
+    /// or replayed — the channel behaves exactly as it did before
+    /// issue #269.</summary>
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+
+    /// <summary>When <c>true</c> (default) every <c>Append</c> calls
+    /// <c>fsync</c> before returning, giving zero-RPO at the cost of
+    /// per-command disk latency. Set to <c>false</c> for higher
+    /// throughput on workloads that tolerate losing the last few
+    /// commands on a host crash.</summary>
+    [JsonPropertyName("fsyncPerWrite")] public bool FsyncPerWrite { get; set; } = true;
 }
 
 /// <summary>

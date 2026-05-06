@@ -43,6 +43,16 @@ public sealed record ChannelStateSnapshot(
     IReadOnlyList<OrderOwnerSnapshot> Owners)
 {
     public const int CurrentVersion = 1;
+
+    /// <summary>
+    /// Issue #269: monotonic counter of commands the dispatcher has
+    /// applied at the time this snapshot was captured. Used by the
+    /// Write-Ahead Log replay path to skip entries already covered by
+    /// the snapshot. Defaults to 0 for snapshots persisted by the
+    /// pre-#269 dispatcher; the WAL replay treats 0 as "no prior
+    /// applied seq" and replays everything in the log.
+    /// </summary>
+    public long LastAppliedSeq { get; init; }
 }
 
 /// <summary>
