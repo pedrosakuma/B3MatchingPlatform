@@ -262,6 +262,30 @@ public sealed class ChannelConfig
 public sealed class PersistenceConfig
 {
     [JsonPropertyName("dataDir")] public string DataDir { get; set; } = "";
+
+    /// <summary>
+    /// Optional snapshot throttling (issue #267). Absent or both fields
+    /// zero means "persist after every command flush" — the PR #261
+    /// default. Provide either <c>everyN</c> (commands), <c>minIntervalMs</c>
+    /// (wall-clock), or both (whichever fires first triggers the persist).
+    /// Operator commands always force-persist regardless of throttle.
+    /// </summary>
+    [JsonPropertyName("throttle")] public SnapshotThrottleConfig? Throttle { get; set; }
+}
+
+/// <summary>
+/// JSON projection of <see cref="B3.Exchange.Core.SnapshotThrottlePolicy"/>.
+/// </summary>
+public sealed class SnapshotThrottleConfig
+{
+    [JsonPropertyName("everyN")] public int EveryNCommands { get; set; } = 1;
+    [JsonPropertyName("minIntervalMs")] public int MinIntervalMs { get; set; }
+
+    public B3.Exchange.Core.SnapshotThrottlePolicy ToPolicy() => new()
+    {
+        EveryNCommands = EveryNCommands,
+        MinIntervalMs = MinIntervalMs,
+    };
 }
 
 /// <summary>

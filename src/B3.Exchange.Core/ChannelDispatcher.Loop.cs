@@ -39,7 +39,9 @@ public sealed partial class ChannelDispatcher
             // BumpVersion publishes ChannelReset_11 and clears engine
             // state. Persist post-flush so a crash after the reset cannot
             // resurrect the pre-reset book on next boot.
-            OnAfterCommandFlushed();
+            // Issue #267: operator commands always force-persist, bypassing
+            // the throttle policy.
+            OnAfterCommandFlushed(force: true);
             return;
         }
 
@@ -49,7 +51,7 @@ public sealed partial class ChannelDispatcher
             // Persist after publishing TradeBust_57 so the consumed RptSeq
             // (engine.AllocateNextRptSeq) survives restart — otherwise a
             // restart would re-issue the same RptSeq for a different event.
-            OnAfterCommandFlushed();
+            OnAfterCommandFlushed(force: true);
             return;
         }
 
@@ -60,7 +62,7 @@ public sealed partial class ChannelDispatcher
             // _phaseById map (captured into EngineStateSnapshot.Phases)
             // and any RptSeq advance from SecurityStatus_3 emission
             // survive restart.
-            OnAfterCommandFlushed();
+            OnAfterCommandFlushed(force: true);
             return;
         }
 

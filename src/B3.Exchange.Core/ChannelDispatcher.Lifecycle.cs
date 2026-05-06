@@ -92,6 +92,20 @@ public sealed partial class ChannelDispatcher
         {
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
+        finally
+        {
+            // Issue #267: ensure any throttle-deferred state is durable
+            // before the loop thread exits. Operator commands always
+            // force-persist, so this only matters when regular order
+            // commands have been deferred.
+            try { FlushPendingSnapshotOnShutdown(); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: final shutdown snapshot flush failed",
+                    ChannelNumber);
+            }
+        }
     }
 
     private void RecordHeartbeat()
@@ -171,6 +185,15 @@ public sealed partial class ChannelDispatcher
         /// <see cref="ChannelDispatcher.KillForTesting"/>.
         /// </summary>
         public void Kill() => _disp.KillForTesting();
+
+        /// <summary>
+        /// Test seam for the cooperative-shutdown final snapshot flush
+        /// (issue #267). Production code never calls this directly —
+        /// it runs from the loop's <c>finally</c> block. Tests that
+        /// drive the dispatcher via <see cref="DrainInbound"/> bypass
+        /// the loop and so must trigger the shutdown hook explicitly.
+        /// </summary>
+        public void FlushPendingSnapshotOnShutdown() => _disp.FlushPendingSnapshotOnShutdown();
     }
 
     public async ValueTask DisposeAsync()

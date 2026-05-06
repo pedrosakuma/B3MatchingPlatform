@@ -142,6 +142,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// (legacy behaviour).
     /// </summary>
     private readonly IChannelStatePersister? _persister;
+    private readonly SnapshotThrottlePolicy _snapshotThrottle;
+    // Throttle bookkeeping (issue #267). Mutated only on the dispatch
+    // loop thread → no Interlocked needed.
+    private long _commandsSincePersist;
+    private long _lastPersistUnixMs;
+    private bool _pendingDirty;
 
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
@@ -193,7 +199,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ChannelMetrics? metrics = null,
         BoundedSessionFirmCounters? sessionFirmCounters = null,
         UmdfPacketRetransmitBuffer? retxBuffer = null,
-        IChannelStatePersister? persister = null)
+        IChannelStatePersister? persister = null,
+        SnapshotThrottlePolicy? snapshotThrottle = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -207,6 +214,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _sessionFirmCounters = sessionFirmCounters;
         _retxBuffer = retxBuffer;
         _persister = persister;
+        _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the
         // instance. No memory barrier is needed.
