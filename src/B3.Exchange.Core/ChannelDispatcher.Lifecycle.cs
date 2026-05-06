@@ -203,6 +203,19 @@ public sealed partial class ChannelDispatcher
         _inbound.Writer.TryComplete();
         try { _cts.Cancel(); } catch { }
         if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
+        // Issue #268: ensure any in-flight async snapshot is durable
+        // before tearing down. The writer drains its pending mailbox
+        // inside StopAsync.
+        if (_asyncSnapshotWriter is { } writer)
+        {
+            try { await writer.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: BackgroundSnapshotWriter shutdown drain failed",
+                    ChannelNumber);
+            }
+        }
         _cts.Dispose();
     }
 }

@@ -283,6 +283,18 @@ public sealed partial class ChannelDispatcher
         try
         {
             var snap = CaptureChannelState();
+            // Issue #268: when an async writer is configured the loop
+            // thread captures the POCO (cheap) and hands it off — the
+            // serialization + atomic write happen on a dedicated thread
+            // so loop throughput is independent of book size.
+            if (_asyncSnapshotWriter is { } writer)
+            {
+                writer.Submit(snap);
+                _commandsSincePersist = 0;
+                _lastPersistUnixMs = nowMs;
+                _pendingDirty = false;
+                return;
+            }
             var bytes = _persister.Save(snap);
             var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
             if (_metrics is { } m)
