@@ -27,9 +27,28 @@ public sealed partial class ChannelDispatcher
     public ChannelStateSnapshot CaptureChannelState()
     {
         AssertOnLoopThread();
-        var owners = new List<OrderOwnerSnapshot>(_orders.Count);
+        // Issue #260 follow-up (review feedback on PR #261): only owners
+        // for orders that the engine considers resting belong in the
+        // snapshot. Stop orders also live in _orders but are intentionally
+        // omitted from EngineStateSnapshot (they do not match against the
+        // limit book). Persisting them would resurrect phantom OrigClOrdID
+        // mappings on restore (cancels would resolve to non-existent
+        // engine orders). Compute the engine-resting set first, then
+        // filter.
+        var engineSnap = _engine.CaptureState();
+        var restingIds = new HashSet<long>();
+        foreach (var book in engineSnap.Books)
+            foreach (var o in book.Orders)
+                restingIds.Add(o.OrderId);
+        var owners = new List<OrderOwnerSnapshot>(restingIds.Count);
+        int dropped = 0;
         foreach (var entry in _orders.EnumerateAll())
         {
+            if (!restingIds.Contains(entry.OrderId))
+            {
+                dropped++;
+                continue;
+            }
             owners.Add(new OrderOwnerSnapshot(
                 OrderId: entry.OrderId,
                 SessionValue: entry.State.Session.Value ?? string.Empty,
@@ -38,12 +57,18 @@ public sealed partial class ChannelDispatcher
                 Side: entry.State.Side,
                 SecurityId: entry.State.SecurityId));
         }
+        if (dropped > 0)
+        {
+            _logger.LogDebug(
+                "channel {ChannelNumber}: snapshot dropped {Dropped} non-resting owners (stops/in-flight)",
+                ChannelNumber, dropped);
+        }
         return new ChannelStateSnapshot(
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: ChannelNumber,
             SequenceNumber: _sequenceNumber,
             SequenceVersion: _sequenceVersion,
-            Engine: _engine.CaptureState(),
+            Engine: engineSnap,
             Owners: owners);
     }
 
@@ -51,6 +76,14 @@ public sealed partial class ChannelDispatcher
     /// Restores dispatcher + engine state from <paramref name="snapshot"/>.
     /// Must be invoked on the dispatch thread, before any command has been
     /// processed. Refuses to overwrite a non-default state.
+    ///
+    /// <para>Issue #260 follow-up (review feedback on PR #261): all
+    /// structural validation runs <em>before</em> any mutation so the
+    /// engine cannot end up half-restored. If validation fails the
+    /// snapshot is rejected with no side effects; if engine/registry
+    /// rebuild fails after validation, the exception is propagated and
+    /// the channel must fail-closed (the loop terminates → heartbeat
+    /// goes stale → <c>/health/live</c> trips).</para>
     /// </summary>
     public void RestoreChannelState(ChannelStateSnapshot snapshot)
     {
@@ -64,6 +97,8 @@ public sealed partial class ChannelDispatcher
                 $"snapshot is for channel {snapshot.ChannelNumber}, not {ChannelNumber}");
         if (_orders.Count != 0)
             throw new InvalidOperationException("RestoreChannelState requires an empty OrderRegistry on the target dispatcher");
+
+        ValidateSnapshotStructure(snapshot);
 
         _engine.RestoreState(snapshot.Engine);
 
@@ -84,14 +119,54 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
+    /// Pure-read structural validation of <paramref name="snapshot"/>.
+    /// Throws <see cref="InvalidOperationException"/> with a precise
+    /// reason when the snapshot is malformed (duplicate orderIds across
+    /// books, owners referencing orderIds not present in any book, etc.).
+    /// Runs before any mutation so RestoreChannelState is all-or-nothing.
+    /// </summary>
+    private static void ValidateSnapshotStructure(ChannelStateSnapshot snapshot)
+    {
+        var seenOrderIds = new HashSet<long>();
+        foreach (var book in snapshot.Engine.Books)
+        {
+            foreach (var o in book.Orders)
+            {
+                if (o.RemainingQuantity <= 0)
+                    throw new InvalidOperationException(
+                        $"snapshot orderId {o.OrderId} on securityId {book.SecurityId} has non-positive remainingQuantity {o.RemainingQuantity}");
+                if (!seenOrderIds.Add(o.OrderId))
+                    throw new InvalidOperationException(
+                        $"snapshot contains duplicate orderId {o.OrderId} (in book for securityId {book.SecurityId})");
+                if (o.OrderId >= snapshot.Engine.NextOrderId)
+                    throw new InvalidOperationException(
+                        $"snapshot orderId {o.OrderId} is >= NextOrderId {snapshot.Engine.NextOrderId} (would collide with future allocations)");
+            }
+        }
+        foreach (var owner in snapshot.Owners)
+        {
+            if (!seenOrderIds.Contains(owner.OrderId))
+                throw new InvalidOperationException(
+                    $"snapshot owner refers to orderId {owner.OrderId} which is not present in any restored book");
+        }
+    }
+
+    /// <summary>
     /// Loads the persisted snapshot (when a persister is wired) and
     /// applies it on the dispatch thread. Called from
     /// <see cref="RunLoopAsync"/> immediately after
     /// <c>BindToDispatchThread</c>, so the engine's owner thread is the
     /// loop thread for both the restore and every subsequent dispatch.
-    /// Errors are logged and swallowed: a corrupt snapshot must not stop
-    /// the channel from accepting new orders (operators can fix the
-    /// underlying file or set <c>--reset-state</c>; future PR).
+    ///
+    /// <para>Issue #260 follow-up (review feedback on PR #261): a
+    /// corrupt/partial snapshot is fatal. We rethrow so the dispatch
+    /// loop exits, the heartbeat goes stale and <c>/health/live</c>
+    /// trips — that is preferable to silently running the channel with
+    /// a half-restored book (would risk duplicate IDs, missing
+    /// ownership, incorrect future matching). Operators must remove
+    /// or repair the snapshot file (or use a future <c>--reset-state</c>
+    /// flag) before restarting. <c>TryLoad</c>-time IO failures are
+    /// also fatal for the same reason.</para>
     /// </summary>
     private void LoadPersistedStateOnLoopThread()
     {
@@ -103,8 +178,10 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "channel {ChannelNumber}: persister TryLoad threw; starting from empty state", ChannelNumber);
-            return;
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: persister TryLoad threw — failing channel closed",
+                ChannelNumber);
+            throw;
         }
         if (snapshot is null) return;
         try
@@ -113,7 +190,10 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "channel {ChannelNumber}: RestoreChannelState failed; channel may be partially restored", ChannelNumber);
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: RestoreChannelState failed — failing channel closed (snapshot must be repaired or removed)",
+                ChannelNumber);
+            throw;
         }
     }
 

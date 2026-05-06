@@ -166,4 +166,144 @@ public class ChannelDispatcherPersistenceTests
 
         Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
     }
+
+    [Fact]
+    public void OperatorBumpVersion_TriggersPersistence()
+    {
+        // Review feedback on PR #261 (issue #260): visible
+        // ChannelReset_11 must be durable — otherwise a crash after the
+        // reset would resurrect the pre-reset book on next boot.
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("30303");
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("CL-1", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, 100, 1000UL),
+            session, enteringFirm: 300, clOrdIdValue: 0xDDDD));
+        probe.DrainInbound();
+        var beforeBump = persister.SaveCount;
+
+        Assert.True(disp.EnqueueOperatorBumpVersion());
+        probe.DrainInbound();
+
+        Assert.True(persister.SaveCount > beforeBump,
+            "BumpVersion must trigger an additional Save");
+        var snap = persister.TryLoad(84);
+        Assert.NotNull(snap);
+        // Engine has been reset → no resting orders, no owners.
+        Assert.Empty(snap!.Engine.Books.Single().Orders);
+        Assert.Empty(snap.Owners);
+        // SequenceVersion bumped, SequenceNumber reset (then bumped to 1
+        // by the ChannelReset_11 packet).
+        Assert.True(snap.SequenceVersion >= 2);
+    }
+
+    [Fact]
+    public void OperatorSetTradingPhase_TriggersPersistence()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var probe = disp.CreateTestProbe();
+        var beforePhase = persister.SaveCount;
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Sec,
+            B3.Exchange.Matching.TradingPhase.Pause));
+        probe.DrainInbound();
+
+        Assert.True(persister.SaveCount > beforePhase,
+            "SetTradingPhase must trigger a Save so the new phase survives restart");
+        var snap = persister.TryLoad(84);
+        Assert.NotNull(snap);
+        Assert.Contains(snap!.Engine.Phases,
+            p => p.SecurityId == Sec && p.Phase == B3.Exchange.Matching.TradingPhase.Pause);
+    }
+
+    [Fact]
+    public void Capture_FiltersStopOrderOwners()
+    {
+        // Review feedback on PR #261: stop orders are registered in
+        // _orders but are intentionally absent from the engine snapshot.
+        // CaptureChannelState must filter them out so a restored
+        // dispatcher does not have phantom OrigClOrdID → OrderId
+        // mappings pointing at non-existent engine orders.
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("40404");
+
+        // One regular Limit order (lands in book) plus one Stop order
+        // (registers ownership but stays off-book).
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("CL-LIMIT", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, 100, 1000UL),
+            session, enteringFirm: 400, clOrdIdValue: 0xE001));
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("CL-STOP", Sec, Side.Buy, OrderType.StopLoss,
+                TimeInForce.Day, Px(11.00m), 100, 100, 2000UL)
+            { StopPxMantissa = Px(10.50m) },
+            session, enteringFirm: 400, clOrdIdValue: 0xE002));
+        probe.DrainInbound();
+
+        var snap = persister.TryLoad(84);
+        Assert.NotNull(snap);
+        Assert.Single(snap!.Engine.Books.Single().Orders);
+        // Only the limit order's owner is persisted; the stop owner is
+        // dropped because no engine book contains its orderId.
+        Assert.Single(snap.Owners);
+        Assert.Equal(0xE001UL, snap.Owners.Single().ClOrdId);
+    }
+
+    [Fact]
+    public void Restore_RejectsSnapshotWithOrphanedOwners()
+    {
+        // Review feedback on PR #261: structural validation runs before
+        // any mutation so a bad snapshot cannot leave the engine
+        // half-restored.
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var snap = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 5, SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(2, 1, 0,
+                Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+                Array.Empty<EngineStateSnapshot.BookSnapshot>()),
+            Owners: new[]
+            {
+                new OrderOwnerSnapshot(
+                    OrderId: 99, SessionValue: "x", Firm: 1,
+                    ClOrdId: 0xAAAA, Side: Side.Buy, SecurityId: Sec),
+            });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
+        Assert.Contains("orderId 99", ex.Message);
+        // Engine must be untouched — counters at defaults.
+        Assert.Equal(0u, disp.SequenceNumber);
+        Assert.Equal((ushort)1, disp.SequenceVersion);
+        Assert.Equal(0, disp.OrderRegistryCount);
+    }
+
+    [Fact]
+    public void Restore_RejectsSnapshotWithDuplicateOrderId()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var dupOrder = new RestingOrderRecord(
+            OrderId: 1, ClOrdId: "x", Side: Side.Buy, PriceMantissa: Px(10.00m),
+            RemainingQuantity: 100, EnteringFirm: 1, InsertTimestampNanos: 0,
+            Tif: TimeInForce.Day, MaxFloor: 0, HiddenQuantity: 0);
+        var snap = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 0, SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(2, 1, 0,
+                Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+                new[] { new EngineStateSnapshot.BookSnapshot(Sec, new[] { dupOrder, dupOrder }) }),
+            Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var ex = Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
+        Assert.Contains("duplicate orderId", ex.Message);
+        Assert.Equal(0, disp.OrderRegistryCount);
+    }
 }
