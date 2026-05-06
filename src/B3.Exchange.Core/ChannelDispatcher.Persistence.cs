@@ -252,10 +252,33 @@ public sealed partial class ChannelDispatcher
     /// Captures the channel state and forwards it to the persister
     /// best-effort — exceptions are logged and swallowed so persistence
     /// failure never crashes the dispatcher.
+    ///
+    /// <para>Issue #267: when <paramref name="force"/> is <c>false</c>
+    /// (regular order-flow commands) the persist may be skipped per the
+    /// configured <see cref="SnapshotThrottlePolicy"/>; the dispatcher
+    /// then marks itself dirty so cooperative shutdown will flush a
+    /// final snapshot. Operator commands set <paramref name="force"/>
+    /// to <c>true</c> so SequenceVersion bumps, TradeBust replays and
+    /// trading-phase changes always persist immediately.</para>
     /// </summary>
-    private void OnAfterCommandFlushed()
+    private void OnAfterCommandFlushed(bool force = false)
     {
         if (_persister is null) return;
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (!force)
+        {
+            // First-ever call: no prior persist → treat msSinceLastSave
+            // as 0 so a configured MinIntervalMs grace window applies
+            // from boot rather than triggering immediately.
+            long sinceMs = _lastPersistUnixMs == 0 ? 0 : nowMs - _lastPersistUnixMs;
+            if (!_snapshotThrottle.ShouldPersist(_commandsSincePersist + 1, sinceMs))
+            {
+                _commandsSincePersist++;
+                _pendingDirty = true;
+                _metrics?.IncSnapshotSkippedByThrottle();
+                return;
+            }
+        }
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
@@ -267,8 +290,11 @@ public sealed partial class ChannelDispatcher
                 m.SnapshotWrite.ObserveTicks(elapsed);
                 m.IncSnapshotSaveOk();
                 if (bytes > 0) m.SetSnapshotLastSizeBytes(bytes);
-                m.SetSnapshotLastSuccessUnixMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                m.SetSnapshotLastSuccessUnixMs(nowMs);
             }
+            _commandsSincePersist = 0;
+            _lastPersistUnixMs = nowMs;
+            _pendingDirty = false;
         }
         catch (Exception ex)
         {
@@ -276,5 +302,18 @@ public sealed partial class ChannelDispatcher
             _metrics?.IncDispatcherCrashes();
             _logger.LogError(ex, "channel {ChannelNumber}: persister Save failed", ChannelNumber);
         }
+    }
+
+    /// <summary>
+    /// Forces a final snapshot if the throttle policy has accumulated
+    /// pending state (issue #267). Called from the cooperative shutdown
+    /// path so a quiet period after the last command flush does not
+    /// silently lose work that the throttle deferred.
+    /// </summary>
+    internal void FlushPendingSnapshotOnShutdown()
+    {
+        if (_persister is null) return;
+        if (!_pendingDirty) return;
+        OnAfterCommandFlushed(force: true);
     }
 }

@@ -164,6 +164,9 @@ public sealed class ChannelMetrics
     public long SnapshotRestoreFailures => Interlocked.Read(ref _snapshotRestoreFailures);
     public long SnapshotLastSizeBytes => Interlocked.Read(ref _snapshotLastSizeBytes);
     public long SnapshotLastSuccessUnixMs => Interlocked.Read(ref _snapshotLastSuccessUnixMs);
+    private long _snapshotSkippedByThrottle;
+    public long SnapshotSkippedByThrottle => Interlocked.Read(ref _snapshotSkippedByThrottle);
+    public void IncSnapshotSkippedByThrottle() => Interlocked.Increment(ref _snapshotSkippedByThrottle);
 
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
     public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
@@ -439,6 +442,9 @@ public sealed class MetricsRegistry
         EmitGauge(sb, "exch_snapshot_last_success_unixms",
             "Unix time (milliseconds) of the most recent successful snapshot persist; 0 if no snapshot has been persisted yet. Use with rate(now() - this) for staleness alerts.",
             channels, c => c.SnapshotLastSuccessUnixMs);
+        EmitCounter(sb, "exch_snapshot_skipped_by_throttle_total",
+            "Total snapshot persists deferred by the SnapshotThrottlePolicy (issue #267). The dispatcher tracks the deferred state and forces a final flush at cooperative shutdown so quiet periods do not lose work.",
+            channels, c => c.SnapshotSkippedByThrottle);
 
         // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
         // exec_type ≤ 7, feed = 3) — safe to ship per-channel.

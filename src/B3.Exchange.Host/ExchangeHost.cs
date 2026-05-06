@@ -169,7 +169,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 metrics: channelMetrics,
                 sessionFirmCounters: _metrics.SessionFirmMessages,
                 retxBuffer: retxBuffer,
-                persister: BuildPersister(ch));
+                persister: BuildPersister(ch),
+                snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy());
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)

@@ -75,7 +75,8 @@ public class ChannelDispatcherPersistenceTests
     private static ChannelDispatcher BuildDispatcher(
         IChannelStatePersister persister,
         out NoOpOutbound outbound,
-        ChannelMetrics? metrics = null)
+        ChannelMetrics? metrics = null,
+        SnapshotThrottlePolicy? throttle = null)
     {
         outbound = new NoOpOutbound();
         var localOutbound = outbound;
@@ -87,7 +88,8 @@ public class ChannelDispatcherPersistenceTests
             outbound: localOutbound,
             logger: NullLogger<ChannelDispatcher>.Instance,
             metrics: metrics,
-            persister: persister);
+            persister: persister,
+            snapshotThrottle: throttle);
     }
 
     [Fact]
@@ -496,5 +498,111 @@ public class ChannelDispatcherPersistenceTests
         var ex = Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
         Assert.Contains("duplicate orderId", ex.Message);
         Assert.Equal(0, disp.OrderRegistryCount);
+    }
+
+    // -------- Issue #267: snapshot throttling --------
+
+    private static bool EnqueueOrder(ChannelDispatcher disp, SessionId session,
+        string clOrdId, ulong clOrdIdValue, ulong nanos)
+        => disp.EnqueueNewOrder(
+            new NewOrderCommand(clOrdId, Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, 100, nanos),
+            session, enteringFirm: 700, clOrdIdValue: clOrdIdValue);
+
+    [Fact]
+    public void Throttle_EveryNCommands_SkipsBelowThreshold_PersistsAtThreshold()
+    {
+        var persister = new InMemoryPersister();
+        var metrics = new ChannelMetrics(channelNumber: 84);
+        var policy = new SnapshotThrottlePolicy { EveryNCommands = 3, MinIntervalMs = 0 };
+        var disp = BuildDispatcher(persister, out _, metrics, policy);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("70701");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0x1, 1000UL));
+        probe.DrainInbound();
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(1, metrics.SnapshotSkippedByThrottle);
+
+        Assert.True(EnqueueOrder(disp, session, "CL-2", 0x2, 1001UL));
+        probe.DrainInbound();
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(2, metrics.SnapshotSkippedByThrottle);
+
+        // Third command hits threshold → persists.
+        Assert.True(EnqueueOrder(disp, session, "CL-3", 0x3, 1002UL));
+        probe.DrainInbound();
+        Assert.Equal(1, persister.SaveCount);
+        Assert.Equal(2, metrics.SnapshotSkippedByThrottle);
+        Assert.Equal(1L, metrics.SnapshotSavesOk);
+    }
+
+    [Fact]
+    public void Throttle_OperatorCommands_AlwaysForcePersist()
+    {
+        var persister = new InMemoryPersister();
+        var metrics = new ChannelMetrics(channelNumber: 84);
+        // Effectively never persist regular commands during the test
+        // window: 1 000 commands or 24h, whichever comes first.
+        var policy = new SnapshotThrottlePolicy { EveryNCommands = 1000, MinIntervalMs = 86_400_000 };
+        var disp = BuildDispatcher(persister, out _, metrics, policy);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("70702");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0x10, 2000UL));
+        probe.DrainInbound();
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(1, metrics.SnapshotSkippedByThrottle);
+
+        // Operator command bypasses throttle.
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Sec, B3.Exchange.Matching.TradingPhase.Pause));
+        probe.DrainInbound();
+        Assert.Equal(1, persister.SaveCount);
+
+        // BumpVersion also forces.
+        Assert.True(disp.EnqueueOperatorBumpVersion());
+        probe.DrainInbound();
+        Assert.Equal(2, persister.SaveCount);
+    }
+
+    [Fact]
+    public void Throttle_PendingDirty_FlushedOnShutdown()
+    {
+        var persister = new InMemoryPersister();
+        var metrics = new ChannelMetrics(channelNumber: 84);
+        var policy = new SnapshotThrottlePolicy { EveryNCommands = 1000, MinIntervalMs = 86_400_000 };
+        var disp = BuildDispatcher(persister, out _, metrics, policy);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("70703");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0x20, 3000UL));
+        probe.DrainInbound();
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(1, metrics.SnapshotSkippedByThrottle);
+
+        // Cooperative shutdown drains pending dirty state.
+        probe.FlushPendingSnapshotOnShutdown();
+        Assert.Equal(1, persister.SaveCount);
+
+        // Calling again is a no-op (dirty cleared after force flush).
+        probe.FlushPendingSnapshotOnShutdown();
+        Assert.Equal(1, persister.SaveCount);
+    }
+
+    [Fact]
+    public void Throttle_DefaultPolicy_PersistsEveryCommand()
+    {
+        // Sanity: dispatcher constructed without an explicit throttle
+        // (BuildDispatcher passes null) preserves PR #261 behaviour —
+        // every command persists.
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("70704");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0x30, 4000UL));
+        Assert.True(EnqueueOrder(disp, session, "CL-2", 0x31, 4001UL));
+        probe.DrainInbound();
+        Assert.Equal(2, persister.SaveCount);
     }
 }
