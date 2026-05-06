@@ -61,8 +61,10 @@ public interface IChannelStatePersister
     /// channel, or <c>null</c> when none exists / load failed.</summary>
     ChannelStateSnapshot? TryLoad(byte channelNumber);
 
-    /// <summary>Persists <paramref name="snapshot"/> atomically.
-    /// Implementations should perform tmp-write + fsync + rename so a
-    /// crash mid-write never leaves a partial file on disk.</summary>
-    void Save(ChannelStateSnapshot snapshot);
+    /// <summary>Persists <paramref name="snapshot"/> atomically and
+    /// returns the number of bytes written (or 0 if the implementation
+    /// does not measure size). Implementations should perform tmp-write
+    /// + fsync + rename so a crash mid-write never leaves a partial file
+    /// on disk.</summary>
+    long Save(ChannelStateSnapshot snapshot);
 }

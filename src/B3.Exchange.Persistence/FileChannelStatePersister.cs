@@ -78,23 +78,26 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         }
     }
 
-    public void Save(ChannelStateSnapshot snapshot)
+    public long Save(ChannelStateSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var path = SnapshotPath(snapshot.ChannelNumber);
         var tmp = TempPath(snapshot.ChannelNumber);
+        long bytesWritten;
         try
         {
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 JsonSerializer.Serialize(fs, snapshot, JsonOptions);
                 fs.Flush(flushToDisk: true);
+                bytesWritten = fs.Length;
             }
             // File.Move uses rename(2) on POSIX → atomic within the same
             // filesystem. overwrite=true so the previous snapshot is
             // replaced in place.
             File.Move(tmp, path, overwrite: true);
             FsyncDirectory(_dataDir);
+            return bytesWritten;
         }
         catch (Exception ex)
         {
