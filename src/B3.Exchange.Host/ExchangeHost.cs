@@ -170,7 +170,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 sessionFirmCounters: _metrics.SessionFirmMessages,
                 retxBuffer: retxBuffer,
                 persister: BuildPersister(ch),
-                snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy());
+                snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
+                useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)

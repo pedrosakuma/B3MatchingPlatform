@@ -167,6 +167,9 @@ public sealed class ChannelMetrics
     private long _snapshotSkippedByThrottle;
     public long SnapshotSkippedByThrottle => Interlocked.Read(ref _snapshotSkippedByThrottle);
     public void IncSnapshotSkippedByThrottle() => Interlocked.Increment(ref _snapshotSkippedByThrottle);
+    private long _snapshotDroppedByBackpressure;
+    public long SnapshotDroppedByBackpressure => Interlocked.Read(ref _snapshotDroppedByBackpressure);
+    public void IncSnapshotDroppedByBackpressure() => Interlocked.Increment(ref _snapshotDroppedByBackpressure);
 
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
     public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
@@ -445,6 +448,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_snapshot_skipped_by_throttle_total",
             "Total snapshot persists deferred by the SnapshotThrottlePolicy (issue #267). The dispatcher tracks the deferred state and forces a final flush at cooperative shutdown so quiet periods do not lose work.",
             channels, c => c.SnapshotSkippedByThrottle);
+        EmitCounter(sb, "exch_snapshot_dropped_by_backpressure_total",
+            "Total snapshots that the BackgroundSnapshotWriter (issue #268) discarded because a newer snapshot was submitted before the previous one had been written. Last-write-wins semantics preserve correctness — each snapshot is a complete state image — but a high rate indicates the writer cannot keep up with the loop and RPO is degraded.",
+            channels, c => c.SnapshotDroppedByBackpressure);
 
         // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
         // exec_type ≤ 7, feed = 3) — safe to ship per-channel.

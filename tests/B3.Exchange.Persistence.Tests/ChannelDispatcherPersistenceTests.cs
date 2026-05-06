@@ -76,7 +76,8 @@ public class ChannelDispatcherPersistenceTests
         IChannelStatePersister persister,
         out NoOpOutbound outbound,
         ChannelMetrics? metrics = null,
-        SnapshotThrottlePolicy? throttle = null)
+        SnapshotThrottlePolicy? throttle = null,
+        bool useAsyncSnapshotWriter = false)
     {
         outbound = new NoOpOutbound();
         var localOutbound = outbound;
@@ -89,7 +90,8 @@ public class ChannelDispatcherPersistenceTests
             logger: NullLogger<ChannelDispatcher>.Instance,
             metrics: metrics,
             persister: persister,
-            snapshotThrottle: throttle);
+            snapshotThrottle: throttle,
+            useAsyncSnapshotWriter: useAsyncSnapshotWriter);
     }
 
     [Fact]
@@ -604,5 +606,141 @@ public class ChannelDispatcherPersistenceTests
         Assert.True(EnqueueOrder(disp, session, "CL-2", 0x31, 4001UL));
         probe.DrainInbound();
         Assert.Equal(2, persister.SaveCount);
+    }
+
+    // -------- Issue #268: async snapshot writer --------
+
+    /// <summary>
+    /// Persister that blocks each Save until the test releases it,
+    /// allowing assertions about backpressure / coalescing.
+    /// </summary>
+    private sealed class BlockingPersister : IChannelStatePersister
+    {
+        private readonly ManualResetEventSlim _gate = new(initialState: false);
+        public int SaveCount { get; private set; }
+        public ChannelStateSnapshot? Last { get; private set; }
+
+        public ChannelStateSnapshot? TryLoad(byte channelNumber) => null;
+
+        public long Save(ChannelStateSnapshot snapshot)
+        {
+            _gate.Wait();
+            SaveCount++;
+            Last = snapshot;
+            return 0;
+        }
+
+        public void Release() => _gate.Set();
+    }
+
+    private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition()) return true;
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+        return condition();
+    }
+
+    [Fact]
+    public async Task AsyncWriter_Submits_PersistAfterFlush()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _, useAsyncSnapshotWriter: true);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("80801");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0xA0, 5000UL));
+        probe.DrainInbound();
+
+        // Async path → poll briefly; the writer thread must observe the
+        // submission and persist.
+        Assert.True(await WaitForAsync(() => persister.SaveCount >= 1, TimeSpan.FromSeconds(2)));
+        var snap = persister.TryLoad(84);
+        Assert.NotNull(snap);
+        Assert.Single(snap!.Engine.Books.Single().Orders);
+
+        await disp.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task AsyncWriter_RapidSubmits_CoalesceLastWriteWins()
+    {
+        // While Save is blocked, several captures in a row collapse to
+        // a single write because the mailbox is single-slot.
+        var blocking = new BlockingPersister();
+        var metrics = new ChannelMetrics(channelNumber: 84);
+        var disp = BuildDispatcher(blocking, out _, metrics, useAsyncSnapshotWriter: true);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("80802");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0xB0, 6000UL));
+        Assert.True(EnqueueOrder(disp, session, "CL-2", 0xB1, 6001UL));
+        Assert.True(EnqueueOrder(disp, session, "CL-3", 0xB2, 6002UL));
+        probe.DrainInbound();
+
+        // Writer thread should be blocked inside Save with the first
+        // submitted snapshot, while the next two were coalesced.
+        Assert.True(await WaitForAsync(() => metrics.SnapshotDroppedByBackpressure >= 2,
+            TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, blocking.SaveCount); // still blocked
+
+        // Release the blocked Save and let the writer drain.
+        blocking.Release();
+        await disp.DisposeAsync();
+
+        // After dispose we expect at most 2 actual writes (the first
+        // blocked one + the final coalesced one); never the full 3.
+        Assert.True(blocking.SaveCount <= 2,
+            $"Expected coalescing → at most 2 writes, got {blocking.SaveCount}");
+        Assert.True(blocking.SaveCount >= 1);
+        Assert.NotNull(blocking.Last);
+        // The final persisted snapshot must contain all 3 orders
+        // (last-write-wins semantics).
+        Assert.Equal(3, blocking.Last!.Engine.Books.Single().Orders.Count);
+    }
+
+    [Fact]
+    public async Task AsyncWriter_DisposeAsync_DrainsPendingSnapshot()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _, useAsyncSnapshotWriter: true);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("80803");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0xC0, 7000UL));
+        probe.DrainInbound();
+
+        // DisposeAsync drains the writer; persister must reflect the
+        // submitted snapshot before the call returns.
+        await disp.DisposeAsync();
+        Assert.True(persister.SaveCount >= 1);
+        Assert.NotNull(persister.TryLoad(84));
+    }
+
+    [Fact]
+    public async Task AsyncWriter_ThrowingPersister_DoesNotCrashWriter()
+    {
+        var throwing = new ThrowingPersister();
+        var metrics = new ChannelMetrics(channelNumber: 84);
+        var disp = BuildDispatcher(throwing, out _, metrics, useAsyncSnapshotWriter: true);
+        var probe = disp.CreateTestProbe();
+        var session = new SessionId("80804");
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 0xD0, 8000UL));
+        probe.DrainInbound();
+
+        Assert.True(await WaitForAsync(() => metrics.SnapshotSaveFailures >= 1,
+            TimeSpan.FromSeconds(2)));
+
+        // Subsequent submissions still flow — writer survived the throw.
+        Assert.True(EnqueueOrder(disp, session, "CL-2", 0xD1, 8001UL));
+        probe.DrainInbound();
+        Assert.True(await WaitForAsync(() => metrics.SnapshotSaveFailures >= 2,
+            TimeSpan.FromSeconds(2)));
+
+        await disp.DisposeAsync();
     }
 }

@@ -271,6 +271,16 @@ public sealed class PersistenceConfig
     /// Operator commands always force-persist regardless of throttle.
     /// </summary>
     [JsonPropertyName("throttle")] public SnapshotThrottleConfig? Throttle { get; set; }
+
+    /// <summary>
+    /// Issue #268: opt-in async snapshot writer. When <c>true</c> the
+    /// dispatcher captures the snapshot POCO on the loop thread (cheap)
+    /// and hands it off to a dedicated writer thread for serialization
+    /// and atomic write. Off by default so existing deployments keep
+    /// the synchronous (zero-RPO) behaviour. Backpressure is
+    /// last-write-wins — see exch_snapshot_dropped_by_backpressure_total.
+    /// </summary>
+    [JsonPropertyName("asyncWriter")] public bool AsyncWriter { get; set; }
 }
 
 /// <summary>

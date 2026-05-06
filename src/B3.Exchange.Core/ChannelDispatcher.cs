@@ -143,6 +143,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     private readonly IChannelStatePersister? _persister;
     private readonly SnapshotThrottlePolicy _snapshotThrottle;
+    private readonly BackgroundSnapshotWriter? _asyncSnapshotWriter;
     // Throttle bookkeeping (issue #267). Mutated only on the dispatch
     // loop thread → no Interlocked needed.
     private long _commandsSincePersist;
@@ -200,7 +201,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         BoundedSessionFirmCounters? sessionFirmCounters = null,
         UmdfPacketRetransmitBuffer? retxBuffer = null,
         IChannelStatePersister? persister = null,
-        SnapshotThrottlePolicy? snapshotThrottle = null)
+        SnapshotThrottlePolicy? snapshotThrottle = null,
+        bool useAsyncSnapshotWriter = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -215,6 +217,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _retxBuffer = retxBuffer;
         _persister = persister;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
+        // Issue #268: opt-in async snapshot writer. Off by default so
+        // pre-existing deployments keep the synchronous in-loop persist
+        // (zero-RPO). Enabled per channel via host config.
+        _asyncSnapshotWriter = (useAsyncSnapshotWriter && persister is not null)
+            ? new BackgroundSnapshotWriter(channelNumber, persister, logger, metrics)
+            : null;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the
         // instance. No memory barrier is needed.
