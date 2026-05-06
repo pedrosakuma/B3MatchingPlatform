@@ -220,27 +220,25 @@ public class ChannelDispatcherPersistenceTests
     }
 
     [Fact]
-    public void Capture_FiltersStopOrderOwners()
+    public void Capture_PersistsStopOrderOwners()
     {
-        // Review feedback on PR #261: stop orders are registered in
-        // _orders but are intentionally absent from the engine snapshot.
-        // CaptureChannelState must filter them out so a restored
-        // dispatcher does not have phantom OrigClOrdID → OrderId
-        // mappings pointing at non-existent engine orders.
+        // Issue #262: stop orders are now persisted alongside book
+        // orders. Both the StopLoss and its owner must appear in the
+        // snapshot so a restored dispatcher resumes the parked stop and
+        // can route a future trigger / cancel back to the original
+        // session.
         var persister = new InMemoryPersister();
         var disp = BuildDispatcher(persister, out _);
         var probe = disp.CreateTestProbe();
         var session = new SessionId("40404");
 
-        // One regular Limit order (lands in book) plus one Stop order
-        // (registers ownership but stays off-book).
         Assert.True(disp.EnqueueNewOrder(
             new NewOrderCommand("CL-LIMIT", Sec, Side.Buy, OrderType.Limit,
                 TimeInForce.Day, Px(10.00m), 100, 100, 1000UL),
             session, enteringFirm: 400, clOrdIdValue: 0xE001));
         Assert.True(disp.EnqueueNewOrder(
             new NewOrderCommand("CL-STOP", Sec, Side.Buy, OrderType.StopLoss,
-                TimeInForce.Day, Px(11.00m), 100, 100, 2000UL)
+                TimeInForce.Day, 0, 100, 100, 2000UL)
             { StopPxMantissa = Px(10.50m) },
             session, enteringFirm: 400, clOrdIdValue: 0xE002));
         probe.DrainInbound();
@@ -248,10 +246,115 @@ public class ChannelDispatcherPersistenceTests
         var snap = persister.TryLoad(84);
         Assert.NotNull(snap);
         Assert.Single(snap!.Engine.Books.Single().Orders);
-        // Only the limit order's owner is persisted; the stop owner is
-        // dropped because no engine book contains its orderId.
-        Assert.Single(snap.Owners);
-        Assert.Equal(0xE001UL, snap.Owners.Single().ClOrdId);
+        Assert.NotNull(snap.Engine.Stops);
+        var stop = Assert.Single(snap.Engine.Stops!);
+        Assert.Equal(OrderType.StopLoss, stop.StopType);
+        Assert.Equal(Px(10.50m), stop.StopPxMantissa);
+        Assert.Equal(0L, stop.LimitPriceMantissa);
+        Assert.Equal(2, snap.Owners.Count);
+        Assert.Contains(snap.Owners, o => o.ClOrdId == 0xE001);
+        Assert.Contains(snap.Owners, o => o.ClOrdId == 0xE002);
+    }
+
+    [Fact]
+    public void RestoreChannelState_RebuildsParkedStops()
+    {
+        // Issue #262: after restore the engine must hold the parked
+        // stop, the OrderRegistry must contain its owner mapping, and
+        // a Cancel-by-orderId must succeed (proving the stop is fully
+        // wired up).
+        var persister = new InMemoryPersister();
+        var dispA = BuildDispatcher(persister, out _);
+        var probeA = dispA.CreateTestProbe();
+        var session = new SessionId("50505");
+
+        Assert.True(dispA.EnqueueNewOrder(
+            new NewOrderCommand("CL-STOPLIM", Sec, Side.Sell, OrderType.StopLimit,
+                TimeInForce.Day, Px(9.50m), 100, 100, 1000UL)
+            { StopPxMantissa = Px(9.80m) },
+            session, enteringFirm: 500, clOrdIdValue: 0xF001));
+        probeA.DrainInbound();
+
+        long stopOid;
+        {
+            var snap = persister.TryLoad(84);
+            Assert.NotNull(snap);
+            Assert.NotNull(snap!.Engine.Stops);
+            var s = Assert.Single(snap.Engine.Stops!);
+            Assert.Equal(OrderType.StopLimit, s.StopType);
+            stopOid = s.OrderId;
+        }
+
+        // Fresh dispatcher, restore, then cancel the parked stop by
+        // its engine OrderId — only succeeds if both _stopById and
+        // OrderRegistry were rebuilt.
+        var dispB = BuildDispatcher(persister, out _);
+        var probeB = dispB.CreateTestProbe();
+        var loaded = persister.TryLoad(84);
+        Assert.NotNull(loaded);
+        dispB.RestoreChannelState(loaded!);
+        Assert.Equal(1, dispB.OrderRegistryCount);
+
+        Assert.True(dispB.EnqueueCancel(
+            new CancelOrderCommand(ClOrdId: "CL-STOPLIM-C", SecurityId: Sec, OrderId: stopOid, EnteredAtNanos: 2000UL),
+            session, enteringFirm: 500, clOrdIdValue: 0xF002, origClOrdIdValue: 0xF001));
+        probeB.DrainInbound();
+
+        // After cancel the stop ownership is evicted; a fresh capture
+        // shows no parked stops and no orphan owner.
+        var post = dispB.CaptureChannelState();
+        Assert.True(post.Engine.Stops is null || post.Engine.Stops.Count == 0);
+        Assert.Empty(post.Owners);
+    }
+
+    [Fact]
+    public void Restore_RejectsSnapshotWithDuplicateStopOrderId()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var dupStop = new RestingStopRecord(
+            OrderId: 1, ClOrdId: "x", SecurityId: Sec, Side: Side.Buy,
+            StopType: OrderType.StopLoss, Tif: TimeInForce.Day,
+            StopPxMantissa: Px(10.50m), LimitPriceMantissa: 0,
+            Quantity: 100, EnteringFirm: 1, EnteredAtNanos: 0);
+        var snap = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 0, SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(2, 1, 0,
+                Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+                Array.Empty<EngineStateSnapshot.BookSnapshot>(),
+                new[] { dupStop, dupStop }),
+            Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var ex = Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
+        Assert.Contains("duplicate orderId", ex.Message);
+        Assert.Equal(0, disp.OrderRegistryCount);
+    }
+
+    [Fact]
+    public void Restore_RejectsStopLossWithLimitPrice()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var bad = new RestingStopRecord(
+            OrderId: 1, ClOrdId: "x", SecurityId: Sec, Side: Side.Buy,
+            StopType: OrderType.StopLoss, Tif: TimeInForce.Day,
+            StopPxMantissa: Px(10.50m), LimitPriceMantissa: Px(11.00m),
+            Quantity: 100, EnteringFirm: 1, EnteredAtNanos: 0);
+        var snap = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 0, SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(2, 1, 0,
+                Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+                Array.Empty<EngineStateSnapshot.BookSnapshot>(),
+                new[] { bad }),
+            Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var ex = Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
+        Assert.Contains("StopLoss", ex.Message);
+        Assert.Equal(0, disp.OrderRegistryCount);
     }
 
     [Fact]

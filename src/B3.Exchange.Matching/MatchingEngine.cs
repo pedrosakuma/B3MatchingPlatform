@@ -146,7 +146,32 @@ public sealed class MatchingEngine
             var orders = kv.Value.EnumerateAllOrdersForSnapshot().ToList();
             books.Add(new EngineStateSnapshot.BookSnapshot(kv.Key, orders));
         }
-        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books);
+        // Issue #262: untriggered stops are persisted so a restart no
+        // longer silently loses parked StopLoss/StopLimit orders.
+        // Iterate _stopsBySymbol (instead of _stopById) so the per-symbol
+        // arrival order is preserved on restore — that order is observable
+        // when multiple stops trigger off the same trade and otherwise
+        // would scramble across restarts.
+        var stops = new List<RestingStopRecord>(_stopById.Count);
+        foreach (var kv in _stopsBySymbol)
+        {
+            foreach (var s in kv.Value)
+            {
+                stops.Add(new RestingStopRecord(
+                    OrderId: s.OrderId,
+                    ClOrdId: s.ClOrdId,
+                    SecurityId: s.SecurityId,
+                    Side: s.Side,
+                    StopType: s.StopType,
+                    Tif: s.Tif,
+                    StopPxMantissa: s.StopPxMantissa,
+                    LimitPriceMantissa: s.LimitPriceMantissa,
+                    Quantity: s.Quantity,
+                    EnteringFirm: s.EnteringFirm,
+                    EnteredAtNanos: s.EnteredAtNanos));
+            }
+        }
+        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books, stops);
     }
 
     /// <summary>
@@ -171,6 +196,8 @@ public sealed class MatchingEngine
             if (book.OrderCount != 0)
                 throw new InvalidOperationException("RestoreState requires empty books on the target engine");
         }
+        if (_stopById.Count != 0)
+            throw new InvalidOperationException("RestoreState requires no parked stops on the target engine");
 
         _nextOrderId = snapshot.NextOrderId;
         _nextTradeId = snapshot.NextTradeId;
@@ -197,8 +224,41 @@ public sealed class MatchingEngine
                 restored++;
             }
         }
-        _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeq={RptSeq} restingOrders={RestingOrders}",
-            _nextOrderId, _nextTradeId, _rptSeq, restored);
+        // Issue #262: rebuild parked stops. Snapshots predating #262 carry
+        // null Stops, treated as empty so older state files keep loading.
+        int restoredStops = 0;
+        if (snapshot.Stops is { } stopRecords)
+        {
+            foreach (var s in stopRecords)
+            {
+                if (!_stopsBySymbol.TryGetValue(s.SecurityId, out var bucket))
+                {
+                    _logger.LogWarning("RestoreState: ignoring stop orderId {OrderId} for unknown securityId {SecurityId}", s.OrderId, s.SecurityId);
+                    continue;
+                }
+                if (_stopById.ContainsKey(s.OrderId))
+                    throw new InvalidOperationException($"RestoreState: duplicate stop orderId {s.OrderId}");
+                var stop = new RestingStop
+                {
+                    OrderId = s.OrderId,
+                    ClOrdId = s.ClOrdId,
+                    Side = s.Side,
+                    StopType = s.StopType,
+                    Tif = s.Tif,
+                    StopPxMantissa = s.StopPxMantissa,
+                    LimitPriceMantissa = s.LimitPriceMantissa,
+                    Quantity = s.Quantity,
+                    EnteringFirm = s.EnteringFirm,
+                    EnteredAtNanos = s.EnteredAtNanos,
+                    SecurityId = s.SecurityId,
+                };
+                bucket.Add(stop);
+                _stopById.Add(s.OrderId, stop);
+                restoredStops++;
+            }
+        }
+        _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeq={RptSeq} restingOrders={RestingOrders} restingStops={RestingStops}",
+            _nextOrderId, _nextTradeId, _rptSeq, restored, restoredStops);
     }
 
     /// <summary>
@@ -248,6 +308,17 @@ public sealed class MatchingEngine
         => _booksById[securityId].EnumerateOrders(side);
 
     public int OrderCount(long securityId) => _booksById[securityId].OrderCount;
+
+    /// <summary>
+    /// Total number of untriggered stop orders parked across every
+    /// instrument. Issue #262 — exposes a counter the persistence tests
+    /// and HTTP /metrics endpoint can read without snapshotting state.
+    /// Read on the engine's owner thread.
+    /// </summary>
+    public int StopOrderCount
+    {
+        get { AssertOnOwnerThread(); return _stopById.Count; }
+    }
 
     /// <summary>
     /// Current trading phase for the supplied security. Throws
