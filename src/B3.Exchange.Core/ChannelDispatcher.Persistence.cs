@@ -1,6 +1,7 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
+using OrderType = B3.Exchange.Matching.OrderType;
 using Side = B3.Exchange.Matching.Side;
 
 namespace B3.Exchange.Core;
@@ -28,18 +29,19 @@ public sealed partial class ChannelDispatcher
     {
         AssertOnLoopThread();
         // Issue #260 follow-up (review feedback on PR #261): only owners
-        // for orders that the engine considers resting belong in the
-        // snapshot. Stop orders also live in _orders but are intentionally
-        // omitted from EngineStateSnapshot (they do not match against the
-        // limit book). Persisting them would resurrect phantom OrigClOrdID
-        // mappings on restore (cancels would resolve to non-existent
-        // engine orders). Compute the engine-resting set first, then
-        // filter.
+        // for orders that the engine considers live belong in the snapshot.
+        // Issue #262: stops are now persisted, so the "live" set is
+        // (resting in books) ∪ (parked stops). Owners for stop orders can
+        // therefore be persisted; owners for in-flight or fully-filled
+        // orders are still dropped.
         var engineSnap = _engine.CaptureState();
         var restingIds = new HashSet<long>();
         foreach (var book in engineSnap.Books)
             foreach (var o in book.Orders)
                 restingIds.Add(o.OrderId);
+        if (engineSnap.Stops is { } stops)
+            foreach (var s in stops)
+                restingIds.Add(s.OrderId);
         var owners = new List<OrderOwnerSnapshot>(restingIds.Count);
         int dropped = 0;
         foreach (var entry in _orders.EnumerateAll())
@@ -60,7 +62,7 @@ public sealed partial class ChannelDispatcher
         if (dropped > 0)
         {
             _logger.LogDebug(
-                "channel {ChannelNumber}: snapshot dropped {Dropped} non-resting owners (stops/in-flight)",
+                "channel {ChannelNumber}: snapshot dropped {Dropped} non-resting owners (in-flight)",
                 ChannelNumber, dropped);
         }
         return new ChannelStateSnapshot(
@@ -143,11 +145,40 @@ public sealed partial class ChannelDispatcher
                         $"snapshot orderId {o.OrderId} is >= NextOrderId {snapshot.Engine.NextOrderId} (would collide with future allocations)");
             }
         }
+        // Issue #262: validate stop records in the same id namespace as
+        // book orders — engine OrderIds are unique across (books ∪ stops).
+        if (snapshot.Engine.Stops is { } stops)
+        {
+            foreach (var s in stops)
+            {
+                if (s.Quantity <= 0)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} has non-positive quantity {s.Quantity}");
+                if (s.StopPxMantissa <= 0)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} has non-positive stopPx {s.StopPxMantissa}");
+                if (s.StopType != OrderType.StopLoss && s.StopType != OrderType.StopLimit)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} has non-stop OrderType {s.StopType}");
+                if (s.StopType == OrderType.StopLimit && s.LimitPriceMantissa <= 0)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} (StopLimit) has non-positive limit price {s.LimitPriceMantissa}");
+                if (s.StopType == OrderType.StopLoss && s.LimitPriceMantissa != 0)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} (StopLoss) must not carry a limit price (got {s.LimitPriceMantissa})");
+                if (!seenOrderIds.Add(s.OrderId))
+                    throw new InvalidOperationException(
+                        $"snapshot contains duplicate orderId {s.OrderId} (stop on securityId {s.SecurityId})");
+                if (s.OrderId >= snapshot.Engine.NextOrderId)
+                    throw new InvalidOperationException(
+                        $"snapshot stop orderId {s.OrderId} is >= NextOrderId {snapshot.Engine.NextOrderId}");
+            }
+        }
         foreach (var owner in snapshot.Owners)
         {
             if (!seenOrderIds.Contains(owner.OrderId))
                 throw new InvalidOperationException(
-                    $"snapshot owner refers to orderId {owner.OrderId} which is not present in any restored book");
+                    $"snapshot owner refers to orderId {owner.OrderId} which is not present in any restored book or stop");
         }
     }
 
