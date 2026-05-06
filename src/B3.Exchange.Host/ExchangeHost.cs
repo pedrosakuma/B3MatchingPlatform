@@ -432,9 +432,13 @@ public sealed class ExchangeHost : IAsyncDisposable
                 ch.ChannelNumber);
             return null;
         }
+        int generations = ch.Persistence.Generations > 0
+            ? ch.Persistence.Generations
+            : FileChannelStatePersister.DefaultGenerations;
         return new FileChannelStatePersister(
             ch.Persistence.DataDir,
-            _loggerFactory.CreateLogger<FileChannelStatePersister>());
+            _loggerFactory.CreateLogger<FileChannelStatePersister>(),
+            generations);
     }
 
     private FirmRegistry BuildFirmRegistry()

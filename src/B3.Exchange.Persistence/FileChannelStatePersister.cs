@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using B3.Exchange.Core;
@@ -7,31 +8,39 @@ namespace B3.Exchange.Persistence;
 
 /// <summary>
 /// File-system backed implementation of
-/// <see cref="IChannelStatePersister"/> (issue #260). One snapshot file per
-/// channel under <see cref="DataDirectory"/>:
-/// <c>channel-{N}.snapshot</c>, written atomically via
-/// tmp + fsync + rename so a crash mid-write can never leave a partial file.
+/// <see cref="IChannelStatePersister"/> (issue #260) with N rolling
+/// generations (issue #264). Snapshots are written to round-robin slots
+/// <c>channel-{N}.snapshot.{slot}</c> where <c>slot</c> is in
+/// <c>0..Generations-1</c>; the persister picks the newest valid slot
+/// on load and writes to <c>(lastUsed + 1) mod Generations</c> on save.
 ///
-/// <para>Serialization uses System.Text.Json with enums-as-strings for
-/// debuggability — operators can <c>cat</c> a snapshot and read it. The
-/// extra cost (vs binary) is bounded: typical snapshots are a few KB to a
-/// few MB and serialization happens once per command flush, off the
-/// hot UMDF send path.</para>
+/// <para>Load semantics: enumerate all per-channel files, sort by
+/// modification time descending, return the first that deserializes.
+/// A corrupted newest file therefore falls back transparently to the
+/// previous generation. <c>ValidateSnapshotStructure</c> failures still
+/// fail-closed in the dispatcher — generations defend against I/O-level
+/// corruption (truncated writes, bad JSON), not against semantically
+/// inconsistent snapshots.</para>
 ///
-/// <para><b>Atomicity:</b> on POSIX <see cref="File.Move(string, string, bool)"/>
-/// uses <c>rename(2)</c>, which is atomic on the same filesystem. We
-/// fsync the tmp file's data before rename and fsync the parent directory
-/// after rename so an abrupt power-loss is recoverable.</para>
+/// <para>Atomicity per slot remains the PR #261 contract: write to
+/// <c>.tmp</c>, fsync the data, rename, fsync the directory entry. The
+/// <c>rename(2)</c> is atomic on POSIX within the same filesystem.</para>
+///
+/// <para>Backward compatibility: a pre-#264 single file
+/// <c>channel-{N}.snapshot</c> (no slot suffix) is still considered on
+/// load. After the first successful generational write the legacy file
+/// is removed so subsequent loads pick from the rolling slots only.</para>
 /// </summary>
 public sealed class FileChannelStatePersister : IChannelStatePersister
 {
-    private const string SnapshotFileNameFormat = "channel-{0}.snapshot";
-    private const string TempFileNameFormat = "channel-{0}.snapshot.tmp";
+    public const int DefaultGenerations = 3;
+
+    private const string LegacyFileNameFormat = "channel-{0}.snapshot";
+    private const string SlotFileNameFormat = "channel-{0}.snapshot.{1}";
+    private const string TempFileNameFormat = "channel-{0}.snapshot.{1}.tmp";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        // Easier to diff/read in incident review. The marginal size cost
-        // is negligible for files of this scale.
         WriteIndented = false,
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
         Converters =
@@ -41,48 +50,79 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     };
 
     private readonly string _dataDir;
+    private readonly int _generations;
     private readonly ILogger<FileChannelStatePersister> _logger;
 
-    public string DataDirectory => _dataDir;
+    // Per-channel last-used slot, -1 = unknown (derive from filesystem).
+    // Mutated only inside Save under the per-channel lock.
+    private readonly Dictionary<byte, int> _lastUsedSlot = new();
+    private readonly object _slotLock = new();
 
-    public FileChannelStatePersister(string dataDirectory, ILogger<FileChannelStatePersister> logger)
+    public string DataDirectory => _dataDir;
+    public int Generations => _generations;
+
+    public FileChannelStatePersister(
+        string dataDirectory,
+        ILogger<FileChannelStatePersister> logger,
+        int generations = DefaultGenerations)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
         ArgumentNullException.ThrowIfNull(logger);
+        if (generations < 1)
+            throw new ArgumentOutOfRangeException(nameof(generations),
+                "generations must be >= 1");
         _dataDir = Path.GetFullPath(dataDirectory);
         _logger = logger;
+        _generations = generations;
         Directory.CreateDirectory(_dataDir);
     }
 
     public ChannelStateSnapshot? TryLoad(byte channelNumber)
     {
-        var path = SnapshotPath(channelNumber);
-        if (!File.Exists(path)) return null;
-        try
+        // Enumerate every generation slot + legacy file for this channel,
+        // newest mtime first, returning the first that deserializes
+        // successfully. This makes a corrupted newest slot transparently
+        // fall back to the previous generation.
+        var candidates = EnumerateCandidateFiles(channelNumber);
+        if (candidates.Count == 0) return null;
+
+        foreach (var (path, _) in candidates)
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(fs, JsonOptions);
-            if (snapshot is null)
+            try
             {
-                _logger.LogWarning("channel {ChannelNumber}: snapshot deserialized to null at {Path}", channelNumber, path);
-                return null;
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(fs, JsonOptions);
+                if (snapshot is null)
+                {
+                    _logger.LogWarning(
+                        "channel {ChannelNumber}: snapshot deserialized to null at {Path}; trying older generation",
+                        channelNumber, path);
+                    continue;
+                }
+                _logger.LogInformation(
+                    "channel {ChannelNumber}: loaded snapshot from {Path} (seq={SequenceNumber}/{SequenceVersion}, owners={OwnerCount})",
+                    channelNumber, path, snapshot.SequenceNumber, snapshot.SequenceVersion, snapshot.Owners.Count);
+                return snapshot;
             }
-            _logger.LogInformation("channel {ChannelNumber}: loaded snapshot from {Path} (seq={SequenceNumber}/{SequenceVersion}, owners={OwnerCount})",
-                channelNumber, path, snapshot.SequenceNumber, snapshot.SequenceVersion, snapshot.Owners.Count);
-            return snapshot;
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "channel {ChannelNumber}: failed to load snapshot at {Path}; trying older generation",
+                    channelNumber, path);
+            }
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "channel {ChannelNumber}: failed to load snapshot at {Path}; ignoring", channelNumber, path);
-            return null;
-        }
+        _logger.LogError(
+            "channel {ChannelNumber}: all {Count} candidate snapshot files failed to load",
+            channelNumber, candidates.Count);
+        return null;
     }
 
     public long Save(ChannelStateSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        var path = SnapshotPath(snapshot.ChannelNumber);
-        var tmp = TempPath(snapshot.ChannelNumber);
+        int slot = NextSlot(snapshot.ChannelNumber);
+        var path = SlotPath(snapshot.ChannelNumber, slot);
+        var tmp = TempPath(snapshot.ChannelNumber, slot);
         long bytesWritten;
         try
         {
@@ -92,48 +132,113 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
                 fs.Flush(flushToDisk: true);
                 bytesWritten = fs.Length;
             }
-            // File.Move uses rename(2) on POSIX → atomic within the same
-            // filesystem. overwrite=true so the previous snapshot is
-            // replaced in place.
             File.Move(tmp, path, overwrite: true);
             FsyncDirectory(_dataDir);
-            return bytesWritten;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "channel {ChannelNumber}: failed to persist snapshot to {Path}", snapshot.ChannelNumber, path);
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: failed to persist snapshot slot {Slot} to {Path}",
+                snapshot.ChannelNumber, slot, path);
             try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
             throw;
         }
+        // Best-effort: drop the legacy single-file once a generational
+        // write succeeded, so future loads stop considering it.
+        try
+        {
+            var legacy = LegacyPath(snapshot.ChannelNumber);
+            if (File.Exists(legacy)) File.Delete(legacy);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "channel {ChannelNumber}: failed to remove legacy snapshot file (non-fatal)",
+                snapshot.ChannelNumber);
+        }
+        return bytesWritten;
     }
 
-    private string SnapshotPath(byte channelNumber)
-        => Path.Combine(_dataDir, string.Format(System.Globalization.CultureInfo.InvariantCulture, SnapshotFileNameFormat, channelNumber));
+    /// <summary>
+    /// Picks the next round-robin slot for the channel, lazily deriving
+    /// the starting point from the on-disk newest file the first time
+    /// a channel is observed (so a host restart does not reuse the slot
+    /// that already contains the most recent snapshot).
+    /// </summary>
+    private int NextSlot(byte channelNumber)
+    {
+        lock (_slotLock)
+        {
+            if (!_lastUsedSlot.TryGetValue(channelNumber, out var last))
+            {
+                last = DiscoverNewestSlot(channelNumber);
+                _lastUsedSlot[channelNumber] = last;
+            }
+            int next = (last + 1) % _generations;
+            _lastUsedSlot[channelNumber] = next;
+            return next;
+        }
+    }
 
-    private string TempPath(byte channelNumber)
-        => Path.Combine(_dataDir, string.Format(System.Globalization.CultureInfo.InvariantCulture, TempFileNameFormat, channelNumber));
+    private int DiscoverNewestSlot(byte channelNumber)
+    {
+        int newest = -1;
+        DateTime newestMtime = DateTime.MinValue;
+        for (int i = 0; i < _generations; i++)
+        {
+            var p = SlotPath(channelNumber, i);
+            if (!File.Exists(p)) continue;
+            var mt = File.GetLastWriteTimeUtc(p);
+            if (mt > newestMtime)
+            {
+                newestMtime = mt;
+                newest = i;
+            }
+        }
+        return newest;
+    }
 
     /// <summary>
-    /// Ensures the parent directory entry for the renamed file is durable.
-    /// On Linux the BCL exposes no portable directory-fsync; we fall back
-    /// to opening the directory with <see cref="FileOptions.WriteThrough"/>
-    /// semantics where supported. Failures are non-fatal — they only widen
-    /// the crash-loss window for the very last rename.
+    /// Returns existing snapshot file paths for the channel (slot files
+    /// + legacy single-file if present), sorted by mtime descending.
     /// </summary>
+    private List<(string Path, DateTime Mtime)> EnumerateCandidateFiles(byte channelNumber)
+    {
+        var list = new List<(string, DateTime)>(_generations + 1);
+        for (int i = 0; i < _generations; i++)
+        {
+            var p = SlotPath(channelNumber, i);
+            if (File.Exists(p)) list.Add((p, File.GetLastWriteTimeUtc(p)));
+        }
+        var legacy = LegacyPath(channelNumber);
+        if (File.Exists(legacy)) list.Add((legacy, File.GetLastWriteTimeUtc(legacy)));
+        list.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        return list;
+    }
+
+    private string LegacyPath(byte channelNumber)
+        => Path.Combine(_dataDir,
+            string.Format(CultureInfo.InvariantCulture, LegacyFileNameFormat, channelNumber));
+
+    private string SlotPath(byte channelNumber, int slot)
+        => Path.Combine(_dataDir,
+            string.Format(CultureInfo.InvariantCulture, SlotFileNameFormat, channelNumber, slot));
+
+    private string TempPath(byte channelNumber, int slot)
+        => Path.Combine(_dataDir,
+            string.Format(CultureInfo.InvariantCulture, TempFileNameFormat, channelNumber, slot));
+
     private static void FsyncDirectory(string dir)
     {
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return;
         try
         {
-            // Open with O_DIRECTORY|O_RDONLY equivalent and call fsync.
-            // SafeFileHandle path keeps us off P/Invoke for portability.
             using var dirHandle = File.OpenHandle(dir, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.None);
             RandomAccess.FlushToDisk(dirHandle);
         }
         catch
         {
-            // Best-effort. On filesystems that reject fsync(directory) this
-            // throws EINVAL; the snapshot file itself is already durable.
+            // Best-effort; some FSes reject directory fsync with EINVAL.
         }
     }
 }
