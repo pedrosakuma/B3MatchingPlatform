@@ -216,6 +216,21 @@ public sealed partial class ChannelDispatcher
                     ChannelNumber);
             }
         }
+        // Issue #269: release the WAL file handle so the underlying
+        // file can be deleted by tests / operator tooling. The
+        // dispatcher loop has already flushed its final snapshot
+        // (which also truncates the WAL) in the loop's finally block,
+        // so the on-disk WAL is empty at this point under a clean
+        // shutdown.
+        if (_wal is IDisposable disposableWal)
+        {
+            try { disposableWal.Dispose(); }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: WAL dispose failed", ChannelNumber);
+            }
+        }
         _cts.Dispose();
     }
 }

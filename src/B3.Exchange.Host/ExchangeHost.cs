@@ -171,7 +171,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 retxBuffer: retxBuffer,
                 persister: BuildPersister(ch),
                 snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
-                useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false);
+                useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false,
+                wal: BuildWal(ch));
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -439,6 +440,29 @@ public sealed class ExchangeHost : IAsyncDisposable
             ch.Persistence.DataDir,
             _loggerFactory.CreateLogger<FileChannelStatePersister>(),
             generations);
+    }
+
+    /// <summary>
+    /// Builds the per-channel Write-Ahead Log (issue #269). Returns
+    /// <c>null</c> when the channel has no <c>persistence.wal</c> block
+    /// or it is not enabled — preserving the snapshot-only behaviour
+    /// for configs that haven't opted in.
+    /// </summary>
+    private IChannelWriteAheadLog? BuildWal(ChannelConfig ch)
+    {
+        if (ch.Persistence?.Wal is not { Enabled: true } walCfg) return null;
+        if (string.IsNullOrWhiteSpace(ch.Persistence.DataDir))
+        {
+            _logger.LogWarning(
+                "channel {ChannelNumber}: persistence.wal.enabled=true but persistence.dataDir is empty; skipping WAL",
+                ch.ChannelNumber);
+            return null;
+        }
+        return new FileChannelWriteAheadLog(
+            ch.Persistence.DataDir,
+            ch.ChannelNumber,
+            _loggerFactory.CreateLogger<FileChannelWriteAheadLog>(),
+            walCfg.FsyncPerWrite);
     }
 
     private FirmRegistry BuildFirmRegistry()

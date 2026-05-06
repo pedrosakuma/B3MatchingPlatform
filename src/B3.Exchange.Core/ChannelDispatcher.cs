@@ -121,8 +121,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private readonly System.Threading.Channels.Channel<WorkItem> _inbound;
     private readonly MatchingEngine _engine;
-    private readonly IUmdfPacketSink _packetSink;
-    private readonly ICoreOutbound _outbound;
+    private IUmdfPacketSink _packetSink;
+    private ICoreOutbound _outbound;
+    private readonly IUmdfPacketSink _liveSink;
+    private readonly ICoreOutbound _liveOutbound;
     private readonly ILogger<ChannelDispatcher> _logger;
     private readonly Func<ulong> _nowNanos;
     private readonly ushort _tradeDate;
@@ -135,6 +137,30 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// (host config <c>umdfRetransmit.bufferSize=0</c>).</summary>
     private readonly UmdfPacketRetransmitBuffer? _retxBuffer;
 
+    /// <summary>
+    /// Issue #269: per-channel Write-Ahead Log. When non-null, the
+    /// dispatcher appends one record per state-mutating command before
+    /// invoking the engine; on cold start the loop loads the snapshot
+    /// then replays surviving WAL records to recover from an unclean
+    /// shutdown. <c>null</c> ⇒ pre-#269 behaviour (snapshot only,
+    /// commands processed since the last snapshot are lost).
+    /// </summary>
+    private readonly IChannelWriteAheadLog? _wal;
+    /// <summary>Monotonic per-channel command counter for the WAL
+    /// (issue #269). Mutated only on the dispatch thread; persisted into
+    /// <see cref="ChannelStateSnapshot.LastAppliedSeq"/> so the replay
+    /// path can skip records already covered by the snapshot.</summary>
+    private long _lastAppliedSeq;
+    /// <summary>Set during <see cref="LoadPersistedStateOnLoopThread"/>
+    /// for the duration of WAL replay so <see cref="FlushPacket"/> and
+    /// the outbound ER calls become no-ops — engine state still mutates
+    /// (and seq counters still advance) but no UMDF packet hits the
+    /// wire and no ExecutionReport is sent to a (potentially long-gone)
+    /// session.</summary>
+    private bool _replayMode;
+
+    private static readonly IUmdfPacketSink NoOpPacketSink = new NoOpPacketSinkImpl();
+    private static readonly ICoreOutbound NoOpOutbound = new NoOpCoreOutboundImpl();
     /// <summary>
     /// Optional state persister (issue #260). When non-null, the dispatcher
     /// loads any persisted snapshot at loop entry and writes a fresh
@@ -202,11 +228,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         UmdfPacketRetransmitBuffer? retxBuffer = null,
         IChannelStatePersister? persister = null,
         SnapshotThrottlePolicy? snapshotThrottle = null,
-        bool useAsyncSnapshotWriter = false)
+        bool useAsyncSnapshotWriter = false,
+        IChannelWriteAheadLog? wal = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
         ChannelNumber = channelNumber;
+        _liveSink = packetSink;
+        _liveOutbound = outbound;
         _packetSink = packetSink;
         _outbound = outbound;
         _logger = logger;
@@ -216,12 +245,18 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _sessionFirmCounters = sessionFirmCounters;
         _retxBuffer = retxBuffer;
         _persister = persister;
+        _wal = wal;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist
         // (zero-RPO). Enabled per channel via host config.
+        // Issue #269: when WAL is also enabled, the writer notifies us
+        // via the post-save callback so we can truncate the WAL on the
+        // writer thread — guaranteeing the WAL is only ever truncated
+        // after the matching snapshot has reached the disk.
         _asyncSnapshotWriter = (useAsyncSnapshotWriter && persister is not null)
-            ? new BackgroundSnapshotWriter(channelNumber, persister, logger, metrics)
+            ? new BackgroundSnapshotWriter(channelNumber, persister, logger, metrics,
+                onSaved: _wal is null ? null : OnAsyncSnapshotSaved)
             : null;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the

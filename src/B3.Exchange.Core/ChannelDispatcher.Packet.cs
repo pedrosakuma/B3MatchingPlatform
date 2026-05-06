@@ -49,6 +49,17 @@ public sealed partial class ChannelDispatcher
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), _sequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));
+        // Issue #269: during WAL replay the live sink has been swapped
+        // for the no-op adapter; we still must not pollute the retx
+        // ring with stale packets, nor count replay traffic into the
+        // throughput metrics that operators alert on. Engine-side seq
+        // counters DO advance above so post-replay state matches the
+        // crash-time state on the wire.
+        if (_replayMode)
+        {
+            _packetWritten = 0;
+            return;
+        }
         // Issue #216 (L3a): retain a deep-copied snapshot of the just-
         // published incremental packet for the future retransmit
         // responder (L3b). Snapshot/instrumentdef feeds are NOT routed

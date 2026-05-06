@@ -71,7 +71,15 @@ public sealed partial class ChannelDispatcher
             SequenceNumber: _sequenceNumber,
             SequenceVersion: _sequenceVersion,
             Engine: engineSnap,
-            Owners: owners);
+            Owners: owners)
+        {
+            // Issue #269: stamp the WAL applied counter so the replay
+            // path on the next boot can skip records already in the
+            // snapshot. Always set even when WAL is disabled — costs
+            // nothing and lets a future "turn WAL on" deployment start
+            // from a sane reference point.
+            LastAppliedSeq = _lastAppliedSeq,
+        };
     }
 
     /// <summary>
@@ -109,6 +117,10 @@ public sealed partial class ChannelDispatcher
         // immediately after the loop becomes ready.
         Volatile.Write(ref _sequenceNumber, snapshot.SequenceNumber);
         Volatile.Write(ref _sequenceVersion, snapshot.SequenceVersion);
+
+        // Issue #269: restore the WAL applied counter so subsequent
+        // appends keep increasing monotonically across the restart.
+        _lastAppliedSeq = snapshot.LastAppliedSeq;
 
         foreach (var o in snapshot.Owners)
         {
@@ -201,7 +213,15 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     private void LoadPersistedStateOnLoopThread()
     {
-        if (_persister is null) return;
+        if (_persister is null)
+        {
+            // Issue #269: even with no persister we may still have a WAL
+            // (e.g. tests with WAL-only configs). Replay against the
+            // empty engine so a crash before the very first snapshot is
+            // recoverable.
+            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
+            return;
+        }
         ChannelStateSnapshot? snapshot;
         var loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
         try
@@ -219,12 +239,20 @@ public sealed partial class ChannelDispatcher
         if (snapshot is null)
         {
             _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
+            // Issue #269: no snapshot but possibly WAL records from a
+            // crash before the first snapshot ever ran. Replay rebuilds
+            // the engine from scratch.
+            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
             return;
         }
         try
         {
             RestoreChannelState(snapshot);
             _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
+            // Issue #269: replay any WAL records that were appended
+            // after the snapshot was taken — closes the gap between
+            // the most-recent snapshot and the moment of the crash.
+            ReplayWalOnLoopThread(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
         }
         catch (InvalidOperationException ex)
         {
@@ -293,6 +321,10 @@ public sealed partial class ChannelDispatcher
                 _commandsSincePersist = 0;
                 _lastPersistUnixMs = nowMs;
                 _pendingDirty = false;
+                // Note: WAL truncation in async-writer mode happens via
+                // BackgroundSnapshotWriter's onSaved callback
+                // (OnAsyncSnapshotSaved) so it runs after the snapshot
+                // bytes are durable on disk — never before.
                 return;
             }
             var bytes = _persister.Save(snap);
@@ -307,6 +339,11 @@ public sealed partial class ChannelDispatcher
             _commandsSincePersist = 0;
             _lastPersistUnixMs = nowMs;
             _pendingDirty = false;
+            // Issue #269: synchronous snapshot succeeded → truncate
+            // the WAL on the dispatch thread. After this point the
+            // on-disk WAL is empty and a crash falls through to the
+            // (just-saved) snapshot for recovery.
+            TruncateWalAfterSyncSave();
         }
         catch (Exception ex)
         {
