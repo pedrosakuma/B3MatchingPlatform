@@ -281,6 +281,17 @@ public sealed class PersistenceConfig
     /// last-write-wins — see exch_snapshot_dropped_by_backpressure_total.
     /// </summary>
     [JsonPropertyName("asyncWriter")] public bool AsyncWriter { get; set; }
+
+    /// <summary>
+    /// Issue #264: number of rolling snapshot generations kept on disk
+    /// per channel. The persister round-robins across slots
+    /// <c>0..generations-1</c> and picks the newest valid one on load,
+    /// transparently falling back to older slots if the newest is
+    /// corrupted. Defaults to
+    /// <see cref="B3.Exchange.Persistence.FileChannelStatePersister.DefaultGenerations"/>
+    /// when absent or zero.
+    /// </summary>
+    [JsonPropertyName("generations")] public int Generations { get; set; }
 }
 
 /// <summary>
