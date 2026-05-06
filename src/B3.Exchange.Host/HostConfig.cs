@@ -241,6 +241,27 @@ public sealed class ChannelConfig
     /// gap detection) without external network-shaping tools.
     /// </summary>
     [JsonPropertyName("chaos")] public ChaosConfigJson? Chaos { get; set; }
+
+    /// <summary>
+    /// Optional per-channel persistence (issue #260). When present, the
+    /// dispatcher loads any existing snapshot from
+    /// <see cref="PersistenceConfig.DataDir"/>/<c>channel-{N}.snapshot</c>
+    /// at boot and persists a fresh snapshot after every command flush so
+    /// a restart resumes with the working order book + RptSeq + counters
+    /// intact. Omit to keep the legacy stateless boot.
+    /// </summary>
+    [JsonPropertyName("persistence")] public PersistenceConfig? Persistence { get; set; }
+}
+
+/// <summary>
+/// Per-channel persistence config (issue #260). The host creates
+/// <see cref="DataDir"/> if missing and writes one snapshot file per
+/// channel. Operators must mount a durable volume at this path
+/// (e.g. <c>/var/lib/b3matching</c>) for restart-safety to be meaningful.
+/// </summary>
+public sealed class PersistenceConfig
+{
+    [JsonPropertyName("dataDir")] public string DataDir { get; set; } = "";
 }
 
 /// <summary>

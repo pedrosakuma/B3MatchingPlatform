@@ -21,6 +21,13 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /app .
 
+# Issue #260: persistence snapshots (when the channel config opts in via
+# a `persistence.dataDir` block) are written here. Mount a durable volume
+# at this path (e.g. `-v b3matching-state:/var/lib/b3matching`) for
+# restart-safety; without a volume the directory lives inside the
+# container's writable layer and is wiped on `docker rm`.
+VOLUME ["/var/lib/b3matching"]
+
 # Default config is mounted into /app/config by docker-compose; override with
 # CMD if needed.
 EXPOSE 9876

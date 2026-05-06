@@ -9,6 +9,7 @@
     <Project Path="src/B3.Exchange.Matching/B3.Exchange.Matching.csproj" />
     <Project Path="src/B3.Exchange.Gateway/B3.Exchange.Gateway.csproj" />
     <Project Path="src/B3.Exchange.Core/B3.Exchange.Core.csproj" />
+    <Project Path="src/B3.Exchange.Persistence/B3.Exchange.Persistence.csproj" />
     <Project Path="src/B3.Exchange.Host/B3.Exchange.Host.csproj" />
     <Project Path="src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.csproj" />
   </Folder>
@@ -23,6 +24,7 @@
     <Project Path="tests/B3.EntryPoint.Wire.Tests/B3.EntryPoint.Wire.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Instruments.Tests/B3.Exchange.Instruments.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Matching.Tests/B3.Exchange.Matching.Tests.csproj" />
+    <Project Path="tests/B3.Exchange.Persistence.Tests/B3.Exchange.Persistence.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Gateway.Tests/B3.Exchange.Gateway.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Core.Tests/B3.Exchange.Core.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Host.Tests/B3.Exchange.Host.Tests.csproj" />

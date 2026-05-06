@@ -36,6 +36,21 @@ public sealed class OrderRegistry
 
     public int Count => _byOrderId.Count;
 
+    /// <summary>
+    /// Enumerates every (OrderId, OrderState) tuple currently registered.
+    /// Snapshot semantics: the underlying
+    /// <see cref="ConcurrentDictionary{TKey, TValue}"/> enumerator is
+    /// weakly consistent, which is acceptable here because the only
+    /// caller (<see cref="ChannelDispatcher.CaptureChannelState"/>) runs
+    /// on the dispatch thread — the single writer — so concurrent
+    /// mutation is impossible during enumeration. Issue #260.
+    /// </summary>
+    public IEnumerable<(long OrderId, OrderState State)> EnumerateAll()
+    {
+        foreach (var kv in _byOrderId)
+            yield return (kv.Key, kv.Value);
+    }
+
     public void Register(long orderId, SessionId session, ulong clOrdId, uint firm, Side side, long securityId)
     {
         _byOrderId[orderId] = new OrderState(session, clOrdId, firm, side, securityId);

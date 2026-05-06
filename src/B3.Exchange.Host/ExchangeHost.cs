@@ -4,6 +4,7 @@ using B3.Exchange.Gateway;
 using B3.Exchange.Instruments;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
+using B3.Exchange.Persistence;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -167,7 +168,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
                 metrics: channelMetrics,
                 sessionFirmCounters: _metrics.SessionFirmMessages,
-                retxBuffer: retxBuffer);
+                retxBuffer: retxBuffer,
+                persister: BuildPersister(ch));
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -411,6 +413,26 @@ public sealed class ExchangeHost : IAsyncDisposable
         var local = localInterface != null ? IPAddress.Parse(localInterface) : null;
         return new MulticastUdpPacketSink(IPAddress.Parse(host), port,
             _loggerFactory.CreateLogger<MulticastUdpPacketSink>(), local, ttl);
+    }
+
+    /// <summary>
+    /// Builds the per-channel persister (issue #260). Returns
+    /// <c>null</c> when the channel has no <c>persistence</c> block,
+    /// preserving the legacy stateless boot for configs that haven't
+    /// opted in.
+    /// </summary>
+    private IChannelStatePersister? BuildPersister(ChannelConfig ch)
+    {
+        if (ch.Persistence is null) return null;
+        if (string.IsNullOrWhiteSpace(ch.Persistence.DataDir))
+        {
+            _logger.LogWarning("channel {ChannelNumber}: persistence.dataDir is empty; skipping persister",
+                ch.ChannelNumber);
+            return null;
+        }
+        return new FileChannelStatePersister(
+            ch.Persistence.DataDir,
+            _loggerFactory.CreateLogger<FileChannelStatePersister>());
     }
 
     private FirmRegistry BuildFirmRegistry()

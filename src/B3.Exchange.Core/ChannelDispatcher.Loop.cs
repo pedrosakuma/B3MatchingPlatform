@@ -248,6 +248,11 @@ public sealed partial class ChannelDispatcher
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
+                // Issue #260: persist post-flush so any consumer-visible
+                // event corresponds to a durable snapshot on disk before
+                // the next command is observed. Best-effort: failures are
+                // logged and swallowed by the helper.
+                OnAfterCommandFlushed();
             }
             else
             {

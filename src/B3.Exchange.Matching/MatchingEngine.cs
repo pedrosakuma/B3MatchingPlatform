@@ -123,6 +123,85 @@ public sealed class MatchingEngine
     public SelfTradePrevention SelfTradePrevention => _stp;
 
     /// <summary>
+    /// Captures the engine's resumable state for persistence (issue #260).
+    /// Counters, per-instrument trading phase and every resting order in
+    /// every book are included; transient artefacts (auction-top
+    /// throttling, dispatch flags, stop-order book) are intentionally
+    /// omitted — see <see cref="EngineStateSnapshot"/> remarks.
+    ///
+    /// <para>Must be invoked from the dispatch thread (matching the
+    /// engine's single-thread invariant); cannot run mid-dispatch.</para>
+    /// </summary>
+    public EngineStateSnapshot CaptureState()
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("CaptureState called from inside a sink callback. Snapshots must not interleave with engine dispatch.");
+        var phases = new List<EngineStateSnapshot.PhaseEntry>(_phaseById.Count);
+        foreach (var kv in _phaseById)
+            phases.Add(new EngineStateSnapshot.PhaseEntry(kv.Key, kv.Value));
+        var books = new List<EngineStateSnapshot.BookSnapshot>(_booksById.Count);
+        foreach (var kv in _booksById)
+        {
+            var orders = kv.Value.EnumerateAllOrdersForSnapshot().ToList();
+            books.Add(new EngineStateSnapshot.BookSnapshot(kv.Key, orders));
+        }
+        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books);
+    }
+
+    /// <summary>
+    /// Restores engine state previously produced by <see cref="CaptureState"/>
+    /// (issue #260). The engine MUST be freshly constructed (all books
+    /// empty, counters at their defaults) — restore refuses to overwrite a
+    /// non-empty state to avoid silently merging an old snapshot on top of
+    /// live state. Phases and books are matched by SecurityId; unknown
+    /// SecurityIds in the snapshot are ignored with a warning so an
+    /// instrument removed from the channel config does not break boot.
+    /// </summary>
+    public void RestoreState(EngineStateSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("cannot restore state while a command is being dispatched");
+        if (_nextOrderId != 1 || _nextTradeId != 1 || _rptSeq != 0)
+            throw new InvalidOperationException("RestoreState requires a freshly constructed engine");
+        foreach (var book in _booksById.Values)
+        {
+            if (book.OrderCount != 0)
+                throw new InvalidOperationException("RestoreState requires empty books on the target engine");
+        }
+
+        _nextOrderId = snapshot.NextOrderId;
+        _nextTradeId = snapshot.NextTradeId;
+        _rptSeq = snapshot.RptSeq;
+        foreach (var p in snapshot.Phases)
+        {
+            if (_phaseById.ContainsKey(p.SecurityId))
+                _phaseById[p.SecurityId] = p.Phase;
+            else
+                _logger.LogWarning("RestoreState: ignoring phase entry for unknown securityId {SecurityId}", p.SecurityId);
+        }
+        int restored = 0;
+        foreach (var b in snapshot.Books)
+        {
+            if (!_booksById.TryGetValue(b.SecurityId, out var book))
+            {
+                _logger.LogWarning("RestoreState: ignoring book for unknown securityId {SecurityId} ({OrderCount} orders dropped)",
+                    b.SecurityId, b.Orders.Count);
+                continue;
+            }
+            foreach (var o in b.Orders)
+            {
+                book.RestoreOrder(o);
+                restored++;
+            }
+        }
+        _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeq={RptSeq} restingOrders={RestingOrders}",
+            _nextOrderId, _nextTradeId, _rptSeq, restored);
+    }
+
+    /// <summary>
     /// Allocates and returns the next <c>RptSeq</c> value without emitting
     /// any matching event. Designed for the operator-triggered trade-bust
     /// replay path (issue #15) where the dispatcher synthesises a

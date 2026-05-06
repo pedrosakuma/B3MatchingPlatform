@@ -228,6 +228,63 @@ internal sealed class LimitOrderBook
         }
     }
 
+    /// <summary>
+    /// Persistence-friendly enumeration of every resting order on this book
+    /// (issue #260). Yields in price-time priority and includes iceberg /
+    /// TimeInForce fields that <see cref="RestingOrderView"/> intentionally
+    /// hides. Used only by the snapshot capture path.
+    /// </summary>
+    public IEnumerable<RestingOrderRecord> EnumerateAllOrdersForSnapshot()
+    {
+        foreach (var side in new[] { Side.Buy, Side.Sell })
+        {
+            foreach (var kv in SideMap(side))
+            {
+                for (var o = kv.Value.Head; o is not null; o = o.Next)
+                {
+                    yield return new RestingOrderRecord(
+                        OrderId: o.OrderId,
+                        ClOrdId: o.ClOrdId,
+                        Side: o.Side,
+                        PriceMantissa: o.PriceMantissa,
+                        RemainingQuantity: o.RemainingQuantity,
+                        EnteringFirm: o.EnteringFirm,
+                        InsertTimestampNanos: o.InsertTimestampNanos,
+                        Tif: o.Tif,
+                        MaxFloor: o.MaxFloor,
+                        HiddenQuantity: o.HiddenQuantity);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inserts a resting order rebuilt from a snapshot (issue #260).
+    /// Insertion happens at the back of the price level, so callers MUST
+    /// feed records in the order produced by
+    /// <see cref="EnumerateAllOrdersForSnapshot"/> (price-time priority)
+    /// to preserve FIFO ordering across restart.
+    /// </summary>
+    public void RestoreOrder(RestingOrderRecord record)
+    {
+        if (record.RemainingQuantity <= 0)
+            throw new ArgumentException("RemainingQuantity must be positive", nameof(record));
+        var order = new RestingOrder
+        {
+            OrderId = record.OrderId,
+            ClOrdId = record.ClOrdId,
+            Side = record.Side,
+            PriceMantissa = record.PriceMantissa,
+            EnteringFirm = record.EnteringFirm,
+            InsertTimestampNanos = record.InsertTimestampNanos,
+            Tif = record.Tif,
+            MaxFloor = record.MaxFloor,
+            HiddenQuantity = record.HiddenQuantity,
+            RemainingQuantity = record.RemainingQuantity,
+        };
+        Insert(order);
+    }
+
     public static Side Opposite(Side s) => s == Side.Buy ? Side.Sell : Side.Buy;
 
     public static bool PriceCrosses(Side aggressorSide, long oppositePrice, long aggressorLimit)

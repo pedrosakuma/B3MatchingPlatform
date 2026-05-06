@@ -135,6 +135,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// (host config <c>umdfRetransmit.bufferSize=0</c>).</summary>
     private readonly UmdfPacketRetransmitBuffer? _retxBuffer;
 
+    /// <summary>
+    /// Optional state persister (issue #260). When non-null, the dispatcher
+    /// loads any persisted snapshot at loop entry and writes a fresh
+    /// snapshot after every command flush. <c>null</c> ⇒ stateless boot
+    /// (legacy behaviour).
+    /// </summary>
+    private readonly IChannelStatePersister? _persister;
+
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private int _packetWritten;
     private SessionId _currentSession;
@@ -184,7 +192,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
         ChannelMetrics? metrics = null,
         BoundedSessionFirmCounters? sessionFirmCounters = null,
-        UmdfPacketRetransmitBuffer? retxBuffer = null)
+        UmdfPacketRetransmitBuffer? retxBuffer = null,
+        IChannelStatePersister? persister = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -197,6 +206,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _metrics = metrics;
         _sessionFirmCounters = sessionFirmCounters;
         _retxBuffer = retxBuffer;
+        _persister = persister;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the
         // instance. No memory barrier is needed.
