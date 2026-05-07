@@ -701,12 +701,133 @@ text format, `channel="{N}"` label on every series).
 | `exch_wal_truncations_total` | counter | WAL truncations (post-snapshot or admin-reset triggered). |
 | `exch_owner_orphans_dropped_total` | counter | `OrderOwnerSnapshot` entries whose sessionId was not in the registry at restore time, dropped per `orphanSessionPolicy=drop`. |
 
-### 7.4 Disaster recovery — backup / restore
+### 7.4 On-disk layout & WAL design
+
+```
+{dataDir}/
+  channel-{N}.snapshot.0     # rolling slot 0 (newest by mtime, usually)
+  channel-{N}.snapshot.1     # slot 1
+  channel-{N}.snapshot.2     # slot 2 (default 3 generations, configurable)
+  channel-{N}.wal            # write-ahead log, single file, append-only
+  channel-{N}.wal.tmp        # ephemeral, only present mid-truncate
+```
+
+**No separate pointer / index / checkpoint file.** The "WAL cursor"
+lives **inside** the snapshot as `ChannelStateSnapshot.LastAppliedSeq`.
+This couples the snapshot and the truncation point into a single
+atomic `rename(2)`, so the system cannot crash into a state where the
+pointer advanced but the snapshot did not (or vice versa).
+
+**Snapshot format:** `B3SS` magic ⇒ binary codec
+(`BinaryChannelStateSnapshotCodec`); otherwise JSON. The persister
+sniffs the first bytes on load, so both formats coexist while a
+fleet rolls between `persistence.format=json` and `binary`.
+
+**WAL format:** JSON-Lines (one `WalRecord` per `\n`-terminated
+line). `Append` opens the file in append mode, writes the record,
+and (when `fsyncPerWrite=true`, the default) fsyncs. `ReadAll`
+parses line-by-line and **stops at the first malformed line** — this
+correctly tolerates a torn final write from an unclean shutdown, but
+is the conservative choice if bit-rot lands mid-file (records past
+the rot are silently dropped from replay; tracked under
+[#285](https://github.com/pedrosakuma/B3MatchingPlatform/issues/285)
+for per-record CRC).
+
+**WAL lifecycle:**
+
+1. Each state-mutating command appends a record before execution.
+2. On a successful **synchronous** snapshot save, the WAL is
+   atomically truncated to empty (`tmp + rename + dir-fsync`).
+3. With `asyncWriter=true`, truncation runs from the writer's
+   `OnSaved` callback after the rename lands.
+4. So at steady state the WAL contains only the commands of the
+   current throttle window (typically seconds to a few minutes of
+   traffic). It is not a long-term audit log.
+
+**Replay at boot:**
+
+1. Load newest valid snapshot (corrupt newest slot ⇒ fall back to
+   an older generation transparently).
+2. Open the WAL and read every record; **skip** any with
+   `Seq <= snapshotLastAppliedSeq`, **apply** the rest in order.
+3. Replay is sequential (no offset/skip-list index) — but because
+   the WAL is bounded by the throttle window in normal operation,
+   this is O(throttle-window) per channel, well under a second.
+4. If the WAL has grown unboundedly (snapshot saves failing, see
+   `exch_snapshot_save_failures_total`), replay stays sequential
+   but takes proportionally longer. That is a saves-broken alert,
+   not a replay-perf concern.
+
+**Idempotency note:** if the newest snapshot is corrupt and the
+persister falls back to an older slot, replay starts from that
+slot's `LastAppliedSeq` — meaning records covered by *intermediate*
+snapshots (now lost with the corrupt slot) get re-applied. The
+engine is deterministic over the recorded `WalRecord` stream, so
+this produces the same final state, but operators monitoring
+`exch_wal_replays_total` will see a larger-than-usual count after
+such a fallback. Tracked under issue
+[#287](https://github.com/pedrosakuma/B3MatchingPlatform/issues/287)
+for explicit invariant testing.
+
+### 7.5 Session disconnect & reattach — durability of private replies
+
+The persistence story above covers the **public** state (order
+book, snapshot multicast). Private replies — `ExecutionReport`s
+delivered back to the originating FIXP session over TCP — have a
+**parallel, independent** durability story that operators must
+understand.
+
+**Design philosophy:** every recovery scenario the FIXP / EntryPoint
+protocol exposes a remediation for (`RetransmitRequest`,
+`Establish` with `NextSeqNo`, suspend/reattach, Cancel-on-Disconnect)
+is meant to be served end-to-end by the simulator. Operational
+reconciliation is a fallback for protocol-out-of-spec situations,
+not a designed-in recovery path.
+
+**Where private replies live:**
+
+| Layer | Storage | Lifetime |
+| --- | --- | --- |
+| Live socket write path | OS socket buffer | Until kernel flushes / connection drops |
+| `RetransmitBuffer` (per FIXP session) | **In-memory ring**, capacity = `session.outboundRetransmitCapacity` | Until the FIXP session is reaped (`SuspendedTimeoutMs`, default **5 min**) or evicted by a newer record |
+| WAL / snapshot | Persisted, but stores **commands**, not the resulting `ExecutionReport`s | Bounded by snapshot cadence |
+
+**The good news (issue [#217](https://github.com/pedrosakuma/B3MatchingPlatform/issues/217)):**
+passive `ExecutionReport`s emitted while the owning FIXP session is
+in `FixpState.Suspended` (transport disconnected but session still
+alive) are appended to that session's `RetransmitBuffer` rather
+than dropped. A subsequent `Establish` + `RetransmitRequest`
+delivers them with `PossResend = 1` as a normal recovery cycle.
+
+**The known gaps (none of these are silent — alert on them):**
+
+| Scenario | Outcome | Mitigation today | Eventual fix |
+| --- | --- | --- | --- |
+| Disconnect window ≤ `SuspendedTimeoutMs`, fills fit in ring | All ERs replayed on `Establish` ✅ | — | — |
+| Disconnect window ≤ `SuspendedTimeoutMs`, **fills exceed ring capacity** | Oldest ERs evicted; `Establish` with too-low `NextSeqNo` ⇒ `Establishment Reject` | Size `outboundRetransmitCapacity` for worst-case fill rate × `SuspendedTimeoutMs`; alert on `exch_fixp_retransmit_buffer_utilization` ([#288](https://github.com/pedrosakuma/B3MatchingPlatform/issues/288)) | Persisted `RetransmitBuffer` ([#289](https://github.com/pedrosakuma/B3MatchingPlatform/issues/289)) |
+| **Host crash** while session is `Suspended` | Ring is in-memory ⇒ all buffered ERs lost | None — by design today; flagged in metrics on next boot | Persisted `RetransmitBuffer` ([#289](https://github.com/pedrosakuma/B3MatchingPlatform/issues/289)) |
+| Disconnect window > `SuspendedTimeoutMs` | `TryReapIfSuspended` removes the session from `SessionRegistry`; ring goes to GC | Size `SuspendedTimeoutMs` to the worst-case operational disconnect for the firm; alert on `exch_fixp_sessions_reaped_total` ([#288](https://github.com/pedrosakuma/B3MatchingPlatform/issues/288)) | Tunable per-firm; protocol-level `OrderMassStatus` on next reconnect (Tier 3) |
+| Cancel-on-Disconnect (CoD) armed, mode 1/3, window expired | `MassCancel` fires ⇒ no passive fills can happen ⇒ no problem | Configure CoD per firm policy | — |
+
+**Operational implication:** the **dimensioning tuple** that
+determines whether a disconnect causes data loss is
+`(outboundRetransmitCapacity, SuspendedTimeoutMs, expected fill
+rate while disconnected)`. Document the chosen values per firm
+and alert on the utilization metrics rather than discovering the
+limit when a real disconnect happens.
+
+**What an operator should NOT do:** rely on out-of-band
+reconciliation (back-office, manual `OrderStatusRequest` sweep) as
+the primary recovery for these scenarios. The protocol offers a
+proper remediation (`RetransmitRequest`); the simulator's job is to
+make that remediation succeed.
+
+### 7.6 Disaster recovery — backup / restore
 
 The persisted state for a channel is everything matching
 `{dataDir}/channel-{N}.snapshot.*` plus (if WAL is enabled)
-`{dataDir}/channel-{N}.wal`. There is no out-of-band index — the
-files are self-describing.
+`{dataDir}/channel-{N}.wal`. See §7.4 for the layout — files are
+self-describing, there is no out-of-band index to back up.
 
 **Backup recipe (rsync-friendly hot copy):**
 
@@ -728,7 +849,7 @@ rsync -a --delete /var/lib/b3matching/ /backup/b3matching/$(date +%F)/
 4. Confirm with `curl -sS http://127.0.0.1:8080/admin/channels/84/snapshot`
    — the returned `sequenceNumber` should match what the backup captured.
 
-### 7.5 Switching format (json ↔ binary)
+### 7.7 Switching format (json ↔ binary)
 
 The persister auto-detects the format on **load**, so flipping
 direction is a config change + restart:
@@ -748,7 +869,7 @@ with a forward-version error. Switch the format *before* the schema
 bump, or use `/admin/channels/{ch}/snapshot/reset?force=true` to
 abandon the on-disk state.
 
-### 7.6 Common persistence headaches
+### 7.8 Common persistence headaches
 
 * **"Channel boots empty after restart."** Check
   `exch_snapshot_load_seconds` — `0` means `TryLoad` returned null.
