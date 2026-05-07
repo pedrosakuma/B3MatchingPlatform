@@ -172,8 +172,15 @@ public class WalReplayIdempotencyTests
                 var s = sessions[rng.Next(sessions.Length)];
                 var f = firms[rng.Next(firms.Length)];
                 var side = rng.Next(2) == 0 ? Side.Buy : Side.Sell;
-                // Tight price grid → frequent matches; lot multiples honoured.
-                var price = Px(9.99m + 0.01m * rng.Next(0, 4));
+                // Issue #295 follow-up: keep buy/sell ranges DISJOINT
+                // so resting orders never trade out from under a
+                // Cancel/Replace that targets them. The determinism
+                // invariant is what's under test, not the matcher's
+                // crossing logic — which has dedicated coverage in
+                // MatchingTests.
+                var price = side == Side.Buy
+                    ? Px(9.95m + 0.01m * rng.Next(0, 4))
+                    : Px(10.05m + 0.01m * rng.Next(0, 4));
                 var qty = 100L * rng.Next(1, 4);
                 var clOrd = nextClOrd++;
                 var no = new NewOrderCommand(
@@ -211,7 +218,10 @@ public class WalReplayIdempotencyTests
                 // in the live set under the same ClOrdId because the engine
                 // identifies it by OrderId, not by the new ClOrdId.
                 var clOrd = nextClOrd++;
-                var newPrice = Px(9.99m + 0.01m * rng.Next(0, 4));
+                // Same-side, non-crossing replacement (see #295 above).
+                var newPrice = t.Side == Side.Buy
+                    ? Px(9.95m + 0.01m * rng.Next(0, 4))
+                    : Px(10.05m + 0.01m * rng.Next(0, 4));
                 var newQty = 100L * rng.Next(1, 4);
                 var ro = new ReplaceOrderCommand(
                     ClOrdId: "CL-" + clOrd.ToString(),
@@ -239,6 +249,61 @@ public class WalReplayIdempotencyTests
         Assert.True(ok, $"enqueue rejected for {c.Kind}");
     }
 
+    /// <summary>
+    /// Issue #295 follow-up: drives the dispatcher the way <c>HostRouter</c>
+    /// drives it in production. For <c>Cancel</c>/<c>Replace</c> the
+    /// gateway-side router resolves <c>OrigClOrdId → OrderId</c> via the
+    /// dispatcher's order registry and stamps the resolved <c>OrderId</c>
+    /// into the command BEFORE calling <c>EnqueueCancel</c>/<c>EnqueueReplace</c>.
+    /// Direct enqueueing with <c>OrderId == 0</c> is short-circuited by
+    /// <c>ProcessOne</c> (it emits an <c>UnknownOrderIdReject</c> and never
+    /// reaches the engine) — which means a test that submits Cancel/Replace
+    /// with <c>OrderId == 0</c> silently exercises the reject path, not the
+    /// engine cancel/replace path. This helper interleaves enqueue + drain
+    /// so the engine state is current at the resolution point and the
+    /// resolved <c>OrderId</c> can be stamped before each command.
+    /// </summary>
+    private static void ApplyResolvingViaIndex(
+        ChannelDispatcher disp,
+        ChannelDispatcher.TestProbe probe,
+        Cmd c)
+    {
+        switch (c.Kind)
+        {
+            case Op.New:
+                Assert.True(disp.EnqueueNewOrder(c.New!, c.Session, c.Firm, c.ClOrdId));
+                break;
+            case Op.Cancel:
+                {
+                    if (!disp.TryResolveByClOrdId(c.Firm, c.OrigClOrdId, out var orderId, out var secId))
+                    {
+                        // Mirror HostRouter: emit UnknownOrderId reject and
+                        // skip both WAL and engine. The order may have been
+                        // matched out (Replace clOrdId rotation) — same
+                        // realistic skip behaviour the gateway exhibits.
+                        break;
+                    }
+                    var resolved = c.Cancel! with { OrderId = orderId, SecurityId = secId };
+                    Assert.True(disp.EnqueueCancel(resolved, c.Session, c.Firm, c.ClOrdId, c.OrigClOrdId));
+                    break;
+                }
+            case Op.Replace:
+                {
+                    if (!disp.TryResolveByClOrdId(c.Firm, c.OrigClOrdId, out var orderId, out var secId))
+                        break;
+                    var resolved = c.Replace! with { OrderId = orderId, SecurityId = secId };
+                    Assert.True(disp.EnqueueReplace(resolved, c.Session, c.Firm, c.ClOrdId, c.OrigClOrdId));
+                    break;
+                }
+            default: throw new InvalidOperationException();
+        }
+        // Drain after every command so the next Cancel/Replace sees an
+        // engine state that already reflects the dependency. DrainInbound
+        // is synchronous on the test thread; the dispatch loop is not
+        // running in baseline / snapshot-at-K builders.
+        probe.DrainInbound();
+    }
+
     private static async Task<(byte[] BaselineBytes, IReadOnlyList<WalRecord> WalRecords)>
         RunBaseline(string root, IReadOnlyList<Cmd> cmds)
     {
@@ -251,17 +316,19 @@ public class WalReplayIdempotencyTests
         var disp = BuildDispatcher(persister, wal);
         var probe = disp.CreateTestProbe();
 
-        foreach (var c in cmds) Apply(disp, c);
-        probe.DrainInbound();
+        foreach (var c in cmds) ApplyResolvingViaIndex(disp, probe, c);
 
         // Read WAL while it still has every record (force-flush below
-        // truncates after a successful Save).
+        // truncates after a successful Save). We may have skipped some
+        // Cancel/Replace items that lost their target (Replace clOrdId
+        // rotation), so records.Count is bounded above by cmds.Count.
         var records = wal.ReadAll();
-        Assert.Equal(cmds.Count, records.Count);
+        Assert.True(records.Count <= cmds.Count);
+        Assert.True(records.Count > 0, "baseline produced no WAL records");
 
         probe.FlushPendingSnapshotOnShutdown();
         Assert.NotNull(persister.Last);
-        Assert.Equal((long)cmds.Count, persister.Last!.LastAppliedSeq);
+        Assert.Equal((long)records.Count, persister.Last!.LastAppliedSeq);
 
         var bytes = BinaryChannelStateSnapshotCodec.Encode(persister.Last);
         wal.Dispose();
@@ -269,27 +336,46 @@ public class WalReplayIdempotencyTests
         return (bytes, records);
     }
 
+    /// <summary>
+    /// Builds a snapshot anchored at WAL record <paramref name="k"/> by
+    /// staging a fresh WAL with <c>records[0..k]</c> and letting the
+    /// dispatcher's normal replay path apply it, then force-persisting.
+    /// Anchoring on WAL records (not on input <c>Cmd</c> indices) keeps
+    /// the split-point arithmetic consistent with the dedup branch under
+    /// test, which gates on <c>WalRecord.Seq</c>.
+    /// </summary>
     private static async Task<ChannelStateSnapshot> BuildSnapshotAtK(
-        string root, IReadOnlyList<Cmd> cmds, int k)
+        string root, IReadOnlyList<WalRecord> walRecords, int k)
     {
         var dir = Path.Combine(root, $"snap-{k}");
         Directory.CreateDirectory(dir);
+
+        using (var stage = new FileChannelWriteAheadLog(dir, Channel,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
+        {
+            for (int i = 0; i < k; i++) stage.Append(walRecords[i]);
+        }
 
         var persister = new InMemoryPersister();
         var wal = new FileChannelWriteAheadLog(dir, Channel,
             NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
         var disp = BuildDispatcher(persister, wal);
-        var probe = disp.CreateTestProbe();
+        disp.Start();
 
-        for (int i = 0; i < k; i++) Apply(disp, cmds[i]);
-        probe.DrainInbound();
-        probe.FlushPendingSnapshotOnShutdown();
-        Assert.NotNull(persister.Last);
+        var savesBefore = Volatile.Read(ref persister.SaveCount);
+        Assert.True(disp.EnqueueOperatorPersistSnapshot());
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (Volatile.Read(ref persister.SaveCount) == savesBefore
+               && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(10);
+        }
+        Assert.True(Volatile.Read(ref persister.SaveCount) > savesBefore);
         Assert.Equal((long)k, persister.Last!.LastAppliedSeq);
 
-        var snap = persister.Last!;
-        wal.Dispose();
+        var snap = Volatile.Read(ref persister.Last)!;
         await disp.DisposeAsync();
+        wal.Dispose();
         return snap;
     }
 
@@ -360,13 +446,16 @@ public class WalReplayIdempotencyTests
         var cmds = BuildSequence(seed, N);
         var (baselineBytes, walRecords) = await RunBaseline(temp.Path, cmds);
 
-        // Cover several split points: very early (snapshot near boot),
-        // mid-stream, and near the tail (most of the engine state already
-        // captured, only a small WAL tail to replay).
-        int[] splits = { 1, N / 4, N / 2, (3 * N) / 4, N - 1 };
+        // Split points expressed in WAL-record indices (the dedup branch
+        // gates on WalRecord.Seq, not on input cmd index — those differ
+        // because Cancel/Replace whose target was already gone are
+        // skipped at the producer side).
+        int rec = walRecords.Count;
+        int[] splits = { 1, rec / 4, rec / 2, (3 * rec) / 4, rec - 1 };
         foreach (var k in splits)
         {
-            var snapAtK = await BuildSnapshotAtK(temp.Path, cmds, k);
+            if (k < 1 || k >= rec) continue;
+            var snapAtK = await BuildSnapshotAtK(temp.Path, walRecords, k);
             Assert.Equal((long)k, snapAtK.LastAppliedSeq);
 
             var replayBytes = await ReplayAndCapture(temp.Path, snapAtK, walRecords, k);
@@ -427,5 +516,87 @@ public class WalReplayIdempotencyTests
 
         Assert.True(baselineBytes.AsSpan().SequenceEqual(bytes),
             $"seed={seed}: WAL-only replay diverged from baseline");
+    }
+
+    /// <summary>
+    /// Issue #295 follow-up (MEDIUM): exercises the
+    /// <c>Seq &lt;= snapshot.LastAppliedSeq</c> dedup branch in
+    /// <c>ChannelDispatcher.ReplayWalOnLoopThread</c>. The realistic
+    /// disaster scenario is: snapshot persisted at K, WAL kept on
+    /// growing past K, then a crash happens before WAL truncation —
+    /// boot-time replay sees a WAL that overlaps the snapshot prefix.
+    /// The dispatcher must skip the prefix without re-applying it
+    /// (re-applying a Cancel for an already-canceled order would
+    /// throw / double-cancel) and converge to the same final state.
+    /// </summary>
+    [Theory]
+    [InlineData(11)]
+    [InlineData(33)]
+    [InlineData(57)]
+    public async Task Replay_SnapshotPlusFullOverlappingWal_DedupsAndEqualsBaseline(int seed)
+    {
+        const int N = 24;
+        using var temp = new TempDir();
+
+        var cmds = BuildSequence(seed, N);
+        var (baselineBytes, walRecords) = await RunBaseline(temp.Path, cmds);
+
+        int rec = walRecords.Count;
+        int[] splits = { 1, rec / 4, rec / 2, (3 * rec) / 4, rec - 1 };
+        foreach (var k in splits)
+        {
+            if (k < 1 || k >= rec) continue;
+            var snapAtK = await BuildSnapshotAtK(temp.Path, walRecords, k);
+            Assert.Equal((long)k, snapAtK.LastAppliedSeq);
+
+            var replayBytes = await ReplayWithFullWalAndCapture(
+                temp.Path, snapAtK, walRecords, k);
+
+            Assert.True(baselineBytes.AsSpan().SequenceEqual(replayBytes),
+                $"seed={seed} k={k}: dedup replay diverged from baseline "
+                + $"(baseline={baselineBytes.Length}B, replay={replayBytes.Length}B)");
+        }
+    }
+
+    private static async Task<byte[]> ReplayWithFullWalAndCapture(
+        string root, ChannelStateSnapshot snapAtK,
+        IReadOnlyList<WalRecord> walTail, int k)
+    {
+        var dir = Path.Combine(root, $"replay-full-{k}");
+        Directory.CreateDirectory(dir);
+
+        // Stage EVERY record (Seq 1..N) — overlap with the snapshot
+        // prefix is intentional. The dispatcher must skip records with
+        // Seq <= k during replay.
+        using (var stage = new FileChannelWriteAheadLog(dir, Channel,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
+        {
+            foreach (var r in walTail) stage.Append(r);
+        }
+
+        var persister = new InMemoryPersister { Last = snapAtK };
+        var wal = new FileChannelWriteAheadLog(dir, Channel,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var disp = BuildDispatcher(persister, wal);
+
+        disp.Start();
+
+        var savesBefore = Volatile.Read(ref persister.SaveCount);
+        Assert.True(disp.EnqueueOperatorPersistSnapshot());
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (Volatile.Read(ref persister.SaveCount) == savesBefore
+               && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(10);
+        }
+        Assert.True(Volatile.Read(ref persister.SaveCount) > savesBefore,
+            "operator persist did not complete within timeout");
+
+        var snap = Volatile.Read(ref persister.Last)!;
+        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+
+        await disp.DisposeAsync();
+        wal.Dispose();
+        return bytes;
     }
 }
