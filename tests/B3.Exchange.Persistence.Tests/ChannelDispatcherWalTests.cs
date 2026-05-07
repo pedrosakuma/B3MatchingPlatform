@@ -295,4 +295,69 @@ public class ChannelDispatcherWalTests
         await disp.DisposeAsync();
         wal.Dispose();
     }
+
+    [Fact]
+    public async Task Replay_HaltsOnSnapshotWalBoundaryGap()
+    {
+        // Issue #285 follow-up (gpt-5.5 round-2 review of PR #298):
+        // FileChannelWriteAheadLog.ReadAll only enforces contiguity
+        // among records physically present in the WAL; it cannot
+        // detect a gap straddling the snapshot/WAL boundary
+        // (snapshot LastAppliedSeq=2 with WAL starting at Seq=4).
+        // Replay must halt the channel rather than apply Seq=4 on
+        // top of the snapshot baseline.
+        using var dir = new TempDir();
+        var persister = new InMemoryPersister();
+
+        // Round 1: two orders → snapshot persisted at LastAppliedSeq=2,
+        // WAL truncated.
+        var wal1 = new FileChannelWriteAheadLog(dir.Path, 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var dispA = BuildDispatcher(persister, wal1, out _, out _);
+        var probeA = dispA.CreateTestProbe();
+        var session = new SessionId("99999");
+        Assert.True(EnqueueOrder(dispA, session, "CL-A", 0xA, 100UL));
+        probeA.DrainInbound();
+        Assert.True(EnqueueOrder(dispA, session, "CL-B", 0xB, 101UL));
+        probeA.DrainInbound();
+        Assert.Equal(2L, persister.Last[84].LastAppliedSeq);
+        wal1.Dispose();
+
+        // Hand-craft a WAL containing a single record with Seq=4
+        // (Seq=3 missing) — within ReadAll a single record passes
+        // contiguity trivially, so only the dispatcher-level boundary
+        // check can catch this.
+        using (var raw = new FileChannelWriteAheadLog(dir.Path, 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
+        {
+            raw.Append(new WalRecord(
+                Seq: 4, Kind: WalRecordKind.NewOrder,
+                SessionValue: "99999", Firm: 700, ClOrdId: 0xC, OrigClOrdId: 0,
+                NewOrder: new NewOrderCommand("CL-C", Sec, Side.Buy, OrderType.Limit,
+                    TimeInForce.Day, Px(10.00m), 100, 100, 102UL),
+                Cancel: null, Replace: null));
+        }
+
+        var wal2 = new FileChannelWriteAheadLog(dir.Path, 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var metricsB = new ChannelMetrics(84);
+        var dispB = BuildDispatcher(persister, wal2, out var sinkB, out var outB,
+            metrics: metricsB);
+        dispB.Start();
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (dispB.IsWalHealthy && DateTime.UtcNow < deadline)
+            Thread.Sleep(20);
+
+        Assert.False(dispB.IsWalHealthy);
+        // Engine must remain at the snapshot baseline (2 resting orders);
+        // the post-gap record was not applied.
+        Assert.Equal(2, dispB.OrderRegistryCount);
+        // Replay must NOT publish on the wire or send ERs.
+        Assert.Equal(0, sinkB.Published);
+        Assert.Equal(0, outB.NewCount);
+
+        wal2.Dispose();
+        await dispB.DisposeAsync();
+    }
 }
