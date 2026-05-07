@@ -238,6 +238,27 @@ public sealed class ChannelMetrics
     public void IncWalAppendFailure() => Interlocked.Increment(ref _walAppendFailures);
     public void IncWalHaltReject() => Interlocked.Increment(ref _walHaltRejects);
 
+    /// <summary>Issue #291: current on-disk WAL size in bytes
+    /// (gauge). Updated by the dispatcher after every successful
+    /// Append/Truncate so the alert can fire well before
+    /// <c>maxBytes</c> is reached.</summary>
+    private long _walSizeBytes;
+    public long WalSizeBytes => Interlocked.Read(ref _walSizeBytes);
+    public void SetWalSizeBytes(long bytes) => Interlocked.Exchange(ref _walSizeBytes, bytes);
+
+    /// <summary>Issue #291: cumulative count of WAL appends silently
+    /// skipped because <c>maxBytes</c> was reached and the resolved
+    /// <see cref="WalSizeCapPolicy"/> is
+    /// <see cref="WalSizeCapPolicy.Drop"/>. Distinct from
+    /// <see cref="WalAppendFailures"/> so on-call can route a "WAL
+    /// is full" page differently from a "WAL is throwing" page.
+    /// Always 0 under <see cref="WalSizeCapPolicy.Halt"/> (the
+    /// halt path bumps <see cref="WalAppendFailures"/> instead and
+    /// flips the channel to unhealthy).</summary>
+    private long _walDropsOnFull;
+    public long WalDropsOnFull => Interlocked.Read(ref _walDropsOnFull);
+    public void SetWalDropsOnFull(long count) => Interlocked.Exchange(ref _walDropsOnFull, count);
+
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
     public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
     public void IncSnapshotValidationFailure() => Interlocked.Increment(ref _snapshotValidationFailures);
@@ -645,6 +666,12 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_halt_rejects_total",
             "Issue #286: producer-side Enqueue* rejections after the channel was WAL-halted. Always 0 unless the channel runs with persistence.wal.onAppendFailure=halt; non-zero means the operator must restart the host after fixing the underlying disk fault.",
             channels, c => c.WalHaltRejects);
+        EmitGauge(sb, "exch_wal_size_bytes",
+            "Issue #291: current on-disk size of the channel's WAL file in bytes. Compare against persistence.wal.maxBytes to alert before the cap is reached. A flat-line at the cap under onFull=halt indicates a halted channel; a flat-line under onFull=drop indicates silent data loss.",
+            channels, c => c.WalSizeBytes);
+        EmitCounter(sb, "exch_wal_drops_on_full_total",
+            "Issue #291: WAL Append() calls silently skipped because persistence.wal.maxBytes was reached and persistence.wal.onFull=drop. Distinct from exch_wal_append_failures_total so on-call can route a capacity-exhaustion alert separately from a generic IO-fault alert. Non-zero means the durability contract has been silently relaxed on this channel.",
+            channels, c => c.WalDropsOnFull);
 
         // Issue #270: cross-channel consistency check. Counts owner
         // entries silently dropped at restore because their SessionId

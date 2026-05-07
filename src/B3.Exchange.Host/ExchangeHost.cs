@@ -557,7 +557,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             ch.Persistence.DataDir,
             ch.ChannelNumber,
             _loggerFactory.CreateLogger<FileChannelWriteAheadLog>(),
-            walCfg.FsyncPerWrite);
+            walCfg.FsyncPerWrite,
+            walCfg.MaxBytes,
+            walCfg.ResolveOnFull());
     }
 
     /// <summary>
