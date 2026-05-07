@@ -140,7 +140,14 @@ public sealed partial class ChannelDispatcher
                 ChannelNumber);
             return;
         }
-        if (records.Count == 0) return;
+        if (records.Count == 0)
+        {
+            // Even an empty record list can carry post-read counters
+            // (e.g. a WAL composed entirely of corrupt records).
+            _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
+            _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
+            return;
+        }
         int replayed = 0;
         int skipped = 0;
         _replayMode = true;
@@ -180,9 +187,14 @@ public sealed partial class ChannelDispatcher
             // ProcessOne via WalAppendIfEnabled (which still increments
             // the counter even in replay mode for a consistent view).
         }
+        // Issue #285: surface CRC-mismatch and legacy-record counts to
+        // observability so operators see storage-layer integrity loss
+        // and migration progress immediately after boot.
+        _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
+        _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
         _logger.LogInformation(
-            "channel {ChannelNumber}: WAL replay complete — replayed={Replayed} skipped={Skipped} (snapshotLastAppliedSeq={SnapshotSeq})",
-            ChannelNumber, replayed, skipped, snapshotLastAppliedSeq);
+            "channel {ChannelNumber}: WAL replay complete — replayed={Replayed} skipped={Skipped} corrupt={Corrupt} legacy={Legacy} (snapshotLastAppliedSeq={SnapshotSeq})",
+            ChannelNumber, replayed, skipped, _wal.LastReadCorruptCount, _wal.LastReadLegacyCount, snapshotLastAppliedSeq);
     }
 
     private static WorkItem? TryBuildReplayWorkItem(WalRecord rec)

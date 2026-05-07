@@ -179,10 +179,20 @@ public sealed class ChannelMetrics
     private long _walBytesAppended;
     private long _walTruncations;
     private long _walReplays;
+    private long _walRecordCorruptions;
+    private long _walRecordsLegacy;
     public long WalAppends => Interlocked.Read(ref _walAppends);
     public long WalBytesAppended => Interlocked.Read(ref _walBytesAppended);
     public long WalTruncations => Interlocked.Read(ref _walTruncations);
     public long WalReplays => Interlocked.Read(ref _walReplays);
+    /// <summary>Issue #285: WAL records dropped on read because the
+    /// stored Crc32C did not match the record bytes (bit-rot).
+    /// Cumulative across all replays for the channel.</summary>
+    public long WalRecordCorruptions => Interlocked.Read(ref _walRecordCorruptions);
+    /// <summary>Issue #285: WAL records read without a CRC suffix
+    /// (i.e. written by a pre-#285 host). Tracks the migration tail
+    /// after upgrading.</summary>
+    public long WalRecordsLegacy => Interlocked.Read(ref _walRecordsLegacy);
     public void IncWalAppend(long bytes)
     {
         Interlocked.Increment(ref _walAppends);
@@ -192,6 +202,14 @@ public sealed class ChannelMetrics
     public void AddWalReplays(long count)
     {
         if (count > 0) Interlocked.Add(ref _walReplays, count);
+    }
+    public void AddWalRecordCorruptions(long count)
+    {
+        if (count > 0) Interlocked.Add(ref _walRecordCorruptions, count);
+    }
+    public void AddWalRecordsLegacy(long count)
+    {
+        if (count > 0) Interlocked.Add(ref _walRecordsLegacy, count);
     }
 
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
@@ -526,6 +544,12 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_replays_total",
             "Total WAL records replayed at boot to bring this channel up to the most-recently-acknowledged command. Non-zero only on the boot following an unclean shutdown.",
             channels, c => c.WalReplays);
+        EmitCounter(sb, "exch_wal_record_corruption_total",
+            "Issue #285: WAL records dropped on read because the stored Crc32C did not match the record bytes (bit-rot). Replay continues past the corrupt record; non-zero indicates storage-layer integrity loss and warrants investigation.",
+            channels, c => c.WalRecordCorruptions);
+        EmitCounter(sb, "exch_wal_records_legacy_total",
+            "Issue #285: WAL records read without a Crc32C suffix (i.e. written by a pre-#285 host). Tracks the migration tail after upgrading; should drift to zero once all pre-#285 records have been truncated by snapshot persists.",
+            channels, c => c.WalRecordsLegacy);
 
         // Issue #270: cross-channel consistency check. Counts owner
         // entries silently dropped at restore because their SessionId

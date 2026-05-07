@@ -124,7 +124,18 @@ public static class BinaryChannelStateSnapshotCodec
         w.WriteUVarInt((ulong)snapshot.Owners.Count);
         foreach (var o in snapshot.Owners) WriteOwner(w, o);
 
-        return w.ToArray();
+        // Issue #285: append a 4-byte little-endian Crc32C footer
+        // covering every preceding byte. Loaders compare the
+        // computed CRC against this footer before invoking the
+        // structural decode; a mismatch surfaces a bit-flip that
+        // would otherwise pass the structural validator (e.g. a
+        // mantissa flipping to a different valid mantissa).
+        var bodyBytes = w.ToArray();
+        uint crc = Crc32C.Compute(bodyBytes);
+        var withFooter = new byte[bodyBytes.Length + 4];
+        Buffer.BlockCopy(bodyBytes, 0, withFooter, 0, bodyBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(withFooter.AsSpan(bodyBytes.Length, 4), crc);
+        return withFooter;
     }
 
     public static ChannelStateSnapshot Decode(ReadOnlySpan<byte> bytes)
@@ -186,9 +197,32 @@ public static class BinaryChannelStateSnapshotCodec
         var owners = new OrderOwnerSnapshot[ownerCount];
         for (ulong i = 0; i < ownerCount; i++) owners[i] = ReadOwner(ref r);
 
-        if (!r.AtEnd)
-            throw new InvalidDataException(
-                $"binary snapshot has {r.Remaining} trailing bytes past the encoded payload");
+        // Issue #285: trailing bytes are either nothing (pre-#285
+        // file with no Crc32C footer) or exactly 4 bytes carrying the
+        // little-endian Crc32C of every byte before them. Anything
+        // else is corruption.
+        switch (r.Remaining)
+        {
+            case 0:
+                // Legacy file (pre-#285). Accept silently — the
+                // tmp+fsync+rename + structural validator combo from
+                // the persister is the only integrity guard for these
+                // files and was the established contract before #285.
+                break;
+            case 4:
+                int bodyEnd = bytes.Length - 4;
+                uint computedCrc = Crc32C.Compute(bytes[..bodyEnd]);
+                uint footerCrc = BinaryPrimitives.ReadUInt32LittleEndian(bytes[bodyEnd..]);
+                if (computedCrc != footerCrc)
+                {
+                    throw new InvalidDataException(
+                        $"binary snapshot Crc32C mismatch: stored=0x{footerCrc:X8} computed=0x{computedCrc:X8}");
+                }
+                break;
+            default:
+                throw new InvalidDataException(
+                    $"binary snapshot has {r.Remaining} trailing bytes past the encoded payload (expected 0 for legacy or 4 for #285 Crc32C footer)");
+        }
 
         var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops);
         return new ChannelStateSnapshot(version, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
