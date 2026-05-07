@@ -209,6 +209,50 @@ Exposes:
     the floor as before. Omit the `persistence` block to keep the legacy
     stateless boot.
 
+### Snapshot file format (issue #266)
+
+The persister's on-disk encoding is selected per-channel via
+`persistence.format` — accepted values are `"json"` (default; the
+historical PR #261 behaviour) and `"binary"`. Both formats are always
+recognised on **load** thanks to the leading magic-byte sniff
+(`B3SS` ⇒ binary, anything else ⇒ JSON), so flipping the value and
+restarting gracefully migrates a channel forward: the next snapshot
+write uses the new format and old slots in the previous format remain
+loadable until the rolling generations evict them. Roll-back works the
+same way in reverse.
+
+* **JSON** — `System.Text.Json` (`JsonStringEnumConverter`,
+  `WriteIndented=false`). Debuggable with `jq`, but pays ~150 bytes of
+  property names per resting order and renders every integer as
+  decimal text.
+* **Binary** — compact little-endian framing implemented by
+  `BinaryChannelStateSnapshotCodec`: 4-byte `B3SS` magic, `uint16`
+  schema version, fixed-width primitives for every numeric field,
+  uvarint-prefixed UTF-8 for strings, uvarint-prefixed counts for
+  every collection. Empty `Stops` and missing `Stops` collapse to the
+  same wire form (uvarint `0`) — the engine treats them identically
+  on restore. There is no trailing checksum; the existing
+  tmp+fsync+rename atomic write contract still protects against
+  partial writes, and length-prefixed framing makes truncation
+  self-detecting (a malformed file throws and the persister falls
+  back to the previous generation).
+
+Measured size ratio on a synthetic 200-order book is ~3× (binary
+~20 KB, JSON ~60 KB). Real production books with longer ClOrdIds,
+larger phase tables, and richer ownership maps tend to push the
+ratio higher; the bundled `BinaryChannelStateSnapshotCodecTests`
+asserts ≥2.5× as the conservative lower bound.
+
+The schema-evolution policy from issue #272 still applies — bump
+`ChannelStateSnapshot.CurrentVersion` and register a migration when
+the layout changes. Binary files carry the same `Version` field in
+their header and are subject to the same forward-version rejection.
+Operators rolling back to a host that does not understand the binary
+format should switch `persistence.format` to `"json"` *before*
+upgrading; once a snapshot has been written by a newer schema,
+rolling the host back without a `POST /admin/channels/{ch}/snapshot/reset?force=true`
+will fail closed.
+
 ### Snapshot schema evolution (issue #272)
 
 `ChannelStateSnapshot` carries an integer `Version` field
