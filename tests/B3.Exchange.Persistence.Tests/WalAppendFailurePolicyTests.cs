@@ -261,33 +261,107 @@ public class WalAppendFailurePolicyTests
     [Fact]
     public async Task Halt_DropsAlreadyQueuedWork_OnDispatchLoop()
     {
-        // Defence-in-depth: a work item posted before the WAL fails can
-        // still be queued when the halt flips. The loop-side gate must
-        // refuse to deliver it to the engine.
+        // gpt-5.5 round-2 review (PR #299): the original version of
+        // this test queued only New orders, all of which are gated by
+        // WalAppendIfEnabled in ProcessOne — so it did not actually
+        // exercise the new top-of-loop _walHalted gate. Cross and
+        // (resolved) MassCancel are state-mutating but bypass
+        // WalAppendIfEnabled (only New/Cancel/Replace are durable),
+        // so without the loop-gate a queued Cross would mutate the
+        // engine after halt. Queue both so the gate is the only
+        // thing keeping the engine clean.
         var wal = new FailingWal();
         var metrics = new ChannelMetrics(84);
         var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);
         try
         {
-            // Enqueue many items BEFORE Start so they all sit in the
-            // bounded channel. Once Start runs, the first triggers halt
-            // (WAL throws); all subsequent items must be dropped on the
-            // loop without reaching the engine.
-            for (ulong i = 1; i <= 5; i++)
-                Assert.True(EnqueueOrder(disp, clOrdIdValue: i));
+            // Pre-Start enqueues: halt flag is not yet flipped, so
+            // each producer-side RejectIfWalHalted check passes and
+            // the items land in the bounded channel. Once Start runs
+            // the loop will process the New first (which trips halt
+            // via WalAppendIfEnabled), then dequeue the Cross +
+            // MassCancel — those must hit the new loop gate, not the
+            // engine.
+            Assert.True(EnqueueOrder(disp, clOrdIdValue: 1));
+
+            // Cross: two non-crossing orders so a successful
+            // Cross() would leave both resting → OrderRegistryCount
+            // observable.
+            var buy = new NewOrderCommand("c-buy", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(9.99m), 100, 700u, EnteredAtNanos: 0);
+            var sell = new NewOrderCommand("c-sell", Sec, Side.Sell, OrderType.Limit,
+                TimeInForce.Day, Px(10.01m), 100, 700u, EnteredAtNanos: 0);
+            var cross = new CrossOrderCommand(buy, sell,
+                BuyClOrdIdValue: 100, SellClOrdIdValue: 101, CrossId: 999);
+            Assert.True(disp.EnqueueCross(cross, new SessionId("S1"), enteringFirm: 700));
+
+            Assert.True(disp.EnqueueResolvedMassCancel(
+                new long[] { 12345L },
+                new SessionId("S1"),
+                enteringFirm: 700,
+                enteredAtNanos: 0));
 
             disp.Start();
+
+            // Deterministic drain: one halt-reject per item — the New
+            // increments via WalAppendIfEnabled returning false; the
+            // Cross + MassCancel via the top-of-loop gate.
+            await WaitForAsync(() => metrics.WalHaltRejects >= 3, timeoutMs: 5000);
+
+            Assert.False(disp.IsWalHealthy);
+            // Only the very first command attempted a WAL append (and
+            // failed). Cross/MassCancel skip WAL append entirely; the
+            // loop gate is what kept them away from the engine.
+            Assert.Equal(1, wal.AppendCalls);
+            Assert.Equal(0, outbound.NewCount);
+            // Engine never observed the Cross — both orders would be
+            // resting if it had.
+            Assert.Equal(0, disp.OrderRegistryCount);
+            Assert.True(metrics.WalHaltRejects >= 3);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Halt_RejectsStateMutatingOperatorCommands_AtProducerSide()
+    {
+        // gpt-5.5 round-2 review (PR #299): EnqueueOperatorBumpVersion,
+        // EnqueueOperatorTradeBust and EnqueueOperatorSetTradingPhase
+        // are state-mutating and previously enqueued unconditionally.
+        // The HTTP layer would return 202 Accepted to the operator, but
+        // the loop-side gate would silently drop the work item — leaving
+        // operators believing their command applied. Add producer-side
+        // halt rejection so those endpoints fail loud (false → 503).
+        // Snapshot publish/persist (EnqueueOperatorSnapshotNow /
+        // EnqueueOperatorPersistSnapshot) are intentionally still
+        // permitted for triage on a halted channel.
+        var wal = new FailingWal();
+        var metrics = new ChannelMetrics(84);
+        var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out _, metrics);
+        try
+        {
+            disp.Start();
+            Assert.True(EnqueueOrder(disp, clOrdIdValue: 1));
             await WaitForAsync(() => !disp.IsWalHealthy);
             Assert.False(disp.IsWalHealthy);
 
-            // Give the loop a chance to drain queued items.
-            await Task.Delay(100);
+            long rejectsBefore = metrics.WalHaltRejects;
 
-            // Only the very first command attempted a WAL append (and
-            // failed). The engine never observed any New event because
-            // ProcessOne short-circuits on halt.
-            Assert.Equal(1, wal.AppendCalls);
-            Assert.Equal(0, outbound.NewCount);
+            Assert.False(disp.EnqueueOperatorBumpVersion());
+            Assert.False(disp.EnqueueOperatorTradeBust(
+                securityId: Sec, priceMantissa: Px(10m), size: 100,
+                tradeId: 1u, tradeDate: 0));
+            Assert.False(disp.EnqueueOperatorSetTradingPhase(
+                Sec, B3.Exchange.Matching.TradingPhase.Open));
+
+            // Snapshot publish/persist remain allowed (operator triage).
+            Assert.True(disp.EnqueueOperatorSnapshotNow());
+            Assert.True(disp.EnqueueOperatorPersistSnapshot());
+
+            Assert.True(metrics.WalHaltRejects >= rejectsBefore + 3);
         }
         finally
         {

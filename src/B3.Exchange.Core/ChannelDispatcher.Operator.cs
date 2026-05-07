@@ -126,8 +126,11 @@ public sealed partial class ChannelDispatcher
     /// if the inbound queue is full. Safe to call from any thread.
     /// </summary>
     public bool EnqueueOperatorBumpVersion()
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBumpVersion, default, 0, false,
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorBumpVersion)) return false;
+        return _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBumpVersion, default, 0, false,
             0, 0, null, null, null, null));
+    }
 
     /// <summary>
     /// Operator command (issue #15): publishes a <c>TradeBust_57</c> frame
@@ -142,9 +145,12 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     public bool EnqueueOperatorTradeBust(long securityId, long priceMantissa, long size,
         uint tradeId, ushort tradeDate)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorTradeBust, default, 0, false,
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorTradeBust)) return false;
+        return _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorTradeBust, default, 0, false,
             0, 0, null, null, null, null,
             TradeBust: new OperatorTradeBust(securityId, priceMantissa, size, tradeId, tradeDate)));
+    }
 
     /// <summary>
     /// Operator command (gap-functional §5 / issue #201): transitions the
@@ -157,9 +163,12 @@ public sealed partial class ChannelDispatcher
     /// if the inbound queue is full. Safe to call from any thread.
     /// </summary>
     public bool EnqueueOperatorSetTradingPhase(long securityId, B3.Exchange.Matching.TradingPhase phase)
-        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSetTradingPhase, default, 0, false,
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorSetTradingPhase)) return false;
+        return _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSetTradingPhase, default, 0, false,
             0, 0, null, null, null, null,
             TradingPhase: new OperatorTradingPhase(securityId, phase)));
+    }
 
     private void ProcessSetTradingPhase(OperatorTradingPhase op)
     {
