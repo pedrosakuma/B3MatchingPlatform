@@ -184,6 +184,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
                 useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false,
                 wal: wal,
+                walAppendFailurePolicy: ch.Persistence?.Wal?.ResolveOnAppendFailure() ?? B3.Exchange.Core.WalAppendFailurePolicy.Continue,
                 sessionExists: sessionExists,
                 orphanPolicy: orphanPolicy);
             disp.Start();
@@ -347,6 +348,16 @@ public sealed class ExchangeHost : IAsyncDisposable
                 action: () => _listener?.TerminateAllSessions("daily-reset"),
                 logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
             _dailyReset.Start();
+        }
+
+        // Issue #286: register a WAL-halt probe iff at least one
+        // channel runs with WalAppendFailurePolicy.Halt. Keeping the
+        // probe optional means deployments that opt out of the halt
+        // semantics never see the probe in /health/ready output.
+        if (_config.Channels.Any(c => c.Persistence?.Wal is { } w
+            && w.ResolveOnAppendFailure() == B3.Exchange.Core.WalAppendFailurePolicy.Halt))
+        {
+            RegisterReadinessProbe(new B3.Exchange.Core.WalHaltReadinessProbe(_dispatchers));
         }
 
         _startupProbe.MarkReady();

@@ -146,6 +146,20 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// commands processed since the last snapshot are lost).
     /// </summary>
     private readonly IChannelWriteAheadLog? _wal;
+    /// <summary>
+    /// Issue #286: behaviour of <see cref="WalAppendIfEnabled"/> when
+    /// <see cref="IChannelWriteAheadLog.Append"/> throws. Captured from
+    /// the ctor; immutable for the dispatcher's lifetime.
+    /// </summary>
+    private readonly WalAppendFailurePolicy _walAppendFailurePolicy;
+    /// <summary>
+    /// Issue #286: sticky flag set on the first WAL append failure when
+    /// the policy is <see cref="WalAppendFailurePolicy.Halt"/>. Read from
+    /// any thread (Inbox short-circuit + readiness probe) — accessed via
+    /// <see cref="Volatile"/> for cross-thread visibility. Cleared only
+    /// by host restart.
+    /// </summary>
+    private int _walHalted;
     /// <summary>Monotonic per-channel command counter for the WAL
     /// (issue #269). Mutated only on the dispatch thread; persisted into
     /// <see cref="ChannelStateSnapshot.LastAppliedSeq"/> so the replay
@@ -228,6 +242,16 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public SnapshotRotator? SnapshotRotator => _snapshotRotator;
 
+    /// <summary>
+    /// Issue #286: <c>false</c> once the channel has refused a WAL
+    /// append under <see cref="WalAppendFailurePolicy.Halt"/>. The
+    /// host's WAL readiness probe AND the producer-side
+    /// <c>Enqueue*</c> short-circuit consume this flag; both consumers
+    /// run off the dispatch thread, hence the
+    /// <see cref="Volatile.Read{T}"/>.
+    /// </summary>
+    public bool IsWalHealthy => Volatile.Read(ref _walHalted) == 0;
+
     public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
         ICoreOutbound outbound,
         ILogger<ChannelDispatcher> logger,
@@ -239,6 +263,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         SnapshotThrottlePolicy? snapshotThrottle = null,
         bool useAsyncSnapshotWriter = false,
         IChannelWriteAheadLog? wal = null,
+        WalAppendFailurePolicy walAppendFailurePolicy = WalAppendFailurePolicy.Continue,
         Func<string, bool>? sessionExists = null,
         OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop)
     {
@@ -257,6 +282,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _retxBuffer = retxBuffer;
         _persister = persister;
         _wal = wal;
+        _walAppendFailurePolicy = walAppendFailurePolicy;
         _sessionExists = sessionExists;
         _orphanPolicy = orphanPolicy;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;

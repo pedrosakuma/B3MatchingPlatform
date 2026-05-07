@@ -181,6 +181,21 @@ public sealed class ChannelMetrics
     private long _walReplays;
     private long _walRecordCorruptions;
     private long _walRecordsLegacy;
+    /// <summary>
+    /// Issue #286: cumulative count of WAL <c>Append</c> calls that
+    /// threw. Bumped from <c>WalAppendIfEnabled</c> regardless of the
+    /// failure-policy in effect (so an alert can fire on the
+    /// <see cref="WalAppendFailurePolicy.Continue"/> path before a
+    /// crash exposes the silent durability gap).
+    /// </summary>
+    private long _walAppendFailures;
+    /// <summary>
+    /// Issue #286: cumulative count of producer-side
+    /// <c>Enqueue*</c> rejects after the channel has been WAL-halted.
+    /// Distinct from queue-full rejections so on-call can route the
+    /// alert correctly.
+    /// </summary>
+    private long _walHaltRejects;
     public long WalAppends => Interlocked.Read(ref _walAppends);
     public long WalBytesAppended => Interlocked.Read(ref _walBytesAppended);
     public long WalTruncations => Interlocked.Read(ref _walTruncations);
@@ -193,6 +208,15 @@ public sealed class ChannelMetrics
     /// (i.e. written by a pre-#285 host). Tracks the migration tail
     /// after upgrading.</summary>
     public long WalRecordsLegacy => Interlocked.Read(ref _walRecordsLegacy);
+    /// <summary>Issue #286: WAL <c>Append</c> calls that threw.
+    /// Counted under both <see cref="WalAppendFailurePolicy.Continue"/>
+    /// and <see cref="WalAppendFailurePolicy.Halt"/> so the metric is
+    /// the canonical "WAL is failing" alert signal.</summary>
+    public long WalAppendFailures => Interlocked.Read(ref _walAppendFailures);
+    /// <summary>Issue #286: <c>Enqueue*</c> rejections after the
+    /// dispatcher has been WAL-halted. Always 0 unless the channel is
+    /// configured with <see cref="WalAppendFailurePolicy.Halt"/>.</summary>
+    public long WalHaltRejects => Interlocked.Read(ref _walHaltRejects);
     public void IncWalAppend(long bytes)
     {
         Interlocked.Increment(ref _walAppends);
@@ -211,6 +235,8 @@ public sealed class ChannelMetrics
     {
         if (count > 0) Interlocked.Add(ref _walRecordsLegacy, count);
     }
+    public void IncWalAppendFailure() => Interlocked.Increment(ref _walAppendFailures);
+    public void IncWalHaltReject() => Interlocked.Increment(ref _walHaltRejects);
 
     public void IncSnapshotSaveOk() => Interlocked.Increment(ref _snapshotSavesOk);
     public void IncSnapshotSaveFailure() => Interlocked.Increment(ref _snapshotSaveFailures);
@@ -550,6 +576,12 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_records_legacy_total",
             "Issue #285: WAL records read without a Crc32C suffix (i.e. written by a pre-#285 host). Tracks the migration tail after upgrading; should drift to zero once all pre-#285 records have been truncated by snapshot persists.",
             channels, c => c.WalRecordsLegacy);
+        EmitCounter(sb, "exch_wal_append_failures_total",
+            "Issue #286: WAL Append() calls that threw (disk full, EIO, permission flip, etc.). Counted under both the Continue and Halt failure policies — the canonical alert signal that the persistence layer is unhealthy on this channel.",
+            channels, c => c.WalAppendFailures);
+        EmitCounter(sb, "exch_wal_halt_rejects_total",
+            "Issue #286: producer-side Enqueue* rejections after the channel was WAL-halted. Always 0 unless the channel runs with persistence.wal.onAppendFailure=halt; non-zero means the operator must restart the host after fixing the underlying disk fault.",
+            channels, c => c.WalHaltRejects);
 
         // Issue #270: cross-channel consistency check. Counts owner
         // entries silently dropped at restore because their SessionId
