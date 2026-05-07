@@ -201,11 +201,46 @@ public sealed class ChannelMetrics
     public void SetSnapshotLastSizeBytes(long bytes) => Interlocked.Exchange(ref _snapshotLastSizeBytes, bytes);
     public void SetSnapshotLastSuccessUnixMs(long unixMs) => Interlocked.Exchange(ref _snapshotLastSuccessUnixMs, unixMs);
 
+    private long _ownerOrphansDropped;
+    public long OwnerOrphansDropped => Interlocked.Read(ref _ownerOrphansDropped);
+    public void AddOwnerOrphansDropped(long count)
+    {
+        if (count > 0) Interlocked.Add(ref _ownerOrphansDropped, count);
+    }
+
     /// <summary>
     /// Heartbeat. Called from the dispatch thread on every loop wakeup so
     /// liveness probes can detect a stuck/dead dispatcher.
     /// </summary>
     public void RecordTick(long unixMs) => Interlocked.Exchange(ref _lastTickUnixMs, unixMs);
+}
+
+/// <summary>
+/// Issue #270: policy applied when a restored
+/// <see cref="OrderOwnerSnapshot.SessionValue"/> does not resolve in
+/// the host's session/firm registry — i.e. an "orphan" owner whose
+/// original session was removed from configuration between the
+/// snapshot being persisted and the channel being restored.
+/// </summary>
+public enum OrphanSessionPolicy
+{
+    /// <summary>
+    /// Skip the owner registration with a warning + metric increment.
+    /// The engine state still loads — the orphaned resting order keeps
+    /// matching, but PASSIVE-side execution reports it generates have
+    /// no destination session and are dropped at the outbound layer.
+    /// Default policy.
+    /// </summary>
+    Drop = 0,
+
+    /// <summary>
+    /// Treat any orphan owner as a fatal restore error and fail-closed.
+    /// <see cref="ChannelDispatcher.RestoreChannelState"/> throws and
+    /// the dispatcher loop terminates so an operator can either repair
+    /// the snapshot, restore the missing session credentials, or
+    /// invoke the admin reset endpoint.
+    /// </summary>
+    Reject = 1,
 }
 
 /// <summary>
@@ -491,6 +526,14 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_replays_total",
             "Total WAL records replayed at boot to bring this channel up to the most-recently-acknowledged command. Non-zero only on the boot following an unclean shutdown.",
             channels, c => c.WalReplays);
+
+        // Issue #270: cross-channel consistency check. Counts owner
+        // entries silently dropped at restore because their SessionId
+        // does not resolve in the host's firm/session registry. Always
+        // 0 under the Reject policy (which throws instead of dropping).
+        EmitCounter(sb, "exch_owner_orphans_dropped_total",
+            "Total OrderOwnerSnapshot entries dropped on snapshot restore because their SessionId did not resolve in the host registry (issue #270, Drop policy).",
+            channels, c => c.OwnerOrphansDropped);
 
         // Issue #174: throughput counters. Bounded labels (msg_type ≤ 6,
         // exec_type ≤ 7, feed = 3) — safe to ship per-channel.

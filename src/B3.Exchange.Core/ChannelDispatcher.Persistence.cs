@@ -122,14 +122,34 @@ public sealed partial class ChannelDispatcher
         // appends keep increasing monotonically across the restart.
         _lastAppliedSeq = snapshot.LastAppliedSeq;
 
+        long droppedOrphans = 0;
+
         foreach (var o in snapshot.Owners)
         {
+            // Issue #270: cross-channel consistency check. Skip owners
+            // whose SessionId no longer resolves in the host registry
+            // under the Drop policy (with a warning + metric); under
+            // Reject the orphan-set is collected and thrown below.
+            if (_sessionExists is not null && !_sessionExists(o.SessionValue))
+            {
+                if (_orphanPolicy == OrphanSessionPolicy.Reject)
+                {
+                    throw new InvalidOperationException(
+                        $"channel {ChannelNumber}: snapshot owner orderId {o.OrderId} references unknown SessionId '{o.SessionValue}' (orphan); orphanPolicy=Reject");
+                }
+                droppedOrphans++;
+                _logger.LogWarning(
+                    "channel {ChannelNumber}: dropping orphan owner orderId={OrderId} sessionId={SessionId} (not in registry)",
+                    ChannelNumber, o.OrderId, o.SessionValue);
+                continue;
+            }
             _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId);
         }
+        if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
 
         _logger.LogInformation(
-            "channel {ChannelNumber}: restored snapshot — seq={SequenceNumber}/{SequenceVersion} owners={OwnerCount}",
-            ChannelNumber, snapshot.SequenceNumber, snapshot.SequenceVersion, snapshot.Owners.Count);
+            "channel {ChannelNumber}: restored snapshot — seq={SequenceNumber}/{SequenceVersion} owners={OwnerCount} orphansDropped={OrphansDropped}",
+            ChannelNumber, snapshot.SequenceNumber, snapshot.SequenceVersion, snapshot.Owners.Count, droppedOrphans);
     }
 
     /// <summary>

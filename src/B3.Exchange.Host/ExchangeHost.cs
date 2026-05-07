@@ -161,6 +161,11 @@ public sealed class ExchangeHost : IAsyncDisposable
             var wal = BuildWal(ch);
             if (persister != null) _persistersByChannel[ch.ChannelNumber] = persister;
             if (wal != null) _walsByChannel[ch.ChannelNumber] = wal;
+            // Issue #270: cross-channel consistency check on restore.
+            // Resolve the policy here so the dispatcher can stay
+            // host-agnostic (it just gets a predicate + enum).
+            var orphanPolicy = ParseOrphanPolicy(ch.Persistence?.OrphanSessionPolicy);
+            Func<string, bool> sessionExists = sid => firmRegistry.FindSession(sid) is not null;
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
@@ -178,7 +183,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 persister: persister,
                 snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
                 useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false,
-                wal: wal);
+                wal: wal,
+                sessionExists: sessionExists,
+                orphanPolicy: orphanPolicy);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -471,6 +478,24 @@ public sealed class ExchangeHost : IAsyncDisposable
             ch.ChannelNumber,
             _loggerFactory.CreateLogger<FileChannelWriteAheadLog>(),
             walCfg.FsyncPerWrite);
+    }
+
+    /// <summary>
+    /// Issue #270: parses the <c>persistence.orphanSessionPolicy</c>
+    /// JSON string into the <see cref="OrphanSessionPolicy"/> enum
+    /// expected by <see cref="ChannelDispatcher"/>. Defaults to
+    /// <see cref="OrphanSessionPolicy.Drop"/> when absent.
+    /// </summary>
+    private static OrphanSessionPolicy ParseOrphanPolicy(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return OrphanSessionPolicy.Drop;
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "drop" => OrphanSessionPolicy.Drop,
+            "reject" => OrphanSessionPolicy.Reject,
+            _ => throw new InvalidOperationException(
+                $"persistence.orphanSessionPolicy must be 'drop' or 'reject' (got '{raw}')"),
+        };
     }
 
     private FirmRegistry BuildFirmRegistry()
