@@ -303,6 +303,17 @@ public sealed class PersistenceConfig
     /// the snapshot-only behaviour (and pay no per-command file IO).
     /// </summary>
     [JsonPropertyName("wal")] public WalConfig? Wal { get; set; }
+
+    /// <summary>
+    /// Issue #270: policy applied to <see cref="OrderOwnerSnapshot"/>
+    /// entries whose <c>SessionValue</c> is not present in the host's
+    /// firm/session registry at restore time. Accepted values:
+    /// <c>"drop"</c> (default — log + metric, skip the owner; engine
+    /// state still loads) or <c>"reject"</c> (treat as fatal restore
+    /// error → channel fails closed). Case-insensitive. Absent ⇒
+    /// <c>"drop"</c>.
+    /// </summary>
+    [JsonPropertyName("orphanSessionPolicy")] public string? OrphanSessionPolicy { get; set; }
 }
 
 /// <summary>

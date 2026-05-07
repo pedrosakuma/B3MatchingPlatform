@@ -170,6 +170,15 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly IChannelStatePersister? _persister;
     private readonly SnapshotThrottlePolicy _snapshotThrottle;
     private readonly BackgroundSnapshotWriter? _asyncSnapshotWriter;
+    /// <summary>
+    /// Issue #270: predicate the restore path uses to detect orphan
+    /// <see cref="OrderOwnerSnapshot.SessionValue"/> entries — owners
+    /// whose original session is no longer present in the host's
+    /// session/firm registry. <c>null</c> ⇒ no check (legacy
+    /// behaviour, all owners restored).
+    /// </summary>
+    private readonly Func<string, bool>? _sessionExists;
+    private readonly OrphanSessionPolicy _orphanPolicy;
     // Throttle bookkeeping (issue #267). Mutated only on the dispatch
     // loop thread → no Interlocked needed.
     private long _commandsSincePersist;
@@ -229,7 +238,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         IChannelStatePersister? persister = null,
         SnapshotThrottlePolicy? snapshotThrottle = null,
         bool useAsyncSnapshotWriter = false,
-        IChannelWriteAheadLog? wal = null)
+        IChannelWriteAheadLog? wal = null,
+        Func<string, bool>? sessionExists = null,
+        OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -246,6 +257,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _retxBuffer = retxBuffer;
         _persister = persister;
         _wal = wal;
+        _sessionExists = sessionExists;
+        _orphanPolicy = orphanPolicy;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist
