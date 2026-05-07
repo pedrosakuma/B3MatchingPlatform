@@ -321,7 +321,16 @@ public readonly record struct SessionDiagnostics(
     int RetxBufferDepth,
     long SendQueueDepth,
     string? AttachedTransportId,
-    long LastActivityAtMs);
+    long LastActivityAtMs)
+{
+    /// <summary>
+    /// Capacity of the per-session FIXP retransmit ring. Combined with
+    /// <see cref="RetxBufferDepth"/> lets the Prometheus renderer expose
+    /// a 0..1 utilization gauge (issue #288). Zero means "unknown / not
+    /// reported by the provider"; treated as "skip the gauge sample".
+    /// </summary>
+    public int RetxBufferCapacity { get; init; }
+}
 
 /// <summary>
 /// Static identity for a participant (corretora). Mirror of the
@@ -344,11 +353,30 @@ public sealed class MetricsRegistry
     private readonly SessionLifecycleMetrics _sessionLifecycle = new();
     private readonly ThrottleMetrics _throttle = new();
     private readonly TransportMetrics _transport = new();
+    private readonly RetransmitMetrics _retransmit = new();
     private readonly BoundedSessionFirmCounters _sessionFirmMessages = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
     public ThrottleMetrics Throttle => _throttle;
     public TransportMetrics Transport => _transport;
+
+    /// <summary>
+    /// Issue #288: process-wide RetransmitBuffer counters
+    /// (per-session-ring evictions and Suspended-state appends). The
+    /// per-session utilization gauge is rendered separately, gated by
+    /// <see cref="EmitFixpSessionLabels"/>.
+    /// </summary>
+    public RetransmitMetrics Retransmit => _retransmit;
+
+    /// <summary>
+    /// Issue #288: when <c>true</c>, the Prometheus renderer emits
+    /// <c>exch_fixp_retransmit_buffer_utilization</c> with a per-session
+    /// label. Default <c>false</c> so deployments with many short-lived
+    /// sessions do not blow up scrape cardinality. The aggregate counters
+    /// (<c>exch_fixp_retransmit_buffer_evictions_total</c>,
+    /// <c>exch_fixp_passive_er_buffered_total</c>) are always emitted.
+    /// </summary>
+    public bool EmitFixpSessionLabels { get; set; }
 
     /// <summary>
     /// Bounded-cardinality per-firm/per-session inbound message counters
@@ -504,6 +532,35 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_transport_send_queue_full_total",
             "Total times the gateway's TcpTransport closed a session because its bounded outbound send queue overflowed (issue #155). A non-zero value means a stuck/slow consumer is causing teardowns — alert.",
             _transport.SendQueueFull);
+
+        // Issue #288: FIXP RetransmitBuffer dimensioning observability.
+        // Aggregate counters are always emitted; the per-session
+        // utilization gauge below is gated by EmitFixpSessionLabels to
+        // protect scrape cardinality on deployments with many short-lived
+        // sessions.
+        EmitProcessCounter(sb, "exch_fixp_retransmit_buffer_evictions_total",
+            "Total per-session FIXP RetransmitBuffer evictions (the ring was full when a new outbound business frame was appended). Each eviction drops a sequence number that can no longer be replayed; a non-zero rate means the configured RetransmitBufferCapacity is too small for the workload's disconnect-window fill rate (issue #288).",
+            _retransmit.BufferEvictions);
+        EmitProcessCounter(sb, "exch_fixp_passive_er_buffered_total",
+            "Total outbound FIXP business frames appended to a per-session RetransmitBuffer while the session was Suspended (the issue #217 path: passive ExecutionReports keep being encoded after the transport drops, awaiting a reattach + RetransmitRequest). Quantifies how much reattach traffic is post-disconnect catch-up (issue #288).",
+            _retransmit.PassiveErBuffered);
+        if (EmitFixpSessionLabels && sessionSnap.Length > 0)
+        {
+            sb.Append("# HELP exch_fixp_retransmit_buffer_utilization Per-session ratio of buffered frames to RetransmitBufferCapacity (0.0..1.0). Combined with exch_fixp_retransmit_buffer_evictions_total this is the dimensioning signal for issue #288. Per-session labels are opt-in; enable via metrics.fixpSessionLabelsEnabled.\n");
+            sb.Append("# TYPE exch_fixp_retransmit_buffer_utilization gauge\n");
+            foreach (var s in sessionSnap)
+            {
+                if (s.RetxBufferCapacity <= 0) continue;
+                double util = (double)s.RetxBufferDepth / s.RetxBufferCapacity;
+                sb.Append("exch_fixp_retransmit_buffer_utilization{session=\"")
+                  .Append(EscapeLabel(s.SessionId))
+                  .Append("\",firm=\"")
+                  .Append(EscapeLabel(s.FirmId))
+                  .Append("\"} ")
+                  .Append(util.ToString("0.######", CultureInfo.InvariantCulture))
+                  .Append('\n');
+            }
+        }
 
         // Issue #173: latency histograms. Per-channel buckets in seconds;
         // observed via Stopwatch.GetTimestamp() at the dispatcher

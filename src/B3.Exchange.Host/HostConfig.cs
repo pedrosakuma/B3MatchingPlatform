@@ -18,6 +18,31 @@ public sealed class HostConfig
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
     [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
+
+    /// <summary>
+    /// Issue #288: optional metrics-rendering tunables (per-session label
+    /// gates, etc). Omit to keep all defaults. Today only controls
+    /// <see cref="MetricsConfig.FixpSessionLabelsEnabled"/>.
+    /// </summary>
+    [JsonPropertyName("metrics")] public MetricsConfig? Metrics { get; set; }
+}
+
+/// <summary>
+/// Issue #288: gates for metrics that carry per-session labels. Per-session
+/// cardinality can blow up scrape size on deployments where firms cycle
+/// through many short-lived FIXP sessions; opt in only when the operator
+/// explicitly accepts that cost.
+/// </summary>
+public sealed class MetricsConfig
+{
+    /// <summary>
+    /// When <c>true</c>, the Prometheus renderer emits the
+    /// <c>exch_fixp_retransmit_buffer_utilization</c> gauge with a
+    /// per-session label. Default <c>false</c>; the aggregate counters
+    /// (<c>exch_fixp_retransmit_buffer_evictions_total</c>,
+    /// <c>exch_fixp_passive_er_buffered_total</c>) are always emitted.
+    /// </summary>
+    [JsonPropertyName("fixpSessionLabelsEnabled")] public bool FixpSessionLabelsEnabled { get; set; }
 }
 
 /// <summary>

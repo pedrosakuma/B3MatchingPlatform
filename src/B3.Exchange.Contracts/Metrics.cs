@@ -73,3 +73,36 @@ public sealed class TransportMetrics
 
     public void IncSendQueueFull() => Interlocked.Increment(ref _sendQueueFull);
 }
+
+/// <summary>
+/// Process-wide counters for the per-session FIXP RetransmitBuffer
+/// dimensioning (issue #288). The May 2026 disconnect/reattach review
+/// identified <c>(buffer capacity, SuspendedTimeoutMs, fill rate while
+/// disconnected)</c> as the dimensioning tuple for a successful reattach;
+/// without these counters, an undersized ring is only discovered when a
+/// peer fails to reattach — too late.
+///
+/// <list type="bullet">
+///   <item><see cref="BufferEvictions"/>: every tick is a sequence number
+///         that is no longer replayable. Each tick is a potential reattach
+///         failure if the peer requests it.</item>
+///   <item><see cref="PassiveErBuffered"/>: outbound frames the encoder
+///         appended to the ring while the session was Suspended (the
+///         issue #217 path). Quantifies "how much reattach traffic is
+///         post-disconnect catch-up?".</item>
+/// </list>
+///
+/// <para>Lives in <c>B3.Exchange.Contracts</c> so the Gateway can consume
+/// the type without taking a project reference on Core.</para>
+/// </summary>
+public sealed class RetransmitMetrics
+{
+    private long _bufferEvictions;
+    private long _passiveErBuffered;
+
+    public long BufferEvictions => Interlocked.Read(ref _bufferEvictions);
+    public long PassiveErBuffered => Interlocked.Read(ref _passiveErBuffered);
+
+    public void IncBufferEvictions() => Interlocked.Increment(ref _bufferEvictions);
+    public void IncPassiveErBuffered() => Interlocked.Increment(ref _passiveErBuffered);
+}

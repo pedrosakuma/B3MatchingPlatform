@@ -228,6 +228,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// in response to a <c>RetransmitRequest</c>. Diagnostic only.</summary>
     public int RetxBufferDepth => _retxBuffer.Count;
 
+    /// <summary>Capacity of the per-session FIXP retransmit ring. Combined
+    /// with <see cref="RetxBufferDepth"/> drives the
+    /// <c>exch_fixp_retransmit_buffer_utilization</c> gauge (issue #288).
+    /// Diagnostic only.</summary>
+    public int RetxBufferCapacity => _retxBuffer.Capacity;
+
     /// <summary>Last allocated outbound MsgSeqNum (the value the next
     /// emitted business frame's <c>NextMsgSeqNum()</c> call will return
     /// is <c>OutboundSeq + 1</c>). Diagnostic only.</summary>
@@ -266,7 +272,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         NegotiationValidator? negotiationValidator = null,
         SessionClaimRegistry? sessionClaims = null,
         EstablishValidator? establishValidator = null,
-        Func<long>? nowMs = null)
+        Func<long>? nowMs = null,
+        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -281,7 +288,13 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
-        _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity);
+        // Issue #288: feed the per-session ring with the process-wide
+        // RetransmitMetrics + a "currently Suspended?" predicate so the
+        // outbound encoder can attribute frames buffered while the
+        // transport is down (the #217 path).
+        _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity,
+            metrics: retransmitMetrics,
+            isSuspended: () => State == FixpState.Suspended);
         _outboundEncoder = new FixpOutboundEncoder(
             sessionId: () => SessionId,
             nextMsgSeqNum: NextMsgSeqNum,
