@@ -192,22 +192,75 @@ Exposes:
   30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
   `snapshot` block to publish only the incremental feed (no bootstrap for
   mid-session consumers).
-* `persistence` *(optional, per channel — issue #260)* — enables order
-  book + counter persistence so a restart resumes with the live working
-  book, RptSeq, and order/trade-id allocators intact. When present, the
-  dispatcher writes an atomic JSON snapshot to
-  `{dataDir}/channel-{N}.snapshot` after every command flush and reloads
-  it on the dispatch loop's first turn.
-  * `dataDir` — directory holding the per-channel snapshot file. The host
-    creates it if missing. Mount a durable volume here in container
-    deployments (e.g. `/var/lib/b3matching` — see Dockerfile).
-  * Limitations *(out of scope for this PR; tracked separately)*: stop
-    orders, auction-top throttling state, the UMDF retransmit ring,
-    snapshot-rotator cursor, and FIXP session counters are not persisted.
-    Resting `OrderRegistry` ownership is restored as-is — passive fills
-    that arrive while the original session is still away are dropped on
-    the floor as before. Omit the `persistence` block to keep the legacy
-    stateless boot.
+* `persistence` *(optional, per channel — issue #260 + roadmap #262–#272)*
+  — enables order book + counter persistence so a restart resumes with
+  the live working book, RptSeq, order/trade-id allocators, untriggered
+  stops, and resting-order ownership intact. The dispatcher captures a
+  snapshot on the loop thread after every command flush (subject to
+  `throttle`), serializes it (synchronously by default, or off-loop
+  when `asyncWriter=true`) and writes it atomically into one of N
+  rolling generation slots. Optional Write-Ahead Log records every
+  state-mutating command between snapshots, replayed on cold start.
+  * `dataDir` — directory holding the per-channel snapshot file(s) and
+    optional WAL. The host creates it if missing. Mount a durable
+    volume here in container deployments (e.g. `/var/lib/b3matching`
+    — see Dockerfile).
+  * `format` *(#266)* — `"json"` (default; pretty + `jq`-friendly) or
+    `"binary"` (compact `B3SS`-prefixed framing, ~3× smaller). Both
+    formats are auto-detected on load via magic-byte sniff, so a
+    deployment can flip the value (or roll back) without a one-shot
+    conversion.
+  * `generations` *(#264)* — number of rolling snapshot slots kept on
+    disk per channel. The persister round-robins across slots
+    `0..generations-1` and falls back to the previous slot if the
+    newest is corrupted. Default `3`.
+  * `throttle` *(#267)* — `{ everyN, minIntervalMs }`. Both fields
+    optional; whichever fires first triggers the persist. Operator
+    commands always force-persist regardless of throttle. Absent /
+    both zero ⇒ persist after every command flush (PR #261 default).
+  * `asyncWriter` *(#268)* — when `true`, the dispatcher captures the
+    snapshot POCO on the loop thread (cheap) and hands serialization
+    + write to a dedicated writer thread. Backpressure is
+    last-write-wins (newest capture supersedes older queued one) —
+    monitor `exch_snapshot_dropped_by_backpressure_total`. Default
+    `false` so existing deployments keep zero-RPO behaviour.
+  * `wal` *(#269)* — `{ enabled, fsyncPerWrite }`. When
+    `enabled=true` the dispatcher appends one record per
+    state-mutating command to `{dataDir}/channel-{N}.wal` BEFORE the
+    engine observes it, and replays the surviving records on cold
+    start — closing the gap between the most-recent snapshot and an
+    unclean shutdown. `fsyncPerWrite` (default `true`) trades
+    latency for durability per-record. Off by default so existing
+    deployments pay no per-command file IO.
+  * `orphanSessionPolicy` *(#270)* — policy applied to
+    `OrderOwnerSnapshot` entries whose `SessionValue` is no longer
+    present in the host's session registry at restore time. Either
+    `"drop"` (default — log + bump
+    `exch_owner_orphans_dropped_total`, skip the owner; engine
+    state still loads) or `"reject"` (treat as fatal; channel fails
+    closed). Case-insensitive.
+* Snapshot evolution and on-disk schema versioning are described in the
+  *Snapshot file format* and *Snapshot schema evolution* sections below.
+* Limitations: auction-top throttling state, the UMDF retransmit ring,
+  snapshot-rotator cursor, and FIXP session counters are not persisted.
+  Operators that depend on auction throttling should drain in-flight
+  indicative state before restart. Omit the `persistence` block to keep
+  the legacy stateless boot.
+
+**Consolidated example with every sub-block:**
+
+```jsonc
+"persistence": {
+  "dataDir": "/var/lib/b3matching/channel-84",
+  "format": "binary",
+  "generations": 5,
+  "throttle": { "everyN": 100, "minIntervalMs": 250 },
+  "asyncWriter": true,
+  "wal": { "enabled": true, "fsyncPerWrite": true },
+  "orphanSessionPolicy": "drop"
+}
+```
+
 
 ### Snapshot file format (issue #266)
 
