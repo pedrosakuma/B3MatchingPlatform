@@ -174,6 +174,20 @@ public sealed partial class FixpSession
         // ChannelDispatcher's order-owners map keeps the session rooted for
         // the lifetime of every resting order it placed → unbounded memory.
         try { _sink.OnSessionClosed(Identity); } catch { }
+        // Issue #289: terminal close ⇒ drop the persisted retransmit
+        // ring file. We deliberately do NOT do this on Suspend so a
+        // host crash while Suspended leaves the file intact for the
+        // next boot to rehydrate from.
+        if (_retransmitPersister is not null)
+        {
+            try { _retransmitPersister.Remove(SessionId); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp session {ConnectionId} sessionId={SessionId} failed to remove persisted retransmit file",
+                    ConnectionId, SessionId);
+            }
+        }
         try { _onClosed?.Invoke(this, reason); } catch { }
     }
 

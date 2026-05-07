@@ -45,6 +45,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private HttpServer? _http;
     private DailyResetScheduler? _dailyReset;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
+    private B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister? _retransmitPersister;
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
@@ -296,6 +297,24 @@ public sealed class ExchangeHost : IAsyncDisposable
         // prior Negotiate/Establish — used by the synthetic trader and
         // pre-#42 integration tests until they learn the handshake.
         bool requireHandshake = _config.Auth.RequireFixpHandshake;
+        // Issue #289: optional FIXP retransmit-buffer persistence. When
+        // configured, every outbound business frame is mirrored to a
+        // per-session file under retransmitPersistenceDir; on boot we
+        // load whatever rings survived a crash and feed them to the
+        // listener so a re-Establishing peer's RetransmitRequest can
+        // be served from the recovered ring instead of falling through
+        // to FIXP §4.5.6 not-applied-range.
+        IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? persistedRings = null;
+        if (!string.IsNullOrWhiteSpace(_config.Tcp.RetransmitPersistenceDir))
+        {
+            _retransmitPersister = new B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister(
+                _config.Tcp.RetransmitPersistenceDir!,
+                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister>());
+            persistedRings = _retransmitPersister.LoadAll();
+            _logger.LogInformation(
+                "fixp retransmit persistence enabled: dir={Dir} recoveredSessions={Count}",
+                _config.Tcp.RetransmitPersistenceDir, persistedRings.Count);
+        }
         _listener = new EntryPointListener(listenEp, _router, sessionRegistry, _loggerFactory,
             identityFactory: remote =>
             {
@@ -315,7 +334,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             negotiationValidator: requireHandshake ? negotiationValidator : null,
             sessionClaims: requireHandshake ? sessionClaims : null,
             establishValidator: requireHandshake ? establishValidator : null,
-            retransmitMetrics: _metrics.Retransmit);
+            retransmitMetrics: _metrics.Retransmit,
+            retransmitPersister: _retransmitPersister,
+            persistedRetransmitSnapshots: persistedRings);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 
@@ -666,6 +687,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
+        _retransmitPersister?.Dispose();
         // Issue #290: release dataDir locks last so any persister/WAL
         // shutdown that needs the directory still has it.
         foreach (var l in _dataDirLocks)

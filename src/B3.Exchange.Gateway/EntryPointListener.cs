@@ -29,6 +29,8 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly SessionClaimRegistry? _sessionClaims;
     private readonly EstablishValidator? _establishValidator;
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
+    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
+    private readonly IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? _persistedRetransmitSnapshots;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -64,7 +66,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         NegotiationValidator? negotiationValidator = null,
         SessionClaimRegistry? sessionClaims = null,
         EstablishValidator? establishValidator = null,
-        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null)
+        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
+        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
+        IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? persistedRetransmitSnapshots = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         ArgumentNullException.ThrowIfNull(registry);
@@ -81,6 +85,8 @@ public sealed class EntryPointListener : IAsyncDisposable
         _sessionClaims = sessionClaims;
         _establishValidator = establishValidator;
         _retransmitMetrics = retransmitMetrics;
+        _retransmitPersister = retransmitPersister;
+        _persistedRetransmitSnapshots = persistedRetransmitSnapshots;
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
             throw new ArgumentException(
@@ -425,13 +431,25 @@ public sealed class EntryPointListener : IAsyncDisposable
         };
 
         Stream sessionStream = firstFrame is null ? stream : new PrependedStream(firstFrame, stream);
+        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedSnapshot = null;
+        // Issue #289: if a persister is wired in and we loaded a ring
+        // for this sessionId at boot, hand it to the new FixpSession so
+        // its RetransmitBuffer is rehydrated before the peer's
+        // Establish (and any subsequent RetransmitRequest) lands.
+        if (_persistedRetransmitSnapshots is not null
+            && _persistedRetransmitSnapshots.TryGetValue(identity.SessionId, out var preLoaded))
+        {
+            persistedSnapshot = preLoaded;
+        }
         var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
             sessionStream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
             options: _sessionOptions, onClosed: onClosed,
             negotiationValidator: _negotiationValidator,
             sessionClaims: _sessionClaims,
             establishValidator: _establishValidator,
-            retransmitMetrics: _retransmitMetrics);
+            retransmitMetrics: _retransmitMetrics,
+            retransmitPersister: _retransmitPersister,
+            persistedRetransmitSnapshot: persistedSnapshot);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();
