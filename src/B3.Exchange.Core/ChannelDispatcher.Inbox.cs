@@ -37,8 +37,26 @@ public sealed partial class ChannelDispatcher
         return act;
     }
 
+    /// <summary>
+    /// Issue #286: producer-side check used by every state-mutating
+    /// <c>Enqueue*</c> entry point. Returns <c>true</c> if the channel
+    /// is WAL-halted; the caller bumps
+    /// <c>exch_wal_halt_rejects_total</c>, returns <c>false</c> to the
+    /// upstream gateway (no work item is posted), and the operator
+    /// alert routes via the readiness probe + the rejection metric.
+    /// Cheap volatile read; called before any allocation.
+    /// </summary>
+    private bool RejectIfWalHalted(WorkKind kind)
+    {
+        if (Volatile.Read(ref _walHalted) == 0) return false;
+        _metrics?.IncWalHaltReject();
+        LogWalHalted(ChannelNumber, kind);
+        return true;
+    }
+
     public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
     {
+        if (RejectIfWalHalted(WorkKind.New)) return false;
         using var act = StartEnqueueSpan(WorkKind.New, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.New, session, enteringFirm, true,
@@ -53,6 +71,7 @@ public sealed partial class ChannelDispatcher
     public bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
+        if (RejectIfWalHalted(WorkKind.Cancel)) return false;
         using var act = StartEnqueueSpan(WorkKind.Cancel, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cancel, session, enteringFirm, true,
@@ -67,6 +86,7 @@ public sealed partial class ChannelDispatcher
     public bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm,
         ulong clOrdIdValue, ulong origClOrdIdValue)
     {
+        if (RejectIfWalHalted(WorkKind.Replace)) return false;
         using var act = StartEnqueueSpan(WorkKind.Replace, session, enteringFirm, clOrdIdValue, cmd.SecurityId);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Replace, session, enteringFirm, true,

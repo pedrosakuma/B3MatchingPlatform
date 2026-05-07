@@ -96,9 +96,17 @@ public sealed partial class ChannelDispatcher
         // resulting state is captured directly. _lastAppliedSeq is
         // advanced by WalAppendIfEnabled regardless, including in
         // replay mode, so the on-loop counter stays consistent.
+        // Issue #286: under WalAppendFailurePolicy.Halt the call
+        // returns false on the first append failure — the command
+        // must NOT reach the engine (state would diverge from the
+        // WAL on next replay). We bail out of ProcessOne entirely.
         if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
         {
-            WalAppendIfEnabled(in item);
+            if (!WalAppendIfEnabled(in item))
+            {
+                _metrics?.IncWalHaltReject();
+                return;
+            }
         }
         bool succeeded = false;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();

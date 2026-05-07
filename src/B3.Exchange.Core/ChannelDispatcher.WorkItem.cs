@@ -73,4 +73,8 @@ public sealed partial class ChannelDispatcher
     [LoggerMessage(EventId = 1004, Level = LogLevel.Error,
         Message = "channel {ChannelNumber} dispatcher work-item crash workKind={WorkKind} session={Session} firm={Firm} clOrdId={ClOrdId}")]
     private partial void LogDispatcherCrash(Exception ex, byte channelNumber, WorkKind workKind, string session, uint firm, ulong clOrdId);
+
+    [LoggerMessage(EventId = 1005, Level = LogLevel.Warning,
+        Message = "channel {ChannelNumber} rejecting {WorkKind} — channel WAL-halted (issue #286); restart host after resolving storage fault")]
+    private partial void LogWalHalted(byte channelNumber, WorkKind workKind);
 }

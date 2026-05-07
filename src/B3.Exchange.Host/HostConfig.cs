@@ -349,6 +349,32 @@ public sealed class WalConfig
     /// throughput on workloads that tolerate losing the last few
     /// commands on a host crash.</summary>
     [JsonPropertyName("fsyncPerWrite")] public bool FsyncPerWrite { get; set; } = true;
+
+    /// <summary>Issue #286: behaviour when <c>Append</c> throws.
+    /// Default <c>continue</c> preserves the pre-#286 contract — the
+    /// failure is logged + counted via
+    /// <c>exch_wal_append_failures_total</c>, and the command runs
+    /// against the engine even though it is not durable. Set to
+    /// <c>halt</c> to refuse the command (no engine mutation, no
+    /// UMDF emission, no ExecutionReport) and flip the host's
+    /// readiness probe to NOT_READY on the first failure; the halt
+    /// is sticky and clears only on host restart.</summary>
+    [JsonPropertyName("onAppendFailure")] public string OnAppendFailure { get; set; } = "continue";
+
+    /// <summary>
+    /// Parses <see cref="OnAppendFailure"/> case-insensitively to
+    /// the typed enum. Throws on unknown values so misconfiguration
+    /// fails the boot rather than silently degrading to the wrong
+    /// policy.
+    /// </summary>
+    public B3.Exchange.Core.WalAppendFailurePolicy ResolveOnAppendFailure() =>
+        OnAppendFailure?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "continue" => B3.Exchange.Core.WalAppendFailurePolicy.Continue,
+            "halt" => B3.Exchange.Core.WalAppendFailurePolicy.Halt,
+            _ => throw new InvalidOperationException(
+                $"persistence.wal.onAppendFailure: unknown value '{OnAppendFailure}' (expected 'continue' or 'halt')"),
+        };
 }
 
 /// <summary>

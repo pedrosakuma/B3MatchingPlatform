@@ -23,14 +23,22 @@ public sealed partial class ChannelDispatcher
     /// engine observes the command. Called from <c>ProcessOne</c>
     /// before each <c>WorkKind.New</c> / <c>Cancel</c> /
     /// <c>Replace</c> branch.
+    ///
+    /// <para>Returns <c>true</c> when the caller may safely execute
+    /// the command. Returns <c>false</c> only when the configured
+    /// <see cref="WalAppendFailurePolicy"/> is
+    /// <see cref="WalAppendFailurePolicy.Halt"/> AND the append
+    /// threw — the command must be skipped (no engine mutation,
+    /// no UMDF emission, no ExecutionReport) and the channel is
+    /// permanently marked WAL-halted (issue #286).</para>
     /// </summary>
-    private void WalAppendIfEnabled(in WorkItem item)
+    private bool WalAppendIfEnabled(in WorkItem item)
     {
         // Always advance the applied counter so snapshot.LastAppliedSeq
         // is meaningful even when WAL is disabled (lets a future WAL
         // turn-on observe a sane "starting point").
         _lastAppliedSeq++;
-        if (_wal is null || _replayMode) return;
+        if (_wal is null || _replayMode) return true;
         WalRecord? rec = item.Kind switch
         {
             WorkKind.New when item.NewOrder is not null => new WalRecord(
@@ -50,7 +58,7 @@ public sealed partial class ChannelDispatcher
                 null, null, item.Replace),
             _ => null,
         };
-        if (rec is null) return;
+        if (rec is null) return true;
         try
         {
             // Best-effort byte accounting: Append re-serializes the
@@ -60,17 +68,38 @@ public sealed partial class ChannelDispatcher
             long approxBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(rec).Length + 1;
             _wal.Append(rec);
             _metrics?.IncWalAppend(approxBytes);
+            return true;
         }
         catch (Exception ex)
         {
-            // WAL append failure is a durability fault but not a
-            // correctness fault: log and continue. The dispatcher
-            // crash counter is bumped so operators alert on it; the
-            // command itself still runs so live consumers see no gap.
+            // Issue #286: track the WAL-specific append failure
+            // separately from the generic dispatcher crash counter so
+            // alert routing can target the persistence on-call story.
+            _metrics?.IncWalAppendFailure();
             _metrics?.IncDispatcherCrashes();
+            if (_walAppendFailurePolicy == WalAppendFailurePolicy.Halt)
+            {
+                // Sticky: the first failure flips the channel to
+                // halted; every subsequent producer-side enqueue and
+                // every readiness probe observe IsWalHealthy=false
+                // until the host is restarted. The command is not
+                // executed — the engine MUST NOT observe a mutation
+                // that did not reach the WAL, otherwise replay would
+                // diverge from the live consumer view.
+                Volatile.Write(ref _walHalted, 1);
+                _logger.LogCritical(ex,
+                    "channel {ChannelNumber}: WAL append failed (seq={Seq} kind={Kind}); WAL-halt policy → channel marked unhealthy and command refused; restart the host after resolving the storage fault",
+                    ChannelNumber, _lastAppliedSeq, item.Kind);
+                return false;
+            }
+            // Continue policy (default, pre-#286 behaviour): durability
+            // fault but not a correctness fault; let the command run so
+            // live consumers see no gap. Operators alert on the new
+            // exch_wal_append_failures_total counter.
             _logger.LogError(ex,
                 "channel {ChannelNumber}: WAL append failed (seq={Seq} kind={Kind}); command will run but is not durable",
                 ChannelNumber, _lastAppliedSeq, item.Kind);
+            return true;
         }
     }
 

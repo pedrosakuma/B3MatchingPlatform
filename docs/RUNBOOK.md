@@ -701,6 +701,8 @@ text format, `channel="{N}"` label on every series).
 | `exch_wal_truncations_total` | counter | WAL truncations (post-snapshot or admin-reset triggered). |
 | `exch_wal_record_corruption_total` | counter | WAL records dropped at replay because the per-record Crc32C did not match (bit-rot or external tampering). |
 | `exch_wal_records_legacy_total` | counter | WAL records replayed in pre-#285 (no Crc32C suffix) format. Steady-state should be `0` once every channel has rolled past the upgrade. |
+| `exch_wal_append_failures_total` | counter | WAL `Append` calls that threw (issue #286). Counted under both `continue` and `halt` policies; the canonical "WAL is failing" alert. |
+| `exch_wal_halt_rejects_total` | counter | Producer-side `Enqueue*` rejections after the channel was WAL-halted (issue #286). Always `0` unless the channel runs with `persistence.wal.onAppendFailure=halt`. |
 | `exch_owner_orphans_dropped_total` | counter | `OrderOwnerSnapshot` entries whose sessionId was not in the registry at restore time, dropped per `orphanSessionPolicy=drop`. |
 
 ### 7.4 On-disk layout & WAL design
@@ -763,6 +765,15 @@ intended behaviour for unclean shutdown.
    `exch_snapshot_save_failures_total`), replay stays sequential
    but takes proportionally longer. That is a saves-broken alert,
    not a replay-perf concern.
+
+**Append-failure policy** (issue #286): when
+`IChannelWriteAheadLog.Append` throws (disk full, EIO, permission
+flip), the channel honours `persistence.wal.onAppendFailure`:
+
+| Value | Behavior |
+| --- | --- |
+| `continue` (default) | Log + bump `exch_wal_append_failures_total`, then run the command. The live consumer view stays consistent, but the command is **not durable** — a host crash before the next snapshot will silently drop it on replay. |
+| `halt` | Log + bump `exch_wal_append_failures_total`, **refuse** the command (no engine mutation, no UMDF emission, no ExecutionReport), flip the channel's WAL-halt flag. The host's `wal-halt` readiness probe goes NOT_READY so load balancers drain new connections; subsequent `Enqueue*` calls are short-circuited and counted by `exch_wal_halt_rejects_total`. The halt is sticky — the operator must restart the host after fixing the underlying storage fault. |
 
 **Idempotency note:** if the newest snapshot is corrupt and the
 persister falls back to an older slot, replay starts from that
