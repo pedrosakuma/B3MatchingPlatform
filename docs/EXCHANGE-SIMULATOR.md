@@ -209,6 +209,30 @@ Exposes:
     the floor as before. Omit the `persistence` block to keep the legacy
     stateless boot.
 
+### Snapshot schema evolution (issue #272)
+
+`ChannelStateSnapshot` carries an integer `Version` field
+(`ChannelStateSnapshot.CurrentVersion`, currently `1`). The persister
+parses every snapshot to a `JsonNode` first and runs it through
+`SnapshotMigrationSet` before final deserialization. Three rules apply:
+
+* **Forward compatibility** — System.Text.Json ignores unknown JSON
+  properties on read by default, so a payload written by a *newer* host
+  loads cleanly under an *older* host as long as the fields the old
+  host already knows about retain their meaning. Only ever add new
+  optional fields with sensible defaults; never repurpose or rename a
+  field without a version bump.
+* **Backward compatibility** — payloads written by older hosts require
+  a registered migration for every step from their `Version` up to
+  `CurrentVersion`. Bumping the schema is a two-commit dance: first
+  register the `N → N+1` migration in `SnapshotMigrationSet.BuildDefault`,
+  then bump `CurrentVersion`. Missing any step on the chain throws and
+  the dispatcher fails closed (per issue #270's restore contract).
+* **Forward-version rejection** — if the on-disk `Version` is *higher*
+  than `CurrentVersion` the load fails with a clear message. Operators
+  must run a host version that supports the snapshot or invoke
+  `POST /admin/channels/{ch}/snapshot/reset?force=true` to start fresh.
+
 ## Operability endpoints
 
 Only enabled when the `http` config block is present. All endpoints are
