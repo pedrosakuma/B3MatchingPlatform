@@ -55,6 +55,12 @@ participants that surround a real exchange:
 - **`B3.Exchange.Core`** — per-channel `ChannelDispatcher`: bounded
   inbound queue, single dispatch thread, packs MBO/Trade frames into 1400-byte
   UMDF packets, publishes via `IUmdfPacketSink`.
+- **`B3.Exchange.Persistence`** — opt-in per-channel snapshot + Write-Ahead
+  Log so a host restart resumes with the live working book, RptSeq, order
+  ownership, and untriggered stops intact. Atomic generational writes
+  (tmp + fsync + rename), schema-migration framework, JSON or compact
+  binary encoding. See `docs/EXCHANGE-SIMULATOR.md` § *Persistence* and
+  `docs/RUNBOOK.md` § *State persistence ops*.
 - **`B3.Exchange.Host`** — JSON-configured single-binary host wiring
   EntryPoint listener + dispatchers + multicast UDP sinks.
 - **`B3.Exchange.SyntheticTrader`** — separate console client that connects

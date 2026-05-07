@@ -634,7 +634,149 @@ sampler) are honored by the SDK directly.
 
 ---
 
-## 7. Where to look in the code
+## 7. State persistence ops
+
+State persistence is **opt-in per channel** via the `persistence` block
+in `config/exchange-simulator.json` (see *Persistence* in
+[`EXCHANGE-SIMULATOR.md`](./EXCHANGE-SIMULATOR.md) for every
+sub-field). When configured, each channel writes a snapshot of its
+matching engine + `OrderRegistry` to disk after every command flush
+(subject to throttle), and optionally appends each command to a
+Write-Ahead Log between snapshots so recovery is nearly RPO-zero.
+
+### 7.1 Boot-time recovery flow
+
+1. Dispatcher cold-starts → `FileChannelStatePersister.TryLoad`
+   sniffs each candidate file (`B3SS` magic ⇒ binary, else JSON),
+   migrates the JSON tree through `SnapshotMigrationSet` if needed,
+   and returns the newest valid snapshot. Corrupt newest slot ⇒
+   transparently falls back to an older generation.
+2. The dispatcher applies the snapshot, then if a WAL exists it
+   replays every record whose sequence number is **greater than**
+   `ChannelStateSnapshot.LastAppliedSeq` — so commands that landed
+   between the last snapshot and an unclean shutdown are reapplied.
+3. Orphaned `OrderOwnerSnapshot` entries (sessionId not in the
+   firm/session registry) are handled per
+   `persistence.orphanSessionPolicy` — `drop` (default) increments
+   `exch_owner_orphans_dropped_total`; `reject` fails the channel
+   closed.
+4. The first outbound packet is stamped with `SequenceNumber+1`
+   under the previous `SequenceVersion`. Consumers that miss the
+   gap recover via the snapshot multicast feed.
+
+### 7.2 Admin endpoints
+
+All endpoints below dispatch onto the channel's inbound queue and
+return `202 Accepted` immediately (`404` unknown channel, `503`
+queue full). They live under `/admin` to keep them out of the
+client-facing operator surface from §2.4.
+
+| Endpoint | Method | What |
+| --- | --- | --- |
+| `/admin/channels/{ch}/snapshot` | GET | JSON summary of the most recently persisted snapshot for the channel (sequence numbers, owner count, file size, mtime). `404` if none exists. |
+| `/admin/channels/{ch}/snapshot/force` | POST | Operator alias for `/channel/{ch}/snapshot-now` under the `/admin` namespace — enqueues a `WorkKind.OperatorPersistSnapshot` so the next dispatcher cycle captures and persists. |
+| `/admin/channels/{ch}/snapshot/validate` | POST | Loads the most recent snapshot through the same structural validator the boot path uses (duplicate orderId, owners-reference-known-orders, stop-record sanity) WITHOUT restoring it. `200 ok` on success, `422` + reason on validation failure, `404` no snapshot, `503` no persister. |
+| `/admin/channels/{ch}/snapshot/reset?force=true` | POST | **Destructive.** Deletes every on-disk snapshot artifact (all rolling generations + legacy file) AND truncates the WAL. The live in-memory engine state is NOT touched — restart the host to actually start the channel empty. The `?force=true` query string is required to acknowledge irreversibility. Use only when an operator has decided to abandon persisted state (e.g., after a forward-version rejection). |
+
+### 7.3 Persistence metrics
+
+Exposed under the existing `/metrics` endpoint (Prometheus 0.0.4
+text format, `channel="{N}"` label on every series).
+
+| Metric | Type | What |
+| --- | --- | --- |
+| `exch_snapshot_saves_total` | counter | Successful snapshot writes (each = one tmp+fsync+rename cycle). |
+| `exch_snapshot_save_failures_total` | counter | Persist attempts that threw (disk full, permission, etc). The dispatcher swallows the exception and keeps running. |
+| `exch_snapshot_skipped_by_throttle_total` | counter | Snapshots the throttle (`everyN` / `minIntervalMs`) suppressed. Operator force-saves bypass the throttle and never increment this. |
+| `exch_snapshot_dropped_by_backpressure_total` | counter | `asyncWriter=true` only. Captures dropped because a newer one superseded them while the writer thread was still serializing the previous one. Last-write-wins is intentional. |
+| `exch_snapshot_last_size_bytes` | gauge | Bytes written by the most recent successful save. Useful for sizing volumes and tracking format-flip impact (json↔binary). |
+| `exch_snapshot_last_success_unixms` | gauge | Unix-ms timestamp of the most recent successful save. Alert if `(now - this)` exceeds your RPO budget. |
+| `exch_snapshot_load_seconds` | gauge | Wall-clock time the boot-time `TryLoad` took (single observation per channel; 0 when no snapshot was loaded). |
+| `exch_snapshot_write_seconds` | gauge | Wall-clock time of the most recent successful save (serialize + fsync + rename + dir-fsync). |
+| `exch_snapshot_restore_failures_total` | counter | Snapshots that loaded but failed structural validation (bumps `RestoreOutcome=FailedValidation`). |
+| `exch_snapshot_validation_failures_total` | counter | `/admin/.../snapshot/validate` calls that returned `422`. |
+| `exch_wal_appends_total` | counter | Records appended to the WAL (one per state-mutating command). |
+| `exch_wal_bytes_appended_total` | counter | Cumulative bytes appended (use as a rate gauge for IO planning). |
+| `exch_wal_replays_total` | counter | Records replayed at boot (one per WAL entry past `LastAppliedSeq`). |
+| `exch_wal_truncations_total` | counter | WAL truncations (post-snapshot or admin-reset triggered). |
+| `exch_owner_orphans_dropped_total` | counter | `OrderOwnerSnapshot` entries whose sessionId was not in the registry at restore time, dropped per `orphanSessionPolicy=drop`. |
+
+### 7.4 Disaster recovery — backup / restore
+
+The persisted state for a channel is everything matching
+`{dataDir}/channel-{N}.snapshot.*` plus (if WAL is enabled)
+`{dataDir}/channel-{N}.wal`. There is no out-of-band index — the
+files are self-describing.
+
+**Backup recipe (rsync-friendly hot copy):**
+
+```bash
+# Hot copy of all persisted state. Files are written via
+# tmp+fsync+rename so a concurrent rsync sees a consistent point-in-time
+# generation; worst case the destination's newest slot is one revision
+# behind the source.
+rsync -a --delete /var/lib/b3matching/ /backup/b3matching/$(date +%F)/
+```
+
+**Restore recipe:**
+
+1. Stop the host.
+2. Replace `dataDir` with the backup contents (preserve filename
+   layout — the persister discovers slots by the `channel-{N}.snapshot.{slot}`
+   pattern).
+3. Start the host. Boot-time recovery (§7.1) takes care of the rest.
+4. Confirm with `curl -sS http://127.0.0.1:8080/admin/channels/84/snapshot`
+   — the returned `sequenceNumber` should match what the backup captured.
+
+### 7.5 Switching format (json ↔ binary)
+
+The persister auto-detects the format on **load**, so flipping
+direction is a config change + restart:
+
+```bash
+# 1. Edit config/exchange-simulator.json:
+#      "persistence": { ..., "format": "binary" }
+# 2. Restart the host. Existing JSON slots remain loadable.
+# 3. The next save writes binary; old JSON slots age out as the
+#    rolling generations rotate (3 saves by default).
+```
+
+Roll-back works identically — set `format: "json"` and restart.
+**Caveat:** if you bumped `ChannelStateSnapshot.CurrentVersion`
+between the host versions, the older host will reject the snapshot
+with a forward-version error. Switch the format *before* the schema
+bump, or use `/admin/channels/{ch}/snapshot/reset?force=true` to
+abandon the on-disk state.
+
+### 7.6 Common persistence headaches
+
+* **"Channel boots empty after restart."** Check
+  `exch_snapshot_load_seconds` — `0` means `TryLoad` returned null.
+  Most likely the `dataDir` is wrong (typo, missing volume mount,
+  permissions). Tail the host log for `failed to load snapshot at
+  ...` warnings.
+* **"`exch_snapshot_restore_failures_total` keeps incrementing."**
+  A persisted snapshot loaded but failed the structural validator.
+  Run `/admin/channels/{ch}/snapshot/validate` for the reason.
+  Usually a hand-edited file or a developer-only test artifact.
+  Recover with `/admin/channels/{ch}/snapshot/reset?force=true`
+  + restart.
+* **"Disk usage on `dataDir` grows unboundedly."** Check
+  `generations` (rolling slots cap snapshot growth). The WAL is
+  truncated on every successful snapshot — if it grows, snapshots
+  are failing (see `exch_snapshot_save_failures_total`) or
+  throttled too aggressively (`everyN` too high relative to command
+  rate).
+* **"`asyncWriter` shows backpressure drops under load."** That is
+  by design — the latest capture supersedes older queued ones so
+  on a crash you lose at most the captures between the latest
+  durable write and the crash. Lower `everyN` / `minIntervalMs` if
+  the drop rate is unacceptable, or switch `asyncWriter=false` to
+  enforce zero-RPO at the cost of a slower dispatch loop.
+
+---
+
+## 8. Where to look in the code
 
 | Subsystem | Path |
 | --- | --- |
@@ -643,6 +785,7 @@ sampler) are honored by the SDK directly.
 | FIXP session lifecycle | `src/B3.Exchange.Gateway/FixpSession.cs`, `FixpStateMachine.cs` |
 | Mass-cancel / CoD plumbing | `src/B3.Exchange.Gateway/OrderOwnershipMap.cs`, `FixpSession.cs` (CoD) |
 | Per-channel matching | `src/B3.Exchange.Core/ChannelDispatcher.cs`, `src/B3.Exchange.Matching/MatchingEngine.cs` |
+| State persistence | `src/B3.Exchange.Persistence/FileChannelStatePersister.cs`, `BinaryChannelStateSnapshotCodec.cs`, `FileChannelWriteAheadLog.cs`; migration framework in `src/B3.Exchange.Core/SnapshotMigrations.cs` |
 | UMDF wire encoders | `src/B3.Umdf.WireEncoder/` |
 | Synthetic trader strategies | `src/B3.Exchange.SyntheticTrader/MarketMakerStrategy.cs`, `NoiseTakerStrategy.cs` |
 
