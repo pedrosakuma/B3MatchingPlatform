@@ -90,4 +90,18 @@ public interface IChannelWriteAheadLog
     /// in-memory fakes used by tests don't need to implement it.
     /// </summary>
     void Reset() { }
+
+    /// <summary>
+    /// Issue #285: number of records the most recent
+    /// <see cref="ReadAll"/> dropped because their stored Crc32C did
+    /// not match the record bytes. Default 0 for in-memory fakes.
+    /// </summary>
+    int LastReadCorruptCount => 0;
+
+    /// <summary>
+    /// Issue #285: number of records the most recent
+    /// <see cref="ReadAll"/> accepted that had no Crc32C suffix
+    /// (pre-#285 files). Default 0 for in-memory fakes.
+    /// </summary>
+    int LastReadLegacyCount => 0;
 }

@@ -133,8 +133,8 @@ public class BinaryChannelStateSnapshotCodecTests
         var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
         // 4 magic + 2 ver + 1 ch + 4 seq + 2 seqVer + 8 last + 8 + 4 + 4
         // engine prims + 1 phase-count + 1 book-count + 1 stop-count + 1
-        // owner-count = 41 bytes.
-        Assert.Equal(41, bytes.Length);
+        // owner-count + 4 Crc32C footer (issue #285) = 45 bytes.
+        Assert.Equal(45, bytes.Length);
     }
 
     [Fact]

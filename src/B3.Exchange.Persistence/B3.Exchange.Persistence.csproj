@@ -13,4 +13,8 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Exchange.Persistence.Tests" />
+  </ItemGroup>
+
 </Project>

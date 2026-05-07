@@ -699,6 +699,8 @@ text format, `channel="{N}"` label on every series).
 | `exch_wal_bytes_appended_total` | counter | Cumulative bytes appended (use as a rate gauge for IO planning). |
 | `exch_wal_replays_total` | counter | Records replayed at boot (one per WAL entry past `LastAppliedSeq`). |
 | `exch_wal_truncations_total` | counter | WAL truncations (post-snapshot or admin-reset triggered). |
+| `exch_wal_record_corruption_total` | counter | WAL records dropped at replay because the per-record Crc32C did not match (bit-rot or external tampering). |
+| `exch_wal_records_legacy_total` | counter | WAL records replayed in pre-#285 (no Crc32C suffix) format. Steady-state should be `0` once every channel has rolled past the upgrade. |
 | `exch_owner_orphans_dropped_total` | counter | `OrderOwnerSnapshot` entries whose sessionId was not in the registry at restore time, dropped per `orphanSessionPolicy=drop`. |
 
 ### 7.4 On-disk layout & WAL design
@@ -723,15 +725,19 @@ pointer advanced but the snapshot did not (or vice versa).
 sniffs the first bytes on load, so both formats coexist while a
 fleet rolls between `persistence.format=json` and `binary`.
 
-**WAL format:** JSON-Lines (one `WalRecord` per `\n`-terminated
-line). `Append` opens the file in append mode, writes the record,
-and (when `fsyncPerWrite=true`, the default) fsyncs. `ReadAll`
-parses line-by-line and **stops at the first malformed line** — this
-correctly tolerates a torn final write from an unclean shutdown, but
-is the conservative choice if bit-rot lands mid-file (records past
-the rot are silently dropped from replay; tracked under
-[#285](https://github.com/pedrosakuma/B3MatchingPlatform/issues/285)
-for per-record CRC).
+**WAL format:** JSON-Lines (one `WalRecord` per line). Each line
+since [#285](https://github.com/pedrosakuma/B3MatchingPlatform/issues/285)
+is `<json>\t<8-hex-Crc32C>\n` — `Append` opens the file in append
+mode, computes Crc32C (Castagnoli) over the JSON bytes, writes the
+suffix, and (when `fsyncPerWrite=true`, the default) fsyncs.
+`ReadAll` validates each record's CRC: a mismatch logs at warn,
+bumps `exch_wal_record_corruption_total`, and **skips that record
+while continuing replay** so a single bit-rot byte does not silently
+truncate the entire log. Records written by pre-#285 hosts have no
+suffix, are accepted unchecked (legacy path), and bump
+`exch_wal_records_legacy_total`. A torn final write on the legacy
+path (last line missing trailing `\n`) still stops replay — the
+intended behaviour for unclean shutdown.
 
 **WAL lifecycle:**
 
