@@ -140,6 +140,38 @@ public static class BinaryChannelStateSnapshotCodec
 
     public static ChannelStateSnapshot Decode(ReadOnlySpan<byte> bytes)
     {
+        // Issue #285 follow-up (gpt-5.5 review of PR #293): verify
+        // the trailing Crc32C footer BEFORE structural decode when
+        // present. Decoding first means a corrupted varint count
+        // (e.g. owner count flipped to 0xFFFF_FFFF) would drive a
+        // multi-GB allocation before the post-decode CRC check
+        // catches it. Trying CRC first eliminates that class of
+        // recovery-time DoS for any file produced by a #285+ host.
+        // Files older than #285 lack the footer and fall through to
+        // the legacy decode path, which protects itself with the
+        // bounded-count helpers added below.
+        if (bytes.Length >= Magic.Length + 4)
+        {
+            int bodyEnd = bytes.Length - 4;
+            uint footer = BinaryPrimitives.ReadUInt32LittleEndian(bytes[bodyEnd..]);
+            uint computed = Crc32C.Compute(bytes[..bodyEnd]);
+            if (computed == footer)
+            {
+                // Modern file with intact footer — decode the body
+                // only and skip the trailing-bytes check.
+                return DecodeBody(bytes[..bodyEnd], hasVerifiedFooter: true);
+            }
+            // Either legacy (no footer) or modern-corrupt. Fall
+            // through to the legacy-compatible path; bounded counts
+            // protect us against allocation bombs in either case,
+            // and the trailing-bytes switch at the end will reject
+            // a 4-byte non-matching footer as corruption.
+        }
+        return DecodeBody(bytes, hasVerifiedFooter: false);
+    }
+
+    private static ChannelStateSnapshot DecodeBody(ReadOnlySpan<byte> bytes, bool hasVerifiedFooter)
+    {
         var r = new BinaryBufferReader(bytes);
         var magic = r.ReadRaw(Magic.Length);
         if (!magic.SequenceEqual(Magic))
@@ -156,7 +188,7 @@ public static class BinaryChannelStateSnapshotCodec
         uint nextTradeId = r.ReadUInt32();
         uint rptSeq = r.ReadUInt32();
 
-        ulong phaseCount = r.ReadUVarInt();
+        ulong phaseCount = ReadBoundedCount(ref r, bytes.Length, "phase");
         var phases = new EngineStateSnapshot.PhaseEntry[phaseCount];
         for (ulong i = 0; i < phaseCount; i++)
         {
@@ -165,18 +197,18 @@ public static class BinaryChannelStateSnapshotCodec
             phases[i] = new EngineStateSnapshot.PhaseEntry(securityId, (TradingPhase)phase);
         }
 
-        ulong bookCount = r.ReadUVarInt();
+        ulong bookCount = ReadBoundedCount(ref r, bytes.Length, "book");
         var books = new EngineStateSnapshot.BookSnapshot[bookCount];
         for (ulong i = 0; i < bookCount; i++)
         {
             long securityId = r.ReadInt64();
-            ulong orderCount = r.ReadUVarInt();
+            ulong orderCount = ReadBoundedCount(ref r, bytes.Length, "order");
             var orders = new RestingOrderRecord[orderCount];
             for (ulong j = 0; j < orderCount; j++) orders[j] = ReadRestingOrder(ref r);
             books[i] = new EngineStateSnapshot.BookSnapshot(securityId, orders);
         }
 
-        ulong stopCount = r.ReadUVarInt();
+        ulong stopCount = ReadBoundedCount(ref r, bytes.Length, "stop");
         IReadOnlyList<RestingStopRecord>? stops;
         if (stopCount == 0)
         {
@@ -193,35 +225,52 @@ public static class BinaryChannelStateSnapshotCodec
             stops = arr;
         }
 
-        ulong ownerCount = r.ReadUVarInt();
+        ulong ownerCount = ReadBoundedCount(ref r, bytes.Length, "owner");
         var owners = new OrderOwnerSnapshot[ownerCount];
         for (ulong i = 0; i < ownerCount; i++) owners[i] = ReadOwner(ref r);
 
-        // Issue #285: trailing bytes are either nothing (pre-#285
-        // file with no Crc32C footer) or exactly 4 bytes carrying the
-        // little-endian Crc32C of every byte before them. Anything
-        // else is corruption.
-        switch (r.Remaining)
+        if (hasVerifiedFooter)
         {
-            case 0:
-                // Legacy file (pre-#285). Accept silently — the
-                // tmp+fsync+rename + structural validator combo from
-                // the persister is the only integrity guard for these
-                // files and was the established contract before #285.
-                break;
-            case 4:
-                int bodyEnd = bytes.Length - 4;
-                uint computedCrc = Crc32C.Compute(bytes[..bodyEnd]);
-                uint footerCrc = BinaryPrimitives.ReadUInt32LittleEndian(bytes[bodyEnd..]);
-                if (computedCrc != footerCrc)
-                {
-                    throw new InvalidDataException(
-                        $"binary snapshot Crc32C mismatch: stored=0x{footerCrc:X8} computed=0x{computedCrc:X8}");
-                }
-                break;
-            default:
+            // CRC was already verified by Decode(); the body span
+            // passed in here ends at the last payload byte — there
+            // should be no remainder. A non-zero remainder means
+            // the file's encoded length disagrees with the count
+            // stream, which is a structural defect.
+            if (r.Remaining != 0)
+            {
                 throw new InvalidDataException(
-                    $"binary snapshot has {r.Remaining} trailing bytes past the encoded payload (expected 0 for legacy or 4 for #285 Crc32C footer)");
+                    $"binary snapshot has {r.Remaining} unread bytes after structural decode despite valid Crc32C footer (encoder/decoder length skew)");
+            }
+        }
+        else
+        {
+            // Issue #285: trailing bytes are either nothing (pre-#285
+            // file with no Crc32C footer) or exactly 4 bytes carrying
+            // the little-endian Crc32C of every byte before them.
+            // Anything else is corruption.
+            switch (r.Remaining)
+            {
+                case 0:
+                    // Legacy file (pre-#285). Accept silently — the
+                    // tmp+fsync+rename + structural validator combo
+                    // from the persister is the only integrity guard
+                    // for these files and was the established
+                    // contract before #285.
+                    break;
+                case 4:
+                    int bodyEnd = bytes.Length - 4;
+                    uint computedCrc = Crc32C.Compute(bytes[..bodyEnd]);
+                    uint footerCrc = BinaryPrimitives.ReadUInt32LittleEndian(bytes[bodyEnd..]);
+                    if (computedCrc != footerCrc)
+                    {
+                        throw new InvalidDataException(
+                            $"binary snapshot Crc32C mismatch: stored=0x{footerCrc:X8} computed=0x{computedCrc:X8}");
+                    }
+                    break;
+                default:
+                    throw new InvalidDataException(
+                        $"binary snapshot has {r.Remaining} trailing bytes past the encoded payload (expected 0 for legacy or 4 for #285 Crc32C footer)");
+            }
         }
 
         var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops);
@@ -312,6 +361,28 @@ public static class BinaryChannelStateSnapshotCodec
         byte side = r.ReadByte();
         long securityId = r.ReadInt64();
         return new OrderOwnerSnapshot(orderId, session, firm, clOrdId, (Side)side, securityId);
+    }
+
+    /// <summary>
+    /// Issue #285 follow-up: reads a uvarint collection count and
+    /// rejects anything that cannot physically fit in the input
+    /// buffer. Each element is at least one byte on the wire, so
+    /// a count strictly greater than <paramref name="totalInputLength"/>
+    /// must be either corruption or an attacker-supplied
+    /// allocation-bomb. Throwing here bounds recovery-time
+    /// allocations to <c>O(file size)</c> regardless of file
+    /// provenance (including legacy files that lack the Crc32C
+    /// footer).
+    /// </summary>
+    private static ulong ReadBoundedCount(ref BinaryBufferReader r, int totalInputLength, string label)
+    {
+        ulong count = r.ReadUVarInt();
+        if (count > (ulong)totalInputLength)
+        {
+            throw new InvalidDataException(
+                $"binary snapshot {label} count={count} exceeds the input length ({totalInputLength}); refusing to allocate (likely corruption or footer Crc32C mismatch — see issue #285 follow-up)");
+        }
+        return count;
     }
 }
 

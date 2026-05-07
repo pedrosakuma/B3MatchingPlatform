@@ -180,6 +180,25 @@ public sealed partial class ChannelDispatcher
         if (_wal is null) return;
         IReadOnlyList<WalRecord> records;
         try { records = _wal.ReadAll(); }
+        catch (B3.Exchange.Core.WalCorruptionException ex)
+        {
+            // Issue #285 follow-up (gpt-5.5 review of PR #293): a
+            // mid-stream WAL corruption — distinct from a torn final
+            // write — would force replay to fabricate a book state
+            // that never existed if we silently skipped past the bad
+            // record. Halt the channel via the issue #286 mechanism
+            // instead. Operators see IsWalHealthy=false on /readyz and
+            // a CRITICAL log line; the engine remains at the snapshot
+            // baseline (no partial replay).
+            _metrics?.IncWalAppendFailure();
+            _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
+            _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: WAL corruption detected at line {RecordNumber} during boot replay; channel marked WAL-halted, engine left at snapshot baseline (LastAppliedSeq={SnapshotSeq})",
+                ChannelNumber, ex.RecordNumber, snapshotLastAppliedSeq);
+            return;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex,
