@@ -100,6 +100,7 @@ public sealed partial class ChannelDispatcher
 
     public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm)
     {
+        if (RejectIfWalHalted(WorkKind.Cross)) return false;
         using var act = StartEnqueueSpan(WorkKind.Cross, session, enteringFirm, cmd.BuyClOrdIdValue, cmd.Buy.SecurityId);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.Cross, session, enteringFirm, true,
@@ -137,6 +138,7 @@ public sealed partial class ChannelDispatcher
         ulong enteredAtNanos)
     {
         if (orderIds == null || orderIds.Count == 0) return true;
+        if (RejectIfWalHalted(WorkKind.MassCancel)) return false;
         var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
         using var act = StartEnqueueSpan(WorkKind.MassCancel, session, enteringFirm, 0, securityId: 0);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;

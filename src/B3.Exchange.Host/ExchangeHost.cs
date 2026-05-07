@@ -318,6 +318,17 @@ public sealed class ExchangeHost : IAsyncDisposable
         var sessionProvider = new ListenerSessionProvider(_listener, firmRegistry);
         _metrics.SetSessionProvider(sessionProvider);
 
+        // Issue #286: register the WAL-halt readiness probe BEFORE the
+        // HttpServer snapshots _probes. Registering after StartAsync
+        // throws (the snapshot is taken on construction); registering
+        // before construction also makes /health/ready report the
+        // halted channels from the very first scrape after boot.
+        if (_config.Channels.Any(c => c.Persistence?.Wal is { } w
+            && w.ResolveOnAppendFailure() == B3.Exchange.Core.WalAppendFailurePolicy.Halt))
+        {
+            RegisterReadinessProbe(new B3.Exchange.Core.WalHaltReadinessProbe(_dispatchers));
+        }
+
         if (_config.Http != null)
         {
             IReadOnlyList<IReadinessProbe> probeSnapshot;
@@ -354,16 +365,6 @@ public sealed class ExchangeHost : IAsyncDisposable
                 action: () => _listener?.TerminateAllSessions("daily-reset"),
                 logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
             _dailyReset.Start();
-        }
-
-        // Issue #286: register a WAL-halt probe iff at least one
-        // channel runs with WalAppendFailurePolicy.Halt. Keeping the
-        // probe optional means deployments that opt out of the halt
-        // semantics never see the probe in /health/ready output.
-        if (_config.Channels.Any(c => c.Persistence?.Wal is { } w
-            && w.ResolveOnAppendFailure() == B3.Exchange.Core.WalAppendFailurePolicy.Halt))
-        {
-            RegisterReadinessProbe(new B3.Exchange.Core.WalHaltReadinessProbe(_dispatchers));
         }
 
         _startupProbe.MarkReady();
