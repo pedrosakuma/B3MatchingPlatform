@@ -92,6 +92,16 @@ public sealed class TcpConfig
     /// the JSON object is present without explicit overrides.
     /// </summary>
     [JsonPropertyName("throttle")] public ThrottleConfig? Throttle { get; set; }
+
+    /// <summary>
+    /// Issue #289: per-FIXP-session retransmit-buffer persistence
+    /// directory. When non-empty, every outbound business frame is
+    /// mirrored to <c>{retransmitPersistenceDir}/sessions/session-{sessionId:x8}.ring</c>
+    /// so a host crash while a session is <c>Suspended</c> does not
+    /// erase the buffered ExecutionReports. The directory is created
+    /// on demand. Empty (the default) disables retransmit persistence.
+    /// </summary>
+    [JsonPropertyName("retransmitPersistenceDir")] public string? RetransmitPersistenceDir { get; set; }
 }
 
 /// <summary>

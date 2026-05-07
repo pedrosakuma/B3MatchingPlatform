@@ -76,6 +76,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// transport can recover via <c>RetransmitRequest</c>.
     /// </summary>
     private readonly RetransmitBuffer _retxBuffer;
+    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
     private readonly FixpOutboundEncoder _outboundEncoder;
     private readonly FixpRetransmitController _retransmitController;
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
@@ -273,7 +274,9 @@ public sealed partial class FixpSession : IAsyncDisposable
         SessionClaimRegistry? sessionClaims = null,
         EstablishValidator? establishValidator = null,
         Func<long>? nowMs = null,
-        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null)
+        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
+        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
+        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedRetransmitSnapshot = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -288,13 +291,30 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
+        _retransmitPersister = retransmitPersister;
         // Issue #288: feed the per-session ring with the process-wide
         // RetransmitMetrics + a "currently Suspended?" predicate so the
         // outbound encoder can attribute frames buffered while the
         // transport is down (the #217 path).
+        // Issue #289: when a persister is wired in, every append is
+        // mirrored to {dataDir}/sessions/session-{id:x8}.ring and the
+        // file is compacted in-place every 2× capacity appends. The
+        // file survives a host crash; on the next boot it is loaded
+        // by FileFixpRetransmitPersister.LoadAll and threaded back
+        // through persistedRetransmitSnapshot below.
         _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity,
             metrics: retransmitMetrics,
-            isSuspended: () => State == FixpState.Suspended);
+            isSuspended: () => State == FixpState.Suspended,
+            onAppendPersist: retransmitPersister is null
+                ? null
+                : (seq, frame) => retransmitPersister.Append(SessionId, seq, frame),
+            onCompactPersist: retransmitPersister is null
+                ? null
+                : entries => retransmitPersister.Compact(SessionId, entries));
+        if (persistedRetransmitSnapshot is { Count: > 0 })
+        {
+            _retxBuffer.RehydrateFromPersistedSnapshot(persistedRetransmitSnapshot);
+        }
         _outboundEncoder = new FixpOutboundEncoder(
             sessionId: () => SessionId,
             nextMsgSeqNum: NextMsgSeqNum,
