@@ -30,6 +30,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly Func<ChannelConfig, SnapshotChannelConfig, IUmdfPacketSink>? _snapshotSinkFactory;
     private readonly Func<ChannelConfig, InstrumentDefinitionConfig, IUmdfPacketSink>? _instrumentDefSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
+    private readonly Dictionary<byte, IChannelStatePersister> _persistersByChannel = new();
+    private readonly Dictionary<byte, IChannelWriteAheadLog> _walsByChannel = new();
     private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
     private readonly List<Timer> _snapshotTimers = new();
@@ -155,6 +157,10 @@ public sealed class ExchangeHost : IAsyncDisposable
             {
                 retxBuffer = new UmdfPacketRetransmitBuffer(retxCapacity);
             }
+            var persister = BuildPersister(ch);
+            var wal = BuildWal(ch);
+            if (persister != null) _persistersByChannel[ch.ChannelNumber] = persister;
+            if (wal != null) _walsByChannel[ch.ChannelNumber] = wal;
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
@@ -169,10 +175,10 @@ public sealed class ExchangeHost : IAsyncDisposable
                 metrics: channelMetrics,
                 sessionFirmCounters: _metrics.SessionFirmMessages,
                 retxBuffer: retxBuffer,
-                persister: BuildPersister(ch),
+                persister: persister,
                 snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
                 useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false,
-                wal: BuildWal(ch));
+                wal: wal);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -316,7 +322,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 msg => _logger.LogInformation("{Message}", msg),
                 sessionsProvider: sessionProvider.Sample,
                 firms: firmInfos,
-                dailyResetTrigger: () => TriggerDailyReset("http-trigger"));
+                dailyResetTrigger: () => TriggerDailyReset("http-trigger"),
+                persisters: _persistersByChannel,
+                wals: _walsByChannel);
             await _http.StartAsync().ConfigureAwait(false);
         }
 

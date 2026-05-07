@@ -139,6 +139,29 @@ public sealed partial class ChannelDispatcher
     /// books, owners referencing orderIds not present in any book, etc.).
     /// Runs before any mutation so RestoreChannelState is all-or-nothing.
     /// </summary>
+    /// <summary>
+    /// Issue #271: public wrapper around the structural validator used
+    /// by the admin "snapshot/validate" HTTP endpoint. Returns
+    /// <c>true</c> when the snapshot's invariants hold; on failure
+    /// returns <c>false</c> and surfaces the first violation message
+    /// in <paramref name="error"/>.
+    /// </summary>
+    public static bool TryValidateSnapshot(ChannelStateSnapshot snapshot, out string? error)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        try
+        {
+            ValidateSnapshotStructure(snapshot);
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
     private static void ValidateSnapshotStructure(ChannelStateSnapshot snapshot)
     {
         var seenOrderIds = new HashSet<long>();

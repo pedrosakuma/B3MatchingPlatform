@@ -82,4 +82,12 @@ public interface IChannelWriteAheadLog
     /// contains records that are not yet reflected in the snapshot.
     /// </summary>
     void Truncate();
+
+    /// <summary>
+    /// Issue #271: removes the underlying WAL artifact entirely (file,
+    /// table, etc.) so a subsequent boot has nothing to replay. Used
+    /// by the admin "snapshot/reset" endpoint. Default no-op so
+    /// in-memory fakes used by tests don't need to implement it.
+    /// </summary>
+    void Reset() { }
 }

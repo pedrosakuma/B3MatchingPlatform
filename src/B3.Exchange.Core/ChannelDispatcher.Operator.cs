@@ -101,6 +101,20 @@ public sealed partial class ChannelDispatcher
             0, 0, null, null, null, null));
 
     /// <summary>
+    /// Issue #271: forces an on-disk snapshot persist on the next
+    /// dispatcher cycle (separate from <see cref="EnqueueOperatorSnapshotNow"/>
+    /// which only publishes a UMDF snapshot). Drives the
+    /// <c>POST /admin/channels/{ch}/snapshot/force</c> endpoint —
+    /// captures channel state on the loop thread and writes through
+    /// the configured <see cref="IChannelStatePersister"/>, bypassing
+    /// any throttle. Returns <c>false</c> if the inbound queue is
+    /// full. Safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorPersistSnapshot()
+        => _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorPersistSnapshot, default, 0, false,
+            0, 0, null, null, null, null));
+
+    /// <summary>
     /// Operator command (issue #6): atomically (a) bumps the incremental
     /// channel's <see cref="SequenceVersion"/> + the attached snapshot
     /// rotator's <c>SequenceVersion</c>, (b) clears every per-instrument
