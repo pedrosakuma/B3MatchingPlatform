@@ -184,4 +184,114 @@ public class WalAppendFailurePolicyTests
             await disp.DisposeAsync();
         }
     }
+
+    [Fact]
+    public async Task Halt_RejectsCross_AtProducerSide()
+    {
+        // Issue #294 follow-up: Cross is state-mutating just like
+        // New/Cancel/Replace and must be gated by the halt check.
+        var wal = new FailingWal();
+        var metrics = new ChannelMetrics(84);
+        var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);
+        try
+        {
+            disp.Start();
+
+            // Trip the halt by submitting a normal order first.
+            Assert.True(EnqueueOrder(disp, clOrdIdValue: 1));
+            await WaitForAsync(() => !disp.IsWalHealthy);
+            Assert.False(disp.IsWalHealthy);
+
+            var buy = new NewOrderCommand("c-buy", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, 700u, EnteredAtNanos: 0);
+            var sell = new NewOrderCommand("c-sell", Sec, Side.Sell, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, 700u, EnteredAtNanos: 0);
+            var cross = new CrossOrderCommand(buy, sell, BuyClOrdIdValue: 100, SellClOrdIdValue: 101, CrossId: 999);
+            int before = wal.AppendCalls;
+            long rejectsBefore = metrics.WalHaltRejects;
+
+            Assert.False(disp.EnqueueCross(cross, new SessionId("S1"), enteringFirm: 700));
+
+            // No new WAL append (work item never reached the loop) and
+            // halt-reject metric advanced.
+            Assert.Equal(before, wal.AppendCalls);
+            Assert.True(metrics.WalHaltRejects > rejectsBefore);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Halt_RejectsResolvedMassCancel_AtProducerSide()
+    {
+        var wal = new FailingWal();
+        var metrics = new ChannelMetrics(84);
+        var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);
+        try
+        {
+            disp.Start();
+
+            Assert.True(EnqueueOrder(disp, clOrdIdValue: 1));
+            await WaitForAsync(() => !disp.IsWalHealthy);
+            Assert.False(disp.IsWalHealthy);
+
+            int before = wal.AppendCalls;
+            long rejectsBefore = metrics.WalHaltRejects;
+
+            // A non-empty list is required to exercise the gate; the
+            // empty-list short-circuit returns true without checking
+            // halt (idempotent no-op) which is intentional.
+            Assert.False(disp.EnqueueResolvedMassCancel(
+                new long[] { 12345L },
+                new SessionId("S1"),
+                enteringFirm: 700,
+                enteredAtNanos: 0));
+
+            Assert.Equal(before, wal.AppendCalls);
+            Assert.True(metrics.WalHaltRejects > rejectsBefore);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Halt_DropsAlreadyQueuedWork_OnDispatchLoop()
+    {
+        // Defence-in-depth: a work item posted before the WAL fails can
+        // still be queued when the halt flips. The loop-side gate must
+        // refuse to deliver it to the engine.
+        var wal = new FailingWal();
+        var metrics = new ChannelMetrics(84);
+        var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);
+        try
+        {
+            // Enqueue many items BEFORE Start so they all sit in the
+            // bounded channel. Once Start runs, the first triggers halt
+            // (WAL throws); all subsequent items must be dropped on the
+            // loop without reaching the engine.
+            for (ulong i = 1; i <= 5; i++)
+                Assert.True(EnqueueOrder(disp, clOrdIdValue: i));
+
+            disp.Start();
+            await WaitForAsync(() => !disp.IsWalHealthy);
+            Assert.False(disp.IsWalHealthy);
+
+            // Give the loop a chance to drain queued items.
+            await Task.Delay(100);
+
+            // Only the very first command attempted a WAL append (and
+            // failed). The engine never observed any New event because
+            // ProcessOne short-circuits on halt.
+            Assert.Equal(1, wal.AppendCalls);
+            Assert.Equal(0, outbound.NewCount);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
 }

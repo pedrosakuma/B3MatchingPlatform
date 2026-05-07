@@ -41,6 +41,20 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        // Issue #286 follow-up: producer-side gates (RejectIfWalHalted)
+        // catch most halts, but a work item already in the channel when
+        // the WAL flips to halted would still reach here and mutate the
+        // engine. Drop any state-mutating work item observed on the loop
+        // after halt; snapshot/persist items above are intentionally
+        // allowed through. This is the last line of defence — readiness
+        // probes already report the channel as unhealthy.
+        if (Volatile.Read(ref _walHalted) != 0)
+        {
+            _metrics?.IncWalHaltReject();
+            LogWalHalted(ChannelNumber, item.Kind);
+            return;
+        }
+
         if (item.Kind == WorkKind.OperatorBumpVersion)
         {
             ProcessBumpVersion();
