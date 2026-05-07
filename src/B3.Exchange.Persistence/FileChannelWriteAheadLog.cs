@@ -19,10 +19,22 @@ namespace B3.Exchange.Persistence;
 /// (issue #285), terminated by a newline, and the implementation
 /// optionally <c>fsync</c>s the file before returning. The
 /// JSON-Lines + per-record CRC framing makes the file robust against
-/// two distinct failure modes: a torn final write fails the trailing
-/// CRC and is dropped, while a bit-rot landing mid-file fails just
-/// that record's CRC — replay logs the corruption and **continues
-/// past it** so the surviving prefix and suffix remain replayable.
+/// two distinct failure modes that demand different responses:
+/// <list type="bullet">
+///   <item><b>Torn final write:</b> the host crashed mid-fsync and
+///   the last physical line is incomplete. The trailing CRC fails (or
+///   the line has no CRC suffix and JSON parse fails), and the loader
+///   tolerates that by dropping the final record and stopping
+///   replay. The surviving prefix is fully replayable.</item>
+///   <item><b>Mid-stream corruption:</b> a CRC mismatch, parse
+///   failure, or sequence gap on any record that has at least one
+///   well-formed record after it. Continuing past the bad record
+///   would apply state transitions out of order and produce a book
+///   state that never existed, so the loader raises a
+///   <see cref="WalCorruptionException"/> (issue #285 follow-up after
+///   gpt-5.5 review of PR #293). The dispatcher catches this and
+///   marks the channel WAL-halted (issue #286 path).</item>
+/// </list>
 /// Per-write fsync gives zero-RPO recovery; the caller can opt for
 /// batched fsync (lower latency, RPO bounded by batch flush) via the
 /// <c>fsyncPerWrite=false</c> ctor argument.</para>
@@ -145,58 +157,20 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
             }
         }
         var result = new List<WalRecord>();
+        // Buffer all physical lines first so we can distinguish a
+        // torn final write (tolerable) from mid-stream corruption
+        // (must halt). The legacy "skip and keep going" path was
+        // unsafe — see WalCorruptionException for the rationale.
+        List<string> rawLines;
         try
         {
             using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new StreamReader(fs, Encoding.UTF8);
-            int lineNumber = 0;
+            rawLines = new List<string>();
             string? line;
             while ((line = reader.ReadLine()) is not null)
             {
-                lineNumber++;
-                if (line.Length == 0) continue;
-                int tab = line.LastIndexOf('\t');
-                if (tab >= 0 && line.Length - tab - 1 == 8)
-                {
-                    // Modern format: JSON \t crc8 .
-                    var json = line.AsSpan(0, tab);
-                    var crcHex = line.AsSpan(tab + 1, 8);
-                    if (!TryParseHex32(crcHex, out uint storedCrc))
-                    {
-                        // Suffix isn't a valid 8-hex CRC — treat as
-                        // legacy (no CRC) and fall through.
-                        ConsumeLegacyLine(line, lineNumber, result);
-                        continue;
-                    }
-                    var jsonBytes = Encoding.UTF8.GetBytes(line[..tab]);
-                    uint computedCrc = Crc32C.Compute(jsonBytes);
-                    if (computedCrc != storedCrc)
-                    {
-                        LastReadCorruptCount++;
-                        _logger.LogWarning(
-                            "channel {ChannelNumber}: WAL line {LineNumber} CRC mismatch (stored=0x{StoredCrc:X8} computed=0x{ComputedCrc:X8}); skipping record and continuing replay",
-                            _channelNumber, lineNumber, storedCrc, computedCrc);
-                        continue;
-                    }
-                    try
-                    {
-                        var rec = JsonSerializer.Deserialize<WalRecord>(jsonBytes, JsonOptions);
-                        if (rec is not null) result.Add(rec);
-                    }
-                    catch (Exception ex)
-                    {
-                        // CRC matched but JSON failed — bizarre, treat
-                        // as corrupt for metric purposes and continue.
-                        LastReadCorruptCount++;
-                        _logger.LogWarning(ex,
-                            "channel {ChannelNumber}: WAL line {LineNumber} JSON parse failed despite CRC match; skipping",
-                            _channelNumber, lineNumber);
-                    }
-                }
-                else
-                {
-                    if (!ConsumeLegacyLine(line, lineNumber, result)) break;
-                }
+                rawLines.Add(line);
             }
         }
         catch (Exception ex)
@@ -206,34 +180,151 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                 _channelNumber, _path);
             return Array.Empty<WalRecord>();
         }
+
+        // Find the index of the LAST non-empty line — only that line
+        // is allowed to fail integrity (torn-tail tolerance). Lines
+        // beyond it must be empty (a partial trailing newline is fine).
+        int lastNonEmptyIdx = -1;
+        for (int i = rawLines.Count - 1; i >= 0; i--)
+        {
+            if (rawLines[i].Length > 0) { lastNonEmptyIdx = i; break; }
+        }
+
+        long? prevSeq = null;
+        for (int i = 0; i <= lastNonEmptyIdx; i++)
+        {
+            var line = rawLines[i];
+            int lineNumber = i + 1;
+            bool isLastNonEmpty = i == lastNonEmptyIdx;
+            if (line.Length == 0) continue;
+
+            int tab = line.LastIndexOf('\t');
+            if (tab >= 0 && line.Length - tab - 1 == 8)
+            {
+                // Modern format: JSON \t crc8 .
+                var crcHex = line.AsSpan(tab + 1, 8);
+                if (!TryParseHex32(crcHex, out uint storedCrc))
+                {
+                    // Suffix isn't a valid 8-hex CRC — treat as legacy
+                    // (no CRC) and fall through.
+                    if (!ConsumeLegacyLine(line, lineNumber, isLastNonEmpty, result, ref prevSeq))
+                        break;
+                    continue;
+                }
+                var jsonBytes = Encoding.UTF8.GetBytes(line[..tab]);
+                uint computedCrc = Crc32C.Compute(jsonBytes);
+                if (computedCrc != storedCrc)
+                {
+                    LastReadCorruptCount++;
+                    if (isLastNonEmpty)
+                    {
+                        // Torn final write — tolerate and stop.
+                        _logger.LogWarning(
+                            "channel {ChannelNumber}: WAL line {LineNumber} CRC mismatch on the FINAL record (stored=0x{StoredCrc:X8} computed=0x{ComputedCrc:X8}); treating as torn-tail and truncating replay here",
+                            _channelNumber, lineNumber, storedCrc, computedCrc);
+                        break;
+                    }
+                    // Mid-stream corruption — refuse to fabricate a
+                    // book state by skipping past the gap.
+                    var msg = $"channel {_channelNumber}: WAL line {lineNumber} CRC mismatch (stored=0x{storedCrc:X8} computed=0x{computedCrc:X8}) and a well-formed record exists after it; refusing to replay around mid-stream corruption";
+                    _logger.LogCritical("{Message}", msg);
+                    throw new WalCorruptionException(_channelNumber, lineNumber, msg);
+                }
+                WalRecord? rec;
+                try
+                {
+                    rec = JsonSerializer.Deserialize<WalRecord>(jsonBytes, JsonOptions);
+                }
+                catch (Exception ex)
+                {
+                    // CRC matched but JSON failed — the on-disk bytes
+                    // are coherent w.r.t. their checksum but the
+                    // schema is wrong (e.g. an enum value the loader
+                    // does not recognize). That is a persistent
+                    // corruption-equivalent condition, never a torn
+                    // write; halt regardless of position.
+                    LastReadCorruptCount++;
+                    var msg = $"channel {_channelNumber}: WAL line {lineNumber} JSON parse failed despite CRC match: {ex.Message}";
+                    _logger.LogCritical(ex, "{Message}", msg);
+                    throw new WalCorruptionException(_channelNumber, lineNumber, msg, ex);
+                }
+                if (rec is null)
+                {
+                    var msg = $"channel {_channelNumber}: WAL line {lineNumber} deserialized to null";
+                    _logger.LogCritical("{Message}", msg);
+                    throw new WalCorruptionException(_channelNumber, lineNumber, msg);
+                }
+                CheckSeqContiguity(rec.Seq, lineNumber, ref prevSeq);
+                result.Add(rec);
+            }
+            else
+            {
+                if (!ConsumeLegacyLine(line, lineNumber, isLastNonEmpty, result, ref prevSeq))
+                    break;
+            }
+        }
         return result;
+    }
+
+    /// <summary>
+    /// Enforces strict monotonic-by-1 ordering on WAL record
+    /// sequences. A gap means we lost a write between the surviving
+    /// records — replaying the records on either side of the gap
+    /// applies state transitions out of order, so we treat any
+    /// non-contiguous seq as mid-stream corruption.
+    /// </summary>
+    private void CheckSeqContiguity(long currentSeq, int lineNumber, ref long? prevSeq)
+    {
+        if (prevSeq.HasValue && currentSeq != prevSeq.Value + 1)
+        {
+            var msg = $"channel {_channelNumber}: WAL line {lineNumber} seq={currentSeq} is not contiguous after seq={prevSeq.Value}; refusing to replay around the gap";
+            _logger.LogCritical("{Message}", msg);
+            throw new WalCorruptionException(_channelNumber, lineNumber, msg);
+        }
+        prevSeq = currentSeq;
     }
 
     /// <summary>
     /// Handles a line written by a pre-#285 host (no <c>\t</c>+CRC
     /// suffix). Returns <c>false</c> to signal the caller to stop
     /// further line processing — preserving the original "torn-final
-    /// stops replay" behavior for legacy files.
+    /// stops replay" behavior for legacy files when the failure is on
+    /// the final line. A parse failure on a NON-final legacy line is
+    /// promoted to a <see cref="WalCorruptionException"/> for the
+    /// same reason mid-stream modern corruption is fatal: skipping
+    /// past it would replay state transitions out of order.
     /// </summary>
-    private bool ConsumeLegacyLine(string line, int lineNumber, List<WalRecord> result)
+    private bool ConsumeLegacyLine(string line, int lineNumber, bool isLastNonEmpty, List<WalRecord> result, ref long? prevSeq)
     {
+        WalRecord? rec;
         try
         {
-            var rec = JsonSerializer.Deserialize<WalRecord>(line, JsonOptions);
-            if (rec is not null)
-            {
-                result.Add(rec);
-                LastReadLegacyCount++;
-            }
-            return true;
+            rec = JsonSerializer.Deserialize<WalRecord>(line, JsonOptions);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex,
-                "channel {ChannelNumber}: legacy WAL line {LineNumber} failed to parse; truncating replay set here",
-                _channelNumber, lineNumber);
-            return false;
+            if (isLastNonEmpty)
+            {
+                _logger.LogWarning(ex,
+                    "channel {ChannelNumber}: legacy WAL line {LineNumber} failed to parse on the FINAL record; treating as torn-tail and truncating replay here",
+                    _channelNumber, lineNumber);
+                return false;
+            }
+            var msg = $"channel {_channelNumber}: legacy WAL line {lineNumber} failed to parse and a well-formed record exists after it; refusing to replay around mid-stream corruption";
+            _logger.LogCritical(ex, "{Message}", msg);
+            throw new WalCorruptionException(_channelNumber, lineNumber, msg, ex);
         }
+        if (rec is null)
+        {
+            if (isLastNonEmpty) return false;
+            var msg = $"channel {_channelNumber}: legacy WAL line {lineNumber} deserialized to null mid-stream";
+            _logger.LogCritical("{Message}", msg);
+            throw new WalCorruptionException(_channelNumber, lineNumber, msg);
+        }
+        CheckSeqContiguity(rec.Seq, lineNumber, ref prevSeq);
+        result.Add(rec);
+        LastReadLegacyCount++;
+        return true;
     }
 
     private static void WriteHexUtf8(uint value, Span<byte> dst)

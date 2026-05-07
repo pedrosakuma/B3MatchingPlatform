@@ -49,8 +49,13 @@ public class FileChannelWriteAheadLogCrcTests
     }
 
     [Fact]
-    public void CorruptMiddleRecord_IsSkipped_AndReplayContinues()
+    public void CorruptMiddleRecord_FailsReplay_WithWalCorruptionException()
     {
+        // Issue #285 follow-up (gpt-5.5 review of PR #293): silently
+        // skipping a mid-stream corrupted record would let replay
+        // apply state transitions out of order and fabricate a book
+        // state that never existed. The loader must refuse to do
+        // that — only a torn FINAL record is tolerable.
         using var dir = new TempDir();
         var walPath = System.IO.Path.Combine(dir.Path, "channel-7.wal");
         using (var wal = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
@@ -58,11 +63,7 @@ public class FileChannelWriteAheadLogCrcTests
         {
             for (int i = 1; i <= 3; i++) wal.Append(MakeNew(i, (ulong)i));
         }
-        // Flip a single byte inside the JSON payload of the middle
-        // line to force a CRC mismatch on that record only.
         var bytes = File.ReadAllBytes(walPath);
-        // Find the second '\n' and corrupt a byte midway in the
-        // second line's JSON (i.e. between the first \n and second \n).
         int firstNl = Array.IndexOf(bytes, (byte)'\n');
         int secondNl = Array.IndexOf(bytes, (byte)'\n', firstNl + 1);
         Assert.True(firstNl >= 0 && secondNl > firstNl);
@@ -72,14 +73,71 @@ public class FileChannelWriteAheadLogCrcTests
 
         using var reread = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
             NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var ex = Assert.Throws<B3.Exchange.Core.WalCorruptionException>(() => reread.ReadAll());
+        Assert.Equal((byte)7, ex.ChannelNumber);
+        Assert.Equal(2, ex.RecordNumber);
+        Assert.Equal(1, reread.LastReadCorruptCount);
+    }
+
+    [Fact]
+    public void CorruptFinalRecord_IsToleratedAsTornTail()
+    {
+        using var dir = new TempDir();
+        var walPath = System.IO.Path.Combine(dir.Path, "channel-7.wal");
+        using (var wal = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
+        {
+            for (int i = 1; i <= 3; i++) wal.Append(MakeNew(i, (ulong)i));
+        }
+        // Flip a byte inside the JSON of the LAST line — torn-tail
+        // semantics: the final record is dropped, prefix survives.
+        var bytes = File.ReadAllBytes(walPath);
+        int secondNl = -1, thirdNl = -1;
+        for (int i = 0, n = 0; i < bytes.Length; i++)
+        {
+            if (bytes[i] == (byte)'\n')
+            {
+                n++;
+                if (n == 2) secondNl = i;
+                else if (n == 3) { thirdNl = i; break; }
+            }
+        }
+        Assert.True(secondNl > 0 && thirdNl > secondNl);
+        bytes[secondNl + 5] ^= 0xFF;
+        File.WriteAllBytes(walPath, bytes);
+
+        using var reread = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
         var records = reread.ReadAll();
         Assert.Equal(2, records.Count);
         Assert.Equal(1, reread.LastReadCorruptCount);
-        Assert.Equal(0, reread.LastReadLegacyCount);
-        // Records 1 and 3 survived; the corrupt one in the middle was skipped.
         Assert.Contains(records, r => r.Seq == 1);
-        Assert.Contains(records, r => r.Seq == 3);
-        Assert.DoesNotContain(records, r => r.Seq == 2);
+        Assert.Contains(records, r => r.Seq == 2);
+        Assert.DoesNotContain(records, r => r.Seq == 3);
+    }
+
+    [Fact]
+    public void NonContiguousSeq_FailsReplay_WithWalCorruptionException()
+    {
+        // Hand-craft a WAL where seq jumps 1 → 3 (record with seq=2
+        // is missing). This is the exact failure mode the seq
+        // contiguity check is built to catch — without it, the
+        // engine would replay r1 + r3 and end up in a state that
+        // never existed at runtime.
+        using var dir = new TempDir();
+        var walPath = System.IO.Path.Combine(dir.Path, "channel-7.wal");
+        using (var wal = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
+        {
+            wal.Append(MakeNew(1, 1));
+            wal.Append(MakeNew(3, 3));   // intentional gap at seq=2
+        }
+
+        using var reread = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var ex = Assert.Throws<B3.Exchange.Core.WalCorruptionException>(() => reread.ReadAll());
+        Assert.Equal((byte)7, ex.ChannelNumber);
+        Assert.Equal(2, ex.RecordNumber);
     }
 
     [Fact]
