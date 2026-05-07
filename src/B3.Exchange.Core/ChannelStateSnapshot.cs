@@ -77,4 +77,15 @@ public interface IChannelStatePersister
     /// + fsync + rename so a crash mid-write never leaves a partial file
     /// on disk.</summary>
     long Save(ChannelStateSnapshot snapshot);
+
+    /// <summary>
+    /// Issue #271: deletes every on-disk snapshot artifact for the
+    /// given channel (all rolling generations + any legacy files).
+    /// Used by the admin "snapshot/reset" endpoint so an operator can
+    /// force the next boot of this channel to start with no
+    /// pre-existing state. Returns the number of files removed (0 when
+    /// none existed). Default implementation is a no-op so in-memory
+    /// fakes used by tests don't need to implement it.
+    /// </summary>
+    int DeleteAll(byte channelNumber) => 0;
 }

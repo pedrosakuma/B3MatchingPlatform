@@ -177,6 +177,36 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         }
     }
 
+    public void Reset()
+    {
+        lock (_writeLock)
+        {
+            if (_appendStream is not null)
+            {
+                _appendStream.Dispose();
+                _appendStream = null;
+            }
+            try
+            {
+                if (File.Exists(_path)) File.Delete(_path);
+                var tmp = System.IO.Path.Combine(_dataDir,
+                    string.Format(CultureInfo.InvariantCulture, WalTempFileNameFormat, _channelNumber));
+                if (File.Exists(tmp)) File.Delete(tmp);
+                FsyncDirectory(_dataDir);
+                _logger.LogInformation(
+                    "channel {ChannelNumber}: admin Reset removed WAL at {Path}",
+                    _channelNumber, _path);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: failed to reset WAL at {Path}",
+                    _channelNumber, _path);
+                throw;
+            }
+        }
+    }
+
     public void Dispose()
     {
         lock (_writeLock)

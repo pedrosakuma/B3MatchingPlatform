@@ -32,6 +32,15 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.OperatorPersistSnapshot)
+        {
+            // Issue #271: admin "snapshot/force" — capture + persist the
+            // engine state on the loop thread and write through the
+            // configured persister. Bypasses the throttle.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
         if (item.Kind == WorkKind.OperatorBumpVersion)
         {
             ProcessBumpVersion();

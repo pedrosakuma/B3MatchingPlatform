@@ -160,6 +160,51 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     }
 
     /// <summary>
+    /// Issue #271: removes every on-disk snapshot artifact for the
+    /// channel — all rolling generations, the legacy single-file
+    /// snapshot if present, plus any leftover tmp files. Returns the
+    /// count of deleted files. The internal slot-rotation cursor is
+    /// reset so the next <see cref="Save"/> starts from slot 0.
+    /// </summary>
+    public int DeleteAll(byte channelNumber)
+    {
+        int removed = 0;
+        for (int i = 0; i < _generations; i++)
+        {
+            removed += TryDelete(SlotPath(channelNumber, i));
+            removed += TryDelete(TempPath(channelNumber, i));
+        }
+        removed += TryDelete(LegacyPath(channelNumber));
+        lock (_slotLock)
+        {
+            _lastUsedSlot.Remove(channelNumber);
+        }
+        if (removed > 0)
+        {
+            try { FsyncDirectory(_dataDir); }
+            catch { /* best effort */ }
+            _logger.LogInformation(
+                "channel {ChannelNumber}: admin DeleteAll removed {Removed} snapshot file(s)",
+                channelNumber, removed);
+        }
+        return removed;
+    }
+
+    private static int TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+                return 1;
+            }
+        }
+        catch { /* best effort — admin path */ }
+        return 0;
+    }
+
+    /// <summary>
     /// Picks the next round-robin slot for the channel, lazily deriving
     /// the starting point from the on-disk newest file the first time
     /// a channel is observed (so a host restart does not reuse the slot
