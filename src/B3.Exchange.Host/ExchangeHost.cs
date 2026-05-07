@@ -451,10 +451,31 @@ public sealed class ExchangeHost : IAsyncDisposable
         int generations = ch.Persistence.Generations > 0
             ? ch.Persistence.Generations
             : FileChannelStatePersister.DefaultGenerations;
+        var writeFormat = ParseSnapshotFormat(ch.Persistence.Format);
         return new FileChannelStatePersister(
             ch.Persistence.DataDir,
             _loggerFactory.CreateLogger<FileChannelStatePersister>(),
-            generations);
+            generations,
+            migrations: null,
+            writeFormat: writeFormat);
+    }
+
+    /// <summary>
+    /// Issue #266: parses the <c>persistence.format</c> JSON string into
+    /// the <see cref="SnapshotFileFormat"/> enum used by the file
+    /// persister when WRITING snapshots. Defaults to
+    /// <see cref="SnapshotFileFormat.Json"/> when absent.
+    /// </summary>
+    private static SnapshotFileFormat ParseSnapshotFormat(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return SnapshotFileFormat.Json;
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "json" => SnapshotFileFormat.Json,
+            "binary" => SnapshotFileFormat.Binary,
+            _ => throw new InvalidOperationException(
+                $"persistence.format must be 'json' or 'binary' (got '{raw}')"),
+        };
     }
 
     /// <summary>

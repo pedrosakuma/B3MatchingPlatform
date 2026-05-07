@@ -314,6 +314,19 @@ public sealed class PersistenceConfig
     /// <c>"drop"</c>.
     /// </summary>
     [JsonPropertyName("orphanSessionPolicy")] public string? OrphanSessionPolicy { get; set; }
+
+    /// <summary>
+    /// Issue #266: on-disk encoding the persister uses when WRITING
+    /// snapshots. Accepted values: <c>"json"</c> (default — historical
+    /// PR #261 behaviour) or <c>"binary"</c>. Case-insensitive. Both
+    /// formats are always recognised on LOAD via magic-byte sniffing,
+    /// so flipping this value (and restarting) gracefully migrates
+    /// the channel forward — old slots in the previous format remain
+    /// loadable until the rolling generations evict them. Picking
+    /// <c>"binary"</c> targets the 5–10× size and serialize-CPU
+    /// reduction documented in issue #266.
+    /// </summary>
+    [JsonPropertyName("format")] public string? Format { get; set; }
 }
 
 /// <summary>

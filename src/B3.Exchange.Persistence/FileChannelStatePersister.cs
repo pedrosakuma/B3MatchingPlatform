@@ -54,6 +54,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     private readonly int _generations;
     private readonly ILogger<FileChannelStatePersister> _logger;
     private readonly SnapshotMigrationSet _migrations;
+    private readonly SnapshotFileFormat _writeFormat;
 
     // Per-channel last-used slot, -1 = unknown (derive from filesystem).
     // Mutated only inside Save under the per-channel lock.
@@ -63,12 +64,14 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     public string DataDirectory => _dataDir;
     public int Generations => _generations;
     public SnapshotMigrationSet Migrations => _migrations;
+    public SnapshotFileFormat WriteFormat => _writeFormat;
 
     public FileChannelStatePersister(
         string dataDirectory,
         ILogger<FileChannelStatePersister> logger,
         int generations = DefaultGenerations,
-        SnapshotMigrationSet? migrations = null)
+        SnapshotMigrationSet? migrations = null,
+        SnapshotFileFormat writeFormat = SnapshotFileFormat.Json)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
         ArgumentNullException.ThrowIfNull(logger);
@@ -79,6 +82,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         _logger = logger;
         _generations = generations;
         _migrations = migrations ?? SnapshotMigrationSet.BuildDefault();
+        _writeFormat = writeFormat;
         Directory.CreateDirectory(_dataDir);
     }
 
@@ -95,23 +99,38 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         {
             try
             {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                // Issue #272: parse to a JsonNode first so older
-                // payloads can be migrated up to the current schema
-                // before the strongly-typed deserializer runs. Forward
-                // compat is delegated to STJ (unknown fields ignored
-                // by default); backward compat goes through the
-                // migration chain.
-                var root = JsonNode.Parse(fs);
-                if (root is null)
+                // Issue #266: sniff the leading bytes to pick the
+                // right decoder. Both formats are recognised on load
+                // regardless of WriteFormat — that's how a deployment
+                // can roll between binary and JSON without a one-shot
+                // conversion (the next save rewrites in the new
+                // format; old slots in the previous format remain
+                // loadable until the rolling generations evict them).
+                byte[] payload = File.ReadAllBytes(path);
+                ChannelStateSnapshot? snapshot;
+                if (BinaryChannelStateSnapshotCodec.LooksLikeBinarySnapshot(payload))
                 {
-                    _logger.LogWarning(
-                        "channel {ChannelNumber}: snapshot at {Path} parsed to null; trying older generation",
-                        channelNumber, path);
-                    continue;
+                    snapshot = BinaryChannelStateSnapshotCodec.Decode(payload);
                 }
-                var migrated = _migrations.MigrateToCurrent(root, ChannelStateSnapshot.CurrentVersion);
-                var snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(migrated.ToJsonString(), JsonOptions);
+                else
+                {
+                    // Issue #272: parse to a JsonNode first so older
+                    // payloads can be migrated up to the current schema
+                    // before the strongly-typed deserializer runs.
+                    // Forward compat is delegated to STJ (unknown
+                    // fields ignored by default); backward compat goes
+                    // through the migration chain.
+                    var root = JsonNode.Parse(payload);
+                    if (root is null)
+                    {
+                        _logger.LogWarning(
+                            "channel {ChannelNumber}: snapshot at {Path} parsed to null; trying older generation",
+                            channelNumber, path);
+                        continue;
+                    }
+                    var migrated = _migrations.MigrateToCurrent(root, ChannelStateSnapshot.CurrentVersion);
+                    snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(migrated.ToJsonString(), JsonOptions);
+                }
                 if (snapshot is null)
                 {
                     _logger.LogWarning(
@@ -148,7 +167,15 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         {
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                JsonSerializer.Serialize(fs, snapshot, JsonOptions);
+                if (_writeFormat == SnapshotFileFormat.Binary)
+                {
+                    var bytes = BinaryChannelStateSnapshotCodec.Encode(snapshot);
+                    fs.Write(bytes, 0, bytes.Length);
+                }
+                else
+                {
+                    JsonSerializer.Serialize(fs, snapshot, JsonOptions);
+                }
                 fs.Flush(flushToDisk: true);
                 bytesWritten = fs.Length;
             }
