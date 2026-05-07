@@ -28,6 +28,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly NegotiationValidator? _negotiationValidator;
     private readonly SessionClaimRegistry? _sessionClaims;
     private readonly EstablishValidator? _establishValidator;
+    private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -62,7 +63,8 @@ public sealed class EntryPointListener : IAsyncDisposable
         Action<FixpSession, string>? onSessionClosed = null,
         NegotiationValidator? negotiationValidator = null,
         SessionClaimRegistry? sessionClaims = null,
-        EstablishValidator? establishValidator = null)
+        EstablishValidator? establishValidator = null,
+        B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         ArgumentNullException.ThrowIfNull(registry);
@@ -78,6 +80,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         _negotiationValidator = negotiationValidator;
         _sessionClaims = sessionClaims;
         _establishValidator = establishValidator;
+        _retransmitMetrics = retransmitMetrics;
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
             throw new ArgumentException(
@@ -427,7 +430,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             options: _sessionOptions, onClosed: onClosed,
             negotiationValidator: _negotiationValidator,
             sessionClaims: _sessionClaims,
-            establishValidator: _establishValidator);
+            establishValidator: _establishValidator,
+            retransmitMetrics: _retransmitMetrics);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();

@@ -376,6 +376,75 @@ public class MetricsRegistryTests
         Assert.Equal(2, inner.PublishCount);
     }
 
+    [Fact]
+    public void Issue288_RetransmitCounters_AreRenderedEvenAtZero()
+    {
+        // Aggregate counters must be present at t=0 so alert rules can
+        // be written before the first eviction or first Suspended-state
+        // append happens.
+        var reg = new MetricsRegistry();
+        var text = reg.RenderProm();
+        Assert.Contains("# TYPE exch_fixp_retransmit_buffer_evictions_total counter\n", text);
+        Assert.Contains("exch_fixp_retransmit_buffer_evictions_total 0\n", text);
+        Assert.Contains("# TYPE exch_fixp_passive_er_buffered_total counter\n", text);
+        Assert.Contains("exch_fixp_passive_er_buffered_total 0\n", text);
+    }
+
+    [Fact]
+    public void Issue288_RetransmitCounters_RenderObservedTotals()
+    {
+        var reg = new MetricsRegistry();
+        reg.Retransmit.IncBufferEvictions();
+        reg.Retransmit.IncBufferEvictions();
+        reg.Retransmit.IncBufferEvictions();
+        reg.Retransmit.IncPassiveErBuffered();
+        var text = reg.RenderProm();
+        Assert.Contains("exch_fixp_retransmit_buffer_evictions_total 3\n", text);
+        Assert.Contains("exch_fixp_passive_er_buffered_total 1\n", text);
+    }
+
+    [Fact]
+    public void Issue288_FixpUtilizationGauge_OmittedByDefault_EvenWithSessions()
+    {
+        // Per-session label cardinality is opt-in via
+        // EmitFixpSessionLabels. Default deployments should not see the
+        // utilization gauge regardless of how many sessions are live.
+        var reg = new MetricsRegistry();
+        reg.SetSessionProvider(new StubSessionProvider(new[]
+        {
+            new SessionDiagnostics(
+                SessionId: "conn-1", FirmId: "F1", State: 2, SessionVerId: 1,
+                OutboundSeq: 50, InboundExpectedSeq: 1, RetxBufferDepth: 50,
+                SendQueueDepth: 0, AttachedTransportId: null, LastActivityAtMs: 0)
+            { RetxBufferCapacity = 100 },
+        }));
+        var text = reg.RenderProm();
+        Assert.DoesNotContain("exch_fixp_retransmit_buffer_utilization", text);
+    }
+
+    [Fact]
+    public void Issue288_FixpUtilizationGauge_EmittedWhenLabelsEnabled()
+    {
+        var reg = new MetricsRegistry { EmitFixpSessionLabels = true };
+        reg.SetSessionProvider(new StubSessionProvider(new[]
+        {
+            new SessionDiagnostics(
+                SessionId: "conn-1", FirmId: "F1", State: 2, SessionVerId: 1,
+                OutboundSeq: 75, InboundExpectedSeq: 1, RetxBufferDepth: 75,
+                SendQueueDepth: 0, AttachedTransportId: null, LastActivityAtMs: 0)
+            { RetxBufferCapacity = 100 },
+            // Capacity 0 => gauge skipped entirely (avoids div-by-zero).
+            new SessionDiagnostics(
+                SessionId: "conn-2", FirmId: "F2", State: 2, SessionVerId: 1,
+                OutboundSeq: 0, InboundExpectedSeq: 1, RetxBufferDepth: 0,
+                SendQueueDepth: 0, AttachedTransportId: null, LastActivityAtMs: 0),
+        }));
+        var text = reg.RenderProm();
+        Assert.Contains("# TYPE exch_fixp_retransmit_buffer_utilization gauge\n", text);
+        Assert.Contains("exch_fixp_retransmit_buffer_utilization{session=\"conn-1\",firm=\"F1\"} 0.75\n", text);
+        Assert.DoesNotContain("session=\"conn-2\"", text.Substring(text.IndexOf("exch_fixp_retransmit_buffer_utilization", StringComparison.Ordinal)));
+    }
+
     private sealed class CapturingSink : IUmdfPacketSink
     {
         public int PublishCount;

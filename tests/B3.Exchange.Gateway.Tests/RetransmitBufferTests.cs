@@ -127,4 +127,66 @@ public class RetransmitBufferTests
         var snap = buf.TryGet(uint.MaxValue, 5);
         Assert.Equal(B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_FROMSEQNO, snap.RejectCode);
     }
+
+    // Issue #288: dimensioning observability tests.
+
+    [Fact]
+    public void Append_below_capacity_does_not_increment_evictions()
+    {
+        var metrics = new B3.Exchange.Contracts.RetransmitMetrics();
+        var buf = new RetransmitBuffer(4, metrics, isSuspended: null);
+        for (uint i = 1; i <= 4; i++) buf.Append(i, FrameWithSeq(i));
+        Assert.Equal(0L, metrics.BufferEvictions);
+    }
+
+    [Fact]
+    public void Append_past_capacity_increments_eviction_counter_per_overflow()
+    {
+        var metrics = new B3.Exchange.Contracts.RetransmitMetrics();
+        var buf = new RetransmitBuffer(3, metrics, isSuspended: null);
+        // First 3 fill the ring without eviction; next 4 each evict one.
+        for (uint i = 1; i <= 7; i++) buf.Append(i, FrameWithSeq(i));
+        Assert.Equal(4L, metrics.BufferEvictions);
+        // Window should have advanced; ring still satisfies the contract.
+        Assert.Equal(5u, buf.FirstAvailableSeqOrZero);
+        Assert.Equal(7u, buf.LastSeqOrZero);
+    }
+
+    [Fact]
+    public void Append_when_isSuspended_true_increments_passive_er_buffered()
+    {
+        var metrics = new B3.Exchange.Contracts.RetransmitMetrics();
+        bool suspended = true;
+        var buf = new RetransmitBuffer(8, metrics, isSuspended: () => suspended);
+        buf.Append(1, FrameWithSeq(1));
+        buf.Append(2, FrameWithSeq(2));
+        Assert.Equal(2L, metrics.PassiveErBuffered);
+    }
+
+    [Fact]
+    public void Append_when_isSuspended_false_does_not_increment_passive_er_buffered()
+    {
+        var metrics = new B3.Exchange.Contracts.RetransmitMetrics();
+        var buf = new RetransmitBuffer(8, metrics, isSuspended: () => false);
+        buf.Append(1, FrameWithSeq(1));
+        buf.Append(2, FrameWithSeq(2));
+        Assert.Equal(0L, metrics.PassiveErBuffered);
+    }
+
+    [Fact]
+    public void Append_isSuspended_predicate_evaluated_per_call()
+    {
+        // Mid-stream Suspended flip: only the appends observed while
+        // suspended should bump the counter.
+        var metrics = new B3.Exchange.Contracts.RetransmitMetrics();
+        bool suspended = false;
+        var buf = new RetransmitBuffer(8, metrics, isSuspended: () => suspended);
+        buf.Append(1, FrameWithSeq(1));        // not counted
+        suspended = true;
+        buf.Append(2, FrameWithSeq(2));        // counted
+        buf.Append(3, FrameWithSeq(3));        // counted
+        suspended = false;
+        buf.Append(4, FrameWithSeq(4));        // not counted
+        Assert.Equal(2L, metrics.PassiveErBuffered);
+    }
 }

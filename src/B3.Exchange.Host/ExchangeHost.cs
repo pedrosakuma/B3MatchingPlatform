@@ -305,9 +305,15 @@ public sealed class ExchangeHost : IAsyncDisposable
             onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason),
             negotiationValidator: requireHandshake ? negotiationValidator : null,
             sessionClaims: requireHandshake ? sessionClaims : null,
-            establishValidator: requireHandshake ? establishValidator : null);
+            establishValidator: requireHandshake ? establishValidator : null,
+            retransmitMetrics: _metrics.Retransmit);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
+
+        // Issue #288: opt-in per-session label cardinality for the
+        // RetransmitBuffer utilization gauge.
+        if (_config.Metrics?.FixpSessionLabelsEnabled == true)
+            _metrics.EmitFixpSessionLabels = true;
 
         var sessionProvider = new ListenerSessionProvider(_listener, firmRegistry);
         _metrics.SetSessionProvider(sessionProvider);
@@ -395,7 +401,10 @@ public sealed class ExchangeHost : IAsyncDisposable
                     RetxBufferDepth: s.RetxBufferDepth,
                     SendQueueDepth: s.SendQueueDepth,
                     AttachedTransportId: s.AttachedTransportId,
-                    LastActivityAtMs: s.LastActivityAtMs);
+                    LastActivityAtMs: s.LastActivityAtMs)
+                {
+                    RetxBufferCapacity = s.RetxBufferCapacity,
+                };
             }
         }
     }

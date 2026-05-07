@@ -46,6 +46,8 @@ internal sealed class RetransmitBuffer
     private readonly object _lock = new();
     private readonly byte[]?[] _frames;
     private readonly uint[] _seqs;
+    private readonly B3.Exchange.Contracts.RetransmitMetrics? _metrics;
+    private readonly Func<bool>? _isSuspended;
     private int _head;        // next write index
     private int _count;
     private uint _lastSeq;
@@ -53,30 +55,57 @@ internal sealed class RetransmitBuffer
     public int Capacity { get; }
 
     public RetransmitBuffer(int capacity)
+        : this(capacity, metrics: null, isSuspended: null)
+    {
+    }
+
+    /// <summary>
+    /// Issue #288 overload: the optional <paramref name="metrics"/> sink
+    /// receives a tick on every full-ring eviction
+    /// (<see cref="B3.Exchange.Contracts.RetransmitMetrics.IncBufferEvictions"/>)
+    /// and on every Append observed while
+    /// <paramref name="isSuspended"/> returns <c>true</c>
+    /// (<see cref="B3.Exchange.Contracts.RetransmitMetrics.IncPassiveErBuffered"/>).
+    /// Both callbacks may be <c>null</c> in tests / standalone use.
+    /// </summary>
+    public RetransmitBuffer(int capacity,
+        B3.Exchange.Contracts.RetransmitMetrics? metrics,
+        Func<bool>? isSuspended)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         Capacity = capacity;
         _frames = new byte[]?[capacity];
         _seqs = new uint[capacity];
+        _metrics = metrics;
+        _isSuspended = isSuspended;
     }
 
     /// <summary>
     /// Appends a wire frame (SOFH+SBE+body) to the buffer at the given
     /// sequence number. The buffer takes a reference; do not mutate
     /// <paramref name="frame"/> after calling. Evicts the oldest entry
-    /// if the buffer is full.
+    /// if the buffer is full (and bumps
+    /// <see cref="B3.Exchange.Contracts.RetransmitMetrics.BufferEvictions"/>
+    /// for issue #288 alerting).
     /// </summary>
     public void Append(uint seq, byte[] frame)
     {
         ArgumentNullException.ThrowIfNull(frame);
+        bool evicted;
         lock (_lock)
         {
+            evicted = _count == Capacity;
             _frames[_head] = frame;
             _seqs[_head] = seq;
             _head = (_head + 1) % Capacity;
             if (_count < Capacity) _count++;
             _lastSeq = seq;
         }
+        // Issue #288: surface eviction + suspended-write counters outside
+        // the lock so a slow metrics consumer cannot back-pressure the
+        // outbound encoder. Both checks are best-effort.
+        if (evicted) _metrics?.IncBufferEvictions();
+        if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();
     }
 
     /// <summary>Snapshot of the lowest seq currently retained, or 0 if
