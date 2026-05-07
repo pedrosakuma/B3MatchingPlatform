@@ -221,9 +221,35 @@ public sealed partial class ChannelDispatcher
         _outbound = NoOpOutbound;
         try
         {
+            bool boundaryChecked = false;
             foreach (var rec in records)
             {
                 if (rec.Seq <= snapshotLastAppliedSeq) { skipped++; continue; }
+                if (!boundaryChecked)
+                {
+                    boundaryChecked = true;
+                    // Issue #285 follow-up (gpt-5.5 round-2 review of PR
+                    // #298): FileChannelWriteAheadLog.ReadAll only
+                    // enforces contiguity among records physically
+                    // present in the WAL — it cannot detect a gap
+                    // straddling the snapshot/WAL boundary (e.g.
+                    // snapshot LastAppliedSeq=2 with WAL starting at
+                    // Seq=4). Replaying that record would fabricate
+                    // state that never existed, the same failure mode
+                    // PR #298 made fatal. Halt the channel here.
+                    long expected = snapshotLastAppliedSeq + 1;
+                    if (rec.Seq != expected)
+                    {
+                        _metrics?.IncWalAppendFailure();
+                        _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
+                        _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
+                        Volatile.Write(ref _walHalted, 1);
+                        _logger.LogCritical(
+                            "channel {ChannelNumber}: WAL replay aborted — snapshot/WAL boundary gap (snapshotLastAppliedSeq={SnapshotSeq}, firstReplayableSeq={FirstSeq}, expected={Expected}); channel marked WAL-halted, engine left at snapshot baseline",
+                            ChannelNumber, snapshotLastAppliedSeq, rec.Seq, expected);
+                        return;
+                    }
+                }
                 var item = TryBuildReplayWorkItem(rec);
                 if (item is null) continue;
                 try
