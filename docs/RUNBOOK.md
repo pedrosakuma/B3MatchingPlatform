@@ -876,6 +876,21 @@ The persisted state for a channel is everything matching
 `{dataDir}/channel-{N}.wal`. See §7.4 for the layout — files are
 self-describing, there is no out-of-band index to back up.
 
+> **Single-writer fence (issue [#290](https://github.com/pedrosakuma/B3MatchingPlatform/issues/290)).**
+> On startup the host acquires an exclusive lock on
+> `{dataDir}/.lock` for every distinct configured `dataDir`. A
+> second host process pointed at the same directory refuses to
+> start with `DataDirLockedException` (the message carries the
+> holder's `pid=… startedUtc=… host=…` line written to the lock
+> file). The lock is released on graceful shutdown and on process
+> exit (the OS drops the file handle), so an ungraceful crash does
+> not strand the lock. **Operational implication:** if a stuck pod
+> holds the lock after a forced reschedule, the new pod will fail
+> fast — `kubectl logs` will surface the holder PID; resolve by
+> killing the orphaned process or removing the stale `.lock` file
+> only after confirming no live writer remains. Never run two
+> hosts against the same `dataDir`.
+
 **Backup recipe (rsync-friendly hot copy):**
 
 ```bash

@@ -44,6 +44,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private HostRouter? _router;
     private HttpServer? _http;
     private DailyResetScheduler? _dailyReset;
+    private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
@@ -105,6 +106,14 @@ public sealed class ExchangeHost : IAsyncDisposable
     public async Task StartAsync()
     {
         _logger.LogInformation("exchange host starting with {ChannelCount} channels", _config.Channels.Count);
+        // Issue #290: acquire an exclusive lock on every distinct
+        // persistence dataDir before constructing any persister or
+        // WAL. Two host processes pointed at the same dataDir would
+        // silently corrupt each other's snapshot + WAL files; the
+        // lock turns that misconfiguration into a loud refuse-to-
+        // start error with the holder PID surfaced in the exception
+        // message. Acquired locks are released by DisposeAsync.
+        AcquireDataDirLocks();
         var sessionRegistry = new SessionRegistry();
         var gatewayRouter = new GatewayRouter(sessionRegistry, _loggerFactory.CreateLogger<GatewayRouter>());
 
@@ -458,6 +467,35 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// Builds the per-channel persister (issue #260). Returns
     /// <c>null</c> when the channel has no <c>persistence</c> block,
     /// preserving the legacy stateless boot for configs that haven't
+    /// <summary>
+    /// Issue #290: walks the channels list, dedupes by absolute
+    /// dataDir path, and acquires an exclusive
+    /// <see cref="B3.Exchange.Persistence.DataDirLock"/> per
+    /// distinct directory. Throws on the first directory that is
+    /// already held by another process so the host fails fast
+    /// rather than silently corrupting concurrent writers.
+    /// </summary>
+    private void AcquireDataDirLocks()
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var ch in _config.Channels)
+        {
+            if (ch.Persistence is null) continue;
+            var dir = ch.Persistence.DataDir;
+            if (string.IsNullOrWhiteSpace(dir)) continue;
+            var canonical = Path.GetFullPath(dir);
+            if (!seen.Add(canonical)) continue;
+            var lockHandle = B3.Exchange.Persistence.DataDirLock.Acquire(
+                canonical,
+                _loggerFactory.CreateLogger<B3.Exchange.Persistence.DataDirLock>());
+            _dataDirLocks.Add(lockHandle);
+        }
+    }
+
+    /// <summary>
+    /// Builds the per-channel persister (issue #260). Returns
+    /// <c>null</c> when the channel has no <c>persistence</c> block,
+    /// preserving the legacy stateless boot for configs that haven't
     /// opted in.
     /// </summary>
     private IChannelStatePersister? BuildPersister(ChannelConfig ch)
@@ -626,6 +664,13 @@ public sealed class ExchangeHost : IAsyncDisposable
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
         foreach (var s in _ownedSinks) s.Dispose();
+        // Issue #290: release dataDir locks last so any persister/WAL
+        // shutdown that needs the directory still has it.
+        foreach (var l in _dataDirLocks)
+        {
+            try { l.Dispose(); } catch { }
+        }
+        _dataDirLocks.Clear();
     }
 
     private int _stopCalled;
