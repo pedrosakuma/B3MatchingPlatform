@@ -703,6 +703,8 @@ text format, `channel="{N}"` label on every series).
 | `exch_wal_records_legacy_total` | counter | WAL records replayed in pre-#285 (no Crc32C suffix) format. Steady-state should be `0` once every channel has rolled past the upgrade. |
 | `exch_wal_append_failures_total` | counter | WAL `Append` calls that threw (issue #286). Counted under both `continue` and `halt` policies; the canonical "WAL is failing" alert. |
 | `exch_wal_halt_rejects_total` | counter | Producer-side `Enqueue*` rejections after the channel was WAL-halted (issue #286). Always `0` unless the channel runs with `persistence.wal.onAppendFailure=halt`. |
+| `exch_wal_size_bytes` | gauge | Current on-disk size of the channel's WAL file (issue #291). Compare against `persistence.wal.maxBytes` to alert before the cap is reached. A flat-line at the cap under `onFull=halt` indicates a halted channel; a flat-line under `onFull=drop` indicates silent data loss. |
+| `exch_wal_drops_on_full_total` | counter | WAL appends silently skipped because `persistence.wal.maxBytes` was reached and `onFull=drop` (issue #291). Distinct from `exch_wal_append_failures_total` so on-call can route a capacity-exhaustion alert separately from a generic IO-fault alert. |
 | `exch_owner_orphans_dropped_total` | counter | `OrderOwnerSnapshot` entries whose sessionId was not in the registry at restore time, dropped per `orphanSessionPolicy=drop`. |
 
 ### 7.4 On-disk layout & WAL design
@@ -774,6 +776,25 @@ flip), the channel honours `persistence.wal.onAppendFailure`:
 | --- | --- |
 | `continue` (default) | Log + bump `exch_wal_append_failures_total`, then run the command. The live consumer view stays consistent, but the command is **not durable** — a host crash before the next snapshot will silently drop it on replay. |
 | `halt` | Log + bump `exch_wal_append_failures_total`, **refuse** the command (no engine mutation, no UMDF emission, no ExecutionReport), flip the channel's WAL-halt flag. The host's `wal-halt` readiness probe goes NOT_READY so load balancers drain new connections; subsequent `Enqueue*` calls are short-circuited and counted by `exch_wal_halt_rejects_total`. The halt is sticky — the operator must restart the host after fixing the underlying storage fault. |
+
+**Size cap & on-full policy** (issue
+[#291](https://github.com/pedrosakuma/B3MatchingPlatform/issues/291)):
+without a cap the WAL grows unbounded between snapshots. If
+snapshots stop succeeding (disk-full elsewhere, persister bug,
+permission flip) the WAL alone will eventually fill the
+filesystem and bring down unrelated subsystems. Set
+`persistence.wal.maxBytes` to the operational ceiling for a
+single channel's WAL and pick `persistence.wal.onFull`:
+
+| Value | Behavior |
+| --- | --- |
+| `halt` (default) | The next `Append` that would push past `maxBytes` throws `WalSizeCapExceededException`. The dispatcher catches this exception **specifically** and marks the channel WAL-halted **regardless** of `onAppendFailure` — silent degradation is disallowed once the operator has explicitly opted into a hard cap. The halt is sticky and clears only on host restart (after raising the cap or resolving the snapshot fault). Same readiness-probe + producer-side reject behaviour as `onAppendFailure=halt`. |
+| `drop` | Silently skip the WAL write, log at warning, bump `exch_wal_drops_on_full_total`, let the command run. Same trade-off as `onAppendFailure=continue` — the live consumer view stays consistent but the command is **not durable**. Distinct counter so on-call can route a "WAL is full" page differently from a "WAL is throwing" page. |
+
+The cap is checked **before** the append stream is opened, so a
+breach never adds even one byte to the file. A successful
+snapshot persist truncates the WAL and resets `exch_wal_size_bytes`
+to `0`, restoring the full budget.
 
 **Idempotency note:** if the newest snapshot is corrupt and the
 persister falls back to an older slot, replay starts from that

@@ -79,7 +79,25 @@ public sealed partial class ChannelDispatcher
             long approxBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(rec).Length + 1;
             _wal.Append(rec);
             _metrics?.IncWalAppend(approxBytes);
+            _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
+            _metrics?.SetWalDropsOnFull(_wal.DropsOnFullCount);
             return true;
+        }
+        catch (WalSizeCapExceededException ex)
+        {
+            // Issue #291: cap breach is a configuration/capacity bug,
+            // not a transient IO fault — always halt regardless of
+            // _walAppendFailurePolicy. We never want to silently
+            // degrade durability when the operator has explicitly
+            // opted into a hard cap.
+            _metrics?.IncWalAppendFailure();
+            _metrics?.IncDispatcherCrashes();
+            _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: WAL size cap exceeded (seq={Seq} kind={Kind} current={CurrentBytes}B max={MaxBytes}B); channel marked unhealthy and command refused; restart the host after raising the cap or resolving the snapshot fault",
+                ChannelNumber, _lastAppliedSeq, item.Kind, ex.CurrentSizeBytes, ex.MaxBytes);
+            return false;
         }
         catch (Exception ex)
         {
@@ -126,6 +144,7 @@ public sealed partial class ChannelDispatcher
         {
             _wal.Truncate();
             _metrics?.IncWalTruncation();
+            _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
         }
         catch (Exception ex)
         {
@@ -148,6 +167,7 @@ public sealed partial class ChannelDispatcher
         {
             _wal.Truncate();
             _metrics?.IncWalTruncation();
+            _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
         }
         catch (Exception ex)
         {

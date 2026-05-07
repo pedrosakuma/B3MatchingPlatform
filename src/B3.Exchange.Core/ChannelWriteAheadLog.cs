@@ -104,4 +104,23 @@ public interface IChannelWriteAheadLog
     /// (pre-#285 files). Default 0 for in-memory fakes.
     /// </summary>
     int LastReadLegacyCount => 0;
+
+    /// <summary>
+    /// Issue #291: current on-disk size in bytes (or in-memory
+    /// equivalent for non-file implementations). Surfaced via the
+    /// <c>exch_wal_size_bytes</c> gauge so operators can alert
+    /// before the configured cap is hit. Defaults to 0 for
+    /// in-memory fakes.
+    /// </summary>
+    long CurrentSizeBytes => 0;
+
+    /// <summary>
+    /// Issue #291: cumulative count of <see cref="Append"/> calls
+    /// that the WAL silently dropped because the configured
+    /// <c>maxBytes</c> cap was already reached and the resolved
+    /// <see cref="WalSizeCapPolicy"/> is
+    /// <see cref="WalSizeCapPolicy.Drop"/>. Surfaced via
+    /// <c>exch_wal_drops_on_full_total</c>. Defaults to 0.
+    /// </summary>
+    long DropsOnFullCount => 0;
 }

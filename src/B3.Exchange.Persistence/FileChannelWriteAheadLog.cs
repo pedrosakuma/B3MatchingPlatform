@@ -70,10 +70,14 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
     private readonly string _path;
     private readonly string _dataDir;
     private readonly bool _fsyncPerWrite;
+    private readonly long _maxBytes;
+    private readonly WalSizeCapPolicy _onFull;
     private readonly ILogger<FileChannelWriteAheadLog> _logger;
     private readonly byte _channelNumber;
     private readonly object _writeLock = new();
     private FileStream? _appendStream;
+    private long _currentSize;
+    private long _dropsOnFull;
 
     /// <summary>
     /// Number of records the most recent <see cref="ReadAll"/> call
@@ -91,6 +95,14 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
     /// </summary>
     public int LastReadLegacyCount { get; private set; }
 
+    /// <summary>Issue #291: current on-disk size in bytes; surfaces
+    /// <c>exch_wal_size_bytes</c> via <see cref="CurrentSizeBytes"/>.</summary>
+    public long CurrentSizeBytes => Interlocked.Read(ref _currentSize);
+
+    /// <summary>Issue #291: cumulative count of appends silently
+    /// skipped under <see cref="WalSizeCapPolicy.Drop"/>.</summary>
+    public long DropsOnFullCount => Interlocked.Read(ref _dropsOnFull);
+
     public string Path => _path;
 
     public FileChannelWriteAheadLog(
@@ -98,6 +110,36 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         byte channelNumber,
         ILogger<FileChannelWriteAheadLog> logger,
         bool fsyncPerWrite = true)
+        : this(dataDirectory, channelNumber, logger, fsyncPerWrite,
+            maxBytes: 0, onFull: WalSizeCapPolicy.Halt)
+    {
+    }
+
+    /// <summary>
+    /// Issue #291 overload accepting an on-disk size cap and the
+    /// policy applied when the next append would exceed it.
+    /// <paramref name="maxBytes"/> &lt;= 0 disables the cap (legacy
+    /// unbounded behaviour). When the cap is positive,
+    /// <paramref name="onFull"/>:
+    /// <list type="bullet">
+    ///   <item><see cref="WalSizeCapPolicy.Halt"/> (default) throws
+    ///   <see cref="WalSizeCapExceededException"/> from
+    ///   <see cref="Append"/>. The dispatcher recognises this
+    ///   exception specifically and marks the channel WAL-halted
+    ///   regardless of <see cref="WalAppendFailurePolicy"/>.</item>
+    ///   <item><see cref="WalSizeCapPolicy.Drop"/> silently skips the
+    ///   write, logs at Warning, and increments
+    ///   <see cref="DropsOnFullCount"/> (surfaced as
+    ///   <c>exch_wal_drops_on_full_total</c>).</item>
+    /// </list>
+    /// </summary>
+    public FileChannelWriteAheadLog(
+        string dataDirectory,
+        byte channelNumber,
+        ILogger<FileChannelWriteAheadLog> logger,
+        bool fsyncPerWrite,
+        long maxBytes,
+        WalSizeCapPolicy onFull)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
         ArgumentNullException.ThrowIfNull(logger);
@@ -105,9 +147,19 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         Directory.CreateDirectory(_dataDir);
         _channelNumber = channelNumber;
         _fsyncPerWrite = fsyncPerWrite;
+        _maxBytes = maxBytes > 0 ? maxBytes : 0;
+        _onFull = onFull;
         _logger = logger;
         _path = System.IO.Path.Combine(_dataDir,
             string.Format(CultureInfo.InvariantCulture, WalFileNameFormat, channelNumber));
+        // Initialise the size counter from any existing on-disk file
+        // so a host restart inherits the pre-restart usage instead of
+        // claiming the WAL is empty until the next truncation.
+        if (File.Exists(_path))
+        {
+            try { _currentSize = new FileInfo(_path).Length; }
+            catch { _currentSize = 0; }
+        }
     }
 
     public void Append(WalRecord record)
@@ -115,14 +167,27 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         ArgumentNullException.ThrowIfNull(record);
         lock (_writeLock)
         {
+            var json = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
+            // Layout: <json bytes> \t <8-hex Crc32C> \n
+            int recordBytes = json.Length + 1 /* \t */ + 8 /* hex crc */ + 1 /* \n */;
+            // Issue #291: enforce on-disk size cap before opening the
+            // append stream so a Drop policy never even creates the
+            // file when the cap is already exceeded by replay state.
+            if (_maxBytes > 0 && _currentSize + recordBytes > _maxBytes)
+            {
+                if (_onFull == WalSizeCapPolicy.Drop)
+                {
+                    Interlocked.Increment(ref _dropsOnFull);
+                    _logger.LogWarning(
+                        "WAL channel-{Channel}: size cap reached (current={Current}B, incoming={Incoming}B, max={Max}B); dropping record (onFull=drop)",
+                        _channelNumber, _currentSize, recordBytes, _maxBytes);
+                    return;
+                }
+                throw new WalSizeCapExceededException(_currentSize, _maxBytes, recordBytes);
+            }
             _appendStream ??= new FileStream(_path,
                 FileMode.Append, FileAccess.Write, FileShare.Read);
-            var json = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
             uint crc = Crc32C.Compute(json);
-            // Layout: <json bytes> \t <8-hex Crc32C> \n. Tab is safe
-            // because JsonSerializer escapes literal tabs to \t inside
-            // strings, so the last \t in the line is always our
-            // separator.
             Span<byte> crcBytes = stackalloc byte[8];
             WriteHexUtf8(crc, crcBytes);
             _appendStream.Write(json, 0, json.Length);
@@ -137,6 +202,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
             {
                 _appendStream.Flush();
             }
+            Interlocked.Add(ref _currentSize, recordBytes);
         }
     }
 
@@ -379,6 +445,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                 }
                 File.Move(tmp, _path, overwrite: true);
                 FsyncDirectory(_dataDir);
+                Interlocked.Exchange(ref _currentSize, 0);
             }
             catch (Exception ex)
             {
@@ -407,6 +474,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                     string.Format(CultureInfo.InvariantCulture, WalTempFileNameFormat, _channelNumber));
                 if (File.Exists(tmp)) File.Delete(tmp);
                 FsyncDirectory(_dataDir);
+                Interlocked.Exchange(ref _currentSize, 0);
                 _logger.LogInformation(
                     "channel {ChannelNumber}: admin Reset removed WAL at {Path}",
                     _channelNumber, _path);

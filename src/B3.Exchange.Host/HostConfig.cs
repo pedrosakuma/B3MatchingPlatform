@@ -400,6 +400,43 @@ public sealed class WalConfig
             _ => throw new InvalidOperationException(
                 $"persistence.wal.onAppendFailure: unknown value '{OnAppendFailure}' (expected 'continue' or 'halt')"),
         };
+
+    /// <summary>
+    /// Issue #291: optional cap (in bytes) on the on-disk WAL
+    /// size. <c>0</c> (default) disables the cap, restoring the
+    /// pre-#291 unbounded behaviour. When set, the dispatcher
+    /// applies <see cref="OnFull"/> when the next append would
+    /// exceed the cap; until a successful snapshot persist
+    /// truncates the WAL the cap stays in force.
+    /// </summary>
+    [JsonPropertyName("maxBytes")] public long MaxBytes { get; set; }
+
+    /// <summary>
+    /// Issue #291: behaviour when <see cref="MaxBytes"/> would be
+    /// exceeded. Accepted values: <c>"halt"</c> (default — refuse
+    /// the command, mark the channel WAL-halted regardless of
+    /// <see cref="OnAppendFailure"/>) or <c>"drop"</c> (silently
+    /// skip the WAL write, log + bump
+    /// <c>exch_wal_drops_on_full_total</c>, let the command run).
+    /// Case-insensitive. Ignored when
+    /// <see cref="MaxBytes"/> &lt;= 0.
+    /// </summary>
+    [JsonPropertyName("onFull")] public string OnFull { get; set; } = "halt";
+
+    /// <summary>
+    /// Parses <see cref="OnFull"/> case-insensitively to the typed
+    /// enum. Throws on unknown values so misconfiguration fails
+    /// the boot rather than silently degrading to the wrong
+    /// policy.
+    /// </summary>
+    public B3.Exchange.Core.WalSizeCapPolicy ResolveOnFull() =>
+        OnFull?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "halt" => B3.Exchange.Core.WalSizeCapPolicy.Halt,
+            "drop" => B3.Exchange.Core.WalSizeCapPolicy.Drop,
+            _ => throw new InvalidOperationException(
+                $"persistence.wal.onFull: unknown value '{OnFull}' (expected 'halt' or 'drop')"),
+        };
 }
 
 /// <summary>
