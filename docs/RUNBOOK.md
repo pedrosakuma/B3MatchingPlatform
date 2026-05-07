@@ -853,7 +853,7 @@ running system instead of a guess:
 | `exch_fixp_retransmit_buffer_evictions_total` | counter | process | **Any non-zero rate** ⇒ at least one session lost replayable history. Bump `outboundRetransmitCapacity` or shorten `SuspendedTimeoutMs`. |
 | `exch_fixp_passive_er_buffered_total` | counter | process | Informational — total `ExecutionReport`s buffered while the owning session was `Suspended`. Sustained growth without matching `exch_session_rebound_total` ⇒ disconnects becoming reaps. |
 | `exch_fixp_retransmit_buffer_utilization` | gauge (0..1) | **per-session** (opt-in) | `>0.8` for any session ⇒ undersized ring for that firm's burst pattern. |
-| `exch_session_reaped_total` (existing, [#70](https://github.com/pedrosakuma/B3MatchingPlatform/issues/70)) | counter | process | Non-zero ⇒ at least one `Suspended` session crossed `SuspendedTimeoutMs` and was dropped; downstream firm needs `OrderMassStatus` on reconnect. |
+| `exch_session_reaped_total` (existing, [#70](https://github.com/pedrosakuma/B3MatchingPlatform/issues/70); also exported as the alias `exch_fixp_sessions_reaped_total` for issue #288) | counter | process | Non-zero ⇒ at least one `Suspended` session crossed `SuspendedTimeoutMs` and was dropped; downstream firm needs `OrderMassStatus` on reconnect. |
 
 The per-session utilization gauge is **off by default** to keep
 scrape cardinality bounded on deployments that cycle through many

@@ -520,6 +520,12 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_session_reaped_total",
             "Total Suspended FIXP sessions closed by the listener's CoD/suspended reaper after exceeding SuspendedTimeoutMs.",
             _sessionLifecycle.Reaped);
+        // Issue #288 acceptance: emit the FIXP-prefixed alias backed by
+        // the same counter so dashboards/alerts that follow the issue's
+        // metric naming work without picking the legacy series name.
+        EmitProcessCounter(sb, "exch_fixp_sessions_reaped_total",
+            "Alias of exch_session_reaped_total exposed for issue #288 (FIXP RetransmitBuffer dimensioning) so operator alerts can use the FIXP-prefixed name listed in the runbook §7.5 mitigation table. Same underlying counter (_sessionLifecycle.Reaped); pick exactly one in your alert rules.",
+            _sessionLifecycle.Reaped);
         EmitProcessCounter(sb, "exch_session_cancel_on_disconnect_fired_total",
             "Total times the cancel-on-disconnect timer fired for a Suspended FIXP session (issue #54 / GAP-18) and the gateway issued a session-scoped mass cancel.",
             _sessionLifecycle.CancelOnDisconnectFired);

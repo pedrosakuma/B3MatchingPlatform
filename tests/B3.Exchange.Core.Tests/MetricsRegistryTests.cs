@@ -92,6 +92,8 @@ public class MetricsRegistryTests
         Assert.Contains("exch_session_suspended_total 1\n", text);
         Assert.Contains("exch_session_rebound_total 1\n", text);
         Assert.Contains("exch_session_reaped_total 3\n", text);
+        // Issue #288 alias backed by the same counter.
+        Assert.Contains("exch_fixp_sessions_reaped_total 3\n", text);
     }
 
     [Fact]
@@ -105,6 +107,7 @@ public class MetricsRegistryTests
         Assert.Contains("exch_session_suspended_total 0\n", text);
         Assert.Contains("exch_session_rebound_total 0\n", text);
         Assert.Contains("exch_session_reaped_total 0\n", text);
+        Assert.Contains("exch_fixp_sessions_reaped_total 0\n", text);
     }
 
     [Fact]
