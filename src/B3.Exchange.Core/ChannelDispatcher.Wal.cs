@@ -31,6 +31,17 @@ public sealed partial class ChannelDispatcher
     /// threw — the command must be skipped (no engine mutation,
     /// no UMDF emission, no ExecutionReport) and the channel is
     /// permanently marked WAL-halted (issue #286).</para>
+    ///
+    /// <para><b>Determinism invariant (issue #287):</b> the engine state
+    /// produced by feeding a command stream through this method must be a
+    /// pure function of that stream — no wall-clock reads (each
+    /// <c>WalRecord</c> carries the original <c>EnteredAtNanos</c>), no
+    /// RNG, no externally-injected sequence numbers. This is what makes
+    /// the snapshot-fallback recovery path safe: loading an older
+    /// snapshot at sequence <c>K</c> and replaying records
+    /// <c>(K, N]</c> from the WAL must converge to the same state as
+    /// applying <c>[1..N]</c> from a clean engine. Guarded by
+    /// <c>WalReplayIdempotencyTests</c>.</para>
     /// </summary>
     private bool WalAppendIfEnabled(in WorkItem item)
     {
@@ -156,6 +167,13 @@ public sealed partial class ChannelDispatcher
     /// engine's state-machine and counter advances exactly match the
     /// pre-crash sequence; the no-op sinks ensure no UMDF packet or
     /// ExecutionReport reaches the wire.
+    ///
+    /// <para><b>Idempotency (issue #287):</b> any (snapshot, WAL-tail)
+    /// split must converge to the same final state as the original
+    /// command stream. The invariant is asserted by
+    /// <c>WalReplayIdempotencyTests</c> across multiple seeded
+    /// sequences and split points; see also the
+    /// <see cref="WalAppendIfEnabled"/> determinism contract.</para>
     /// </summary>
     private void ReplayWalOnLoopThread(long snapshotLastAppliedSeq)
     {

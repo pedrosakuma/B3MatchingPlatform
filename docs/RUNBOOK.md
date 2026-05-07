@@ -782,9 +782,12 @@ snapshots (now lost with the corrupt slot) get re-applied. The
 engine is deterministic over the recorded `WalRecord` stream, so
 this produces the same final state, but operators monitoring
 `exch_wal_replays_total` will see a larger-than-usual count after
-such a fallback. Tracked under issue
-[#287](https://github.com/pedrosakuma/B3MatchingPlatform/issues/287)
-for explicit invariant testing.
+such a fallback. The invariant — *"snapshot at K + WAL tail (K, N]
+≡ apply [1..N] from clean engine"* — is enforced at build time by
+`WalReplayIdempotencyTests` (issue
+[#287](https://github.com/pedrosakuma/B3MatchingPlatform/issues/287)),
+which exercises multiple seeded command streams across several
+split points and asserts byte-for-byte snapshot equality.
 
 ### 7.5 Session disconnect & reattach — durability of private replies
 
