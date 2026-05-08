@@ -128,16 +128,22 @@ public sealed partial class ChannelDispatcher
         // span captured at enqueue time. The dispatch loop crosses thread
         // boundaries from the gateway IO thread, so propagation must be
         // explicit — Activity.Current would not carry the context here.
-        using var engineSpan = ExchangeTelemetry.Source.StartActivity(
-            ExchangeTelemetry.SpanEngineProcess,
-            System.Diagnostics.ActivityKind.Internal,
-            item.ParentContext);
-        if (engineSpan is not null)
+        // Fast path: skip the virtual StartActivity call when no listeners
+        // are attached (round-2 perf #11).
+        System.Diagnostics.Activity? engineSpan = null;
+        if (ExchangeTelemetry.Source.HasListeners())
         {
-            engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
-            engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, item.Kind.ToString());
-            if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
-            if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+            engineSpan = ExchangeTelemetry.Source.StartActivity(
+                ExchangeTelemetry.SpanEngineProcess,
+                System.Diagnostics.ActivityKind.Internal,
+                item.ParentContext);
+            if (engineSpan is not null)
+            {
+                engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+                engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
+                if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
+                if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+            }
         }
         try
         {
@@ -292,16 +298,23 @@ public sealed partial class ChannelDispatcher
             if (succeeded)
             {
                 long flushStart = engineEnd;
-                using (var flushSpan = ExchangeTelemetry.Source.StartActivity(
-                    ExchangeTelemetry.SpanOutboundEmit,
-                    System.Diagnostics.ActivityKind.Producer))
+                // Fast path: skip the virtual StartActivity call when no
+                // listeners are attached (round-2 perf #11).
+                if (ExchangeTelemetry.Source.HasListeners())
                 {
+                    using var flushSpan = ExchangeTelemetry.Source.StartActivity(
+                        ExchangeTelemetry.SpanOutboundEmit,
+                        System.Diagnostics.ActivityKind.Producer);
                     if (flushSpan is not null)
                         flushSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
                     int bytes = _packetWritten;
                     FlushPacket();
                     if (flushSpan is not null)
                         flushSpan.SetTag(ExchangeTelemetry.TagBytes, bytes);
+                }
+                else
+                {
+                    FlushPacket();
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
@@ -321,6 +334,7 @@ public sealed partial class ChannelDispatcher
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
             _currentReceivedTimeNanos = ulong.MaxValue;
+            engineSpan?.Dispose();
         }
     }
 

@@ -24,6 +24,11 @@ public sealed partial class ChannelDispatcher
     private System.Diagnostics.Activity? StartEnqueueSpan(
         WorkKind kind, SessionId session, uint enteringFirm, ulong clOrdId, long securityId)
     {
+        // Fast path: skip the virtual StartActivity call when no listeners
+        // are attached to the ActivitySource (round-2 perf #11). When
+        // listeners are present, StartActivity may still return null due
+        // to sampling — handled below.
+        if (!ExchangeTelemetry.Source.HasListeners()) return null;
         var act = ExchangeTelemetry.Source.StartActivity(
             ExchangeTelemetry.SpanDispatchEnqueue,
             System.Diagnostics.ActivityKind.Producer);
@@ -31,7 +36,7 @@ public sealed partial class ChannelDispatcher
         act.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
         act.SetTag(ExchangeTelemetry.TagSession, session.Value);
         act.SetTag(ExchangeTelemetry.TagFirm, (long)enteringFirm);
-        act.SetTag(ExchangeTelemetry.TagWorkKind, kind.ToString());
+        act.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(kind));
         if (clOrdId != 0) act.SetTag(ExchangeTelemetry.TagClOrdId, (long)clOrdId);
         if (securityId != 0) act.SetTag(ExchangeTelemetry.TagSecurityId, securityId);
         return act;

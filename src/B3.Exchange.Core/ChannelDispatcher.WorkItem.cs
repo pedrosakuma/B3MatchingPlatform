@@ -12,6 +12,35 @@ public sealed partial class ChannelDispatcher
 {
     internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot }
 
+    /// <summary>
+    /// Pre-allocated string names for <see cref="WorkKind"/> used as
+    /// Activity tag values on the dispatch hot path. Avoids the
+    /// per-command <c>Enum.ToString()</c> allocation (round-2 perf #12)
+    /// when telemetry listeners are attached.
+    /// Indexed by <c>(byte)WorkKind</c>; keep in sync with the enum.
+    /// </summary>
+    private static readonly string[] WorkKindNames =
+    {
+        "New",
+        "Cancel",
+        "Replace",
+        "Cross",
+        "MassCancel",
+        "DecodeError",
+        "SnapshotRotation",
+        "OperatorSnapshotNow",
+        "OperatorBumpVersion",
+        "OperatorTradeBust",
+        "OperatorSetTradingPhase",
+        "OperatorPersistSnapshot",
+    };
+
+    private static string WorkKindName(WorkKind kind)
+    {
+        int idx = (int)kind;
+        return (uint)idx < (uint)WorkKindNames.Length ? WorkKindNames[idx] : kind.ToString();
+    }
+
     internal sealed record WorkItem(
         WorkKind Kind,
         SessionId Session,
