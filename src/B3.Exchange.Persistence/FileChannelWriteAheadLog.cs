@@ -79,6 +79,19 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
     private long _currentSize;
     private long _dropsOnFull;
 
+    // Issue #312 (Tier-2 perf): GroupCommit mode infrastructure.
+    // _pendingSeq advances in Append (under _writeLock); _durableSeq
+    // advances after the background fsync completes. Waiters block on
+    // _durabilityLock and are pulsed when _durableSeq advances.
+    private readonly bool _groupCommit;
+    private readonly TimeSpan _groupCommitInterval;
+    private readonly object _durabilityLock = new();
+    private readonly ManualResetEventSlim _fsyncSignal;
+    private readonly CancellationTokenSource? _stopFsyncThread;
+    private readonly Thread? _fsyncThread;
+    private long _pendingSeq;
+    private long _durableSeq;
+
     /// <summary>
     /// Number of records the most recent <see cref="ReadAll"/> call
     /// rejected because their stored Crc32C did not match the JSON
@@ -102,6 +115,14 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
     /// <summary>Issue #291: cumulative count of appends silently
     /// skipped under <see cref="WalSizeCapPolicy.Drop"/>.</summary>
     public long DropsOnFullCount => Interlocked.Read(ref _dropsOnFull);
+
+    /// <summary>Issue #312: see
+    /// <see cref="IChannelWriteAheadLog.PendingDurableSeqOrZero"/>.</summary>
+    public long PendingDurableSeqOrZero => Interlocked.Read(ref _pendingSeq);
+
+    /// <summary>Issue #312: see
+    /// <see cref="IChannelWriteAheadLog.DurableSeqOrZero"/>.</summary>
+    public long DurableSeqOrZero => Interlocked.Read(ref _durableSeq);
 
     public string Path => _path;
 
@@ -140,9 +161,49 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         bool fsyncPerWrite,
         long maxBytes,
         WalSizeCapPolicy onFull)
+        : this(dataDirectory, channelNumber, logger, fsyncPerWrite, maxBytes, onFull,
+            fsyncMode: WalFsyncMode.PerWrite, groupCommitInterval: default)
+    {
+    }
+
+    /// <summary>
+    /// Issue #312 (Tier-2 perf): full constructor accepting the
+    /// <see cref="WalFsyncMode"/> selector and the
+    /// <paramref name="groupCommitInterval"/> used in
+    /// <see cref="WalFsyncMode.GroupCommit"/> mode as the maximum
+    /// time between background fsync passes (i.e. the worst-case
+    /// RPO when no caller blocks on
+    /// <see cref="WaitForDurable"/>). When the interval is
+    /// <c>default</c> a 1ms default is applied — small enough to
+    /// bound RPO and large enough to amortise fsync syscall cost
+    /// across multiple appends under load.
+    ///
+    /// <para><see cref="WalFsyncMode.GroupCommit"/> requires
+    /// <paramref name="fsyncPerWrite"/> = <c>false</c>; passing
+    /// the conflicting combination throws
+    /// <see cref="ArgumentException"/>. Both legacy fsync flags
+    /// (<paramref name="fsyncPerWrite"/>) and the new mode are
+    /// kept on the surface so existing call sites need not
+    /// change.</para>
+    /// </summary>
+    public FileChannelWriteAheadLog(
+        string dataDirectory,
+        byte channelNumber,
+        ILogger<FileChannelWriteAheadLog> logger,
+        bool fsyncPerWrite,
+        long maxBytes,
+        WalSizeCapPolicy onFull,
+        WalFsyncMode fsyncMode,
+        TimeSpan groupCommitInterval)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
         ArgumentNullException.ThrowIfNull(logger);
+        if (fsyncMode == WalFsyncMode.GroupCommit && fsyncPerWrite)
+        {
+            throw new ArgumentException(
+                "WalFsyncMode.GroupCommit is incompatible with fsyncPerWrite=true; choose one durability strategy.",
+                nameof(fsyncMode));
+        }
         _dataDir = System.IO.Path.GetFullPath(dataDirectory);
         Directory.CreateDirectory(_dataDir);
         _channelNumber = channelNumber;
@@ -159,6 +220,22 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         {
             try { _currentSize = new FileInfo(_path).Length; }
             catch { _currentSize = 0; }
+        }
+
+        _groupCommit = fsyncMode == WalFsyncMode.GroupCommit;
+        _groupCommitInterval = _groupCommit
+            ? (groupCommitInterval > TimeSpan.Zero ? groupCommitInterval : TimeSpan.FromMilliseconds(1))
+            : TimeSpan.Zero;
+        _fsyncSignal = new ManualResetEventSlim(initialState: false);
+        if (_groupCommit)
+        {
+            _stopFsyncThread = new CancellationTokenSource();
+            _fsyncThread = new Thread(GroupCommitFsyncLoop)
+            {
+                IsBackground = true,
+                Name = $"wal-fsync-ch{channelNumber}",
+            };
+            _fsyncThread.Start();
         }
     }
 
@@ -194,16 +271,106 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
             _appendStream.WriteByte(CrcSeparator);
             _appendStream.Write(crcBytes);
             _appendStream.WriteByte((byte)'\n');
-            if (_fsyncPerWrite)
+            if (_groupCommit)
+            {
+                // Push bytes to the OS so the background fsync thread
+                // (which doesn't take _writeLock) sees a consistent
+                // snapshot of the file contents. The disk-level sync
+                // is deferred to GroupCommitFsyncLoop.
+                _appendStream.Flush();
+                Interlocked.Exchange(ref _pendingSeq, record.Seq);
+                _fsyncSignal.Set();
+            }
+            else if (_fsyncPerWrite)
             {
                 _appendStream.Flush(flushToDisk: true);
+                Interlocked.Exchange(ref _pendingSeq, record.Seq);
+                Interlocked.Exchange(ref _durableSeq, record.Seq);
             }
             else
             {
                 _appendStream.Flush();
+                Interlocked.Exchange(ref _pendingSeq, record.Seq);
             }
             Interlocked.Add(ref _currentSize, recordBytes);
             return recordBytes;
+        }
+    }
+
+    public void WaitForDurable(long seq, CancellationToken cancellationToken = default)
+    {
+        if (seq <= 0) return;
+        if (Interlocked.Read(ref _durableSeq) >= seq) return;
+        if (!_groupCommit)
+        {
+            // PerWrite / fire-and-forget Flush modes advance _durableSeq
+            // (or skip durability entirely) inside Append itself; if we
+            // haven't reached `seq` yet it never will via this WAL.
+            return;
+        }
+        // Nudge the bg thread in case the signal was missed (e.g. a
+        // caller blocked between Append and WaitForDurable while the
+        // bg thread was already sleeping).
+        _fsyncSignal.Set();
+        lock (_durabilityLock)
+        {
+            while (Interlocked.Read(ref _durableSeq) < seq)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Monitor.Wait(_durabilityLock, _groupCommitInterval);
+            }
+        }
+    }
+
+    private void GroupCommitFsyncLoop()
+    {
+        var stopToken = _stopFsyncThread!.Token;
+        while (!stopToken.IsCancellationRequested)
+        {
+            try { _fsyncSignal.Wait(_groupCommitInterval, stopToken); }
+            catch (OperationCanceledException) { break; }
+            _fsyncSignal.Reset();
+            FsyncOnce();
+        }
+        // Final pass on shutdown so anything appended between the last
+        // signal and the cancellation request still hits the disk.
+        FsyncOnce();
+    }
+
+    private void FsyncOnce()
+    {
+        long pending;
+        lock (_writeLock)
+        {
+            if (_appendStream is null) return;
+            pending = Interlocked.Read(ref _pendingSeq);
+            if (pending <= Interlocked.Read(ref _durableSeq)) return;
+            try
+            {
+                _appendStream.Flush(flushToDisk: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: WAL background fsync failed; durable seq stays at {Durable}",
+                    _channelNumber, Interlocked.Read(ref _durableSeq));
+                return;
+            }
+        }
+        // Publish the new durability watermark and pulse waiters
+        // outside the write lock so an Append on the dispatch thread
+        // never contends with a wakeup.
+        lock (_durabilityLock)
+        {
+            // Use Math.Max because pending may have advanced again
+            // between our snapshot above and the lock acquisition; we
+            // only ever want to MOVE FORWARD here.
+            long current = Interlocked.Read(ref _durableSeq);
+            if (pending > current)
+            {
+                Interlocked.Exchange(ref _durableSeq, pending);
+            }
+            Monitor.PulseAll(_durabilityLock);
         }
     }
 
@@ -447,6 +614,16 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                 File.Move(tmp, _path, overwrite: true);
                 FsyncDirectory(_dataDir);
                 Interlocked.Exchange(ref _currentSize, 0);
+                // Issue #312: every previously-appended record is now
+                // either durable (it was fsynced into the old file
+                // before snapshot persist asked us to truncate) or
+                // intentionally discarded — either way it can't be
+                // replayed any more, so it counts as "durable" for
+                // any caller still waiting on its seq. Advancing
+                // _durableSeq here unblocks them instead of letting
+                // them spin until the fsync thread notices the empty
+                // file.
+                AdvanceDurableSeqOnTruncate();
             }
             catch (Exception ex)
             {
@@ -479,6 +656,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                 _logger.LogInformation(
                     "channel {ChannelNumber}: admin Reset removed WAL at {Path}",
                     _channelNumber, _path);
+                AdvanceDurableSeqOnTruncate();
             }
             catch (Exception ex)
             {
@@ -492,10 +670,41 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
 
     public void Dispose()
     {
+        // Issue #312: stop the bg fsync thread before tearing down the
+        // append stream so its final flush sees a live FileStream.
+        // Order matters: cancel + signal + join, then dispose stream.
+        if (_groupCommit && _stopFsyncThread is not null && _fsyncThread is not null)
+        {
+            try { _stopFsyncThread.Cancel(); } catch { /* ignore */ }
+            _fsyncSignal.Set();
+            try { _fsyncThread.Join(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
+            _stopFsyncThread.Dispose();
+        }
+        _fsyncSignal.Dispose();
         lock (_writeLock)
         {
             _appendStream?.Dispose();
             _appendStream = null;
+        }
+        // Anyone still parked in WaitForDurable on a disposed log
+        // should bail; pulse the monitor so the loop wakes and re-checks
+        // (cancellation token is the contractual exit, but disposing
+        // the WAL while someone waits is undefined and we'd rather
+        // unblock than deadlock).
+        lock (_durabilityLock)
+        {
+            Monitor.PulseAll(_durabilityLock);
+        }
+    }
+
+    private void AdvanceDurableSeqOnTruncate()
+    {
+        long pending = Interlocked.Read(ref _pendingSeq);
+        long durable = Interlocked.Read(ref _durableSeq);
+        if (pending > durable)
+        {
+            Interlocked.Exchange(ref _durableSeq, pending);
+            lock (_durabilityLock) Monitor.PulseAll(_durabilityLock);
         }
     }
 
