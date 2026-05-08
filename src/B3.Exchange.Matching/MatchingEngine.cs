@@ -74,6 +74,22 @@ public sealed class MatchingEngine
     // sentinel "no prior state" is the all-default record.
     private readonly Dictionary<long, AuctionTopState> _auctionTopById = new();
 
+    // Reusable scratch buffers for ComputeAuctionTop (round-2 perf #15).
+    // The engine is single-threaded and ComputeAuctionTop is invoked
+    // strictly synchronously inside an EnterDispatch/ExitDispatch
+    // bracket, so a single shared set of buffers is safe and
+    // eliminates per-invocation List/SortedSet allocations on the
+    // auction hot path.
+    private readonly List<(long Px, long Qty)> _auctionBidsScratch = new();
+    private readonly List<(long Px, long Qty)> _auctionAsksScratch = new();
+    private readonly List<long> _auctionCandidatesScratch = new();
+
+    // Reusable scratch buffer for MassCancel single-pass resolution
+    // (round-2 perf #8). Holds the (book, resting) pairs resolved on
+    // the first pass so the second pass — which emits the per-order
+    // cancel events — can iterate without re-scanning every book.
+    private readonly List<(LimitOrderBook Book, RestingOrder Resting)> _massCancelResolved = new();
+
     private readonly record struct AuctionTopState(
         bool HasTop,
         long TopPriceMantissa,
@@ -967,12 +983,17 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
-            // First pass — group target orderIds by (SecurityId, Side) so we
-            // can emit one OrderMassCanceledEvent summary per group BEFORE
-            // the per-order cancels (UMDF MassDeleteOrders_MBO_52, gap #8).
-            // Orders that no longer resolve are silently dropped, matching
-            // the second-pass behaviour below. We use a small dictionary
-            // since the typical mass-cancel touches O(10) groups.
+            // Single-pass resolution (round-2 perf #8): the previous
+            // implementation walked every (orderId × book) pair twice —
+            // once to bucket the (SecurityId, Side) summary counts and a
+            // second time to emit per-order cancels. We now resolve each
+            // orderId at most once, capture the (book, resting) pair in
+            // a reusable scratch list, and iterate it for both the
+            // grouped summary frames and the per-order cancels.
+            // Orders that no longer resolve are silently dropped,
+            // matching the prior behaviour.
+            var resolved = _massCancelResolved;
+            resolved.Clear();
             Dictionary<(long securityId, Side side), int>? groups = null;
             foreach (var orderId in orderIds)
             {
@@ -980,6 +1001,7 @@ public sealed class MatchingEngine
                 {
                     if (book.TryGet(orderId, out var resting))
                     {
+                        resolved.Add((book, resting));
                         groups ??= new Dictionary<(long, Side), int>();
                         var key = (book.SecurityId, resting.Side);
                         groups[key] = groups.TryGetValue(key, out var c) ? c + 1 : 1;
@@ -1000,23 +1022,17 @@ public sealed class MatchingEngine
                 }
             }
 
-            int cancelled = 0;
-            foreach (var orderId in orderIds)
+            int cancelled = resolved.Count;
+            // Snapshot count BEFORE emitting because EmitCanceled mutates
+            // the underlying book; the scratch list itself is unchanged
+            // but we must not leave entries pointing at stale state if a
+            // sink throws partway through.
+            for (int i = 0; i < resolved.Count; i++)
             {
-                // Locate the book that owns this orderId. Mass-cancel runs
-                // in O(books × orderIds) which is acceptable since a typical
-                // mass-cancel touches a small number of resting orders
-                // within one channel.
-                foreach (var book in _booksById.Values)
-                {
-                    if (book.TryGet(orderId, out var resting))
-                    {
-                        EmitCanceled(book, resting, enteredAtNanos, CancelReason.MassCancel);
-                        cancelled++;
-                        break;
-                    }
-                }
+                var (book, resting) = resolved[i];
+                EmitCanceled(book, resting, enteredAtNanos, CancelReason.MassCancel);
             }
+            resolved.Clear();
             return cancelled;
         }
         finally { ExitDispatch(); }
@@ -1258,21 +1274,24 @@ public sealed class MatchingEngine
             RptSeq: NextRptSeq()));
     }
 
-    private static AuctionTopState ComputeAuctionTop(LimitOrderBook book)
+    private AuctionTopState ComputeAuctionTop(LimitOrderBook book)
     {
-        // Snapshot both sides; bids enumerated highest-first, asks
-        // enumerated lowest-first (each is best-first per book).
-        var bids = new List<(long Px, long Qty)>();
+        // Snapshot both sides into reusable scratch buffers
+        // (round-2 perf #15). Bids are enumerated highest-first, asks
+        // lowest-first (each is best-first per book).
+        var bids = _auctionBidsScratch;
+        var asks = _auctionAsksScratch;
+        bids.Clear();
+        asks.Clear();
         foreach (var lvl in book.EnumerateLevels(Side.Buy))
             bids.Add(lvl);
-        var asks = new List<(long Px, long Qty)>();
         foreach (var lvl in book.EnumerateLevels(Side.Sell))
             asks.Add(lvl);
 
         long buyTotal = 0;
-        foreach (var (_, q) in bids) buyTotal += q;
+        for (int i = 0; i < bids.Count; i++) buyTotal += bids[i].Qty;
         long sellTotal = 0;
-        foreach (var (_, q) in asks) sellTotal += q;
+        for (int i = 0; i < asks.Count; i++) sellTotal += asks[i].Qty;
 
         // No crossing: best bid < best ask, or one side empty.
         bool anyCross = bids.Count > 0 && asks.Count > 0 && bids[0].Px >= asks[0].Px;
@@ -1291,28 +1310,69 @@ public sealed class MatchingEngine
             return new AuctionTopState(false, 0, 0, false, Side.Buy, 0);
         }
 
-        // Build the candidate price set: every distinct price in either
-        // side. Walk best-first on bids and asks, maintaining running
-        // cumulatives. To get cumBuy@P (qty with bid >= P) and
-        // cumSell@P (qty with ask <= P) we sort the union ascending in
-        // PRICE and scan once.
-        var candidates = new SortedSet<long>();
-        foreach (var (px, _) in bids) candidates.Add(px);
-        foreach (var (px, _) in asks) candidates.Add(px);
+        // Sweepline (round-2 perf #9): walk the union of bid + ask
+        // prices once in ascending order. cumBuy(P) = qty with bid >= P
+        // is monotonically non-increasing as P grows; cumSell(P) =
+        // qty with ask <= P is monotonically non-decreasing. Bids are
+        // already sorted highest-first (so we walk them tail-to-head as
+        // a "next-bid-to-drop" pointer); asks are already sorted
+        // lowest-first (so we walk them head-to-tail as a
+        // "next-ask-to-add" pointer).
+        var candidates = _auctionCandidatesScratch;
+        candidates.Clear();
+        // Build sorted-ascending union without a SortedSet: merge the
+        // two already-sorted sources (bids descending → reverse iter
+        // gives ascending; asks ascending) with dedupe.
+        int bi = bids.Count - 1;
+        int ai = 0;
+        long lastAdded = long.MinValue;
+        while (bi >= 0 || ai < asks.Count)
+        {
+            long bpx = bi >= 0 ? bids[bi].Px : long.MaxValue;
+            long apx = ai < asks.Count ? asks[ai].Px : long.MaxValue;
+            long pick;
+            if (bpx < apx) { pick = bpx; bi--; }
+            else if (apx < bpx) { pick = apx; ai++; }
+            else { pick = bpx; bi--; ai++; }
+            if (pick != lastAdded)
+            {
+                candidates.Add(pick);
+                lastAdded = pick;
+            }
+        }
+
+        // Two-pointer sweep over candidates ascending.
+        // bidPtr: index into bids (sorted desc) — tracks the smallest
+        //   bid price already included in cumBuy. Decremented (toward
+        //   lower-priced bids excluded) as P rises past their price.
+        // askPtr: index into asks (sorted asc) — tracks the next ask
+        //   to include in cumSell. Incremented as P rises past it.
+        long cumBuy = buyTotal;
+        long cumSell = 0;
+        int bidPtr = bids.Count - 1; // points at lowest-priced bid still in cumBuy
+        int askPtr = 0;              // points at next ask to add to cumSell
 
         long bestMatched = -1;
         long bestImbalance = long.MaxValue;
         long bestPx = 0;
         long bestCumBuy = 0;
         long bestCumSell = 0;
-        foreach (var px in candidates)
+
+        for (int ci = 0; ci < candidates.Count; ci++)
         {
-            long cumBuy = 0;
-            foreach (var (bpx, bqty) in bids)
-                if (bpx >= px) cumBuy += bqty;
-            long cumSell = 0;
-            foreach (var (apx, aqty) in asks)
-                if (apx <= px) cumSell += aqty;
+            long px = candidates[ci];
+            // Drop bids strictly below px (they no longer satisfy bid >= px).
+            while (bidPtr >= 0 && bids[bidPtr].Px < px)
+            {
+                cumBuy -= bids[bidPtr].Qty;
+                bidPtr--;
+            }
+            // Add asks <= px (they satisfy ask <= px).
+            while (askPtr < asks.Count && asks[askPtr].Px <= px)
+            {
+                cumSell += asks[askPtr].Qty;
+                askPtr++;
+            }
             long matched = Math.Min(cumBuy, cumSell);
             if (matched <= 0) continue;
             long imbalance = Math.Abs(cumBuy - cumSell);
