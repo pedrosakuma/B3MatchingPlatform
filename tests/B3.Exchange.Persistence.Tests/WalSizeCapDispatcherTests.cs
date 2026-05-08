@@ -67,7 +67,7 @@ public class WalSizeCapDispatcherTests
         public long DropsOnFullCount => 0;
 
         public CapExceededAfterNWal(int allowedAppends) { _allowedAppends = allowedAppends; }
-        public void Append(WalRecord record)
+        public int Append(WalRecord record)
         {
             AppendCalls++;
             if (AppendCalls > _allowedAppends)
@@ -75,6 +75,7 @@ public class WalSizeCapDispatcherTests
                     currentSizeBytes: CurrentSizeBytes,
                     maxBytes: CurrentSizeBytes,
                     incomingRecordBytes: 64);
+            return 64;
         }
         public IReadOnlyList<WalRecord> ReadAll() => Array.Empty<WalRecord>();
         public void Truncate() { }

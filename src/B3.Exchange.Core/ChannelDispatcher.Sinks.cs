@@ -231,9 +231,8 @@ public sealed partial class ChannelDispatcher
         // evict the canonical entry. Pass the active session's ClOrdId (if
         // any) so the wire ER carries the requester's id while
         // OrigClOrdID points to the owner's original ClOrdID.
-        if (_orders.TryResolve(e.OrderId, out var owner))
+        if (_orders.TryEvict(e.OrderId, out var owner))
         {
-            _orders.Evict(e.OrderId);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
                 _currentClOrdId, _currentReceivedTimeNanos);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
@@ -385,9 +384,8 @@ public sealed partial class ChannelDispatcher
     public void OnStopOrderCanceled(in StopOrderCanceledEvent e)
     {
         AssertOnLoopThread();
-        if (_orders.TryResolve(e.OrderId, out var owner))
+        if (_orders.TryEvict(e.OrderId, out var owner))
         {
-            _orders.Evict(e.OrderId);
             var canceled = new OrderCanceledEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,

@@ -162,12 +162,12 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
         }
     }
 
-    public void Append(WalRecord record)
+    public int Append(WalRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
         lock (_writeLock)
         {
-            var json = JsonSerializer.SerializeToUtf8Bytes(record, JsonOptions);
+            var json = JsonSerializer.SerializeToUtf8Bytes(record, WalJsonContext.Default.WalRecord);
             // Layout: <json bytes> \t <8-hex Crc32C> \n
             int recordBytes = json.Length + 1 /* \t */ + 8 /* hex crc */ + 1 /* \n */;
             // Issue #291: enforce on-disk size cap before opening the
@@ -181,7 +181,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                     _logger.LogWarning(
                         "WAL channel-{Channel}: size cap reached (current={Current}B, incoming={Incoming}B, max={Max}B); dropping record (onFull=drop)",
                         _channelNumber, _currentSize, recordBytes, _maxBytes);
-                    return;
+                    return 0;
                 }
                 throw new WalSizeCapExceededException(_currentSize, _maxBytes, recordBytes);
             }
@@ -203,6 +203,7 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
                 _appendStream.Flush();
             }
             Interlocked.Add(ref _currentSize, recordBytes);
+            return recordBytes;
         }
     }
 

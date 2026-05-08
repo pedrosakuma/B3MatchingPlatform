@@ -40,18 +40,34 @@ public sealed class UmdfPacketRetransmitBuffer
     public int Capacity { get; }
 
     private readonly object _lock = new();
-    private readonly byte[]?[] _packets;
+    // Issue (perf tier-1): pre-allocate per-slot buffers and store the
+    // valid prefix length separately, so steady-state Append never
+    // allocates and never produces evictable garbage. Each slot holds a
+    // fixed-size 1.4 KiB buffer; the actual stored prefix is delimited
+    // by _lengths[i].
+    private readonly byte[][] _packets;
+    private readonly int[] _lengths;
     private readonly uint[] _seqs;
     private int _head;        // next write slot
     private int _count;
     private long _evictions;
 
+    /// <summary>Maximum payload bytes per slot — matches the UMDF packet
+    /// MTU enforced by the dispatcher, so any inbound packet always fits.
+    /// </summary>
+    public const int MaxPacketBytes = 1500;
+
     public UmdfPacketRetransmitBuffer(int capacity)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity), "capacity must be > 0");
         Capacity = capacity;
-        _packets = new byte[]?[capacity];
+        _packets = new byte[capacity][];
+        _lengths = new int[capacity];
         _seqs = new uint[capacity];
+        for (int i = 0; i < capacity; i++)
+        {
+            _packets[i] = new byte[MaxPacketBytes];
+        }
     }
 
     /// <summary>Number of packets currently retained.</summary>
@@ -93,12 +109,15 @@ public sealed class UmdfPacketRetransmitBuffer
         }
     }
 
-    /// <summary>Append a packet. Bytes are deep-copied. When the ring is
-    /// full the oldest entry is dropped and <see cref="Evictions"/> is
-    /// incremented.</summary>
+    /// <summary>Append a packet. Bytes are deep-copied into the
+    /// pre-allocated slot buffer (no per-call allocation). When the
+    /// ring is full the oldest entry is overwritten and
+    /// <see cref="Evictions"/> is incremented.</summary>
     public void Append(uint sequenceNumber, ReadOnlySpan<byte> packet)
     {
-        var copy = packet.ToArray();
+        if (packet.Length > MaxPacketBytes)
+            throw new ArgumentOutOfRangeException(nameof(packet),
+                $"packet too large: {packet.Length} > {MaxPacketBytes}");
         lock (_lock)
         {
             if (_count == Capacity)
@@ -109,7 +128,8 @@ public sealed class UmdfPacketRetransmitBuffer
             {
                 _count++;
             }
-            _packets[_head] = copy;
+            packet.CopyTo(_packets[_head].AsSpan(0, packet.Length));
+            _lengths[_head] = packet.Length;
             _seqs[_head] = sequenceNumber;
             _head = (_head + 1) % Capacity;
         }
@@ -122,7 +142,15 @@ public sealed class UmdfPacketRetransmitBuffer
     {
         lock (_lock)
         {
-            for (int i = 0; i < _packets.Length; i++) _packets[i] = null;
+            // We keep the per-slot buffers — they are reused across resets
+            // so a SequenceVersion roll doesn't trigger ~90 MiB of fresh
+            // allocations. Only the length/seq metadata needs clearing so
+            // a stale slot can never satisfy a TryGet from the new epoch.
+            for (int i = 0; i < _lengths.Length; i++)
+            {
+                _lengths[i] = 0;
+                _seqs[i] = 0;
+            }
             _head = 0;
             _count = 0;
             // _evictions intentionally retained — it is a lifetime
@@ -149,8 +177,8 @@ public sealed class UmdfPacketRetransmitBuffer
             // before the version bump.
             int offset = (int)(sequenceNumber - first);
             int slot = (oldest + offset) % Capacity;
-            var stored = _packets[slot];
-            if (stored is null || _seqs[slot] != sequenceNumber)
+            int len = _lengths[slot];
+            if (len == 0 || _seqs[slot] != sequenceNumber)
             {
                 // Defensive: shouldn't happen under append-only single-writer
                 // semantics, but if it does, fail safe rather than serve a
@@ -158,7 +186,7 @@ public sealed class UmdfPacketRetransmitBuffer
                 packet = Array.Empty<byte>();
                 return false;
             }
-            packet = (byte[])stored.Clone();
+            packet = _packets[slot].AsSpan(0, len).ToArray();
             return true;
         }
     }
@@ -185,13 +213,13 @@ public sealed class UmdfPacketRetransmitBuffer
             {
                 uint seq = fromSeq + (uint)i;
                 int slot = (oldest + (int)(seq - first)) % Capacity;
-                var stored = _packets[slot];
-                if (stored is null || _seqs[slot] != seq)
+                int len = _lengths[slot];
+                if (len == 0 || _seqs[slot] != seq)
                 {
                     packets = Array.Empty<byte[]>();
                     return false;
                 }
-                result[i] = (byte[])stored.Clone();
+                result[i] = _packets[slot].AsSpan(0, len).ToArray();
             }
             packets = result;
             return true;

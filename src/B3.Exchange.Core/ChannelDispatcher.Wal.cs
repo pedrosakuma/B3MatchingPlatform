@@ -72,12 +72,11 @@ public sealed partial class ChannelDispatcher
         if (rec is null) return true;
         try
         {
-            // Best-effort byte accounting: Append re-serializes the
-            // record internally; we approximate the byte count from
-            // the JSON serializer here so the metric stays meaningful
-            // without requiring the Append signature to leak the size.
-            long approxBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(rec).Length + 1;
-            _wal.Append(rec);
+            // Single serialization (issue: WAL hot-path double serialize).
+            // The dispatcher previously called SerializeToUtf8Bytes here
+            // *only* to get the byte count, then Append re-serialized — so
+            // we return the on-disk bytes from this single call.
+            long approxBytes = _wal.Append(rec);
             _metrics?.IncWalAppend(approxBytes);
             _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
             _metrics?.SetWalDropsOnFull(_wal.DropsOnFullCount);

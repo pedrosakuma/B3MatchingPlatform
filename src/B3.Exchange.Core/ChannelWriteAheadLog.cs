@@ -63,9 +63,12 @@ public interface IChannelWriteAheadLog
     /// <summary>
     /// Appends a record to the WAL. Implementations choose whether to
     /// fsync per-write (zero RPO, lower throughput) or batch (higher
-    /// throughput, RPO bounded by batch interval).
+    /// throughput, RPO bounded by batch interval). Returns the number
+    /// of bytes the record consumed on the underlying medium so the
+    /// dispatcher can update <c>exch_wal_append_bytes_total</c> without
+    /// re-serializing the record itself.
     /// </summary>
-    void Append(WalRecord record);
+    int Append(WalRecord record);
 
     /// <summary>
     /// Returns every record currently in the log in append order.
