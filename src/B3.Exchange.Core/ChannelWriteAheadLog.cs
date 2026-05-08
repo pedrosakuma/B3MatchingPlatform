@@ -126,4 +126,43 @@ public interface IChannelWriteAheadLog
     /// <c>exch_wal_drops_on_full_total</c>. Defaults to 0.
     /// </summary>
     long DropsOnFullCount => 0;
+
+    /// <summary>
+    /// Issue #312 (Tier-2 perf): the <see cref="WalRecord.Seq"/>
+    /// of the most-recently <see cref="Append"/>ed record (i.e.
+    /// the highest seq the WAL has ACCEPTED — but not necessarily
+    /// fsynced). Equal to <see cref="DurableSeqOrZero"/> in
+    /// <see cref="WalFsyncMode.PerWrite"/> mode and in in-memory
+    /// fakes. <c>0</c> means nothing has been appended.
+    /// </summary>
+    long PendingDurableSeqOrZero => 0;
+
+    /// <summary>
+    /// Issue #312: the highest <see cref="WalRecord.Seq"/> that
+    /// has been fsynced to durable storage. In
+    /// <see cref="WalFsyncMode.PerWrite"/> mode this advances
+    /// inside every <see cref="Append"/>; in
+    /// <see cref="WalFsyncMode.GroupCommit"/> mode it advances on
+    /// each background fsync. <c>0</c> means nothing is durable
+    /// yet. Default implementation returns
+    /// <see cref="PendingDurableSeqOrZero"/> so in-memory fakes
+    /// trivially satisfy <see cref="WaitForDurable"/>.
+    /// </summary>
+    long DurableSeqOrZero => PendingDurableSeqOrZero;
+
+    /// <summary>
+    /// Issue #312: blocks until the WAL's
+    /// <see cref="DurableSeqOrZero"/> has reached
+    /// <paramref name="seq"/>, i.e. the record with that seq (and
+    /// every earlier record) is on durable storage. Returns
+    /// immediately when the predicate is already satisfied or
+    /// when <paramref name="seq"/> is &lt;= 0.
+    ///
+    /// <para>Implementations MUST honour
+    /// <paramref name="cancellationToken"/> so the caller can
+    /// abort on shutdown without leaking the dispatch thread.
+    /// The default implementation is a no-op (the in-memory fake
+    /// reports its writes as immediately durable).</para>
+    /// </summary>
+    void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
 }
