@@ -33,10 +33,12 @@ namespace B3.Exchange.Contracts;
 public interface ICoreOutbound
 {
     bool WriteExecutionReportNew(SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e,
-        ulong receivedTimeNanos = ulong.MaxValue);
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default);
 
     bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor,
-        long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty);
+        long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
+        DurabilityHandle durability = default);
 
     /// <summary>
     /// Routes an <c>ExecutionReport_Trade</c> for the resting (passive) side
@@ -49,7 +51,8 @@ public interface ICoreOutbound
     /// behaviour as the active path).
     /// </summary>
     bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
-        in TradeEvent e, long leavesQty, long cumQty);
+        in TradeEvent e, long leavesQty, long cumQty,
+        DurabilityHandle durability = default);
 
     /// <summary>
     /// Routes an <c>ExecutionReport_Cancel</c> for the owner of
@@ -63,14 +66,17 @@ public interface ICoreOutbound
     /// a request from a live session (e.g. engine-internal cancel).
     /// </summary>
     bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId,
-        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue);
+        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default);
 
     bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
         MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
-        ulong receivedTimeNanos = ulong.MaxValue);
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default);
 
-    bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue);
+    bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue,
+        DurabilityHandle durability = default);
 }
 
 /// <summary>

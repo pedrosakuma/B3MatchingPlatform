@@ -58,7 +58,7 @@ public enum WalRecordKind
 /// visible to <see cref="ReadAll"/> or absent — partial / torn writes
 /// would invalidate replay.</para>
 /// </summary>
-public interface IChannelWriteAheadLog
+public interface IChannelWriteAheadLog : IDurabilityBarrier
 {
     /// <summary>
     /// Appends a record to the WAL. Implementations choose whether to
@@ -149,20 +149,4 @@ public interface IChannelWriteAheadLog
     /// trivially satisfy <see cref="WaitForDurable"/>.
     /// </summary>
     long DurableSeqOrZero => PendingDurableSeqOrZero;
-
-    /// <summary>
-    /// Issue #312: blocks until the WAL's
-    /// <see cref="DurableSeqOrZero"/> has reached
-    /// <paramref name="seq"/>, i.e. the record with that seq (and
-    /// every earlier record) is on durable storage. Returns
-    /// immediately when the predicate is already satisfied or
-    /// when <paramref name="seq"/> is &lt;= 0.
-    ///
-    /// <para>Implementations MUST honour
-    /// <paramref name="cancellationToken"/> so the caller can
-    /// abort on shutdown without leaking the dispatch thread.
-    /// The default implementation is a no-op (the in-memory fake
-    /// reports its writes as immediately durable).</para>
-    /// </summary>
-    void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
 }

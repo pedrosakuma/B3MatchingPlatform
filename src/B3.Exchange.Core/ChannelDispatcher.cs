@@ -173,6 +173,19 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// session.</summary>
     private bool _replayMode;
 
+    /// <summary>
+    /// Issue #312: snapshot of the durability barrier the outbound ER
+    /// for the currently-dispatching command must wait on. Captured
+    /// after <see cref="WalAppendIfEnabled"/> stamps <c>_lastAppliedSeq</c>
+    /// so every ER triggered by the same command awaits the SAME WAL
+    /// seq, regardless of how many engine events fire. Returns
+    /// <see cref="DurabilityHandle.None"/> when WAL is disabled or
+    /// during replay so the send loop fast-paths through.
+    /// </summary>
+    private DurabilityHandle CurrentDurability =>
+        (_wal is null || _replayMode) ? DurabilityHandle.None
+            : new DurabilityHandle(_wal, _lastAppliedSeq);
+
     private static readonly IUmdfPacketSink NoOpPacketSink = new NoOpPacketSinkImpl();
     private static readonly ICoreOutbound NoOpOutbound = new NoOpCoreOutboundImpl();
     /// <summary>

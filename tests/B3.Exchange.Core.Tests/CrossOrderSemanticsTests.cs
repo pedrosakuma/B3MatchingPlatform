@@ -57,33 +57,33 @@ public class CrossOrderSemanticsTests
         private readonly Dictionary<B3.Exchange.Contracts.SessionId, FakeSession> _sessions = new();
         public void Register(FakeSession s) => _sessions[s.Id] = s;
 
-        public bool WriteExecutionReportNew(SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
+        public bool WriteExecutionReportNew(SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         {
             if (_sessions.TryGetValue(session, out var s)) s.News.Add(e);
             return true;
         }
 
-        public bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
+        public bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty, DurabilityHandle d = default)
         {
             if (_sessions.TryGetValue(session, out var s)) { s.Trades.Add(e); s.TradeIsAggressor.Add(isAggressor); }
             return true;
         }
 
-        public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty)
+        public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty, DurabilityHandle d = default)
         {
             if (_sessions.TryGetValue(ownerSession, out var s)) { s.Trades.Add(e); s.TradeIsAggressor.Add(false); }
             return true;
         }
 
-        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
+        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         {
             if (_sessions.TryGetValue(ownerSession, out var s)) s.Cancels.Add(e);
             return true;
         }
 
-        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue) => true;
+        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default) => true;
 
-        public bool WriteExecutionReportReject(SessionId session, in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue) => true;
+        public bool WriteExecutionReportReject(SessionId session, in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default) => true;
     }
 
     private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()

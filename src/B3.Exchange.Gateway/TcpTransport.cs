@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using B3.Exchange.Contracts;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Gateway;
@@ -26,7 +27,7 @@ public sealed class TcpTransport : IAsyncDisposable
 {
     private readonly Stream _stream;
     private readonly ILogger<TcpTransport> _logger;
-    private readonly Channel<byte[]> _sendQueue;
+    private readonly Channel<OutboundFrame> _sendQueue;
     private readonly SemaphoreSlim _streamWriteLock = new(1, 1);
     private readonly long _connectionId;
     private readonly Action<string>? _onClose;
@@ -34,6 +35,15 @@ public sealed class TcpTransport : IAsyncDisposable
     private int _isOpen = 1;
     private long _lastOutboundTickMs;
     private Task? _sendTask;
+
+    /// <summary>
+    /// Issue #312: per-frame envelope tying the encoded bytes to the
+    /// optional durability handle the send loop must satisfy before
+    /// writing them to the socket. <see cref="DurabilityHandle.None"/>
+    /// (the default for non-ER frames such as keep-alive,
+    /// SessionReject, BusinessMessageReject) skips the wait.
+    /// </summary>
+    private readonly record struct OutboundFrame(byte[] Bytes, DurabilityHandle Durability);
 
     /// <summary>
     /// Underlying stream. Exposed for the session-level receive loop —
@@ -70,7 +80,7 @@ public sealed class TcpTransport : IAsyncDisposable
         _logger = logger;
         _onClose = onClose;
         _onSendQueueFull = onSendQueueFull;
-        _sendQueue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(sendQueueCapacity)
+        _sendQueue = Channel.CreateBounded<OutboundFrame>(new BoundedChannelOptions(sendQueueCapacity)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -94,11 +104,18 @@ public sealed class TcpTransport : IAsyncDisposable
     /// <c>false</c> if the transport is closed or the queue overflowed
     /// (in which case the transport is closed as a side-effect to avoid
     /// unbounded memory growth under a stuck peer).
+    ///
+    /// <para>Issue #312: the optional <paramref name="durability"/>
+    /// pair tells the send loop which WAL seq must be fsynced before
+    /// the bytes leave the host. <see cref="DurabilityHandle.None"/>
+    /// (the default) means "send immediately" — the pre-#312
+    /// behaviour preserved by every keep-alive / SessionReject /
+    /// BusinessMessageReject call site.</para>
     /// </summary>
-    public bool TryEnqueueFrame(byte[] frame)
+    public bool TryEnqueueFrame(byte[] frame, DurabilityHandle durability = default)
     {
         if (!IsOpen) return false;
-        if (_sendQueue.Writer.TryWrite(frame)) return true;
+        if (_sendQueue.Writer.TryWrite(new OutboundFrame(frame, durability))) return true;
         try { _onSendQueueFull?.Invoke(); } catch { }
         Close("send-queue-full");
         return false;
@@ -134,10 +151,21 @@ public sealed class TcpTransport : IAsyncDisposable
             {
                 try
                 {
+                    // Issue #312: never let an ER (or any frame tagged
+                    // with a durability handle) hit the wire before its
+                    // covering WAL record is fsynced. Synchronous wait
+                    // is fine here — the send loop is the only consumer
+                    // of the queue and we WANT it to back-pressure on
+                    // un-durable frames; that's the whole point of the
+                    // gating contract.
+                    if (frame.Durability.IsActive)
+                    {
+                        frame.Durability.Barrier!.WaitForDurable(frame.Durability.Seq, ct);
+                    }
                     await _streamWriteLock.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
-                        await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                        await _stream.WriteAsync(frame.Bytes, ct).ConfigureAwait(false);
                     }
                     finally
                     {

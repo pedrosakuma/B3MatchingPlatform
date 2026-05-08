@@ -434,6 +434,37 @@ public sealed class WalConfig
     [JsonPropertyName("onFull")] public string OnFull { get; set; } = "halt";
 
     /// <summary>
+    /// Issue #312 (Tier-2 perf): selects the WAL fsync strategy.
+    /// <list type="bullet">
+    ///   <item><c>"perWrite"</c> (default when <see cref="FsyncPerWrite"/>
+    ///   is <c>true</c>) — every <c>Append</c> calls <c>fsync</c>
+    ///   before returning. Zero RPO, per-command disk latency.</item>
+    ///   <item><c>"groupCommit"</c> — appends are written + fsynced on
+    ///   a background thread no more often than every
+    ///   <c>groupCommitIntervalMs</c> milliseconds. The outbound
+    ///   stack uses <c>WaitForDurable</c> to gate ER frames so
+    ///   peers never observe state that is not yet on disk; this
+    ///   amortises fsync cost across bursty workloads while keeping
+    ///   the durable-before-observable contract intact.</item>
+    /// </list>
+    /// When omitted, the resolved mode comes from
+    /// <see cref="FsyncPerWrite"/>: <c>true</c> ⇒ <c>perWrite</c>,
+    /// <c>false</c> ⇒ <c>groupCommit</c>. Setting both
+    /// <see cref="FsyncMode"/>=<c>perWrite</c> AND
+    /// <see cref="FsyncPerWrite"/>=<c>false</c> (or the inverse) is
+    /// flagged as a misconfiguration at boot.
+    /// </summary>
+    [JsonPropertyName("fsyncMode")] public string? FsyncMode { get; set; }
+
+    /// <summary>
+    /// Group-commit batching window in milliseconds. Ignored unless
+    /// the resolved fsync mode is <c>groupCommit</c>. Defaults to
+    /// <c>1</c> ms — small enough to bound RPO under steady load,
+    /// large enough to amortise fsync syscall cost across the burst.
+    /// </summary>
+    [JsonPropertyName("groupCommitIntervalMs")] public int GroupCommitIntervalMs { get; set; } = 1;
+
+    /// <summary>
     /// Parses <see cref="OnFull"/> case-insensitively to the typed
     /// enum. Throws on unknown values so misconfiguration fails
     /// the boot rather than silently degrading to the wrong
@@ -447,6 +478,48 @@ public sealed class WalConfig
             _ => throw new InvalidOperationException(
                 $"persistence.wal.onFull: unknown value '{OnFull}' (expected 'halt' or 'drop')"),
         };
+
+    /// <summary>
+    /// Resolves <see cref="FsyncMode"/> + <see cref="FsyncPerWrite"/>
+    /// into the typed <see cref="B3.Exchange.Core.WalFsyncMode"/>
+    /// the WAL ctor expects. When <see cref="FsyncMode"/> is unset,
+    /// derives from the legacy <see cref="FsyncPerWrite"/> flag so
+    /// existing configs keep their pre-#312 behaviour. Throws on
+    /// unknown values or contradictory combinations
+    /// (<c>perWrite</c> + <see cref="FsyncPerWrite"/>=<c>false</c>,
+    /// or <c>groupCommit</c> + <see cref="FsyncPerWrite"/>=<c>true</c>).
+    /// </summary>
+    public B3.Exchange.Core.WalFsyncMode ResolveFsyncMode()
+    {
+        var raw = FsyncMode?.Trim().ToLowerInvariant();
+        switch (raw)
+        {
+            case null or "":
+                return FsyncPerWrite
+                    ? B3.Exchange.Core.WalFsyncMode.PerWrite
+                    : B3.Exchange.Core.WalFsyncMode.GroupCommit;
+            case "perwrite":
+                if (!FsyncPerWrite)
+                {
+                    throw new InvalidOperationException(
+                        "persistence.wal.fsyncMode='perWrite' contradicts persistence.wal.fsyncPerWrite=false; remove one of the two settings.");
+                }
+                return B3.Exchange.Core.WalFsyncMode.PerWrite;
+            case "groupcommit":
+                if (FsyncPerWrite && FsyncMode is not null)
+                {
+                    // FsyncPerWrite default is true; treat the explicit
+                    // groupCommit override as authoritative and override
+                    // the legacy flag transparently. Operators upgrading
+                    // an old config only need to set fsyncMode.
+                    return B3.Exchange.Core.WalFsyncMode.GroupCommit;
+                }
+                return B3.Exchange.Core.WalFsyncMode.GroupCommit;
+            default:
+                throw new InvalidOperationException(
+                    $"persistence.wal.fsyncMode: unknown value '{FsyncMode}' (expected 'perWrite' or 'groupCommit').");
+        }
+    }
 }
 
 /// <summary>

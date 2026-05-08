@@ -431,21 +431,25 @@ public sealed partial class FixpSession : IAsyncDisposable
     private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
         => _retransmitController.ProcessAndEnqueueRetransmitRequest(fixedBlock);
 
-    public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
-        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos);
+    public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
+        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability);
 
-    public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
-        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty);
+    public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
+        DurabilityHandle durability = default)
+        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability);
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
-        ulong receivedTimeNanos = ulong.MaxValue)
-        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos);
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
+        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos, durability);
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
-        ulong receivedTimeNanos = ulong.MaxValue)
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability);
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
@@ -460,8 +464,9 @@ public sealed partial class FixpSession : IAsyncDisposable
         => _outboundEncoder.WriteOrderMassActionReport(clOrdIdValue, massActionResponse,
             massActionRejectReason, side, securityId, transactTimeNanos, text);
 
-    public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue)
-        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue);
+    public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue,
+        DurabilityHandle durability = default)
+        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue, durability);
 
     public bool WriteSessionReject(byte terminationCode)
         => _outboundEncoder.WriteSessionReject(terminationCode);

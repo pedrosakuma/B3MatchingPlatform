@@ -1,6 +1,7 @@
 using B3.EntryPoint.Wire;
 using System.Buffers.Binary;
 using B3.Exchange.Matching;
+using DurabilityHandle = B3.Exchange.Contracts.DurabilityHandle;
 
 namespace B3.Exchange.Gateway;
 
@@ -58,7 +59,8 @@ internal sealed class FixpOutboundEncoder
         _close = close;
     }
 
-    public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue)
+    public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_isOpen()) return false;
         ulong clOrd = ulong.TryParse(e.ClOrdId, out var v) ? v : 0;
@@ -72,11 +74,12 @@ internal sealed class FixpOutboundEncoder
                 OrderType.Limit, TimeInForce.Day,
                 e.RemainingQuantity, e.PriceMantissa,
                 receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
+            return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
-    public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
+    public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
+        DurabilityHandle durability = default)
     {
         if (!_isOpen()) return false;
         var side = isAggressor ? e.AggressorSide : (e.AggressorSide == Side.Buy ? Side.Sell : Side.Buy);
@@ -92,12 +95,13 @@ internal sealed class FixpOutboundEncoder
                 isAggressor ? e.RestingFirm : e.AggressorFirm,
                 tradeDate: 0,
                 orderQty: leavesQty + cumQty);
-            return AppendAndEnqueueLocked(exact);
+            return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
-        ulong receivedTimeNanos = ulong.MaxValue)
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_isOpen()) return false;
         var exact = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
@@ -110,13 +114,14 @@ internal sealed class FixpOutboundEncoder
                 (ulong)e.RptSeq, e.TransactTimeNanos,
                 cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa,
                 receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
+            return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
-        ulong receivedTimeNanos = ulong.MaxValue)
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_isOpen()) return false;
         var exact = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
@@ -128,7 +133,7 @@ internal sealed class FixpOutboundEncoder
                 securityId, orderId, (ulong)rptSeq, transactTimeNanos,
                 leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
                 receivedTimeNanos: receivedTimeNanos);
-            return AppendAndEnqueueLocked(exact);
+            return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
@@ -155,7 +160,8 @@ internal sealed class FixpOutboundEncoder
         }
     }
 
-    public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue,
+        DurabilityHandle durability = default)
     {
         if (!_isOpen()) return false;
         uint rej = MapRejectReason(e.Reason);
@@ -166,7 +172,7 @@ internal sealed class FixpOutboundEncoder
                 _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                 clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
                 rej, e.TransactTimeNanos);
-            return AppendAndEnqueueLocked(exact);
+            return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
@@ -203,7 +209,7 @@ internal sealed class FixpOutboundEncoder
     /// transport. Centralizes the two-step "buffer + enqueue" so every
     /// business-frame write site has identical semantics.
     /// </summary>
-    private bool AppendAndEnqueueLocked(byte[] exact)
+    private bool AppendAndEnqueueLocked(byte[] exact, DurabilityHandle durability = default)
     {
         // OutboundBusinessHeader.MsgSeqNum sits at body offset 4
         // (SessionID(4) | MsgSeqNum(4) | …) → absolute offset
@@ -215,7 +221,7 @@ internal sealed class FixpOutboundEncoder
         // that has been allocated MUST be replayable, even if the local
         // send queue rejects the frame (gpt-5.5 critique #9).
         _retxBuffer.Append(seq, exact);
-        return _transport().TryEnqueueFrame(exact);
+        return _transport().TryEnqueueFrame(exact, durability);
     }
 
     /// <summary>
