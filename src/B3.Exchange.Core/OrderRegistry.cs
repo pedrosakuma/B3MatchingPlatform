@@ -97,8 +97,19 @@ public sealed class OrderRegistry
     /// reverse <c>(Firm, ClOrdId)</c> index entry (if any).
     /// </summary>
     public bool Evict(long orderId)
+        => TryEvict(orderId, out _);
+
+    /// <summary>
+    /// Single-pass evict: removes the entry for <paramref name="orderId"/>
+    /// (and its reverse index entry) and returns the evicted owner via
+    /// <paramref name="owner"/>. Use this in dispatcher sinks where the
+    /// outbound ER routing needs the owner's session/ClOrdId — saves the
+    /// dictionary lookup that <see cref="TryResolve"/> + <see cref="Evict"/>
+    /// would do twice.
+    /// </summary>
+    public bool TryEvict(long orderId, out OrderState owner)
     {
-        if (!_byOrderId.TryRemove(orderId, out var owner))
+        if (!_byOrderId.TryRemove(orderId, out owner))
             return false;
         if (owner.ClOrdId != 0)
             _byClOrdId.TryRemove(new KeyValuePair<(uint, ulong), long>((owner.Firm, owner.ClOrdId), orderId));

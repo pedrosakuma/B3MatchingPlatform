@@ -56,7 +56,7 @@ public class WalAppendFailurePolicyTests
     private sealed class FailingWal : IChannelWriteAheadLog
     {
         public int AppendCalls;
-        public void Append(WalRecord record)
+        public int Append(WalRecord record)
         {
             AppendCalls++;
             throw new IOException("simulated disk failure");
