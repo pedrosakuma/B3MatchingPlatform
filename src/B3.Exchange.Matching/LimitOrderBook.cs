@@ -92,6 +92,14 @@ internal sealed class LimitOrderBook
     private readonly SortedDictionary<long, PriceLevel> _asks;   // best = lowest price → natural comparer
     private readonly Dictionary<long, RestingOrder> _byOrderId = new();
 
+    // Reusable scratch buffer for OppositeLevels(). The book is single-
+    // threaded and the two callers in MatchingEngine (the FOK STP
+    // pre-check and the actual cross walk) execute strictly sequentially
+    // within one Submit, so a single shared buffer is safe and
+    // eliminates a per-aggressor List allocation that previously
+    // dominated steady-state Gen0 pressure.
+    private readonly List<PriceLevel> _oppositeScratch = new();
+
     public LimitOrderBook(long securityId)
     {
         SecurityId = securityId;
@@ -197,14 +205,26 @@ internal sealed class LimitOrderBook
     /// <summary>
     /// Iterates the opposite side level-by-level in match priority order. Used
     /// only by <see cref="MatchingEngine"/> during a cross.
+    ///
+    /// <para><b>Buffer reuse:</b> the returned list is the book's shared
+    /// <c>_oppositeScratch</c> field, populated fresh on every call.
+    /// Callers MUST iterate-to-completion (or copy the contents) before
+    /// invoking <see cref="OppositeLevels"/> again on the same book —
+    /// the next call will <c>Clear()</c> + refill the same instance.
+    /// In practice the only callers are the two sequential phases of a
+    /// single <c>MatchingEngine.Submit</c> (FOK STP pre-check, then the
+    /// cross walk), and the engine is single-threaded per book, so this
+    /// invariant holds without callers needing to defend.</para>
     /// </summary>
-    internal IEnumerable<PriceLevel> OppositeLevels(Side aggressorSide)
+    internal List<PriceLevel> OppositeLevels(Side aggressorSide)
     {
         // Snapshot to a list because the engine mutates levels while iterating.
         var oppositeMap = SideMap(Opposite(aggressorSide));
-        var snap = new List<PriceLevel>(oppositeMap.Count);
-        foreach (var kv in oppositeMap) snap.Add(kv.Value);
-        return snap;
+        _oppositeScratch.Clear();
+        if (_oppositeScratch.Capacity < oppositeMap.Count)
+            _oppositeScratch.Capacity = oppositeMap.Count;
+        foreach (var kv in oppositeMap) _oppositeScratch.Add(kv.Value);
+        return _oppositeScratch;
     }
 
     /// <summary>
