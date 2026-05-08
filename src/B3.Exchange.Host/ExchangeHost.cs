@@ -574,13 +574,22 @@ public sealed class ExchangeHost : IAsyncDisposable
                 ch.ChannelNumber);
             return null;
         }
+        var fsyncMode = walCfg.ResolveFsyncMode();
+        // GroupCommit MUST NOT also fsync per write — the WAL ctor
+        // hard-rejects the contradictory combination. ResolveFsyncMode
+        // already ensures the operator-facing config is consistent;
+        // here we just normalise the internal flag passed downstream.
+        bool fsyncPerWrite = fsyncMode == B3.Exchange.Core.WalFsyncMode.PerWrite;
+        var groupCommitInterval = TimeSpan.FromMilliseconds(Math.Max(1, walCfg.GroupCommitIntervalMs));
         return new FileChannelWriteAheadLog(
             ch.Persistence.DataDir,
             ch.ChannelNumber,
             _loggerFactory.CreateLogger<FileChannelWriteAheadLog>(),
-            walCfg.FsyncPerWrite,
+            fsyncPerWrite,
             walCfg.MaxBytes,
-            walCfg.ResolveOnFull());
+            walCfg.ResolveOnFull(),
+            fsyncMode,
+            groupCommitInterval);
     }
 
     /// <summary>

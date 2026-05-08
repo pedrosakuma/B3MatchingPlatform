@@ -268,7 +268,7 @@ public sealed partial class ChannelDispatcher
                     {
                         _outbound.WriteExecutionReportReject(_currentSession,
                             new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
-                            _currentClOrdId);
+                            _currentClOrdId, CurrentDurability);
                         _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
                     }
                     break;
@@ -332,7 +332,7 @@ public sealed partial class ChannelDispatcher
         {
             _outbound.WriteExecutionReportReject(_currentSession,
                 new RejectEvent(clOrdId, securityId, 0, RejectReason.UnknownOrderId, nowNanos),
-                _currentClOrdId);
+                _currentClOrdId, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
     }

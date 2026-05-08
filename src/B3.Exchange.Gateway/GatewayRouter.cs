@@ -47,48 +47,54 @@ public sealed class GatewayRouter : ICoreOutbound
     }
 
     public bool WriteExecutionReportNew(ContractsSessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e,
-        ulong receivedTimeNanos = ulong.MaxValue)
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
-        return s.WriteExecutionReportNew(e, receivedTimeNanos);
+        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability);
     }
 
     public bool WriteExecutionReportTrade(ContractsSessionId session, in TradeEvent e, bool isAggressor,
-        long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty)
+        long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty);
+        return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability);
     }
 
     public bool WriteExecutionReportPassiveTrade(ContractsSessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
-        in TradeEvent e, long leavesQty, long cumQty)
+        in TradeEvent e, long leavesQty, long cumQty,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty);
+        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty, durability);
     }
 
     public bool WriteExecutionReportPassiveCancel(ContractsSessionId ownerSession, ulong ownerClOrdId, long orderId,
-        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue)
+        in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveCancel"); return false; }
         ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : ownerClOrdId;
-        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos);
+        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos, durability);
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
-        ulong receivedTimeNanos = ulong.MaxValue)
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportModify"); return false; }
         return s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability);
     }
 
-    public bool WriteExecutionReportReject(ContractsSessionId session, in RejectEvent e, ulong clOrdIdValue)
+    public bool WriteExecutionReportReject(ContractsSessionId session, in RejectEvent e, ulong clOrdIdValue,
+        DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportReject"); return false; }
-        return s.WriteExecutionReportReject(e, clOrdIdValue);
+        return s.WriteExecutionReportReject(e, clOrdIdValue, durability);
     }
 
     private void LogMiss(ContractsSessionId session, string kind)

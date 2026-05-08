@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
 using Side = B3.Exchange.Matching.Side;
 
@@ -34,7 +35,7 @@ public sealed partial class ChannelDispatcher
             // trade fired in the same dispatch turn can resolve owner ↦
             // session locally.
             _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
-            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos);
+            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
         }
     }
@@ -79,7 +80,8 @@ public sealed partial class ChannelDispatcher
             side: e.Side, newPriceMantissa: e.NewPriceMantissa,
             newRemainingQty: e.NewRemainingQuantity,
             transactTimeNanos: e.TransactTimeNanos, rptSeq: e.RptSeq,
-            receivedTimeNanos: _currentReceivedTimeNanos);
+            receivedTimeNanos: _currentReceivedTimeNanos,
+            durability: CurrentDurability);
         _metrics?.IncExecutionReport(ExecutionReportKind.Replace);
 
         // Refresh the canonical (Firm, ClOrdID) → OrderId index so
@@ -234,7 +236,7 @@ public sealed partial class ChannelDispatcher
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
-                _currentClOrdId, _currentReceivedTimeNanos);
+                _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
@@ -286,7 +288,7 @@ public sealed partial class ChannelDispatcher
         {
             _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
                 ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
-                leavesQty: 0, cumQty: e.Quantity);
+                leavesQty: 0, cumQty: e.Quantity, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Trade);
         }
         // ER_Trade for the resting side: resolve owner locally on the
@@ -296,7 +298,7 @@ public sealed partial class ChannelDispatcher
         if (_orders.TryResolve(e.RestingOrderId, out var owner))
         {
             _outbound.WriteExecutionReportPassiveTrade(owner.Session, owner.ClOrdId, e.RestingOrderId,
-                e, leavesQty: 0, cumQty: e.Quantity);
+                e, leavesQty: 0, cumQty: e.Quantity, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
         }
     }
@@ -306,7 +308,7 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         if (_hasCurrentSession)
         {
-            _outbound.WriteExecutionReportReject(_currentSession, e, _currentClOrdId);
+            _outbound.WriteExecutionReportReject(_currentSession, e, _currentClOrdId, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
     }
@@ -370,7 +372,7 @@ public sealed partial class ChannelDispatcher
                 EnteringFirm: e.EnteringFirm,
                 InsertTimestampNanos: e.InsertTimestampNanos,
                 RptSeq: e.RptSeq);
-            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, accepted, _currentReceivedTimeNanos);
+            _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, accepted, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
         }
     }
@@ -396,7 +398,7 @@ public sealed partial class ChannelDispatcher
                 Reason: CancelReason.Client,
                 RptSeq: e.RptSeq);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
-                _currentClOrdId, _currentReceivedTimeNanos);
+                _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
