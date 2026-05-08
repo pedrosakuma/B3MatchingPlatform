@@ -124,6 +124,17 @@ internal sealed class LimitOrderBook
         _byOrderId.Clear();
     }
 
+    // Reusable scratch buffer for SnapshotOrders() (round-2 perf #10).
+    // The book is single-threaded and the only production caller
+    // (MatchingEngine.UncrossAuction's auction-survivor expiration
+    // sweep) iterates the snapshot once, sequentially, without
+    // nested calls back into this book. Reusing a single buffer
+    // eliminates the per-uncross List allocation that the previous
+    // ToList() implementation incurred.
+    private readonly List<RestingOrder> _snapshotScratch = new();
+
+    private SortedDictionary<long, PriceLevel> SideMap(Side side) => side == Side.Buy ? _bids : _asks;
+
     public bool TryGet(long orderId, out RestingOrder order) => _byOrderId.TryGetValue(orderId, out order!);
 
     /// <summary>
@@ -132,10 +143,22 @@ internal sealed class LimitOrderBook
     /// expiration sweep in <see cref="MatchingEngine.UncrossAuction"/> to
     /// find <see cref="TimeInForce.GoodForAuction"/> /
     /// <see cref="TimeInForce.AtClose"/> survivors. Issue #232 / Onda M5.
+    ///
+    /// <para>Returns a buffer owned by this book; the contents remain
+    /// valid until the next call to <see cref="SnapshotOrders"/> on
+    /// the same book. The single-thread invariant on the engine
+    /// guarantees no concurrent or nested invocation. Round-2 perf #10
+    /// — eliminates the per-call List allocation that
+    /// <c>_byOrderId.Values.ToList()</c> incurred.</para>
     /// </summary>
-    public IReadOnlyList<RestingOrder> SnapshotOrders() => _byOrderId.Values.ToList();
-
-    private SortedDictionary<long, PriceLevel> SideMap(Side side) => side == Side.Buy ? _bids : _asks;
+    public IReadOnlyList<RestingOrder> SnapshotOrders()
+    {
+        var buf = _snapshotScratch;
+        buf.Clear();
+        foreach (var o in _byOrderId.Values)
+            buf.Add(o);
+        return buf;
+    }
 
     public void Insert(RestingOrder o)
     {

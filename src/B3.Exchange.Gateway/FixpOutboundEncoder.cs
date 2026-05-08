@@ -60,10 +60,15 @@ internal sealed class FixpOutboundEncoder
     }
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default,
+        ulong clOrdIdValue = 0)
     {
         if (!_isOpen()) return false;
-        ulong clOrd = ulong.TryParse(e.ClOrdId, out var v) ? v : 0;
+        // Round-2 perf #14: prefer the ulong threaded from the dispatch
+        // layer (it already has the parsed value from inbound decode);
+        // fall back to TryParse only when callers don't supply it
+        // (legacy tests). Avoids a ~50–100 ns parse on every ER hot path.
+        ulong clOrd = clOrdIdValue != 0 ? clOrdIdValue : (ulong.TryParse(e.ClOrdId, out var v) ? v : 0);
         var exact = new byte[ExecutionReportEncoder.ExecReportNewTotal];
         lock (_outboundLock)
         {

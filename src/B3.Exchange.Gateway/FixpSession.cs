@@ -432,8 +432,9 @@ public sealed partial class FixpSession : IAsyncDisposable
         => _retransmitController.ProcessAndEnqueueRetransmitRequest(fixedBlock);
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
-        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability);
+        DurabilityHandle durability = default,
+        ulong clOrdIdValue = 0)
+        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue);
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
         DurabilityHandle durability = default)
