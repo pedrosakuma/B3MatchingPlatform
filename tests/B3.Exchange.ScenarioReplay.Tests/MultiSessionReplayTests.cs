@@ -69,7 +69,7 @@ public class MultiSessionReplayTests
         await host.StartAsync();
         var ep = host.TcpEndpoint!;
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
         await using var clientA = await EntryPointClient.ConnectAsync(
             ep.Address.ToString(), ep.Port,
@@ -94,10 +94,15 @@ public class MultiSessionReplayTests
         // firmA posts a resting bid; firmB hits it with a marketable IOC sell.
         // clOrdId reuse across sessions is allowed (issue note: the gateway
         // namespaces orders by (firm, clOrdId)).
+        // The 200ms script-time gap (=> 20ms wall-clock at speed=10) is
+        // deliberately wider than the original 2ms: under CI parallel
+        // contention, a 2ms gap let firmB's NewOrder reach the dispatch
+        // queue ahead of firmA's, turning the IOC sell into an
+        // unmatched cancel and starving the test of trade ERs.
         var script = new[]
         {
-            new ScriptEvent(0,  ScriptEventKind.New, 1, Petr, Side.Buy,  OrderType.Limit, Tif.Day, 100, 320000, 0, 1, "firmA"),
-            new ScriptEvent(20, ScriptEventKind.New, 1, Petr, Side.Sell, OrderType.Limit, Tif.IOC, 100, 320000, 0, 2, "firmB"),
+            new ScriptEvent(0,   ScriptEventKind.New, 1, Petr, Side.Buy,  OrderType.Limit, Tif.Day, 100, 320000, 0, 1, "firmA"),
+            new ScriptEvent(200, ScriptEventKind.New, 1, Petr, Side.Sell, OrderType.Limit, Tif.IOC, 100, 320000, 0, 2, "firmB"),
         };
 
         await runner.RunAsync(script, cts.Token);
@@ -110,7 +115,9 @@ public class MultiSessionReplayTests
         // firmB ER_Trade. ER_New for the resting bid races the trade ER on
         // its own session — waiting only on the trade can break before
         // ER_New is captured (#146 reincarnation).
-        var deadline = DateTime.UtcNow.AddSeconds(20);
+        // Deadline bumped to 60s (was 20s) so CI scheduling jitter under
+        // parallel test contention does not race the assertions.
+        var deadline = DateTime.UtcNow.AddSeconds(60);
         while (DateTime.UtcNow < deadline)
         {
             var snapLines = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
