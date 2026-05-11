@@ -51,7 +51,7 @@ public sealed class GatewayRouter : ICoreOutbound
         DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
-        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability);
+        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue);
     }
 
     public bool WriteExecutionReportTrade(ContractsSessionId session, in TradeEvent e, bool isAggressor,
