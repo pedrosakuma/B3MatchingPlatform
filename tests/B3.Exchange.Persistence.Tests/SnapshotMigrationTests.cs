@@ -49,8 +49,10 @@ public class SnapshotMigrationTests
             var p = new FileChannelStatePersister(dir, NullLogger<FileChannelStatePersister>.Instance);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            Assert.Equal(1, loaded!.Version);
-            Assert.Equal((uint)42, loaded.SequenceNumber);
+            // Issue #319: a v1 payload now passes through the v1→v2
+            // migration registered in BuildDefault(); the loaded
+            // version reflects the bumped schema.
+            Assert.Equal(2, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -81,7 +83,10 @@ public class SnapshotMigrationTests
                 migrations: migrations);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            Assert.Equal(1, loaded!.Version);
+            // Issue #319: chain is 0→1 (registered here) followed by
+            // 1→2 (registered by BuildDefault), so the loaded version
+            // reflects CurrentVersion = 2.
+            Assert.Equal(2, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

@@ -28,8 +28,20 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed class OrderRegistry
 {
+    /// <summary>
+    /// Per-order canonical state. <see cref="OriginalQty"/> is the order
+    /// quantity as last accepted/replaced by the engine (FIX OrderQty);
+    /// <see cref="CumQty"/> is the running sum of executed quantity for
+    /// this order (issue #319). Both default to 0 in legacy callers
+    /// (e.g. tests that don't exercise multi-fill). The dispatcher
+    /// updates <see cref="CumQty"/> on every passive-side
+    /// <c>OnTrade</c> via <see cref="OnTrade"/> so subsequent
+    /// <c>ER_PassiveTrade</c> frames carry monotonically-cumulative
+    /// values per the FIX/B3 wire contract.
+    /// </summary>
     public readonly record struct OrderState(
-        SessionId Session, ulong ClOrdId, uint Firm, Side Side, long SecurityId);
+        SessionId Session, ulong ClOrdId, uint Firm, Side Side, long SecurityId,
+        long OriginalQty = 0, long CumQty = 0);
 
     private readonly ConcurrentDictionary<long, OrderState> _byOrderId = new();
     private readonly ConcurrentDictionary<(uint Firm, ulong ClOrdId), long> _byClOrdId = new();
@@ -51,9 +63,10 @@ public sealed class OrderRegistry
             yield return (kv.Key, kv.Value);
     }
 
-    public void Register(long orderId, SessionId session, ulong clOrdId, uint firm, Side side, long securityId)
+    public void Register(long orderId, SessionId session, ulong clOrdId, uint firm, Side side, long securityId,
+        long originalQty = 0, long cumQty = 0)
     {
-        _byOrderId[orderId] = new OrderState(session, clOrdId, firm, side, securityId);
+        _byOrderId[orderId] = new OrderState(session, clOrdId, firm, side, securityId, originalQty, cumQty);
         if (clOrdId != 0)
             _byClOrdId[(firm, clOrdId)] = orderId;
     }
@@ -89,6 +102,56 @@ public sealed class OrderRegistry
         if (owner.ClOrdId != 0)
             _byClOrdId.TryRemove(new KeyValuePair<(uint, ulong), long>((owner.Firm, owner.ClOrdId), orderId));
         _byClOrdId[(owner.Firm, newClOrdId)] = orderId;
+        return true;
+    }
+
+    /// <summary>
+    /// Issue #319: accumulates a trade fill against <paramref name="orderId"/>
+    /// and returns the post-fill <c>(cumQty, leavesQty)</c> tuple. Callers
+    /// (the dispatcher's <c>OnTrade</c> sink) use the result to populate
+    /// the FIX/B3 wire fields on <c>ER_PassiveTrade</c> /
+    /// <c>ER_Trade (aggressor)</c> with monotonically-cumulative values.
+    ///
+    /// <para>Single-writer: must run on the owning dispatcher's dispatch
+    /// thread (mirrors <see cref="Register"/>). Returns <c>false</c> when
+    /// the entry is unknown (callers fall back to legacy non-cumulative
+    /// behaviour). When <see cref="OrderState.OriginalQty"/> is 0
+    /// (uninitialised — pre-#319 callers / restored snapshots whose origin
+    /// the dispatcher could not reconstruct) we treat
+    /// <c>originalQty</c> as <c>cumQty + lastQty</c> so leaves still
+    /// degrades gracefully to 0 on the final fill.</para>
+    /// </summary>
+    public bool OnTrade(long orderId, long lastQty, out long cumQty, out long leavesQty)
+    {
+        if (!_byOrderId.TryGetValue(orderId, out var owner))
+        {
+            cumQty = 0;
+            leavesQty = 0;
+            return false;
+        }
+        long newCum = owner.CumQty + lastQty;
+        long origQty = owner.OriginalQty > 0 ? owner.OriginalQty : newCum;
+        long leaves = origQty - newCum;
+        if (leaves < 0) leaves = 0;
+        _byOrderId[orderId] = owner with { CumQty = newCum };
+        cumQty = newCum;
+        leavesQty = leaves;
+        return true;
+    }
+
+    /// <summary>
+    /// Issue #319: updates the canonical <see cref="OrderState.OriginalQty"/>
+    /// for <paramref name="orderId"/> after a successful Replace ack. The
+    /// new wire <c>OrderQty</c> is the prior cumQty plus the engine's
+    /// post-replace remainingQty; preserving cum keeps subsequent ER
+    /// frames cumulative across the rotation. Returns <c>false</c> when
+    /// the entry no longer exists.
+    /// </summary>
+    public bool UpdateOriginalQty(long orderId, long newOriginalQty)
+    {
+        if (!_byOrderId.TryGetValue(orderId, out var owner)) return false;
+        if (owner.OriginalQty == newOriginalQty) return true;
+        _byOrderId[orderId] = owner with { OriginalQty = newOriginalQty };
         return true;
     }
 

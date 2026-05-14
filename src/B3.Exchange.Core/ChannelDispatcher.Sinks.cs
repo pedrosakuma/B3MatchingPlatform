@@ -34,7 +34,21 @@ public sealed partial class ChannelDispatcher
             // thread (single writer) BEFORE emitting the ER so any passive
             // trade fired in the same dispatch turn can resolve owner ↦
             // session locally.
-            _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
+            // Issue #319: also stamp the aggressor's running cumQty into
+            // the registry so post-resting passive fills continue from
+            // where the (partial-fill-then-rest) aggressor left off
+            // instead of resetting cum to 0. If the OrderId is already
+            // registered (e.g. a parked stop that just triggered and
+            // partially filled before resting), preserve its existing
+            // tracking — the dispatcher's _aggressor* counters belong to
+            // the outermost trade-causing command, not to the
+            // re-executed stop.
+            if (!_orders.TryResolve(e.OrderId, out _))
+            {
+                _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
+                    originalQty: _aggressorOrigQty > 0 ? _aggressorOrigQty : e.RemainingQuantity,
+                    cumQty: _aggressorCumQty);
+            }
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
         }
@@ -90,6 +104,13 @@ public sealed partial class ChannelDispatcher
         // identity is rotated.
         if (newClOrdId != 0 && newClOrdId != origClOrdId)
             _orders.Reregister(e.OrderId, newClOrdId);
+
+        // Issue #319: a Replace can change the wire OrderQty. The new
+        // OrderQty equals previously-executed (cumQty) plus the engine's
+        // new remaining quantity; refresh the registry so subsequent
+        // passive fills emit leavesQty against the right denominator.
+        if (_orders.TryResolve(e.OrderId, out var refreshed))
+            _orders.UpdateOriginalQty(e.OrderId, refreshed.CumQty + e.NewRemainingQuantity);
     }
 
     public void OnOrderBookSideEmpty(in OrderBookSideEmptyEvent e)
@@ -282,23 +303,44 @@ public sealed partial class ChannelDispatcher
         Commit(n);
 
         // ER_Trade for the aggressor side: routed to the active session by
-        // SessionId. We do not maintain per-aggressor cum/leaves tracking
-        // here; integration tests are scope-limited to single-fill scenarios.
+        // SessionId. Issue #319: cumQty/leavesQty are accumulated across
+        // every fill of the outermost command's aggressor (set by
+        // BeginAggressor in the dispatch loop) so multi-fill scenarios
+        // emit monotonically-cumulative wire values per the FIX/B3
+        // contract. _aggressorOrigQty == 0 means the aggressor was a
+        // re-entrant submit the dispatcher did not stamp (e.g. a
+        // triggered stop the engine rolled internally) — fall back to
+        // the per-trade quantity rather than a misleading negative
+        // leaves.
         if (_hasCurrentSession)
         {
+            _aggressorCumQty += e.Quantity;
+            long aggCum = _aggressorCumQty;
+            long aggLeaves = _aggressorOrigQty > 0
+                ? Math.Max(0, _aggressorOrigQty - aggCum)
+                : 0;
             _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
                 ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
-                leavesQty: 0, cumQty: e.Quantity, durability: CurrentDurability);
+                leavesQty: aggLeaves, cumQty: aggCum, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Trade);
         }
         // ER_Trade for the resting side: resolve owner locally on the
         // dispatch thread (#167) and pass pre-resolved (session, clOrdId)
         // to the Gateway. If the owner has no live session entry the
         // Gateway drops at SessionRegistry.TryGet.
+        // Issue #319: per-order cum/leaves tracking lives in the
+        // registry so multi-fill resting orders emit monotonic
+        // (cumQty, leavesQty) and the final fill carries leaves=0.
         if (_orders.TryResolve(e.RestingOrderId, out var owner))
         {
+            long restCum, restLeaves;
+            if (!_orders.OnTrade(e.RestingOrderId, e.Quantity, out restCum, out restLeaves))
+            {
+                restCum = e.Quantity;
+                restLeaves = 0;
+            }
             _outbound.WriteExecutionReportPassiveTrade(owner.Session, owner.ClOrdId, e.RestingOrderId,
-                e, leavesQty: 0, cumQty: e.Quantity, durability: CurrentDurability);
+                e, leavesQty: restLeaves, cumQty: restCum, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
         }
     }
@@ -361,7 +403,8 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         if (_hasCurrentSession)
         {
-            _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId);
+            _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
+                originalQty: e.Quantity);
             var accepted = new OrderAcceptedEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,

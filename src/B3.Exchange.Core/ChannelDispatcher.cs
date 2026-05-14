@@ -242,6 +242,19 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private SnapshotRotator? _snapshotRotator;
 
+    /// <summary>
+    /// Issue #319: outermost-command aggressor cumulative tracking. Set at
+    /// the start of each engine submit (<c>WorkKind.New</c> /
+    /// <c>WorkKind.Cross</c> legs) by <see cref="BeginAggressor"/> and
+    /// reset in the <c>finally</c> of <c>ProcessOne</c>. Used by
+    /// <c>OnTrade</c> to emit monotonically-cumulative
+    /// <c>cumQty</c>/<c>leavesQty</c> on <c>ER_Trade</c> for the
+    /// aggressor side; for the resting side the per-order tracking lives
+    /// on <see cref="OrderRegistry"/> instead.
+    /// </summary>
+    private long _aggressorOrigQty;
+    private long _aggressorCumQty;
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
     // Captured on entry to RunLoopAsync; used by AssertOnLoopThread() to

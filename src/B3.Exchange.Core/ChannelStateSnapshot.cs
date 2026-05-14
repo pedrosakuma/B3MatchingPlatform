@@ -10,6 +10,13 @@ namespace B3.Exchange.Core;
 /// alongside the engine snapshot so <see cref="OrderRegistry"/> can be
 /// rebuilt and PASSIVE-side execution reports keep routing to the original
 /// session after a restart (assuming the same session reconnects).
+///
+/// <para>Issue #319: <see cref="OriginalQty"/> and <see cref="CumQty"/>
+/// are persisted so multi-fill <c>cumQty</c>/<c>leavesQty</c> survives
+/// restart. Defaulting them to 0 keeps construction sites backwards
+/// compatible (legacy v1 snapshots roundtrip cleanly; the dispatcher's
+/// restore path reconstructs <c>OriginalQty = engineRemainingQty + CumQty</c>
+/// when the persisted value is 0).</para>
 /// </summary>
 public sealed record OrderOwnerSnapshot(
     long OrderId,
@@ -17,7 +24,11 @@ public sealed record OrderOwnerSnapshot(
     uint Firm,
     ulong ClOrdId,
     Side Side,
-    long SecurityId);
+    long SecurityId)
+{
+    public long OriginalQty { get; init; }
+    public long CumQty { get; init; }
+}
 
 /// <summary>
 /// Per-channel persistable state captured by
@@ -42,7 +53,7 @@ public sealed record ChannelStateSnapshot(
     EngineStateSnapshot Engine,
     IReadOnlyList<OrderOwnerSnapshot> Owners)
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
 
     /// <summary>
     /// Issue #269: monotonic counter of commands the dispatcher has

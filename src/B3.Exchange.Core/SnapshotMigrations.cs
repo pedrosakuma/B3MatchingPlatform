@@ -58,11 +58,27 @@ public sealed class SnapshotMigrationSet
 
     /// <summary>
     /// Builds the default migration set used by the file persister.
-    /// Currently empty — <see cref="ChannelStateSnapshot.CurrentVersion"/>
-    /// is 1 and no on-disk format predates that. Future schema bumps
-    /// register migrations here.
+    /// Registers the <c>1 → 2</c> migration (issue #319) which bumps
+    /// the version stamp. The new schema only adds two optional fields
+    /// (<see cref="OrderOwnerSnapshot.OriginalQty"/> and
+    /// <see cref="OrderOwnerSnapshot.CumQty"/>) that default to 0;
+    /// the dispatcher's <c>RestoreChannelState</c> reconstructs a
+    /// sensible <c>OrderQty</c> from the engine's remaining quantity
+    /// when both are 0.
     /// </summary>
-    public static SnapshotMigrationSet BuildDefault() => new();
+    public static SnapshotMigrationSet BuildDefault()
+    {
+        var set = new SnapshotMigrationSet();
+        set.Register(1, MigrateV1ToV2);
+        return set;
+    }
+
+    private static JsonNode MigrateV1ToV2(JsonNode previous)
+    {
+        if (previous is JsonObject obj)
+            obj["Version"] = 2;
+        return previous;
+    }
 
     /// <summary>
     /// Registers a migration that upgrades a snapshot tree from
