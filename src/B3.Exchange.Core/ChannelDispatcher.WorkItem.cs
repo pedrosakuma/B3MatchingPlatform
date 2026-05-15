@@ -10,7 +10,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -34,6 +34,8 @@ public sealed partial class ChannelDispatcher
         "OperatorSetTradingPhase",
         "OperatorPersistSnapshot",
         "OperatorUncrossAuction",
+        "OperatorHaltInstrument",
+        "OperatorResumeInstrument",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -58,6 +60,9 @@ public sealed partial class ChannelDispatcher
         OperatorTradingPhase? TradingPhase = null,
         OperatorUncrossAuction? UncrossAuction = null,
         TaskCompletionSource<PhaseChangeOutcome>? PhaseCompletion = null,
+        OperatorHalt? Halt = null,
+        OperatorResume? Resume = null,
+        TaskCompletionSource<HaltOutcome>? HaltCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -94,6 +99,18 @@ public sealed partial class ChannelDispatcher
     /// (opening call) or FinalClosingCall→Close (closing call) target phase.
     /// </summary>
     internal sealed record OperatorUncrossAuction(long SecurityId, B3.Exchange.Matching.TradingPhase TargetPhase);
+
+    /// <summary>
+    /// Issue #322: operator-triggered halt payload — carries the
+    /// security to halt, the categorical reason, and an optional
+    /// free-form note for downstream observability.
+    /// </summary>
+    internal sealed record OperatorHalt(long SecurityId, B3.Exchange.Matching.HaltReason Reason, string? Note);
+
+    /// <summary>
+    /// Issue #322: operator-triggered resume payload.
+    /// </summary>
+    internal sealed record OperatorResume(long SecurityId);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

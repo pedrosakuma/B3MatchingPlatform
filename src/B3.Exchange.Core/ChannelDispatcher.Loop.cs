@@ -59,6 +59,10 @@ public sealed partial class ChannelDispatcher
             item.PhaseCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; phase command rejected"));
+            // Issue #322: same applies to halt/resume HTTP callers.
+            item.HaltCompletion?.TrySetException(
+                new InvalidOperationException(
+                    $"channel {ChannelNumber} WAL-halted; halt/resume command rejected"));
             return;
         }
 
@@ -99,6 +103,20 @@ public sealed partial class ChannelDispatcher
         if (item.Kind == WorkKind.OperatorUncrossAuction)
         {
             ProcessUncrossAuction(item.UncrossAuction!, item.PhaseCompletion);
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorHaltInstrument)
+        {
+            ProcessHalt(item.Halt!, item.HaltCompletion);
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorResumeInstrument)
+        {
+            ProcessResume(item.Resume!, item.HaltCompletion);
             OnAfterCommandFlushed(force: true);
             return;
         }

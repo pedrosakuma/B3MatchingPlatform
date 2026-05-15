@@ -87,6 +87,27 @@ public enum RejectReason : byte
     /// (e.g. <see cref="NewOrderCommand.MinQty"/> &gt;
     /// <see cref="NewOrderCommand.Quantity"/>). Issue #203.</summary>
     InvalidField,
+    /// <summary>The instrument has been administratively halted via the
+    /// halt/resume operator API (issue #322). New orders and replaces are
+    /// rejected with this reason; cancels are allowed so participants can
+    /// pull resting orders during the halt.</summary>
+    InstrumentHalted,
+}
+
+/// <summary>
+/// Reason an instrument was placed into administrative halt by the
+/// operator halt/resume API (issue #322). Carried on the outbound
+/// <c>SecurityStatus_3</c> frame's <c>securityTradingEvent</c> byte
+/// (best-effort mapping to FIX SecurityTradingEvent values) and on
+/// the engine-level <c>InstrumentHaltedEvent</c> for downstream
+/// observability.
+/// </summary>
+public enum HaltReason : byte
+{
+    RegulatoryHalt = 1,
+    VolatilityCircuitBreaker = 2,
+    NewsHold = 3,
+    PendingDisclosure = 4,
 }
 
 /// <summary>

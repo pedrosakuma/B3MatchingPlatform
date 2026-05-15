@@ -70,6 +70,11 @@ public sealed class SnapshotMigrationSet
     {
         var set = new SnapshotMigrationSet();
         set.Register(1, MigrateV1ToV2);
+        // Issue #322: v3 only adds an optional `Halts` collection on the
+        // engine snapshot. v2 trees are upgraded by stamping the version;
+        // STJ's missing-property tolerance leaves Halts at the default
+        // (null) on deserialise.
+        set.Register(2, MigrateV2ToV3);
         return set;
     }
 
@@ -77,6 +82,13 @@ public sealed class SnapshotMigrationSet
     {
         if (previous is JsonObject obj)
             obj["Version"] = 2;
+        return previous;
+    }
+
+    private static JsonNode MigrateV2ToV3(JsonNode previous)
+    {
+        if (previous is JsonObject obj)
+            obj["Version"] = 3;
         return previous;
     }
 

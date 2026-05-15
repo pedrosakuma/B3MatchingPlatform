@@ -163,6 +163,61 @@ public sealed partial class ChannelDispatcher
         Commit(n);
     }
 
+    /// <summary>
+    /// Issue #322: B3-aligned best-effort wire markers on
+    /// <c>securityTradingEvent</c> for halt and resume. The downstream
+    /// consumer just needs them to be distinct and non-NULL; the
+    /// <c>SecurityStatus_3</c> frame's <c>securityTradingStatus</c> still
+    /// carries the engine's preserved <see cref="TradingPhase"/> so the
+    /// post-resume phase is unambiguous.
+    /// </summary>
+    private const byte SecurityTradingEventHalt = 1;
+    private const byte SecurityTradingEventResume = 2;
+
+    public void OnInstrumentHalted(in InstrumentHaltedEvent e)
+    {
+        AssertOnLoopThread();
+        byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
+            ? (byte)phase
+            : (byte)TradingPhase.Open;
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
+            dst,
+            securityId: e.SecurityId,
+            tradingSessionId: 0,
+            securityTradingStatus: phaseByte,
+            securityTradingEvent: SecurityTradingEventHalt,
+            tradeDate: 0,
+            tradSesOpenTimeNanos: 0,
+            transactTimeNanos: e.TransactTimeNanos,
+            rptSeq: e.RptSeq);
+        Commit(n);
+    }
+
+    public void OnInstrumentResumed(in InstrumentResumedEvent e)
+    {
+        AssertOnLoopThread();
+        byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
+            ? (byte)phase
+            : (byte)TradingPhase.Open;
+        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
+            dst,
+            securityId: e.SecurityId,
+            tradingSessionId: 0,
+            securityTradingStatus: phaseByte,
+            securityTradingEvent: SecurityTradingEventResume,
+            tradeDate: 0,
+            tradSesOpenTimeNanos: 0,
+            transactTimeNanos: e.TransactTimeNanos,
+            rptSeq: e.RptSeq);
+        Commit(n);
+    }
+
     public void OnAuctionTopChanged(in AuctionTopChangedEvent e)
     {
         AssertOnLoopThread();

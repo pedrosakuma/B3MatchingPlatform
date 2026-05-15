@@ -268,6 +268,18 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         = new();
 
     /// <summary>
+    /// Issue #322: per-securityId snapshot of the most-recently observed
+    /// administrative halt overlay. Written only on the dispatch loop
+    /// thread inside <see cref="ProcessHalt"/> / <see cref="ProcessResume"/>;
+    /// re-seeded by <see cref="RestoreChannelState"/>. Read from any
+    /// thread by <see cref="TryGetHaltSnapshot"/> so the HTTP admin
+    /// endpoint can resolve the current halt state without queueing a
+    /// synchronous query into the engine.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, HaltSnapshot> _haltSnapshot
+        = new();
+
+    /// <summary>
     /// Issue #321: latest <see cref="AuctionPrintInfo"/> captured by the
     /// <c>OnAuctionPrint</c> sink for the command currently being
     /// processed. Reset to <c>null</c> at the start of each Process*
@@ -382,6 +394,16 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool TryGetPhaseSnapshot(long securityId, out B3.Exchange.Matching.TradingPhase phase)
         => _phaseSnapshot.TryGetValue(securityId, out phase);
+
+    /// <summary>
+    /// Issue #322: thread-safe snapshot of the most-recent administrative
+    /// halt state for <paramref name="securityId"/>. Returns <c>true</c>
+    /// when the instrument is currently halted; <c>false</c> when it is
+    /// either not halted or unknown to this channel. Safe to call from
+    /// any thread.
+    /// </summary>
+    public bool TryGetHaltSnapshot(long securityId, out HaltSnapshot state)
+        => _haltSnapshot.TryGetValue(securityId, out state);
 
     private static ulong DefaultNowNanos()
         => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;

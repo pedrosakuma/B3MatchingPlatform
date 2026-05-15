@@ -26,11 +26,21 @@ public sealed record EngineStateSnapshot(
     uint RptSeq,
     IReadOnlyList<EngineStateSnapshot.PhaseEntry> Phases,
     IReadOnlyList<EngineStateSnapshot.BookSnapshot> Books,
-    IReadOnlyList<RestingStopRecord>? Stops = null)
+    IReadOnlyList<RestingStopRecord>? Stops = null,
+    IReadOnlyList<EngineStateSnapshot.HaltEntry>? Halts = null)
 {
     public sealed record PhaseEntry(long SecurityId, TradingPhase Phase);
 
     public sealed record BookSnapshot(long SecurityId, IReadOnlyList<RestingOrderRecord> Orders);
+
+    /// <summary>
+    /// Issue #322: per-instrument administrative-halt overlay entry.
+    /// Captured by <see cref="MatchingEngine.CaptureState"/> so a halted
+    /// instrument stays halted across a process restart. Snapshots
+    /// produced before #322 deserialise with <see cref="Halts"/> null →
+    /// treated as "no halts", preserving backward compatibility.
+    /// </summary>
+    public sealed record HaltEntry(long SecurityId, byte Reason, ulong HaltedAtNanos, string? Note);
 }
 
 /// <summary>

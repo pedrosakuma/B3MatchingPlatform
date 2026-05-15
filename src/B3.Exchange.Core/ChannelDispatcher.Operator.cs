@@ -225,6 +225,15 @@ public sealed partial class ChannelDispatcher
     {
         AssertOnLoopThread();
         _pendingAuctionPrint = null;
+        // Issue #322: halt overlay blocks operator phase commands. The
+        // engine itself doesn't know about the halt overlay's "blocks
+        // phase" semantics — the dispatcher enforces it so HTTP admin
+        // callers see a deterministic 409 instead of a silent no-op.
+        if (_haltSnapshot.ContainsKey(op.SecurityId))
+        {
+            completion?.TrySetException(new InvalidOperationException("instrument halted"));
+            return;
+        }
         try
         {
             B3.Exchange.Matching.TradingPhase prev;
@@ -275,6 +284,11 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         _pendingAuctionPrint = null;
         _packetWritten = 0;
+        if (_haltSnapshot.ContainsKey(op.SecurityId))
+        {
+            completion?.TrySetException(new InvalidOperationException("instrument halted"));
+            return;
+        }
         try
         {
             B3.Exchange.Matching.TradingPhase prev;
@@ -302,6 +316,158 @@ public sealed partial class ChannelDispatcher
             var current = _engine.GetTradingPhase(op.SecurityId);
             bool applied = current != prev;
             completion?.TrySetResult(new PhaseChangeOutcome(applied, prev, current, _pendingAuctionPrint));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Issue #322: enqueue an administrative halt for
+    /// <paramref name="securityId"/>. Sets the overlay on the dispatch
+    /// thread, emits an <c>InstrumentHaltedEvent</c> through the engine
+    /// (driving a UMDF <c>SecurityStatus_3</c>), and completes the
+    /// supplied task with the resulting <see cref="HaltOutcome"/>.
+    /// </summary>
+    public bool EnqueueOperatorHalt(long securityId, B3.Exchange.Matching.HaltReason reason, string? note,
+        TaskCompletionSource<HaltOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorHaltInstrument))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; HaltInstrument rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorHaltInstrument, default, 0, false,
+            0, 0, null, null, null, null,
+            Halt: new OperatorHalt(securityId, reason, note),
+            HaltCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; HaltInstrument rejected"));
+        return false;
+    }
+
+    /// <summary>
+    /// Issue #322: enqueue a resume for <paramref name="securityId"/>.
+    /// </summary>
+    public bool EnqueueOperatorResume(long securityId,
+        TaskCompletionSource<HaltOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorResumeInstrument))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; ResumeInstrument rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorResumeInstrument, default, 0, false,
+            0, 0, null, null, null, null,
+            Resume: new OperatorResume(securityId),
+            HaltCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; ResumeInstrument rejected"));
+        return false;
+    }
+
+    private void ProcessHalt(OperatorHalt op, TaskCompletionSource<HaltOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _packetWritten = 0;
+        try
+        {
+            B3.Exchange.Matching.HaltState prevState;
+            bool wasHalted = _engine.IsHalted(op.SecurityId, out prevState);
+            bool stateChanged;
+            try
+            {
+                stateChanged = _engine.HaltInstrument(op.SecurityId, op.Reason, op.Note, _nowNanos());
+            }
+            catch (KeyNotFoundException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            catch (InvalidOperationException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            if (stateChanged)
+            {
+                _haltSnapshot[op.SecurityId] = new HaltSnapshot(op.Reason, _engine.IsHalted(op.SecurityId, out var nowState) ? nowState.HaltedAtNanos : 0UL, op.Note);
+            }
+            if (_packetWritten > 0) FlushPacket();
+            // Re-read so the outcome reflects the canonical engine state
+            // (handles the no-op case where stateChanged=false but the
+            // instrument was already halted with a different reason/note).
+            _engine.IsHalted(op.SecurityId, out var current);
+            if (stateChanged)
+            {
+                completion?.TrySetResult(new HaltOutcome(
+                    StateChanged: true,
+                    IsHaltedNow: true,
+                    Reason: current.Reason,
+                    HaltedAtNanos: current.HaltedAtNanos,
+                    Note: current.Note));
+            }
+            else
+            {
+                completion?.TrySetResult(new HaltOutcome(
+                    StateChanged: false,
+                    IsHaltedNow: wasHalted,
+                    Reason: wasHalted ? prevState.Reason : null,
+                    HaltedAtNanos: wasHalted ? prevState.HaltedAtNanos : 0UL,
+                    Note: wasHalted ? prevState.Note : null));
+            }
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
+
+    private void ProcessResume(OperatorResume op, TaskCompletionSource<HaltOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _packetWritten = 0;
+        try
+        {
+            B3.Exchange.Matching.HaltState prevState;
+            bool wasHalted = _engine.IsHalted(op.SecurityId, out prevState);
+            bool stateChanged;
+            try
+            {
+                stateChanged = _engine.ResumeInstrument(op.SecurityId, _nowNanos());
+            }
+            catch (KeyNotFoundException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            catch (InvalidOperationException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            if (stateChanged)
+            {
+                _haltSnapshot.TryRemove(op.SecurityId, out _);
+            }
+            if (_packetWritten > 0) FlushPacket();
+            completion?.TrySetResult(new HaltOutcome(
+                StateChanged: stateChanged,
+                IsHaltedNow: false,
+                Reason: null,
+                HaltedAtNanos: stateChanged && wasHalted ? prevState.HaltedAtNanos : 0UL,
+                Note: stateChanged && wasHalted ? prevState.Note : null));
         }
         catch (Exception ex)
         {
