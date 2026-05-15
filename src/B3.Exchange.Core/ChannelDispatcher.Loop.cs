@@ -149,7 +149,7 @@ public sealed partial class ChannelDispatcher
         {
             switch (item.Kind)
             {
-                case WorkKind.New: _metrics?.IncOrdersIn(); _engine.Submit(item.NewOrder!); break;
+                case WorkKind.New: _metrics?.IncOrdersIn(); BeginAggressor(item.NewOrder!.Quantity); _engine.Submit(item.NewOrder!); break;
                 case WorkKind.Cancel:
                     {
                         _metrics?.IncOrdersIn();
@@ -217,6 +217,7 @@ public sealed partial class ChannelDispatcher
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = prioClOrd;
                             _crossSweepFilledQty = 0;
+                            BeginAggressor(sweepLeg.Quantity);
                             _engine.Submit(sweepLeg);
                             long swept = _crossSweepFilledQty.GetValueOrDefault();
                             _crossSweepFilledQty = null;
@@ -229,6 +230,7 @@ public sealed partial class ChannelDispatcher
                             {
                                 _metrics?.IncOrdersIn();
                                 _currentClOrdId = prioClOrd;
+                                BeginAggressor(residual);
                                 _engine.Submit(prioLeg with { Quantity = residual });
                             }
 
@@ -238,6 +240,7 @@ public sealed partial class ChannelDispatcher
                             // (price-time priority handles the rest).
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = otherClOrd;
+                            BeginAggressor(otherLeg.Quantity);
                             _engine.Submit(otherLeg);
                         }
                         else
@@ -248,9 +251,11 @@ public sealed partial class ChannelDispatcher
                             // cross price.
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = prioClOrd;
+                            BeginAggressor(prioLeg.Quantity);
                             _engine.Submit(prioLeg);
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = otherClOrd;
+                            BeginAggressor(otherLeg.Quantity);
                             _engine.Submit(otherLeg);
                         }
                         break;
@@ -334,8 +339,26 @@ public sealed partial class ChannelDispatcher
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
             _currentReceivedTimeNanos = ulong.MaxValue;
+            _aggressorOrigQty = 0;
+            _aggressorCumQty = 0;
             engineSpan?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Issue #319: rebinds the outermost-command aggressor tracker to a
+    /// new submit (NewOrder, or one leg of a Cross). Resets
+    /// <c>_aggressorCumQty</c> to 0 and stamps
+    /// <c>_aggressorOrigQty</c> with the order quantity the engine is
+    /// about to process. Subsequent <c>OnTrade</c> sink invocations on
+    /// the aggressor side accumulate against this counter so
+    /// <c>ER_Trade</c> emits monotonically-cumulative
+    /// <c>cumQty</c>/<c>leavesQty</c>.
+    /// </summary>
+    private void BeginAggressor(long originalQty)
+    {
+        _aggressorOrigQty = originalQty;
+        _aggressorCumQty = 0;
     }
 
     private void EmitUnknownOrderIdReject(string clOrdId, long securityId, ulong nowNanos)

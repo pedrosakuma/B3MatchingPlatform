@@ -57,7 +57,17 @@ public sealed partial class ChannelDispatcher
                 Firm: entry.State.Firm,
                 ClOrdId: entry.State.ClOrdId,
                 Side: entry.State.Side,
-                SecurityId: entry.State.SecurityId));
+                SecurityId: entry.State.SecurityId)
+            {
+                // Issue #319: persist cum/orderQty so multi-fill
+                // wire values survive restart. Owners captured by a
+                // pre-#319 dispatcher serialise as 0/0, which the
+                // restore path treats as "infer from engine
+                // remainingQty" via the ChannelStateSnapshot v1→v2
+                // migration.
+                OriginalQty = entry.State.OriginalQty,
+                CumQty = entry.State.CumQty,
+            });
         }
         if (dropped > 0)
         {
@@ -124,6 +134,28 @@ public sealed partial class ChannelDispatcher
 
         long droppedOrphans = 0;
 
+        // Issue #319: build a (orderId -> remainingQty) lookup from the
+        // restored engine state so owners persisted with OriginalQty=0
+        // (legacy v1 snapshots, or v2 snapshots whose dispatcher never
+        // stamped the field) can fall back to "OrderQty = remainingQty
+        // + cumQty" — preserves any cum the snapshot did persist while
+        // recovering a sane denominator for leaves on subsequent fills.
+        Dictionary<long, long>? remainingByOrderId = null;
+        foreach (var o in snapshot.Owners)
+        {
+            if (o.OriginalQty != 0) continue;
+            if (remainingByOrderId is null)
+            {
+                remainingByOrderId = new Dictionary<long, long>();
+                foreach (var book in snapshot.Engine.Books)
+                    foreach (var ro in book.Orders)
+                        remainingByOrderId[ro.OrderId] = ro.RemainingQuantity;
+                if (snapshot.Engine.Stops is { } stops)
+                    foreach (var s in stops)
+                        remainingByOrderId[s.OrderId] = s.Quantity;
+            }
+        }
+
         foreach (var o in snapshot.Owners)
         {
             // Issue #270: cross-channel consistency check. Skip owners
@@ -143,7 +175,14 @@ public sealed partial class ChannelDispatcher
                     ChannelNumber, o.OrderId, o.SessionValue);
                 continue;
             }
-            _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId);
+            long origQty = o.OriginalQty;
+            if (origQty == 0 && remainingByOrderId is not null
+                && remainingByOrderId.TryGetValue(o.OrderId, out var remaining))
+            {
+                origQty = remaining + o.CumQty;
+            }
+            _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId,
+                originalQty: origQty, cumQty: o.CumQty);
         }
         if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
 

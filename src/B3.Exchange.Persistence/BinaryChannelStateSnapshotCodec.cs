@@ -227,7 +227,7 @@ public static class BinaryChannelStateSnapshotCodec
 
         ulong ownerCount = ReadBoundedCount(ref r, bytes.Length, "owner");
         var owners = new OrderOwnerSnapshot[ownerCount];
-        for (ulong i = 0; i < ownerCount; i++) owners[i] = ReadOwner(ref r);
+        for (ulong i = 0; i < ownerCount; i++) owners[i] = ReadOwner(ref r, version);
 
         if (hasVerifiedFooter)
         {
@@ -274,7 +274,17 @@ public static class BinaryChannelStateSnapshotCodec
         }
 
         var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops);
-        return new ChannelStateSnapshot(version, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
+        // Issue #319: a v1 file is wire-compatible with v2 except every
+        // owner record is missing the trailing OriginalQty/CumQty pair —
+        // ReadOwner handles that by defaulting both to 0, and the
+        // dispatcher's RestoreChannelState then reconstructs a sensible
+        // OrderQty from the engine's remainingQty. Stamping the snapshot
+        // as CurrentVersion here lets RestoreChannelState's strict
+        // version check accept the migrated payload without a separate
+        // JSON-style migration shim (none is needed because no field
+        // semantics changed).
+        int effectiveVersion = version == 1 ? ChannelStateSnapshot.CurrentVersion : version;
+        return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,
         };
@@ -350,9 +360,13 @@ public static class BinaryChannelStateSnapshotCodec
         w.WriteUInt64(o.ClOrdId);
         w.WriteByte((byte)o.Side);
         w.WriteInt64(o.SecurityId);
+        // Issue #319 (snapshot v2): cumulative tracking persisted so
+        // multi-fill cumQty/leavesQty survive restart.
+        w.WriteInt64(o.OriginalQty);
+        w.WriteInt64(o.CumQty);
     }
 
-    private static OrderOwnerSnapshot ReadOwner(ref BinaryBufferReader r)
+    private static OrderOwnerSnapshot ReadOwner(ref BinaryBufferReader r, int version)
     {
         long orderId = r.ReadInt64();
         string session = r.ReadString();
@@ -360,7 +374,17 @@ public static class BinaryChannelStateSnapshotCodec
         ulong clOrdId = r.ReadUInt64();
         byte side = r.ReadByte();
         long securityId = r.ReadInt64();
-        return new OrderOwnerSnapshot(orderId, session, firm, clOrdId, (Side)side, securityId);
+        long originalQty = 0, cumQty = 0;
+        if (version >= 2)
+        {
+            originalQty = r.ReadInt64();
+            cumQty = r.ReadInt64();
+        }
+        return new OrderOwnerSnapshot(orderId, session, firm, clOrdId, (Side)side, securityId)
+        {
+            OriginalQty = originalQty,
+            CumQty = cumQty,
+        };
     }
 
     /// <summary>

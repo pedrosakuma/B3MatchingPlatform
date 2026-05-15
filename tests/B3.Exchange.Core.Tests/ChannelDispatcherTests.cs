@@ -48,6 +48,7 @@ public class ChannelDispatcherTests
         public List<OrderCanceledEvent> Cancels { get; } = new();
         public List<RejectEvent> Rejects { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
+        public List<(long LeavesQty, long CumQty)> TradeQty { get; } = new();
         public bool CaptureCancelIds { get; set; }
         public List<(ulong ClOrdId, ulong OrigClOrdId)> CancelIds { get; } = new();
         public ulong LastReceivedTime { get; set; } = ulong.MaxValue;
@@ -66,9 +67,9 @@ public class ChannelDispatcherTests
         public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         { _owners[e.OrderId] = (session, clOrdIdValue); if (Find(session) is { } s) { s.News.Add(e); s.Calls.Add("New"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty, DurabilityHandle d = default)
-        { if (Find(session) is { } s) { s.Trades.Add(e); s.Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); } return true; }
+        { if (Find(session) is { } s) { s.Trades.Add(e); s.TradeQty.Add((leavesQty, cumQty)); s.Calls.Add(isAggressor ? "TradeAgg" : "TradePass"); } return true; }
         public bool WriteExecutionReportPassiveTrade(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty, DurabilityHandle d = default)
-        { if (Find(ownerSession) is { } s) { s.Trades.Add(e); s.Calls.Add("TradePass"); } return true; }
+        { if (Find(ownerSession) is { } s) { s.Trades.Add(e); s.TradeQty.Add((leavesQty, cumQty)); s.Calls.Add("TradePass"); } return true; }
         public bool WriteExecutionReportPassiveCancel(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         {
             if (Find(ownerSession) is { } s)
@@ -671,5 +672,110 @@ public class ChannelDispatcherTests
         DrainInbound(disp);
 
         Assert.Empty(pkt.Packets);
+    }
+
+    [Fact]
+    public void Issue319_RestingMultiFill_EmitsCumulativeCumQtyAndLeavesQty()
+    {
+        // Repro from issue body: SELL 200 resting + two BUY 100 aggressors.
+        // Pre-fix the resting side received cumQty=100/leaves=0 on each
+        // trade — consumers applying "advance only if cumQty > order.cum"
+        // dropped the 2nd ER as stale and never observed the terminal
+        // Filled. With #319, cum/leaves accumulate monotonically.
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker1 = new FakeSession(outbound);
+        var taker2 = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 100UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("T1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
+            taker1.Id, taker1.EnteringFirm, clOrdIdValue: 201UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("T2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 9, 3_000UL),
+            taker2.Id, taker2.EnteringFirm, clOrdIdValue: 202UL);
+        DrainInbound(disp);
+
+        // Maker's passive ERs: cumulative across the two fills.
+        Assert.Equal(2, maker.TradeQty.Count);
+        Assert.Equal((100L, 100L), maker.TradeQty[0]);
+        Assert.Equal((0L, 200L), maker.TradeQty[1]);
+
+        // Each taker fully filled in one print → cum=100/leaves=0.
+        var t1 = Assert.Single(taker1.TradeQty);
+        Assert.Equal((0L, 100L), t1);
+        var t2 = Assert.Single(taker2.TradeQty);
+        Assert.Equal((0L, 100L), t2);
+    }
+
+    [Fact]
+    public void Issue319_AggressorMultiFill_EmitsCumulativeCumQtyAndLeavesQty()
+    {
+        // Aggressor side: a single BUY 200 that sweeps two resting SELL
+        // 100s must emit two ER_Trade frames with cumQty advancing 100
+        // → 200 and leaves 100 → 0. Pre-#319 both prints carried
+        // cum=100/leaves=0.
+        var (disp, _, outbound) = NewDispatcher();
+        var m1 = new FakeSession(outbound);
+        var m2 = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("M1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            m1.Id, m1.EnteringFirm, clOrdIdValue: 11UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("M2", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 1_500UL),
+            m2.Id, m2.EnteringFirm, clOrdIdValue: 12UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("T", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 9, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 99UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, taker.TradeQty.Count);
+        Assert.Equal((100L, 100L), taker.TradeQty[0]);
+        Assert.Equal((0L, 200L), taker.TradeQty[1]);
+    }
+
+    [Fact]
+    public void Issue319_Replace_AfterPartialFill_PreservesCumQty()
+    {
+        // After a partial fill, a successful Replace that bumps the
+        // wire OrderQty must keep cum monotonic: subsequent fills
+        // continue from the prior cum, with leaves recomputed against
+        // the new (cum + newRemaining) denominator.
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
+
+        // Maker rests SELL 300 @ 10.
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 300, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 50UL);
+        DrainInbound(disp);
+        long makerOrderId = maker.News[0].OrderId;
+
+        // First taker eats 100 → maker cum=100, leaves=200.
+        disp.EnqueueNewOrder(new NewOrderCommand("T1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 201UL);
+        DrainInbound(disp);
+        Assert.Equal((200L, 100L), maker.TradeQty[^1]);
+
+        // Maker replaces the resting order down to 100 leaves (price
+        // unchanged → priority preserved). New OrderQty becomes
+        // cumQty(100) + newLeaves(100) = 200.
+        disp.EnqueueReplace(new ReplaceOrderCommand("M2", Petr, makerOrderId, Px(10m), 100, 3_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 51UL, origClOrdIdValue: 50UL);
+        DrainInbound(disp);
+
+        // Second taker eats the remaining 100 → terminal fill. Maker's
+        // ER must carry cumQty=200/leaves=0.
+        disp.EnqueueNewOrder(new NewOrderCommand("T2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 9, 4_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 202UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, maker.TradeQty.Count);
+        Assert.Equal((0L, 200L), maker.TradeQty[^1]);
     }
 }
