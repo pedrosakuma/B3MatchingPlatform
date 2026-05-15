@@ -122,6 +122,16 @@ public sealed partial class ChannelDispatcher
 
         _engine.RestoreState(snapshot.Engine);
 
+        // Issue #321 review (gpt-5.5): re-seed the cross-thread phase
+        // snapshot from restored engine state. Without this, the HTTP
+        // routing layer would still see the constructor-seeded Open phase
+        // and route Reserved→Open / FinalClosingCall→Close through plain
+        // SetTradingPhase, skipping the auction uncross.
+        foreach (var p in snapshot.Engine.Phases)
+        {
+            _phaseSnapshot[p.SecurityId] = p.Phase;
+        }
+
         // Re-publish counters via the cross-thread-readable Volatile
         // backing fields so the HTTP scrape sees the restored values
         // immediately after the loop becomes ready.

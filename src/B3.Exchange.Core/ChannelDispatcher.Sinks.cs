@@ -141,6 +141,10 @@ public sealed partial class ChannelDispatcher
     public void OnTradingPhaseChanged(in TradingPhaseChangedEvent e)
     {
         AssertOnLoopThread();
+        // Issue #321: maintain a thread-safe per-securityId phase snapshot
+        // so the HTTP admin endpoint can decide between SetPhase and
+        // UncrossAuction without piercing the engine off-thread.
+        _phaseSnapshot[e.SecurityId] = e.Phase;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
@@ -206,6 +210,11 @@ public sealed partial class ChannelDispatcher
     public void OnAuctionPrint(in AuctionPrintEvent e)
     {
         AssertOnLoopThread();
+
+        // Issue #321: capture for the operator HTTP outcome. Only the
+        // most recent print for the currently-dispatching command is
+        // retained; reset to null at the start of each Process* method.
+        _pendingAuctionPrint = new AuctionPrintInfo(e.Kind, e.PriceMantissa, e.ClearedQuantity);
 
         if (e.Kind == AuctionPrintKind.Opening)
         {

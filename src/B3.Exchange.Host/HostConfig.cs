@@ -16,6 +16,7 @@ public sealed class HostConfig
     [JsonPropertyName("sessions")] public List<SessionConfig> Sessions { get; set; } = new();
     [JsonPropertyName("http")] public HttpConfig? Http { get; set; }
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
+    [JsonPropertyName("phaseScheduler")] public PhaseSchedulerConfig? PhaseScheduler { get; set; }
     [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 
@@ -210,6 +211,47 @@ public sealed class DailyResetConfig
     /// platform's <c>TimeZoneInfo</c> store must recognize the value
     /// (Linux containers ship with the IANA database).</summary>
     [JsonPropertyName("timezone")] public string Timezone { get; set; } = "America/Sao_Paulo";
+}
+
+/// <summary>
+/// Issue #321: scheduled trading-phase transitions. When
+/// <see cref="Enabled"/> is <c>true</c>, each <see cref="PhaseSchedulerGroup"/>
+/// runs its <see cref="PhaseSchedulerGroup.Schedule"/> entries against the
+/// listed instruments at the configured local time.
+/// </summary>
+public sealed record PhaseSchedulerConfig
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; init; }
+    [JsonPropertyName("groups")] public IReadOnlyList<PhaseSchedulerGroup> Groups { get; init; } = Array.Empty<PhaseSchedulerGroup>();
+}
+
+/// <summary>
+/// Issue #321: a named bundle of instruments + a list of scheduled
+/// transitions (e.g. all equities, B3 cash-equity day plan).
+/// </summary>
+public sealed record PhaseSchedulerGroup
+{
+    [JsonPropertyName("name")] public string Name { get; init; } = "default";
+    [JsonPropertyName("timezone")] public string Timezone { get; init; } = "America/Sao_Paulo";
+    /// <summary>SecurityIds the schedule applies to. Empty list ⇒ all
+    /// instruments routed by the host.</summary>
+    [JsonPropertyName("instruments")] public IReadOnlyList<long> Instruments { get; init; } = Array.Empty<long>();
+    [JsonPropertyName("schedule")] public IReadOnlyList<PhaseSchedulerEntry> Schedule { get; init; } = Array.Empty<PhaseSchedulerEntry>();
+}
+
+/// <summary>
+/// Issue #321: one scheduled transition. <see cref="At"/> is HH:mm in the
+/// owning <see cref="PhaseSchedulerGroup.Timezone"/>.
+/// <see cref="Action"/> is either <c>"EnterPhase"</c> (plain SetPhase) or
+/// <c>"UncrossAuction"</c> (Reserved→Open / FinalClosingCall→Close).
+/// <see cref="Target"/> is a <c>TradingPhase</c> enum name
+/// (e.g. <c>"Open"</c>).
+/// </summary>
+public sealed record PhaseSchedulerEntry
+{
+    [JsonPropertyName("at")] public string At { get; init; } = "";
+    [JsonPropertyName("action")] public string Action { get; init; } = "EnterPhase";
+    [JsonPropertyName("target")] public string Target { get; init; } = "";
 }
 
 public sealed class ChannelConfig

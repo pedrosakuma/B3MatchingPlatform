@@ -44,6 +44,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private HostRouter? _router;
     private HttpServer? _http;
     private DailyResetScheduler? _dailyReset;
+    private PhaseScheduler? _phaseScheduler;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
     private B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister? _retransmitPersister;
 
@@ -196,7 +197,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 wal: wal,
                 walAppendFailurePolicy: ch.Persistence?.Wal?.ResolveOnAppendFailure() ?? B3.Exchange.Core.WalAppendFailurePolicy.Continue,
                 sessionExists: sessionExists,
-                orphanPolicy: orphanPolicy);
+                orphanPolicy: orphanPolicy,
+                seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray());
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -379,7 +381,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 firms: firmInfos,
                 dailyResetTrigger: () => TriggerDailyReset("http-trigger"),
                 persisters: _persistersByChannel,
-                wals: _walsByChannel);
+                wals: _walsByChannel,
+                instrumentRouting: routing);
             await _http.StartAsync().ConfigureAwait(false);
         }
 
@@ -395,6 +398,16 @@ public sealed class ExchangeHost : IAsyncDisposable
                 action: () => _listener?.TerminateAllSessions("daily-reset"),
                 logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
             _dailyReset.Start();
+        }
+
+        if (_config.PhaseScheduler is { Enabled: true } pcfg)
+        {
+            _phaseScheduler = new PhaseScheduler(
+                pcfg,
+                routing,
+                _metrics,
+                _loggerFactory.CreateLogger<PhaseScheduler>());
+            _phaseScheduler.Start();
         }
 
         _startupProbe.MarkReady();
@@ -690,6 +703,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         if (_dailyReset != null) await _dailyReset.DisposeAsync().ConfigureAwait(false);
+        if (_phaseScheduler != null) await _phaseScheduler.DisposeAsync().ConfigureAwait(false);
         if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);

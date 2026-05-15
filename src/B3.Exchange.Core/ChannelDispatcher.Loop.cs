@@ -52,6 +52,13 @@ public sealed partial class ChannelDispatcher
         {
             _metrics?.IncWalHaltReject();
             LogWalHalted(ChannelNumber, item.Kind);
+            // Issue #321 review (gpt-5.5): a phase work item already in the
+            // queue when WAL flips to halted is dropped here — but the HTTP
+            // caller is awaiting item.PhaseCompletion. Fail the TCS so the
+            // request fails fast with a real reason instead of timing out.
+            item.PhaseCompletion?.TrySetException(
+                new InvalidOperationException(
+                    $"channel {ChannelNumber} WAL-halted; phase command rejected"));
             return;
         }
 
@@ -80,11 +87,18 @@ public sealed partial class ChannelDispatcher
 
         if (item.Kind == WorkKind.OperatorSetTradingPhase)
         {
-            ProcessSetTradingPhase(item.TradingPhase!);
+            ProcessSetTradingPhase(item.TradingPhase!, item.PhaseCompletion);
             // Persist after the phase mutation so the engine's per-symbol
             // _phaseById map (captured into EngineStateSnapshot.Phases)
             // and any RptSeq advance from SecurityStatus_3 emission
             // survive restart.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorUncrossAuction)
+        {
+            ProcessUncrossAuction(item.UncrossAuction!, item.PhaseCompletion);
             OnAfterCommandFlushed(force: true);
             return;
         }

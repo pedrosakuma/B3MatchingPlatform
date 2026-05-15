@@ -255,6 +255,27 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private long _aggressorOrigQty;
     private long _aggressorCumQty;
 
+    /// <summary>
+    /// Issue #321: per-securityId snapshot of the most-recently observed
+    /// trading phase. Written only on the dispatch loop thread inside
+    /// <c>OnTradingPhaseChanged</c>; seeded in the ctor from the engine's
+    /// initial phase map for each <c>seedSecurityIds</c> entry. Read from
+    /// any thread by <see cref="TryGetPhaseSnapshot"/> so the HTTP admin
+    /// endpoint can decide between SetPhase / UncrossAuction without
+    /// queueing a synchronous query into the engine.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, B3.Exchange.Matching.TradingPhase> _phaseSnapshot
+        = new();
+
+    /// <summary>
+    /// Issue #321: latest <see cref="AuctionPrintInfo"/> captured by the
+    /// <c>OnAuctionPrint</c> sink for the command currently being
+    /// processed. Reset to <c>null</c> at the start of each Process*
+    /// method so a subsequent uncross with no print yields
+    /// <c>UncrossPrint = null</c> in the outcome.
+    /// </summary>
+    private AuctionPrintInfo? _pendingAuctionPrint;
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
     // Captured on entry to RunLoopAsync; used by AssertOnLoopThread() to
@@ -291,7 +312,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         IChannelWriteAheadLog? wal = null,
         WalAppendFailurePolicy walAppendFailurePolicy = WalAppendFailurePolicy.Continue,
         Func<string, bool>? sessionExists = null,
-        OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop)
+        OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop,
+        IReadOnlyList<long>? seedSecurityIds = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -340,7 +362,26 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                 FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
             });
         _engine = engineFactory(this);
+        if (seedSecurityIds is not null)
+        {
+            foreach (var secId in seedSecurityIds)
+            {
+                try { _phaseSnapshot[secId] = _engine.GetTradingPhase(secId); }
+                catch (KeyNotFoundException) { /* engine doesn't know this id; skip */ }
+            }
+        }
     }
+
+    /// <summary>
+    /// Issue #321: thread-safe snapshot of the most-recently observed
+    /// trading phase for <paramref name="securityId"/>. Returns
+    /// <c>true</c> with the phase out value if the dispatcher has ever
+    /// observed (or been seeded with) a phase for the security; returns
+    /// <c>false</c> when the security is unknown to this channel. Safe
+    /// to call from any thread.
+    /// </summary>
+    public bool TryGetPhaseSnapshot(long securityId, out B3.Exchange.Matching.TradingPhase phase)
+        => _phaseSnapshot.TryGetValue(securityId, out phase);
 
     private static ulong DefaultNowNanos()
         => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;

@@ -163,23 +163,150 @@ public sealed partial class ChannelDispatcher
     /// if the inbound queue is full. Safe to call from any thread.
     /// </summary>
     public bool EnqueueOperatorSetTradingPhase(long securityId, B3.Exchange.Matching.TradingPhase phase)
+        => EnqueueOperatorSetTradingPhase(securityId, phase, completion: null);
+
+    /// <summary>
+    /// Issue #321: overload accepting a <see cref="TaskCompletionSource{TResult}"/>
+    /// that is completed on the dispatch thread once the phase change
+    /// has been applied (or faulted if the engine throws / the channel
+    /// is WAL-halted). HTTP admin endpoint uses this to <c>await</c> the
+    /// outcome with a bounded timeout.
+    /// </summary>
+    public bool EnqueueOperatorSetTradingPhase(long securityId, B3.Exchange.Matching.TradingPhase phase,
+        TaskCompletionSource<PhaseChangeOutcome>? completion)
     {
-        if (RejectIfWalHalted(WorkKind.OperatorSetTradingPhase)) return false;
-        return _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSetTradingPhase, default, 0, false,
+        if (RejectIfWalHalted(WorkKind.OperatorSetTradingPhase))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; SetTradingPhase rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorSetTradingPhase, default, 0, false,
             0, 0, null, null, null, null,
-            TradingPhase: new OperatorTradingPhase(securityId, phase)));
+            TradingPhase: new OperatorTradingPhase(securityId, phase),
+            PhaseCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; SetTradingPhase rejected"));
+        return false;
     }
 
-    private void ProcessSetTradingPhase(OperatorTradingPhase op)
+    /// <summary>
+    /// Issue #321: operator-issued auction uncross. Allowed transitions
+    /// are <c>Reserved → Open</c> (opening call) and
+    /// <c>FinalClosingCall → Close</c> (closing call); other transitions
+    /// fault the supplied completion source with
+    /// <see cref="InvalidOperationException"/>.
+    /// </summary>
+    public bool EnqueueOperatorUncrossAuction(long securityId, B3.Exchange.Matching.TradingPhase targetPhase,
+        TaskCompletionSource<PhaseChangeOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorUncrossAuction))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; UncrossAuction rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorUncrossAuction, default, 0, false,
+            0, 0, null, null, null, null,
+            UncrossAuction: new OperatorUncrossAuction(securityId, targetPhase),
+            PhaseCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; UncrossAuction rejected"));
+        return false;
+    }
+
+    private void ProcessSetTradingPhase(OperatorTradingPhase op, TaskCompletionSource<PhaseChangeOutcome>? completion)
     {
         AssertOnLoopThread();
-        // The engine emits the TradingPhaseChangedEvent inline (if the
-        // transition is non-trivial); the sink writes a SecurityStatus_3
-        // frame into the per-command packet buffer. Flush it as a
-        // single-message packet so consumers see the status update
-        // immediately, mirroring the trade-bust pattern.
+        _pendingAuctionPrint = null;
+        try
+        {
+            B3.Exchange.Matching.TradingPhase prev;
+            try { prev = _engine.GetTradingPhase(op.SecurityId); }
+            catch (KeyNotFoundException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            // The engine emits the TradingPhaseChangedEvent inline (if the
+            // transition is non-trivial); the sink writes a SecurityStatus_3
+            // frame into the per-command packet buffer. Flush it as a
+            // single-message packet so consumers see the status update
+            // immediately, mirroring the trade-bust pattern.
+            _packetWritten = 0;
+            bool applied;
+            try
+            {
+                applied = _engine.SetTradingPhase(op.SecurityId, op.Phase, _nowNanos());
+            }
+            catch (Exception ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            if (_packetWritten > 0) FlushPacket();
+            var current = _engine.GetTradingPhase(op.SecurityId);
+            completion?.TrySetResult(new PhaseChangeOutcome(applied, prev, current, UncrossPrint: null));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Issue #321: process a queued <see cref="OperatorUncrossAuction"/>.
+    /// Wraps <see cref="MatchingEngine.UncrossAuction"/>, captures the
+    /// previous/current phase snapshot for the outcome, and surfaces
+    /// engine validation faults
+    /// (<see cref="InvalidOperationException"/>,
+    /// <see cref="KeyNotFoundException"/>) through the optional
+    /// completion source instead of crashing the dispatch loop.
+    /// </summary>
+    private void ProcessUncrossAuction(OperatorUncrossAuction op, TaskCompletionSource<PhaseChangeOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _pendingAuctionPrint = null;
         _packetWritten = 0;
-        _engine.SetTradingPhase(op.SecurityId, op.Phase, _nowNanos());
-        if (_packetWritten > 0) FlushPacket();
+        try
+        {
+            B3.Exchange.Matching.TradingPhase prev;
+            try { prev = _engine.GetTradingPhase(op.SecurityId); }
+            catch (KeyNotFoundException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            try
+            {
+                _engine.UncrossAuction(op.SecurityId, op.TargetPhase, _nowNanos());
+            }
+            catch (InvalidOperationException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            catch (KeyNotFoundException ex)
+            {
+                completion?.TrySetException(ex);
+                return;
+            }
+            if (_packetWritten > 0) FlushPacket();
+            var current = _engine.GetTradingPhase(op.SecurityId);
+            bool applied = current != prev;
+            completion?.TrySetResult(new PhaseChangeOutcome(applied, prev, current, _pendingAuctionPrint));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
     }
 }
