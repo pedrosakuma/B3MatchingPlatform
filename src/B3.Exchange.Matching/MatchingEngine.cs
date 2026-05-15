@@ -84,6 +84,18 @@ public sealed class MatchingEngine
 
     private bool _dispatching;
 
+    // Issue #322: per-instrument administrative-halt overlay. While an
+    // entry is present here, Submit and Replace are short-circuited
+    // with RejectReason.InstrumentHalted before any other validation.
+    // Cancel paths are intentionally NOT gated so participants can pull
+    // resting orders during a halt (consistent with B3 behaviour). The
+    // engine's TradingPhase is preserved across halt/resume so resuming
+    // restores trading without losing the book.
+    private readonly Dictionary<long, HaltState> _haltById = new();
+
+    // HaltState lives at namespace scope — see HaltState.cs.
+
+
     // Single-thread invariant (issue #169). Latched on first call to any
     // mutation/read entry point (or eagerly via BindToDispatchThread) so
     // future call-site regressions are caught at test time. Production
@@ -171,7 +183,18 @@ public sealed class MatchingEngine
                     EnteredAtNanos: s.EnteredAtNanos));
             }
         }
-        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books, stops);
+        // Issue #322: capture per-instrument administrative halts so the
+        // overlay survives a restart. Empty list is collapsed to null at
+        // the codec layer to keep encode→decode→encode byte-stable for
+        // hosts that never halted anything.
+        List<EngineStateSnapshot.HaltEntry>? halts = null;
+        if (_haltById.Count > 0)
+        {
+            halts = new List<EngineStateSnapshot.HaltEntry>(_haltById.Count);
+            foreach (var kv in _haltById)
+                halts.Add(new EngineStateSnapshot.HaltEntry(kv.Key, (byte)kv.Value.Reason, kv.Value.HaltedAtNanos, kv.Value.Note));
+        }
+        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books, stops, halts);
     }
 
     /// <summary>
@@ -198,6 +221,8 @@ public sealed class MatchingEngine
         }
         if (_stopById.Count != 0)
             throw new InvalidOperationException("RestoreState requires no parked stops on the target engine");
+        if (_haltById.Count != 0)
+            throw new InvalidOperationException("RestoreState requires no halt overlay on the target engine");
 
         _nextOrderId = snapshot.NextOrderId;
         _nextTradeId = snapshot.NextTradeId;
@@ -257,6 +282,21 @@ public sealed class MatchingEngine
                 restoredStops++;
             }
         }
+        // Issue #322: rebuild administrative-halt overlay. Snapshots
+        // predating #322 carry null Halts, treated as empty so older
+        // state files keep loading.
+        if (snapshot.Halts is { } haltRecords)
+        {
+            foreach (var h in haltRecords)
+            {
+                if (!_phaseById.ContainsKey(h.SecurityId))
+                {
+                    _logger.LogWarning("RestoreState: ignoring halt entry for unknown securityId {SecurityId}", h.SecurityId);
+                    continue;
+                }
+                _haltById[h.SecurityId] = new HaltState((HaltReason)h.Reason, h.HaltedAtNanos, h.Note);
+            }
+        }
         _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeq={RptSeq} restingOrders={RestingOrders} restingStops={RestingStops}",
             _nextOrderId, _nextTradeId, _rptSeq, restored, restoredStops);
     }
@@ -297,6 +337,7 @@ public sealed class MatchingEngine
         foreach (var book in _booksById.Values) book.Clear();
         foreach (var list in _stopsBySymbol.Values) list.Clear();
         _stopById.Clear();
+        _haltById.Clear();
         _rptSeq = 0;
     }
 
@@ -361,6 +402,72 @@ public sealed class MatchingEngine
             TransactTimeNanos: txnNanos,
             RptSeq: ++_rptSeq));
         return true;
+    }
+
+    /// <summary>
+    /// <summary>
+    /// Issue #322: places <paramref name="securityId"/> into administrative
+    /// halt. Idempotent — returns <c>true</c> if the call flipped the
+    /// instrument from "not halted" to "halted" (and emitted an
+    /// <see cref="InstrumentHaltedEvent"/>); returns <c>false</c> if the
+    /// instrument was already halted (no event emitted, no state change).
+    /// While halted, Submit and Replace are rejected with
+    /// <see cref="RejectReason.InstrumentHalted"/>; Cancel is allowed.
+    /// Throws <see cref="KeyNotFoundException"/> if the security is
+    /// unknown to this channel. Must run on the dispatch thread; not
+    /// re-entrant from inside a sink callback.
+    /// </summary>
+    public bool HaltInstrument(long securityId, HaltReason reason, string? note, ulong txnNanos)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("HaltInstrument called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        if (!_phaseById.ContainsKey(securityId))
+            throw new KeyNotFoundException($"unknown securityId {securityId}");
+        if (_haltById.ContainsKey(securityId)) return false;
+        _haltById[securityId] = new HaltState(reason, txnNanos, note);
+        _sink.OnInstrumentHalted(new InstrumentHaltedEvent(
+            SecurityId: securityId,
+            Reason: reason,
+            Note: note,
+            TransactTimeNanos: txnNanos,
+            RptSeq: ++_rptSeq));
+        return true;
+    }
+
+    /// <summary>
+    /// Issue #322: resumes <paramref name="securityId"/> from administrative
+    /// halt. Idempotent — returns <c>true</c> if the call flipped the
+    /// instrument from halted to not-halted (and emitted an
+    /// <see cref="InstrumentResumedEvent"/>); returns <c>false</c> if the
+    /// instrument was not halted (no event emitted, no state change).
+    /// Throws <see cref="KeyNotFoundException"/> if the security is
+    /// unknown to this channel.
+    /// </summary>
+    public bool ResumeInstrument(long securityId, ulong txnNanos)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("ResumeInstrument called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
+        if (!_phaseById.ContainsKey(securityId))
+            throw new KeyNotFoundException($"unknown securityId {securityId}");
+        if (!_haltById.Remove(securityId)) return false;
+        _sink.OnInstrumentResumed(new InstrumentResumedEvent(
+            SecurityId: securityId,
+            TransactTimeNanos: txnNanos,
+            RptSeq: ++_rptSeq));
+        return true;
+    }
+
+    /// <summary>
+    /// Issue #322: returns <c>true</c> with the populated halt state when
+    /// <paramref name="securityId"/> is currently halted, <c>false</c>
+    /// otherwise. Read on the dispatch thread.
+    /// </summary>
+    public bool IsHalted(long securityId, out HaltState state)
+    {
+        AssertOnOwnerThread();
+        return _haltById.TryGetValue(securityId, out state);
     }
 
     /// <summary>
@@ -640,6 +747,15 @@ public sealed class MatchingEngine
                 return;
             }
 
+            // Issue #322: administrative halt overlay short-circuits before
+            // any other validation. Cancels of resting orders remain
+            // permitted (handled in Cancel below).
+            if (_haltById.ContainsKey(cmd.SecurityId))
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InstrumentHalted, cmd.EnteredAtNanos);
+                return;
+            }
+
             // #201: trading-phase gating combined with #202 TIF semantics.
             // Day/IOC/FOK/GTC require Open. AtClose requires FinalClosingCall.
             // GoodForAuction requires Reserved (pre-open auction). GTD is
@@ -913,6 +1029,10 @@ public sealed class MatchingEngine
         {
             if (!_rulesById.TryGetValue(cmd.SecurityId, out var rules))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownInstrument, cmd.EnteredAtNanos); return; }
+            // Issue #322: replace under an administrative halt is rejected
+            // before mutating the resting order. Cancel remains allowed.
+            if (_haltById.ContainsKey(cmd.SecurityId))
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.InstrumentHalted, cmd.EnteredAtNanos); return; }
             var book = _booksById[cmd.SecurityId];
             if (!book.TryGet(cmd.OrderId, out var resting))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownOrderId, cmd.EnteredAtNanos); return; }

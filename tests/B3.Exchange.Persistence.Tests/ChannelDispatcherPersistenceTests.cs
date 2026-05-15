@@ -186,6 +186,33 @@ public class ChannelDispatcherPersistenceTests
     }
 
     [Fact]
+    public void Issue322_RestoreChannelState_ReseedsHaltOverlay()
+    {
+        // Issue #322: same reasoning as #321 phase reseed — the HTTP
+        // routing/admin layers consult _haltSnapshot to gate phase
+        // commands and surface 409s. After restart the overlay must be
+        // rebuilt from the engine's persisted halt list.
+        var persister = new InMemoryPersister();
+
+        var dispA = BuildDispatcher(persister, out _);
+        var probe = dispA.CreateTestProbe();
+        Assert.True(dispA.EnqueueOperatorHalt(Sec, B3.Exchange.Matching.HaltReason.RegulatoryHalt, "circuit-A"));
+        probe.DrainInbound();
+        Assert.True(dispA.TryGetHaltSnapshot(Sec, out var aSnap));
+        Assert.Equal(B3.Exchange.Matching.HaltReason.RegulatoryHalt, aSnap.Reason);
+        Assert.Equal("circuit-A", aSnap.Note);
+
+        var dispB = BuildDispatcher(persister, out _);
+        var loaded = persister.TryLoad(84);
+        Assert.NotNull(loaded);
+        dispB.RestoreChannelState(loaded!);
+
+        Assert.True(dispB.TryGetHaltSnapshot(Sec, out var bSnap));
+        Assert.Equal(B3.Exchange.Matching.HaltReason.RegulatoryHalt, bSnap.Reason);
+        Assert.Equal("circuit-A", bSnap.Note);
+    }
+
+    [Fact]
     public void RestoreChannelState_RejectsMismatchedChannelNumber()
     {
         var persister = new InMemoryPersister();

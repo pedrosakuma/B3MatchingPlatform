@@ -132,6 +132,21 @@ public sealed partial class ChannelDispatcher
             _phaseSnapshot[p.SecurityId] = p.Phase;
         }
 
+        // Issue #322: re-seed the halt overlay snapshot. Required so the
+        // HTTP/admin layer correctly rejects phase commands after a
+        // restart while an instrument is still administratively halted.
+        _haltSnapshot.Clear();
+        if (snapshot.Engine.Halts is { } halts)
+        {
+            foreach (var h in halts)
+            {
+                _haltSnapshot[h.SecurityId] = new HaltSnapshot(
+                    (B3.Exchange.Matching.HaltReason)h.Reason,
+                    h.HaltedAtNanos,
+                    h.Note);
+            }
+        }
+
         // Re-publish counters via the cross-thread-readable Volatile
         // backing fields so the HTTP scrape sees the restored values
         // immediately after the loop becomes ready.

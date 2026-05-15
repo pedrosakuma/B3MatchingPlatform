@@ -890,4 +890,78 @@ public class ChannelDispatcherTests
         Assert.True(disp.TryGetPhaseSnapshot(Petr, out var phase));
         Assert.Equal(B3.Exchange.Matching.TradingPhase.Pause, phase);
     }
+
+    // ===== Issue #322 =====
+
+    [Fact]
+    public async Task Issue322_OperatorHaltInstrument_RejectsSubsequentOrdersAndPopulatesSnapshot()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var session = new FakeSession(outbound);
+
+        var tcs = new TaskCompletionSource<HaltOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorHalt(Petr, B3.Exchange.Matching.HaltReason.RegulatoryHalt, "manual", tcs));
+        DrainInbound(disp);
+
+        var outcome = await tcs.Task;
+        Assert.True(outcome.StateChanged);
+        Assert.True(outcome.IsHaltedNow);
+        Assert.Equal(B3.Exchange.Matching.HaltReason.RegulatoryHalt, outcome.Reason);
+        Assert.Equal("manual", outcome.Note);
+
+        Assert.True(disp.TryGetHaltSnapshot(Petr, out var snap));
+        Assert.Equal(B3.Exchange.Matching.HaltReason.RegulatoryHalt, snap.Reason);
+
+        // Subsequent NewOrder is rejected back to the originating session.
+        session.Rejects.Clear();
+        disp.EnqueueNewOrder(new NewOrderCommand("X", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, session.EnteringFirm, 1_000UL),
+            session.Id, session.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        var rej = Assert.Single(session.Rejects);
+        Assert.Equal(B3.Exchange.Matching.RejectReason.InstrumentHalted, rej.Reason);
+    }
+
+    [Fact]
+    public async Task Issue322_OperatorResumeInstrument_RestoresOrderAcceptanceAndClearsSnapshot()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var session = new FakeSession(outbound);
+
+        Assert.True(disp.EnqueueOperatorHalt(Petr, B3.Exchange.Matching.HaltReason.NewsHold, null));
+        DrainInbound(disp);
+        Assert.True(disp.TryGetHaltSnapshot(Petr, out _));
+
+        var resumeTcs = new TaskCompletionSource<HaltOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorResume(Petr, resumeTcs));
+        DrainInbound(disp);
+
+        var outcome = await resumeTcs.Task;
+        Assert.True(outcome.StateChanged);
+        Assert.False(outcome.IsHaltedNow);
+        Assert.False(disp.TryGetHaltSnapshot(Petr, out _));
+
+        // New order now accepted again.
+        session.News.Clear();
+        session.Rejects.Clear();
+        disp.EnqueueNewOrder(new NewOrderCommand("Y", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, session.EnteringFirm, 2_000UL),
+            session.Id, session.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+        Assert.Empty(session.Rejects);
+        Assert.Single(session.News);
+    }
+
+    [Fact]
+    public void Issue322_OperatorPhaseChange_WhileHalted_FaultsCompletionWithInvalidOperation()
+    {
+        var (disp, _, _) = NewDispatcher();
+        Assert.True(disp.EnqueueOperatorHalt(Petr, B3.Exchange.Matching.HaltReason.RegulatoryHalt, null));
+        DrainInbound(disp);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Pause, tcs));
+        DrainInbound(disp);
+
+        Assert.True(tcs.Task.IsFaulted);
+        Assert.IsType<InvalidOperationException>(tcs.Task.Exception!.InnerException);
+    }
 }

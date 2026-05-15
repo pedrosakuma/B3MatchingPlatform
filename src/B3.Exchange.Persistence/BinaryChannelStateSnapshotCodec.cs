@@ -124,6 +124,30 @@ public static class BinaryChannelStateSnapshotCodec
         w.WriteUVarInt((ulong)snapshot.Owners.Count);
         foreach (var o in snapshot.Owners) WriteOwner(w, o);
 
+        // Issue #322 (codec v3): per-instrument administrative-halt
+        // overlay. Older snapshots (v1/v2) never carried halts; skip
+        // writing the section so encode→decode→encode is byte-stable
+        // for legacy fixtures.
+        if (snapshot.Version >= 3)
+        {
+            var halts = engine.Halts;
+            if (halts is null)
+            {
+                w.WriteUVarInt(0);
+            }
+            else
+            {
+                w.WriteUVarInt((ulong)halts.Count);
+                foreach (var h in halts)
+                {
+                    w.WriteInt64(h.SecurityId);
+                    w.WriteByte(h.Reason);
+                    w.WriteUInt64(h.HaltedAtNanos);
+                    w.WriteString(h.Note);
+                }
+            }
+        }
+
         // Issue #285: append a 4-byte little-endian Crc32C footer
         // covering every preceding byte. Loaders compare the
         // computed CRC against this footer before invoking the
@@ -229,6 +253,28 @@ public static class BinaryChannelStateSnapshotCodec
         var owners = new OrderOwnerSnapshot[ownerCount];
         for (ulong i = 0; i < ownerCount; i++) owners[i] = ReadOwner(ref r, version);
 
+        // Issue #322 (codec v3): halts overlay appears only in v3+ files.
+        // Older snapshots round-trip with no halts (none could exist).
+        IReadOnlyList<EngineStateSnapshot.HaltEntry>? halts = null;
+        if (version >= 3)
+        {
+            ulong haltCount = ReadBoundedCount(ref r, bytes.Length, "halt");
+            if (haltCount > 0)
+            {
+                var arr = new EngineStateSnapshot.HaltEntry[haltCount];
+                for (ulong i = 0; i < haltCount; i++)
+                {
+                    long secId = r.ReadInt64();
+                    byte reason = r.ReadByte();
+                    ulong ts = r.ReadUInt64();
+                    string note = r.ReadString();
+                    arr[i] = new EngineStateSnapshot.HaltEntry(
+                        secId, reason, ts, string.IsNullOrEmpty(note) ? null : note);
+                }
+                halts = arr;
+            }
+        }
+
         if (hasVerifiedFooter)
         {
             // CRC was already verified by Decode(); the body span
@@ -273,7 +319,7 @@ public static class BinaryChannelStateSnapshotCodec
             }
         }
 
-        var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops);
+        var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops, halts);
         // Issue #319: a v1 file is wire-compatible with v2 except every
         // owner record is missing the trailing OriginalQty/CumQty pair —
         // ReadOwner handles that by defaulting both to 0, and the
@@ -283,7 +329,10 @@ public static class BinaryChannelStateSnapshotCodec
         // version check accept the migrated payload without a separate
         // JSON-style migration shim (none is needed because no field
         // semantics changed).
-        int effectiveVersion = version == 1 ? ChannelStateSnapshot.CurrentVersion : version;
+        // Issue #322: v2 → v3 is also a clean migration — v2 files have no
+        // halts section, and the decoder above leaves <c>halts</c> null,
+        // so re-stamping here is safe.
+        int effectiveVersion = (version == 1 || version == 2) ? ChannelStateSnapshot.CurrentVersion : version;
         return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,

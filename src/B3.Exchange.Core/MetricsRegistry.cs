@@ -441,6 +441,31 @@ public sealed class MetricsRegistry
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(long, byte, byte, string), long> _phaseTransitions
         = new();
 
+    /// <summary>
+    /// Issue #322: process-wide counter of administrative single-stock
+    /// halts, keyed on <c>(security_id, reason)</c>. Atomic — safe to
+    /// call from any thread. Increments only when the engine reports an
+    /// actual state change (re-asserting an existing halt is a no-op).
+    /// </summary>
+    public void IncInstrumentHalted(long securityId, B3.Exchange.Matching.HaltReason reason)
+    {
+        var key = (securityId, (byte)reason);
+        _instrumentHalted.AddOrUpdate(key, 1L, static (_, prev) => prev + 1L);
+    }
+
+    /// <summary>
+    /// Issue #322: companion counter for resumes, keyed on
+    /// <c>security_id</c>. Increments only when the engine reports an
+    /// actual state change.
+    /// </summary>
+    public void IncInstrumentResumed(long securityId)
+    {
+        _instrumentResumed.AddOrUpdate(securityId, 1L, static (_, prev) => prev + 1L);
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long, byte), long> _instrumentHalted = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> _instrumentResumed = new();
+
     public void SetSessionProvider(ISessionMetricsProvider provider)
     {
         lock (_lock) _sessions = provider;
@@ -731,6 +756,8 @@ public sealed class MetricsRegistry
 
         EmitPhaseTransitions(sb);
 
+        EmitHaltMetrics(sb);
+
         EmitRuntimeMetrics(sb);
 
         return sb.ToString();
@@ -759,6 +786,42 @@ public sealed class MetricsRegistry
               .Append("\"} ")
               .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
               .Append('\n');
+        }
+    }
+
+    private void EmitHaltMetrics(StringBuilder sb)
+    {
+        // Issue #322: process-wide single-stock halt/resume counters.
+        var halts = _instrumentHalted.ToArray();
+        if (halts.Length > 0)
+        {
+            sb.Append("# HELP exch_instrument_halts_total Operator-driven instrument halts, per (security_id, reason). Issue #322.\n");
+            sb.Append("# TYPE exch_instrument_halts_total counter\n");
+            foreach (var kv in halts)
+            {
+                var (secId, reason) = kv.Key;
+                sb.Append("exch_instrument_halts_total{security_id=\"")
+                  .Append(secId.ToString(CultureInfo.InvariantCulture))
+                  .Append("\",reason=\"")
+                  .Append(((B3.Exchange.Matching.HaltReason)reason).ToString())
+                  .Append("\"} ")
+                  .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+                  .Append('\n');
+            }
+        }
+        var resumes = _instrumentResumed.ToArray();
+        if (resumes.Length > 0)
+        {
+            sb.Append("# HELP exch_instrument_resumes_total Operator-driven instrument resumes, per security_id. Issue #322.\n");
+            sb.Append("# TYPE exch_instrument_resumes_total counter\n");
+            foreach (var kv in resumes)
+            {
+                sb.Append("exch_instrument_resumes_total{security_id=\"")
+                  .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
+                  .Append("\"} ")
+                  .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+                  .Append('\n');
+            }
         }
     }
 

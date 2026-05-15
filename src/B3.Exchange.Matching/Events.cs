@@ -312,6 +312,36 @@ public readonly record struct OrderModifiedEvent(
     uint RptSeq);
 
 /// <summary>
+/// Fired when an instrument is placed into administrative halt via
+/// <see cref="MatchingEngine.HaltInstrument"/> (issue #322). The
+/// integration layer translates this to a UMDF
+/// <c>SecurityStatus_3</c> frame carrying the current
+/// <see cref="TradingPhase"/> as <c>securityTradingStatus</c> and a
+/// halt-marker as <c>securityTradingEvent</c>. While halted the
+/// engine rejects new orders and replaces with
+/// <see cref="RejectReason.InstrumentHalted"/>; cancels of resting
+/// orders are still accepted.
+/// </summary>
+public readonly record struct InstrumentHaltedEvent(
+    long SecurityId,
+    HaltReason Reason,
+    string? Note,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
+/// Fired when an instrument is resumed from administrative halt via
+/// <see cref="MatchingEngine.ResumeInstrument"/> (issue #322). The
+/// integration layer translates this to a UMDF
+/// <c>SecurityStatus_3</c> frame with the engine's preserved phase
+/// and a resume-marker on <c>securityTradingEvent</c>.
+/// </summary>
+public readonly record struct InstrumentResumedEvent(
+    long SecurityId,
+    ulong TransactTimeNanos,
+    uint RptSeq);
+
+/// <summary>
 /// from any of these methods — the engine is single-threaded per channel and
 /// reentrant commands corrupt internal linked lists.
 /// </summary>
@@ -408,4 +438,19 @@ public interface IMatchingEventSink
     /// when the uncross drained no volume.
     /// </summary>
     void OnAuctionPrint(in AuctionPrintEvent e) { }
+
+    /// <summary>
+    /// Issue #322: fired when an instrument enters administrative halt.
+    /// Default no-op; the production <c>ChannelDispatcher</c> overrides
+    /// this to emit a UMDF <c>SecurityStatus_3</c> frame.
+    /// </summary>
+    void OnInstrumentHalted(in InstrumentHaltedEvent e) { }
+
+    /// <summary>
+    /// Issue #322: fired when an instrument is resumed from
+    /// administrative halt. Default no-op; the production
+    /// <c>ChannelDispatcher</c> overrides this to emit a UMDF
+    /// <c>SecurityStatus_3</c> frame.
+    /// </summary>
+    void OnInstrumentResumed(in InstrumentResumedEvent e) { }
 }

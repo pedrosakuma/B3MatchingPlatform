@@ -259,6 +259,12 @@ internal sealed class FixpOutboundEncoder
         RejectReason.FokUnfillable => 0u,
         RejectReason.SelfTradePrevention => 0u,
         RejectReason.MarketClosed => 13u,
+        // Issue #322: administrative single-stock halt is operationally a
+        // closed-market state for the affected instrument, so it maps to
+        // the same FIX OrdRejReason (13 = ExchangeClosed) as a phase-driven
+        // closure. Operators distinguish the two via the engine reason
+        // surfaced in the audit log.
+        RejectReason.InstrumentHalted => 13u,
         RejectReason.TimeInForceNotSupported => 11u,
         RejectReason.MinQtyNotMet => 0u,
         RejectReason.InvalidField => 11u,

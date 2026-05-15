@@ -200,6 +200,7 @@ public class EnumMappingTests
         MatchingRejectReason.InvalidTimeInForceForMarket => OrdRejReason.UnsupportedOrderCharacteristic,
         MatchingRejectReason.SelfTradePrevention => OrdRejReason.Other,
         MatchingRejectReason.MarketClosed => OrdRejReason.ExchangeClosed,
+        MatchingRejectReason.InstrumentHalted => OrdRejReason.ExchangeClosed,
         MatchingRejectReason.TimeInForceNotSupported => OrdRejReason.UnsupportedOrderCharacteristic,
         MatchingRejectReason.MinQtyNotMet => OrdRejReason.Other,
         MatchingRejectReason.InvalidField => OrdRejReason.UnsupportedOrderCharacteristic,
