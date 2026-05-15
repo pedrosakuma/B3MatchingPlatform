@@ -778,4 +778,116 @@ public class ChannelDispatcherTests
         Assert.Equal(2, maker.TradeQty.Count);
         Assert.Equal((0L, 200L), maker.TradeQty[^1]);
     }
+
+    // ===== Issue #321 =====
+
+    [Fact]
+    public async Task Issue321_OperatorUncrossAuction_ReservedToOpen_EmitsAuctionPrintAndPhaseChange()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Reserved));
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("T", Petr, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorUncrossAuction(Petr, B3.Exchange.Matching.TradingPhase.Open, tcs));
+        DrainInbound(disp);
+
+        Assert.True(tcs.Task.IsCompletedSuccessfully);
+        var outcome = await tcs.Task;
+        Assert.True(outcome.TransitionApplied);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Reserved, outcome.PreviousPhase);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Open, outcome.CurrentPhase);
+        Assert.NotNull(outcome.UncrossPrint);
+        Assert.Equal(AuctionPrintKind.Opening, outcome.UncrossPrint!.Value.Kind);
+        Assert.Equal(200L, outcome.UncrossPrint.Value.ClearedQuantity);
+        Assert.Equal(Px(10m), outcome.UncrossPrint.Value.PriceMantissa);
+    }
+
+    [Fact]
+    public async Task Issue321_OperatorUncrossAuction_FCCToClose_EmitsClosingPrint()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.FinalClosingCall));
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.AtClose, Px(10m), 100, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("T", Petr, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10m), 100, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorUncrossAuction(Petr, B3.Exchange.Matching.TradingPhase.Close, tcs));
+        DrainInbound(disp);
+
+        var outcome = await tcs.Task;
+        Assert.True(outcome.TransitionApplied);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.FinalClosingCall, outcome.PreviousPhase);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Close, outcome.CurrentPhase);
+        Assert.NotNull(outcome.UncrossPrint);
+        Assert.Equal(AuctionPrintKind.Closing, outcome.UncrossPrint!.Value.Kind);
+        Assert.Equal(100L, outcome.UncrossPrint.Value.ClearedQuantity);
+    }
+
+    [Fact]
+    public void Issue321_OperatorUncrossAuction_InvalidTransition_FailsCompletionWithInvalidOperation()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        _ = new FakeSession(outbound);
+
+        // Default phase is Open; uncross to Reserved is not a permitted target.
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorUncrossAuction(Petr, B3.Exchange.Matching.TradingPhase.Reserved, tcs));
+        DrainInbound(disp);
+
+        Assert.True(tcs.Task.IsFaulted);
+        Assert.IsType<InvalidOperationException>(tcs.Task.Exception!.InnerException);
+    }
+
+    [Fact]
+    public async Task Issue321_OperatorSetTradingPhase_WithCompletion_ReturnsOutcome()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        _ = new FakeSession(outbound);
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Pause));
+        DrainInbound(disp);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Open, tcs));
+        DrainInbound(disp);
+
+        Assert.True(tcs.Task.IsCompletedSuccessfully);
+        var outcome = await tcs.Task;
+        Assert.True(outcome.TransitionApplied);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Pause, outcome.PreviousPhase);
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Open, outcome.CurrentPhase);
+        Assert.Null(outcome.UncrossPrint);
+    }
+
+    [Fact]
+    public void Issue321_PhaseSnapshot_ReflectsLatestTransition()
+    {
+        var (disp, _, _) = NewDispatcher();
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Pause));
+        DrainInbound(disp);
+
+        Assert.True(disp.TryGetPhaseSnapshot(Petr, out var phase));
+        Assert.Equal(B3.Exchange.Matching.TradingPhase.Pause, phase);
+    }
 }

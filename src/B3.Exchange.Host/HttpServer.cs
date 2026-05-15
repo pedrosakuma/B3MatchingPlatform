@@ -28,6 +28,7 @@ namespace B3.Exchange.Host;
 public sealed class HttpServer : IAsyncDisposable
 {
     private readonly HttpConfig _config;
+    private readonly IReadOnlyDictionary<long, ChannelDispatcher> _instrumentRouting;
     private readonly MetricsRegistry _metrics;
     private readonly IReadOnlyList<IReadinessProbe> _probes;
     private readonly IReadOnlyDictionary<byte, ChannelDispatcher> _dispatchers;
@@ -47,7 +48,8 @@ public sealed class HttpServer : IAsyncDisposable
         IReadOnlyList<FirmInfo>? firms = null,
         Func<int>? dailyResetTrigger = null,
         IReadOnlyDictionary<byte, IChannelStatePersister>? persisters = null,
-        IReadOnlyDictionary<byte, IChannelWriteAheadLog>? wals = null)
+        IReadOnlyDictionary<byte, IChannelWriteAheadLog>? wals = null,
+        IReadOnlyDictionary<long, ChannelDispatcher>? instrumentRouting = null)
     {
         _config = config;
         _metrics = metrics;
@@ -58,6 +60,7 @@ public sealed class HttpServer : IAsyncDisposable
         _dailyResetTrigger = dailyResetTrigger;
         _persisters = persisters ?? new Dictionary<byte, IChannelStatePersister>();
         _wals = wals ?? new Dictionary<byte, IChannelWriteAheadLog>();
+        _instrumentRouting = instrumentRouting ?? new Dictionary<long, ChannelDispatcher>();
         _log = log;
     }
 
@@ -222,6 +225,15 @@ public sealed class HttpServer : IAsyncDisposable
         //   exists; 503 when no persister is wired.
         app.MapPost("/admin/channels/{ch:int}/snapshot/validate", (int ch, HttpContext ctx) =>
             HandleAdminValidate(ctx, ch));
+
+        // Issue #321: operator-initiated trading-phase transition for a
+        // single instrument. Body: { "targetPhase": "...", "asOf": <opt> }.
+        // 200 with structured outcome on success; 404 unknown securityId;
+        // 409 invalid transition (e.g. Open → Reserved); 503 inbound
+        // queue full; 400 malformed body or unknown phase.
+        app.MapPost("/admin/instruments/{securityId:long}/phase",
+            async (long securityId, HttpContext ctx) =>
+                await HandleSetPhaseAsync(ctx, securityId).ConfigureAwait(false));
 
         await app.StartAsync(ct).ConfigureAwait(false);
         _app = app;
@@ -541,6 +553,122 @@ public sealed class HttpServer : IAsyncDisposable
             new System.Text.Json.Serialization.JsonStringEnumConverter(),
         },
     };
+
+    /// <summary>
+    /// Issue #321: max time the HTTP request blocks waiting for the
+    /// dispatch-thread completion of the phase change. Generous enough to
+    /// absorb a transient queue spike but bounded so a wedged dispatcher
+    /// surfaces as a 504 instead of hanging the operator's tooling.
+    /// </summary>
+    private static readonly TimeSpan PhaseChangeTimeout = TimeSpan.FromSeconds(5);
+
+    private async Task<IResult> HandleSetPhaseAsync(HttpContext ctx, long securityId)
+    {
+        if (!_instrumentRouting.TryGetValue(securityId, out var disp))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"unknown securityId {securityId}\n", "text/plain");
+        }
+        SetPhaseRequest? body;
+        try
+        {
+            body = await System.Text.Json.JsonSerializer.DeserializeAsync<SetPhaseRequest>(
+                ctx.Request.Body, AdminJsonOptions, ctx.RequestAborted).ConfigureAwait(false);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"malformed body: {ex.Message}\n", "text/plain");
+        }
+        if (body is null || string.IsNullOrWhiteSpace(body.TargetPhase))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("body must contain non-empty 'targetPhase'\n", "text/plain");
+        }
+        if (!Enum.TryParse<B3.Exchange.Matching.TradingPhase>(body.TargetPhase, ignoreCase: true, out var target))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"unknown targetPhase '{body.TargetPhase}'\n", "text/plain");
+        }
+        if (!disp.TryGetPhaseSnapshot(securityId, out var current))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"unknown securityId {securityId} (no phase snapshot)\n", "text/plain");
+        }
+        bool useUncross =
+            (current == B3.Exchange.Matching.TradingPhase.Reserved && target == B3.Exchange.Matching.TradingPhase.Open) ||
+            (current == B3.Exchange.Matching.TradingPhase.FinalClosingCall && target == B3.Exchange.Matching.TradingPhase.Close);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool enqueued = useUncross
+            ? disp.EnqueueOperatorUncrossAuction(securityId, target, tcs)
+            : disp.EnqueueOperatorSetTradingPhase(securityId, target, tcs);
+        if (!enqueued)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text($"channel {disp.ChannelNumber} inbound queue full\n", "text/plain");
+        }
+
+        PhaseChangeOutcome outcome;
+        try
+        {
+            outcome = await tcs.Task.WaitAsync(PhaseChangeTimeout, ctx.RequestAborted).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+            return Results.Text("timed out waiting for phase change\n", "text/plain");
+        }
+        catch (InvalidOperationException ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status409Conflict;
+            return Results.Text($"invalid transition: {ex.Message}\n", "text/plain");
+        }
+        catch (KeyNotFoundException ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"not found: {ex.Message}\n", "text/plain");
+        }
+        catch (Exception ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            return Results.Text($"phase change failed: {ex.Message}\n", "text/plain");
+        }
+
+        _metrics.IncPhaseTransition(securityId, outcome.PreviousPhase, outcome.CurrentPhase, "operator");
+
+        var responseJson = SerializePhaseOutcome(outcome);
+        ctx.Response.StatusCode = StatusCodes.Status200OK;
+        return Results.Text(responseJson, "application/json");
+    }
+
+    private static string SerializePhaseOutcome(PhaseChangeOutcome o)
+    {
+        var sb = new System.Text.StringBuilder(96);
+        sb.Append("{\"previousPhase\":\"").Append(o.PreviousPhase.ToString())
+          .Append("\",\"currentPhase\":\"").Append(o.CurrentPhase.ToString())
+          .Append("\"");
+        if (o.UncrossPrint is { } p)
+        {
+            sb.Append(",\"uncrossPrint\":{\"kind\":\"")
+              .Append(p.Kind.ToString())
+              .Append("\",\"priceMantissa\":")
+              .Append(p.PriceMantissa.ToString(System.Globalization.CultureInfo.InvariantCulture))
+              .Append(",\"clearedQuantity\":")
+              .Append(p.ClearedQuantity.ToString(System.Globalization.CultureInfo.InvariantCulture))
+              .Append('}');
+        }
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    private sealed class SetPhaseRequest
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("targetPhase")]
+        public string? TargetPhase { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("asOf")]
+        public ulong? AsOf { get; set; }
+    }
 
     private static IPEndPoint ParseEndpoint(string s)
     {

@@ -418,6 +418,29 @@ public sealed class MetricsRegistry
         }
     }
 
+    /// <summary>
+    /// Issue #321: process-wide counter for operator/scheduler-driven
+    /// trading-phase transitions. Keyed by
+    /// <c>(securityId, fromPhase, toPhase, trigger)</c> so dashboards can
+    /// alert on a specific instrument's missing scheduled transition or
+    /// quantify operator overrides per session. <paramref name="trigger"/>
+    /// is a low-cardinality label
+    /// (typically <c>"operator"</c> or <c>"scheduled"</c>).
+    /// Atomic — safe to call from any thread.
+    /// </summary>
+    public void IncPhaseTransition(long securityId,
+        B3.Exchange.Matching.TradingPhase fromPhase,
+        B3.Exchange.Matching.TradingPhase toPhase,
+        string trigger)
+    {
+        ArgumentNullException.ThrowIfNull(trigger);
+        var key = (securityId, (byte)fromPhase, (byte)toPhase, trigger);
+        _phaseTransitions.AddOrUpdate(key, 1L, static (_, prev) => prev + 1L);
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long, byte, byte, string), long> _phaseTransitions
+        = new();
+
     public void SetSessionProvider(ISessionMetricsProvider provider)
     {
         lock (_lock) _sessions = provider;
@@ -706,9 +729,37 @@ public sealed class MetricsRegistry
 
         EmitSessionFirmCounters(sb);
 
+        EmitPhaseTransitions(sb);
+
         EmitRuntimeMetrics(sb);
 
         return sb.ToString();
+    }
+
+    private void EmitPhaseTransitions(StringBuilder sb)
+    {
+        // Issue #321: process-wide trading-phase transition counter.
+        // Snapshot the dictionary once so the rendered output is
+        // self-consistent even if a transition fires mid-render.
+        var snap = _phaseTransitions.ToArray();
+        if (snap.Length == 0) return;
+        sb.Append("# HELP exch_phase_transitions_total Operator and scheduler-driven trading-phase transitions, per (security_id, from, to, trigger). trigger=\"operator\" for HTTP-driven changes; trigger=\"scheduled\" for the daily PhaseScheduler. Issue #321.\n");
+        sb.Append("# TYPE exch_phase_transitions_total counter\n");
+        foreach (var kv in snap)
+        {
+            var (secId, from, to, trigger) = kv.Key;
+            sb.Append("exch_phase_transitions_total{security_id=\"")
+              .Append(secId.ToString(CultureInfo.InvariantCulture))
+              .Append("\",from=\"")
+              .Append(((B3.Exchange.Matching.TradingPhase)from).ToString())
+              .Append("\",to=\"")
+              .Append(((B3.Exchange.Matching.TradingPhase)to).ToString())
+              .Append("\",trigger=\"")
+              .Append(EscapeLabel(trigger))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
     }
 
     private void EmitSessionFirmCounters(StringBuilder sb)

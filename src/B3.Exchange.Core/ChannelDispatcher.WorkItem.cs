@@ -10,7 +10,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -33,6 +33,7 @@ public sealed partial class ChannelDispatcher
         "OperatorTradeBust",
         "OperatorSetTradingPhase",
         "OperatorPersistSnapshot",
+        "OperatorUncrossAuction",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -55,6 +56,8 @@ public sealed partial class ChannelDispatcher
         ResolvedMassCancel? MassCancel = null,
         OperatorTradeBust? TradeBust = null,
         OperatorTradingPhase? TradingPhase = null,
+        OperatorUncrossAuction? UncrossAuction = null,
+        TaskCompletionSource<PhaseChangeOutcome>? PhaseCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -84,6 +87,13 @@ public sealed partial class ChannelDispatcher
     /// engine remains single-threaded.
     /// </summary>
     internal sealed record OperatorTradingPhase(long SecurityId, B3.Exchange.Matching.TradingPhase Phase);
+
+    /// <summary>
+    /// Issue #321: operator-triggered auction uncross payload.
+    /// Drives <see cref="MatchingEngine.UncrossAuction"/> with a Reserved→Open
+    /// (opening call) or FinalClosingCall→Close (closing call) target phase.
+    /// </summary>
+    internal sealed record OperatorUncrossAuction(long SecurityId, B3.Exchange.Matching.TradingPhase TargetPhase);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

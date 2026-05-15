@@ -158,6 +158,34 @@ public class ChannelDispatcherPersistenceTests
     }
 
     [Fact]
+    public void Issue321_RestoreChannelState_ReseedsPhaseSnapshot()
+    {
+        // Issue #321 review (gpt-5.5 finding): if RestoreChannelState
+        // didn't reseed _phaseSnapshot from the restored engine state,
+        // the HTTP routing layer would still see the constructor-seeded
+        // Open phase after restart and route Reserved→Open through plain
+        // SetTradingPhase, skipping the auction uncross.
+        var persister = new InMemoryPersister();
+
+        // Round 1: dispatcher A, transition PETR4 to Reserved and persist.
+        var dispA = BuildDispatcher(persister, out _);
+        var probe = dispA.CreateTestProbe();
+        Assert.True(dispA.EnqueueOperatorSetTradingPhase(Sec, TradingPhase.Reserved));
+        probe.DrainInbound();
+        Assert.True(dispA.TryGetPhaseSnapshot(Sec, out var aPhase));
+        Assert.Equal(TradingPhase.Reserved, aPhase);
+
+        // Round 2: brand-new dispatcher restored from the persisted snapshot.
+        var dispB = BuildDispatcher(persister, out _);
+        var loaded = persister.TryLoad(84);
+        Assert.NotNull(loaded);
+        dispB.RestoreChannelState(loaded!);
+
+        Assert.True(dispB.TryGetPhaseSnapshot(Sec, out var bPhase));
+        Assert.Equal(TradingPhase.Reserved, bPhase);
+    }
+
+    [Fact]
     public void RestoreChannelState_RejectsMismatchedChannelNumber()
     {
         var persister = new InMemoryPersister();
