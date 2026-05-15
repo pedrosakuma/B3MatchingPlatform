@@ -216,6 +216,25 @@ public sealed partial class FixpSession
                         reason = $"peer-terminate:code={tm.TerminationCode}";
                     }
                     ApplyTransition(FixpEvent.Terminate);
+                    // Issue #319 follow-up: a fast client (real EPC SDK
+                    // ReconnectAsync) opens a fresh TCP socket and sends
+                    // Negotiate(v+1) immediately after this Terminate
+                    // frame. If we wait for the async SendDirect +
+                    // Close cycle to release the FIXP session claim,
+                    // the new transport's Negotiate races and observes
+                    // DUPLICATE_SESSION_CONNECTION. Since the state
+                    // machine has already moved to Terminated, the
+                    // claim is already logically dead — release it
+                    // synchronously so the next Negotiate succeeds
+                    // even on slow CI hardware. Close() re-issues the
+                    // Release; SessionClaimRegistry.Release is
+                    // idempotent and scoped by ReferenceEquals to this
+                    // session, so the second call is a no-op.
+                    if (_claimedSessionId != 0 && _claims is not null)
+                    {
+                        try { _claims.Release(_claimedSessionId, this); } catch { }
+                        _claimedSessionId = 0;
+                    }
                     await TerminateAndCloseAsync(
                         SessionRejectEncoder.TerminationCode.Finished, reason).ConfigureAwait(false);
                     return false;
