@@ -5,9 +5,10 @@
 - **Supersedes:** —
 - **Superseded by:** —
 - **Related issues:** #327 (closed as wrong-shape by this ADR),
-  B3TradingPlatform#274 (downstream consumer), #321 (phase scheduler,
-  provides the session-close trigger), #322 (single-stock halt API,
-  companion operator surface).
+  B3TradingPlatform#274 (downstream consumer), #321 (phase scheduler;
+  this ADR does **not** claim it already exposes a post-trade trigger
+  — see *D+0 vs D+1 cycle* below for what does and does not exist
+  today), #322 (single-stock halt API, companion operator surface).
 
 ## Context
 
@@ -109,10 +110,45 @@ We adopt **three concentric decisions**:
   schema.
 - Crash-safety: CRC32C per record; `fsync` on rotation boundary and
   on operator-triggered checkpoints. We do **not** fsync per record
-  — the audit log is allowed to lose the last few in-flight trades
-  in a hard crash, the same window the WAL already accepts. Recovery
-  on restart replays the WAL's trade events into the audit log to
-  close the gap before opening the next day's file.
+  in v1 — the audit log accepts a bounded RPO equal to the records
+  written since the last fsync. The exact fsync policy (per-record
+  vs interval vs operator-triggered) is an open question pinned by
+  the implementing issue; whichever policy ships, the **durability
+  contract** below must hold.
+
+  **Audit-durability watermark — hard requirement.** The WAL today
+  (`src/B3.Exchange.Core/ChannelWriteAheadLog.cs`) is an *input
+  command* log (`NewOrder`, `Cancel`, `Replace`); it does not
+  contain `ER_Trade` events, and `Cross` / `MassCancel` are
+  excluded outright. Snapshots capture book/owner state, not
+  historical trades. As a result, **a trade record lost from the
+  audit log cannot be reconstructed by replaying the WAL or the
+  snapshot.** The earlier wording in drafts of this ADR claiming
+  otherwise was wrong.
+
+  To make the bounded-RPO acceptable, the implementing issue
+  **must** add a durability watermark coupling the WAL/snapshot
+  retention to the audit log:
+  - The dispatcher tracks `auditDurableSeq` (highest audit record
+    confirmed `fsync`-stable on disk).
+  - Snapshot save and WAL truncation
+    (`src/B3.Exchange.Core/ChannelDispatcher.Persistence.cs`) must
+    not advance past any input command whose resulting trades are
+    not yet covered by `auditDurableSeq`. In other words, WAL
+    truncation watermark = `min(snapshot-durable, audit-durable)`.
+  - Restart re-emits any input command beyond `auditDurableSeq`
+    through the engine in a "replay-into-audit-only" mode that
+    re-writes the audit records without re-publishing
+    `ER_Trade` / UMDF (these were already broadcast before the
+    crash and consumers' recovery is the UMDF snapshot
+    mechanism's job, not ours). The implementing issue spells out
+    the exact replay-only path.
+
+  Net: the audit log's worst-case loss on hard crash is bounded
+  by the WAL durability + the dispatcher's ability to replay.
+  Without the watermark, the audit log silently drops trades and
+  D+1 recon mismatches go undetected — unacceptable for an audit
+  artifact.
 - Retention is **independent of WAL retention**, controlled by
   `config.postTrade.audit.retentionDays` (default to a sane
   compliance-friendly value — exact number TBD; the open question is
@@ -133,14 +169,27 @@ We adopt **three concentric decisions**:
   directory `config.postTrade.dropDir`.
 - **Format v1 is CSV.** Header + rows, columns frozen at:
   ```
-  tradeId, ts, symbol, side, qty, price, buyClOrdId, sellClOrdId, buyFirm, sellFirm
+  tradeId, ts, symbol, aggressorSide, qty, price, buyClOrdId, sellClOrdId, buyFirm, sellFirm
   ```
-  This matches #327's column list verbatim so the downstream recon
-  script's expectations carry over unchanged. `ts` is ISO-8601 UTC
-  with microsecond precision. `side` is omitted from the file and
-  always derivable from `buyFirm` / `sellFirm` — but kept here for
-  symmetry with the consumer-side statement and to avoid forcing
-  the recon script to compute it.
+  These columns match #327's intent verbatim with one deliberate
+  substitution: #327 spelled `side` as `B`/`S` from the queried
+  firm's perspective, which only makes sense in a per-firm
+  projection. The chosen v1 file shape is **one file per channel
+  per trading date**, both firms in the same row, so the column
+  must be perspective-independent. `aggressorSide` (taker = `B`
+  or `S`, matching the existing UMDF `Trade_53` semantics) is
+  unambiguous in that shape and lets the consumer recover the
+  firm-relative side at read time from `buyFirm` / `sellFirm`.
+  Internal crosses (same firm on both sides) emit one row with
+  `buyFirm == sellFirm`; the consumer's recon counts them as a
+  single fill, not two.
+
+  `ts` is ISO-8601 UTC with microsecond precision.
+
+  If a downstream consumer later needs firm-relative `side` at the
+  file level, that is a per-firm projection — covered by the
+  open question on "multi-firm split files" below, not by
+  redefining the v1 column.
 - **Format v2 (deferred):** wrap the CSV rows inside an XML envelope
   that mimics a BVBG header (sender, receiver, business date, file
   sequence, hash) so downstream consumers that ingest real BVBG can
@@ -155,8 +204,22 @@ We adopt **three concentric decisions**:
 
 ### D+0 vs D+1 cycle
 
-- **D+0 (intraday close):** EOD export runs after the session-close
-  trigger. The file lands in `<dropDir>/<YYYYMMDD>/`.
+- **D+0 (intraday close):** EOD export runs after a session-close
+  trigger. **In v1 the trigger is one of**:
+  - a new operator endpoint
+    `/admin/post-trade/eod-export?date=YYYY-MM-DD`, or
+  - the existing `DailyResetScheduler` /
+    `/admin/daily-reset` flow (see `docs/RUNBOOK.md` section 2),
+    which is the closest thing to a "session is over" hook the
+    host has today.
+
+  The `PhaseScheduler` from #321 / PR #324 currently only enqueues
+  phase / `Uncross` actions and has **no** generic post-close
+  callback (see `src/B3.Exchange.Host/PhaseScheduler.cs`); wiring
+  it as the automatic export trigger is **future integration
+  work** for issue B (or a follow-up issue), not a current
+  capability this ADR can assume.
+- The file lands in `<dropDir>/<YYYYMMDD>/`.
 - **D+1 (next morning):** trading-host's recon tool reads
   matching's D+0 drop and diffs against its own statement. Match =
   same trade count, same notional sum to the cent, no orphan
@@ -164,8 +227,30 @@ We adopt **three concentric decisions**:
   trading reopens.
 - **Reprocessing:** the export is idempotent — pointing the operator
   endpoint at a past date rewrites the drop file deterministically
-  from the audit log. Useful when the consumer wants a regenerated
-  copy or the file was lost downstream.
+  from the audit log. **Atomic publish semantics — hard
+  requirement.** A consumer that polls the drop directory must
+  never observe a partial or truncated file. Therefore:
+  - The export writes to a staging path
+    `<dropDir>/<YYYYMMDD>/.fills.csv.tmp-<pid>-<nonce>`.
+  - On success: `fsync` the staging file, `rename(2)` to
+    `fills.csv`, `fsync` the directory.
+  - On any failure mid-write (disk full, audit-log CRC failure
+    detected during projection, process crash): the staging file
+    is removed on next operator-triggered rerun or on host
+    startup; the previously successful `fills.csv` from a prior
+    run remains untouched and consumable.
+  - A sidecar `fills.csv.done` is written **last**, after the
+    rename, carrying `{ rowCount, sha256, generatedAt }`. Its
+    presence is the consumer-visible signal that the file is
+    final; consumers wait for `.done` before reading. Rerunning
+    overwrites both `fills.csv` and `fills.csv.done` atomically
+    (rename ordering: data file first, then `.done`).
+  - Failed exports surface via the operator endpoint's HTTP
+    response (and a structured log line) — never via a partial
+    file on disk. Audit-log corruption discovered during
+    projection is a hard failure: the export aborts, no file is
+    overwritten, and the operator gets a clear error pointing at
+    the offending audit record offset.
 
 ## Consequences
 
