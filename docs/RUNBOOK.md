@@ -76,6 +76,15 @@ See §4 for tuning recipes.
 
 ## 2. Operator surface
 
+> **Scope note.** Everything under `/admin/*` here is **operational
+> admin** of the running matching engine. Post-trade artifacts
+> (audit log, EOD fills export, future clearing files) live on a
+> separate boundary and are **file-based**, not REST — see
+> [ADR 0001](./adr/0001-post-trade-boundary-and-eod-file-export.md).
+> If you are looking for "where do I download yesterday's fills",
+> the answer is "a configured drop directory once the post-trade
+> module ships", not an endpoint on this surface.
+
 ### 2.1 Liveness & readiness
 
 | Endpoint | Method | Status code | Body | Use it for |
