@@ -12,6 +12,9 @@ changes, a new ADR supersedes the old one.
 - One ADR per file, numbered sequentially: `NNNN-short-kebab-title.md`.
   The number is allocated on merge, not on draft, so re-number before
   merging if another ADR landed first.
+- Many post-trade ADRs (numbers 0002 onward) sit under
+  [RFC 0001 — Post-trade architecture](../rfc/0001-post-trade-architecture.md).
+  See `docs/rfc/README.md` for the distinction between RFCs and ADRs.
 - Each ADR has a status header. Lifecycle:
   - **Proposed** — under review on a PR.
   - **Accepted** — merged on `main`. Default once merged.

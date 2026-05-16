@@ -4,6 +4,9 @@
 - **Date:** 2026-05-16
 - **Supersedes:** —
 - **Superseded by:** —
+- **Part of:** [RFC 0001 — Post-trade architecture](../rfc/0001-post-trade-architecture.md)
+  (this ADR is the first child of that umbrella; it was written
+  before the RFC and folded into the roadmap retroactively).
 - **Related issues:** #327 (closed as wrong-shape by this ADR),
   B3TradingPlatform#274 (downstream consumer), #321 (phase scheduler;
   this ADR does **not** claim it already exposes a post-trade trigger
