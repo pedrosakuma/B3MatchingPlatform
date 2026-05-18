@@ -13,7 +13,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Core.Tests;
 
-public class ChannelDispatcherTests
+public partial class ChannelDispatcherTests
 {
     private const long Petr = 900_000_000_001L;
 

@@ -206,6 +206,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     private readonly Func<string, bool>? _sessionExists;
     private readonly OrphanSessionPolicy _orphanPolicy;
+    // Per-channel post-trade audit sink (#329 PR-1). Defaults to
+    // NullPostTradeSink.Instance so existing callers see no behaviour
+    // change; subsequent PRs install a real append-only writer.
+    private readonly B3.Exchange.PostTrade.IPostTradeSink _postTradeSink;
     // Throttle bookkeeping (issue #267). Mutated only on the dispatch
     // loop thread → no Interlocked needed.
     private long _commandsSincePersist;
@@ -325,7 +329,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         WalAppendFailurePolicy walAppendFailurePolicy = WalAppendFailurePolicy.Continue,
         Func<string, bool>? sessionExists = null,
         OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop,
-        IReadOnlyList<long>? seedSecurityIds = null)
+        IReadOnlyList<long>? seedSecurityIds = null,
+        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -345,6 +350,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _walAppendFailurePolicy = walAppendFailurePolicy;
         _sessionExists = sessionExists;
         _orphanPolicy = orphanPolicy;
+        _postTradeSink = postTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist

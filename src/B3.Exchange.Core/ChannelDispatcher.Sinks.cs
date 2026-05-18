@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 using Side = B3.Exchange.Matching.Side;
 
 namespace B3.Exchange.Core;
@@ -406,6 +407,42 @@ public sealed partial class ChannelDispatcher
             _outbound.WriteExecutionReportPassiveTrade(owner.Session, owner.ClOrdId, e.RestingOrderId,
                 e, leavesQty: restLeaves, cumQty: restCum, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
+        }
+
+        // #329 PR-1: emit the per-trade audit record after both ER writes so
+        // the audit log's order matches the wire-published trade order. ClOrdId
+        // resolution: aggressor side uses _currentClOrdId when a session is
+        // bound; resting side uses the owner registry. A 0 on either side
+        // means "no resolvable owner" — never a valid clOrdId — which the
+        // on-disk schema in later PRs treats as unknown.
+        bool aggressorIsBuyForAudit = e.AggressorSide == Side.Buy;
+        ulong aggClOrdId = _hasCurrentSession ? _currentClOrdId : 0UL;
+        ulong restClOrdId = _orders.TryResolve(e.RestingOrderId, out var ownerForAudit) ? ownerForAudit.ClOrdId : 0UL;
+        var record = new B3.Exchange.PostTrade.PostTradeRecord(
+            TradeId: e.TradeId,
+            TransactTimeNanos: e.TransactTimeNanos,
+            SecurityId: e.SecurityId,
+            AggressorSide: e.AggressorSide,
+            Quantity: e.Quantity,
+            PriceMantissa: e.PriceMantissa,
+            BuyClOrdId: aggressorIsBuyForAudit ? aggClOrdId : restClOrdId,
+            SellClOrdId: aggressorIsBuyForAudit ? restClOrdId : aggClOrdId,
+            BuyFirm: aggressorIsBuyForAudit ? e.AggressorFirm : e.RestingFirm,
+            SellFirm: aggressorIsBuyForAudit ? e.RestingFirm : e.AggressorFirm,
+            BuyOrderId: aggressorIsBuyForAudit ? e.AggressorOrderId : e.RestingOrderId,
+            SellOrderId: aggressorIsBuyForAudit ? e.RestingOrderId : e.AggressorOrderId);
+        try
+        {
+            _postTradeSink.OnTrade(record);
+        }
+        catch (Exception ex)
+        {
+            // Audit-sink exceptions must not poison the dispatch loop. The
+            // durability watermark (PR-4) will surface persistent failures
+            // by refusing to advance auditDurableSeq, which in turn blocks
+            // WAL truncation — the operationally correct backpressure.
+            _logger.LogError(ex, "post-trade sink threw on channel {Channel} tradeId={TradeId}; record dropped",
+                ChannelNumber, e.TradeId);
         }
     }
 
