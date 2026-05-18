@@ -702,21 +702,15 @@ public sealed class MatchingEngine
             var icebergSide = o.Side;
             long icebergPx = o.PriceMantissa;
             long icebergOid = o.OrderId;
+            // Mutate-in-place + re-Insert. Remove clears Level/Prev/Next and
+            // the by-order-id index; Insert re-adds at the tail of the same
+            // price level, so the order loses time priority while retaining
+            // its identity (no RestingOrder allocation).
             book.Remove(o);
-            var refreshed = new RestingOrder
-            {
-                OrderId = icebergOid,
-                ClOrdId = o.ClOrdId,
-                Side = icebergSide,
-                PriceMantissa = icebergPx,
-                EnteringFirm = o.EnteringFirm,
-                InsertTimestampNanos = txnNanos,
-                RemainingQuantity = newVisible,
-                Tif = o.Tif,
-                MaxFloor = o.MaxFloor,
-                HiddenQuantity = newHidden,
-            };
-            book.Insert(refreshed);
+            o.RemainingQuantity = newVisible;
+            o.HiddenQuantity = newHidden;
+            o.InsertTimestampNanos = txnNanos;
+            book.Insert(o);
             uint deleteSeq = NextRptSeq();
             uint addSeq = NextRptSeq();
             _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
@@ -1506,30 +1500,17 @@ public sealed class MatchingEngine
                             long icebergPx = maker.PriceMantissa;
                             long icebergOid = maker.OrderId;
                             // Atomically: remove from current spot, mutate
-                            // visible/hidden counters, re-insert at tail of
-                            // same level. The book.Remove + book.Insert pair
-                            // is correct even if this is the only order at
-                            // the level (Insert recreates the level).
+                            // visible/hidden counters + insert timestamp,
+                            // re-insert at tail of same level. Mutating
+                            // `maker` in place avoids allocating a fresh
+                            // RestingOrder on every iceberg replenish hot
+                            // path; identity is preserved across the
+                            // Remove/Insert pair.
                             book.Remove(maker);
                             maker.RemainingQuantity = newVisible;
                             maker.HiddenQuantity = newHidden;
-                            // Reset insert timestamp to the trade time — the
-                            // replenished slice is logically a fresh entry at
-                            // the back of the queue.
-                            var refreshed = new RestingOrder
-                            {
-                                OrderId = icebergOid,
-                                ClOrdId = maker.ClOrdId,
-                                Side = icebergSide,
-                                PriceMantissa = icebergPx,
-                                EnteringFirm = maker.EnteringFirm,
-                                InsertTimestampNanos = cmd.EnteredAtNanos,
-                                RemainingQuantity = newVisible,
-                                Tif = maker.Tif,
-                                MaxFloor = maker.MaxFloor,
-                                HiddenQuantity = newHidden,
-                            };
-                            book.Insert(refreshed);
+                            maker.InsertTimestampNanos = cmd.EnteredAtNanos;
+                            book.Insert(maker);
                             uint deleteSeq = NextRptSeq();
                             uint addSeq = NextRptSeq();
                             _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
