@@ -396,8 +396,15 @@ public sealed partial class ChannelDispatcher
         // Issue #319: per-order cum/leaves tracking lives in the
         // registry so multi-fill resting orders emit monotonic
         // (cumQty, leavesQty) and the final fill carries leaves=0.
+        ulong restClOrdIdForAudit = 0UL;
         if (_orders.TryResolve(e.RestingOrderId, out var owner))
         {
+            // Snapshot the resting ClOrdId here so the audit record below
+            // sees the same owner the passive ER did, even if the owning
+            // session is concurrently evicted by HostRouter.OnSessionClosed
+            // before we build the audit record (the registry is backed by
+            // ConcurrentDictionary, so this is observable).
+            restClOrdIdForAudit = owner.ClOrdId;
             long restCum, restLeaves;
             if (!_orders.OnTrade(e.RestingOrderId, e.Quantity, out restCum, out restLeaves))
             {
@@ -410,14 +417,20 @@ public sealed partial class ChannelDispatcher
         }
 
         // #329 PR-1: emit the per-trade audit record after both ER writes so
-        // the audit log's order matches the wire-published trade order. ClOrdId
-        // resolution: aggressor side uses _currentClOrdId when a session is
-        // bound; resting side uses the owner registry. A 0 on either side
-        // means "no resolvable owner" — never a valid clOrdId — which the
-        // on-disk schema in later PRs treats as unknown.
+        // the audit log's order matches the wire-published trade order.
+        //
+        // Aggressor ClOrdId resolution policy: prefer the registry lookup
+        // on AggressorOrderId because operator/auction work runs without a
+        // bound session (HasSession=false → _currentClOrdId is stale), yet
+        // both legs of the cross are real registered orders. Fall back to
+        // _currentClOrdId only when the aggressor side is not in the
+        // registry (e.g. a transient cross/internal print the dispatcher
+        // never registered). Resting ClOrdId is taken from the snapshot
+        // captured above to avoid the close-race second-lookup window.
+        ulong aggClOrdIdForAudit = _orders.TryResolve(e.AggressorOrderId, out var aggOwner)
+            ? aggOwner.ClOrdId
+            : (_hasCurrentSession ? _currentClOrdId : 0UL);
         bool aggressorIsBuyForAudit = e.AggressorSide == Side.Buy;
-        ulong aggClOrdId = _hasCurrentSession ? _currentClOrdId : 0UL;
-        ulong restClOrdId = _orders.TryResolve(e.RestingOrderId, out var ownerForAudit) ? ownerForAudit.ClOrdId : 0UL;
         var record = new B3.Exchange.PostTrade.PostTradeRecord(
             TradeId: e.TradeId,
             TransactTimeNanos: e.TransactTimeNanos,
@@ -425,8 +438,8 @@ public sealed partial class ChannelDispatcher
             AggressorSide: e.AggressorSide,
             Quantity: e.Quantity,
             PriceMantissa: e.PriceMantissa,
-            BuyClOrdId: aggressorIsBuyForAudit ? aggClOrdId : restClOrdId,
-            SellClOrdId: aggressorIsBuyForAudit ? restClOrdId : aggClOrdId,
+            BuyClOrdId: aggressorIsBuyForAudit ? aggClOrdIdForAudit : restClOrdIdForAudit,
+            SellClOrdId: aggressorIsBuyForAudit ? restClOrdIdForAudit : aggClOrdIdForAudit,
             BuyFirm: aggressorIsBuyForAudit ? e.AggressorFirm : e.RestingFirm,
             SellFirm: aggressorIsBuyForAudit ? e.RestingFirm : e.AggressorFirm,
             BuyOrderId: aggressorIsBuyForAudit ? e.AggressorOrderId : e.RestingOrderId,

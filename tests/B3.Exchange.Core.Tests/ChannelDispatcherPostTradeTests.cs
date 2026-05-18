@@ -69,4 +69,46 @@ public partial class ChannelDispatcherTests
         Assert.Single(maker.Trades);
         Assert.Single(taker.Trades);
     }
+
+    [Fact]
+    public async Task PostTradeSink_OperatorUncrossAuction_ResolvesBothClOrdIdsFromRegistry()
+    {
+        // Regression for PR #344 review: auction uncross runs with
+        // _hasCurrentSession=false, so the audit record must NOT fall back
+        // to _currentClOrdId for the aggressor side. Both legs are
+        // registered orders → both ClOrdIds must be resolved from the
+        // owner registry.
+        var pkt = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var audit = new RecordingPostTradeSink();
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
+            packetSink: pkt,
+            outbound: outbound,
+            logger: NullLogger<ChannelDispatcher>.Instance,
+            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
+            postTradeSink: audit);
+        var maker = new FakeSession(outbound) { EnteringFirm = 7 };
+        var taker = new FakeSession(outbound) { EnteringFirm = 8 };
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, B3.Exchange.Matching.TradingPhase.Reserved));
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 111UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("T", Petr, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 222UL);
+        DrainInbound(disp);
+
+        var tcs = new TaskCompletionSource<PhaseChangeOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorUncrossAuction(Petr, B3.Exchange.Matching.TradingPhase.Open, tcs));
+        DrainInbound(disp);
+        await tcs.Task;
+
+        var record = Assert.Single(audit.Records);
+        Assert.NotEqual(0UL, record.BuyClOrdId);
+        Assert.NotEqual(0UL, record.SellClOrdId);
+        Assert.Equal(new HashSet<ulong> { 111UL, 222UL }, new HashSet<ulong> { record.BuyClOrdId, record.SellClOrdId });
+        Assert.Equal(new HashSet<uint> { 7u, 8u }, new HashSet<uint> { record.BuyFirm, record.SellFirm });
+    }
 }
