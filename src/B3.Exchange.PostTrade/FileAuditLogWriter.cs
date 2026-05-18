@@ -44,6 +44,15 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     private long _pendingCommandSeq;
     private long _durableCommandSeq;
 
+    // Issue #329 PR-4 (HIGH review finding): once an OnTrade write throws,
+    // the audit log has a known hole — every subsequent OnCommandBoundary
+    // and Checkpoint MUST refuse to advance the watermark so the WAL
+    // truncation gate stays closed and operators can recover from the
+    // on-disk WAL. Mirrors the WalAppendFailurePolicy.Halt model in
+    // ChannelDispatcher (issue #286). Sticky for the lifetime of this
+    // writer instance — only a restart/rebuild clears it.
+    private bool _writeFault;
+
     // Current in-progress index block. _blockFirmIds is kept sorted+distinct
     // (linear insertion — typical session has well below 64 firms per block,
     // so this is cheaper than a HashSet allocation per block).
@@ -80,35 +89,56 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     {
         lock (_checkpointLock)
         {
-            var recordDate = ToUtcDate(record.TransactTimeNanos);
-            if (_stream is null || recordDate != _currentDate)
+            // If a prior write already failed, refuse silently — the audit
+            // log is in a known-broken state and further writes would only
+            // deepen the hole. ChannelDispatcher's OnTrade catches and
+            // swallows post-trade sink exceptions, so throwing here would
+            // not even reach the operator; the deferred-truncate metric
+            // (bumped on every Checkpoint attempt below) is the alert path.
+            if (_writeFault) return;
+            try
             {
-                RotateTo(recordDate);
+                var recordDate = ToUtcDate(record.TransactTimeNanos);
+                if (_stream is null || recordDate != _currentDate)
+                {
+                    RotateTo(recordDate);
+                }
+                if (_blockRecordCount == 0)
+                    _blockStartOffset = _stream!.Position;
+
+                int n = AuditRecordCodec.Encode(_scratch, in record);
+                _stream!.Write(_scratch, 0, n);
+                _stream.Flush(flushToDisk: false);
+                _recordsWritten++;
+
+                TrackFirm(record.BuyFirm);
+                TrackFirm(record.SellFirm);
+                _blockRecordCount++;
+                if (_blockRecordCount >= _indexBlockRecords)
+                    FlushCurrentBlock();
             }
-            if (_blockRecordCount == 0)
-                _blockStartOffset = _stream!.Position;
-
-            int n = AuditRecordCodec.Encode(_scratch, in record);
-            _stream!.Write(_scratch, 0, n);
-            _stream.Flush(flushToDisk: false);
-            _recordsWritten++;
-
-            TrackFirm(record.BuyFirm);
-            TrackFirm(record.SellFirm);
-            _blockRecordCount++;
-            if (_blockRecordCount >= _indexBlockRecords)
-                FlushCurrentBlock();
+            catch
+            {
+                // Poison the watermark for the rest of this writer's life.
+                // Any subsequent OnCommandBoundary/Checkpoint will refuse to
+                // advance _durableCommandSeq, keeping the WAL truncation
+                // gate permanently closed until the operator restarts.
+                _writeFault = true;
+                throw;
+            }
         }
     }
 
     /// <summary>Tags every record OnTrade'd since the previous boundary as
     /// "produced by <paramref name="commandSeq"/>". The watermark advances
     /// from pending to durable on the next <see cref="Checkpoint"/> call.
-    /// Dispatch-thread-only; cheap (single store under the shared lock).</summary>
+    /// Dispatch-thread-only; cheap (single store under the shared lock).
+    /// No-op when the writer is in write-fault state.</summary>
     public void OnCommandBoundary(long commandSeq)
     {
         lock (_checkpointLock)
         {
+            if (_writeFault) return;
             // Monotonic: tolerate replay paths that resubmit lower seqs.
             if (commandSeq > _pendingCommandSeq) _pendingCommandSeq = commandSeq;
         }
@@ -119,11 +149,18 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
     /// (the lock serializes against OnTrade/OnCommandBoundary on the
     /// dispatch thread). If the fsync throws the watermark is NOT advanced
-    /// — callers must treat that as "audit not durable; defer truncation".</summary>
+    /// — callers must treat that as "audit not durable; defer truncation".
+    /// Throws when the writer is in write-fault state so the WAL truncation
+    /// gate stays closed.</summary>
     public void Checkpoint()
     {
         lock (_checkpointLock)
         {
+            if (_writeFault)
+            {
+                throw new IOException(
+                    "audit log writer in write-fault state — refusing to advance durability watermark; restart the host after investigating the prior OnTrade failure");
+            }
             // Snapshot the pending boundary BEFORE the fsync — any
             // concurrent OnCommandBoundary call would have to acquire
             // this lock so the value is stable while we fsync.
@@ -141,6 +178,16 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// fsync'd to disk. Read cross-thread by the WAL truncation gate;
     /// uses Volatile.Read for a torn-safe 64-bit read on ARM.</summary>
     public long DurableThroughCommandSeq => Volatile.Read(ref _durableCommandSeq);
+
+    /// <summary>True once an OnTrade write has thrown; the writer is
+    /// permanently broken and the watermark will not advance. Exposed
+    /// for regression tests of the issue #329 PR-4 write-fault contract.</summary>
+    internal bool WriteFault => _writeFault;
+
+    /// <summary>Test-only hook to force the writer into write-fault state
+    /// without engineering a real I/O failure. Exercises the watermark
+    /// poisoning contract.</summary>
+    internal void ForceWriteFaultForTests() { lock (_checkpointLock) { _writeFault = true; } }
 
     private void TrackFirm(uint firmId)
     {

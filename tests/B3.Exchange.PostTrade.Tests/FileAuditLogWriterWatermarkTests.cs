@@ -150,4 +150,34 @@ public class FileAuditLogWriterWatermarkTests : IDisposable
         Assert.True(w.DurableThroughCommandSeq > 0);
         Assert.True(w.DurableThroughCommandSeq <= 200);
     }
+
+    [Fact]
+    public void WriteFault_FreezesWatermark_AndCheckpointThrows()
+    {
+        // Issue #329 PR-4 (HIGH review finding): once an OnTrade fails the
+        // writer marks itself "broken" — OnCommandBoundary must not advance
+        // _pendingCommandSeq, Checkpoint must throw (so the WAL gate stays
+        // closed), and DurableThroughCommandSeq must never advance past
+        // the failed command's seq.
+        using var w = new FileAuditLogWriter(_root, channelNumber: 1);
+        w.OnTrade(Make(1, Day0Nanos));
+        w.OnCommandBoundary(1);
+        w.Checkpoint();
+        Assert.Equal(1, w.DurableThroughCommandSeq);
+
+        w.ForceWriteFaultForTests();
+        Assert.True(w.WriteFault);
+
+        // Subsequent boundary tries to bump pending → must be ignored.
+        w.OnCommandBoundary(42);
+        // Subsequent OnTrade must silently drop (so dispatcher can keep
+        // running) — pinning the contract that the audit log already has
+        // a known hole and further writes only deepen it.
+        w.OnTrade(Make(2, Day0Nanos));
+        // Checkpoint must throw — the WAL gate translates that to a
+        // deferred truncation and bumps exch_audit_wal_truncate_deferred_total.
+        Assert.Throws<IOException>(() => w.Checkpoint());
+        // Watermark must NOT have advanced past the last good command.
+        Assert.Equal(1, w.DurableThroughCommandSeq);
+    }
 }
