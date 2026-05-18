@@ -89,6 +89,12 @@ public class MultiSessionReplayTests
             ["firmA"] = clientA,
             ["firmB"] = clientB,
         };
+        // Capture any BusinessMessageReject from the gateway so #326-style
+        // silent failures (BMR was previously discarded by the recv loop)
+        // surface in the failure dump. See EntryPointClient OnBusinessReject.
+        var bmrLog = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        clientA.OnBusinessReject += b => bmrLog.Enqueue($"firmA BMR refMsgType={b.RefMsgType} refSeqNum={b.RefSeqNum} refId={b.BusinessRejectRefId} reason={b.BusinessRejectReason}");
+        clientB.OnBusinessReject += b => bmrLog.Enqueue($"firmB BMR refMsgType={b.RefMsgType} refSeqNum={b.RefSeqNum} refId={b.BusinessRejectRefId} reason={b.BusinessRejectReason}");
         var runner = new ReplayRunner(sessions, "firmA", new SystemClock(speed: 10.0), capture);
 
         // firmA posts a resting bid; firmB hits it with a marketable IOC sell.
@@ -135,6 +141,8 @@ public class MultiSessionReplayTests
         // Dump captured tape on failure to make this test self-diagnosing
         // (the previous incarnations of #146 left no clue what was missing).
         var dump = "captured tape:\n  " + string.Join("\n  ", lines);
+        if (!bmrLog.IsEmpty)
+            dump += "\nBusinessMessageRejects observed:\n  " + string.Join("\n  ", bmrLog);
 
         Assert.True(lines.Any(l => l.Contains("\"session\":\"firmA\"") && l.Contains("submit_new") && l.Contains("clOrdId=1")), dump);
         Assert.True(lines.Any(l => l.Contains("\"session\":\"firmB\"") && l.Contains("submit_new") && l.Contains("clOrdId=1")), dump);
