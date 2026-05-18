@@ -12,6 +12,11 @@ BenchmarkDotNet harness for the simulator's hot paths. See issue #118.
 The matching benchmarks use a `NoOpSink` to keep the measurement focused on
 engine work, and `IterationSetup` to give each invocation a clean book.
 
+Each `MatchingBenchmarks` benchmark batches `Batch` (2048) operations per
+invocation and reports per-op timings via `OperationsPerInvoke`. The setup
+costs (book pre-staging, etc.) are excluded from the measurement, so reported
+means reflect steady-state per-call cost.
+
 ## Run locally
 
 ```bash
