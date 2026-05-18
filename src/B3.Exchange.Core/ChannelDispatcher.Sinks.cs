@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 using Side = B3.Exchange.Matching.Side;
 
 namespace B3.Exchange.Core;
@@ -395,8 +396,15 @@ public sealed partial class ChannelDispatcher
         // Issue #319: per-order cum/leaves tracking lives in the
         // registry so multi-fill resting orders emit monotonic
         // (cumQty, leavesQty) and the final fill carries leaves=0.
+        ulong restClOrdIdForAudit = 0UL;
         if (_orders.TryResolve(e.RestingOrderId, out var owner))
         {
+            // Snapshot the resting ClOrdId here so the audit record below
+            // sees the same owner the passive ER did, even if the owning
+            // session is concurrently evicted by HostRouter.OnSessionClosed
+            // before we build the audit record (the registry is backed by
+            // ConcurrentDictionary, so this is observable).
+            restClOrdIdForAudit = owner.ClOrdId;
             long restCum, restLeaves;
             if (!_orders.OnTrade(e.RestingOrderId, e.Quantity, out restCum, out restLeaves))
             {
@@ -406,6 +414,48 @@ public sealed partial class ChannelDispatcher
             _outbound.WriteExecutionReportPassiveTrade(owner.Session, owner.ClOrdId, e.RestingOrderId,
                 e, leavesQty: restLeaves, cumQty: restCum, durability: CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.TradePassive);
+        }
+
+        // #329 PR-1: emit the per-trade audit record after both ER writes so
+        // the audit log's order matches the wire-published trade order.
+        //
+        // Aggressor ClOrdId resolution policy: prefer the registry lookup
+        // on AggressorOrderId because operator/auction work runs without a
+        // bound session (HasSession=false → _currentClOrdId is stale), yet
+        // both legs of the cross are real registered orders. Fall back to
+        // _currentClOrdId only when the aggressor side is not in the
+        // registry (e.g. a transient cross/internal print the dispatcher
+        // never registered). Resting ClOrdId is taken from the snapshot
+        // captured above to avoid the close-race second-lookup window.
+        ulong aggClOrdIdForAudit = _orders.TryResolve(e.AggressorOrderId, out var aggOwner)
+            ? aggOwner.ClOrdId
+            : (_hasCurrentSession ? _currentClOrdId : 0UL);
+        bool aggressorIsBuyForAudit = e.AggressorSide == Side.Buy;
+        var record = new B3.Exchange.PostTrade.PostTradeRecord(
+            TradeId: e.TradeId,
+            TransactTimeNanos: e.TransactTimeNanos,
+            SecurityId: e.SecurityId,
+            AggressorSide: e.AggressorSide,
+            Quantity: e.Quantity,
+            PriceMantissa: e.PriceMantissa,
+            BuyClOrdId: aggressorIsBuyForAudit ? aggClOrdIdForAudit : restClOrdIdForAudit,
+            SellClOrdId: aggressorIsBuyForAudit ? restClOrdIdForAudit : aggClOrdIdForAudit,
+            BuyFirm: aggressorIsBuyForAudit ? e.AggressorFirm : e.RestingFirm,
+            SellFirm: aggressorIsBuyForAudit ? e.RestingFirm : e.AggressorFirm,
+            BuyOrderId: aggressorIsBuyForAudit ? e.AggressorOrderId : e.RestingOrderId,
+            SellOrderId: aggressorIsBuyForAudit ? e.RestingOrderId : e.AggressorOrderId);
+        try
+        {
+            _postTradeSink.OnTrade(record);
+        }
+        catch (Exception ex)
+        {
+            // Audit-sink exceptions must not poison the dispatch loop. The
+            // durability watermark (PR-4) will surface persistent failures
+            // by refusing to advance auditDurableSeq, which in turn blocks
+            // WAL truncation — the operationally correct backpressure.
+            _logger.LogError(ex, "post-trade sink threw on channel {Channel} tradeId={TradeId}; record dropped",
+                ChannelNumber, e.TradeId);
         }
     }
 
