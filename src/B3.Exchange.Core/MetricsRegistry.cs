@@ -229,6 +229,18 @@ public sealed class ChannelMetrics
     public long WalHaltRejects => Interlocked.Read(ref _walHaltRejects);
     /// <summary>Issue #329 PR-4: see <see cref="IncAuditWalTruncateDeferred"/>.</summary>
     public long AuditWalTruncateDeferred => Interlocked.Read(ref _auditWalTruncateDeferred);
+
+    /// <summary>
+    /// Issue #329 PR-5: cumulative count of trades suppressed during WAL
+    /// replay because their owning command had been fsync'd to the audit
+    /// log pre-crash (<c>commandSeq &lt;= bootAuditDurableSeq</c>).
+    /// Always 0 outside replay. Useful as a boot-time sanity check that
+    /// the replay-into-audit-only gate is active and as a corroboration
+    /// of the persisted watermark.
+    /// </summary>
+    private long _auditReplaySkipped;
+    public long AuditReplaySkipped => Interlocked.Read(ref _auditReplaySkipped);
+    public void IncAuditReplaySkipped() => Interlocked.Increment(ref _auditReplaySkipped);
     public void IncWalAppend(long bytes)
     {
         Interlocked.Increment(ref _walAppends);
@@ -739,6 +751,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_audit_wal_truncate_deferred_total",
             "Issue #329 PR-4: WAL truncation attempts (sync or async snapshot-saved path) deferred because the post-trade audit watermark had not yet caught up with the snapshot's LastAppliedSeq, OR the audit-log Checkpoint itself threw. Always 0 when audit logging is disabled (the no-op sink reports DurableThroughCommandSeq=long.MaxValue). A sustained non-zero rate means audit-log durability lag is pinning the WAL size open and warrants investigation of audit storage latency.",
             channels, c => c.AuditWalTruncateDeferred);
+        EmitCounter(sb, "exch_audit_replay_skipped_total",
+            "Issue #329 PR-5: trades suppressed during WAL replay because their owning command had been fsync'd to the audit log pre-crash (commandSeq <= bootAuditDurableSeq from the watermark sidecar). Always 0 outside boot replay and 0 when audit logging is disabled. Boot-time corroboration that the replay-into-audit-only gate engaged.",
+            channels, c => c.AuditReplaySkipped);
 
         // Issue #270: cross-channel consistency check. Counts owner
         // entries silently dropped at restore because their SessionId

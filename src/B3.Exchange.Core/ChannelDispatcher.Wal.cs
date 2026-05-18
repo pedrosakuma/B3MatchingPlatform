@@ -286,6 +286,14 @@ public sealed partial class ChannelDispatcher
         int replayed = 0;
         int skipped = 0;
         _replayMode = true;
+        // Issue #329 PR-5: snapshot the audit sink's durability watermark
+        // BEFORE replay so OnTrade can gate duplicate emissions. We read
+        // the value here (not lazily inside OnTrade) so any later sink
+        // mutation by the replay itself cannot move the bar. A value of
+        // 0 (no sidecar / fresh install / sink without persistence)
+        // means every replayed trade is re-emitted — the conservative
+        // pre-PR-5 behaviour.
+        _bootAuditDurableSeq = _postTradeSink.DurableThroughCommandSeq;
         _packetSink = NoOpPacketSink;
         _outbound = NoOpOutbound;
         try
@@ -337,6 +345,7 @@ public sealed partial class ChannelDispatcher
         finally
         {
             _replayMode = false;
+            _bootAuditDurableSeq = long.MaxValue;
             _packetSink = _liveSink;
             _outbound = _liveOutbound;
         }

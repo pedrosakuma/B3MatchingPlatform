@@ -67,14 +67,16 @@ public class ChannelDispatcherAuditWatermarkTests
 
     /// <summary>Controllable sink: exposes manual watermark advancement so the
     /// test can hold DurableThroughCommandSeq below the dispatcher's
-    /// snapshotSeq and observe truncation deferral.</summary>
+    /// snapshotSeq and observe truncation deferral. Also counts OnTrade
+    /// invocations so PR-5 tests can assert the replay-mode gate.</summary>
     private sealed class ManualPostTradeSink : IPostTradeSink
     {
         public int CheckpointCount;
+        public int OnTradeCount;
         public List<long> Boundaries { get; } = new();
         private long _pending;
         public long DurableOverride = -1;
-        public void OnTrade(in PostTradeRecord record) { }
+        public void OnTrade(in PostTradeRecord record) { OnTradeCount++; }
         public void OnCommandBoundary(long commandSeq)
         {
             Boundaries.Add(commandSeq);
@@ -123,6 +125,12 @@ public class ChannelDispatcherAuditWatermarkTests
             new NewOrderCommand(clOrdId, Sec, Side.Buy, OrderType.Limit,
                 TimeInForce.Day, Px(10.00m), 100, 100, nanos),
             new SessionId("10101"), enteringFirm: 700, clOrdIdValue: clOrdIdValue);
+
+    private static bool EnqueueSideOrder(ChannelDispatcher disp, Side side, string clOrdId, ulong clOrdIdValue, ulong nanos, uint firm = 700, string sessionId = "10101")
+        => disp.EnqueueNewOrder(
+            new NewOrderCommand(clOrdId, Sec, side, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 100, firm, nanos),
+            new SessionId(sessionId), enteringFirm: firm, clOrdIdValue: clOrdIdValue);
 
     [Fact]
     public void SyncTruncate_DeferredWhenAuditWatermarkBehind()
@@ -223,5 +231,116 @@ public class ChannelDispatcherAuditWatermarkTests
         // 3 commands → 3 boundaries, monotonically increasing from 1.
         Assert.Equal(new long[] { 1, 2, 3 }, sink.Boundaries);
         wal.Dispose();
+    }
+
+    [Fact]
+    public async Task Replay_SuppressesOnTrade_ForCommands_AtOrBelow_BootDurableSeq()
+    {
+        // Issue #329 PR-5: during WAL replay the audit sink must NOT see
+        // OnTrade for any trade whose owning command was already fsync'd
+        // pre-crash. Phase 1 uses the live (DrainInbound) path to stage
+        // WAL records that cross. Phase 2 uses the REAL replay path
+        // (disp.Start → LoadPersistedStateOnLoopThread → ReplayWalOnLoopThread)
+        // with a sink whose recovered watermark covers both commands;
+        // OnTrade must not be invoked and AuditReplaySkipped must bump.
+        using var dir = new TempDir();
+        // Phase 1 — populate the WAL with cross-producing commands.
+        // DurableOverride=0 PREVENTS the post-snapshot WAL truncation
+        // (PR-4 gate) so phase 2 has the staged records to replay.
+        {
+            var wal = new FileChannelWriteAheadLog(dir.Path, 84,
+                NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+            var sink = new ManualPostTradeSink { DurableOverride = 0 };
+            var disp = BuildDispatcher(new InMemoryPersister(),
+                wal, new ChannelMetrics(84), sink);
+            var probe = disp.CreateTestProbe();
+            // Different firms to keep this independent of any future
+            // self-trade-prevention default.
+            Assert.True(EnqueueSideOrder(disp, Side.Sell, "S-1", 0x10, 1UL, firm: 7, sessionId: "10101"));
+            Assert.True(EnqueueSideOrder(disp, Side.Buy, "B-1", 0x11, 2UL, firm: 8, sessionId: "10102"));
+            probe.DrainInbound();
+            Assert.Equal(new long[] { 1, 2 }, sink.Boundaries);
+            // CRITICAL: this trade must actually happen for the gate test
+            // below to be meaningful. If this regresses (e.g. matching
+            // engine changes default phase, or this test's crossing setup
+            // becomes invalid) we fail here loudly instead of in phase 2.
+            Assert.Equal(1, sink.OnTradeCount);
+            wal.Dispose();
+        }
+
+        // Phase 2 — real replay. Sink claims watermark=2 (covers both
+        // staged commands) → the gate must skip the trade's OnTrade call.
+        var metrics2 = new ChannelMetrics(84);
+        var sink2 = new ManualPostTradeSink { DurableOverride = 2 };
+        var wal2 = new FileChannelWriteAheadLog(dir.Path, 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        // Sanity: phase 1 actually wrote both records to the WAL so
+        // there is something for the replay path to consume.
+        var files = string.Join(", ", Directory.GetFiles(dir.Path, "*", SearchOption.AllDirectories)
+            .Select(f => $"{Path.GetRelativePath(dir.Path, f)}({new FileInfo(f).Length}B)"));
+        Assert.True(wal2.ReadAll().Count == 2, $"expected 2 WAL records; files=[{files}]");
+        var persister2 = new InMemoryPersister();
+        var disp2 = BuildDispatcher(persister2, wal2, metrics2, sink2);
+
+        disp2.Start();
+        // Quiescence: AddWalReplays runs AFTER the entire WAL replay
+        // foreach completes. SaveCount bumps mid-replay (each command's
+        // OnAfterCommandFlushed under the AlwaysPersist throttle) so it
+        // is NOT a reliable post-replay barrier. Poll WalReplays
+        // directly.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (metrics2.WalReplays < 2 && DateTime.UtcNow < deadline)
+            Thread.Sleep(10);
+
+        // The replay path itself emits a trade event the gate must
+        // suppress. Boundaries still fire (they don't go through the gate).
+        Assert.Equal(2, metrics2.WalReplays);
+        Assert.Equal(0, sink2.OnTradeCount);
+        Assert.True(metrics2.AuditReplaySkipped >= 1,
+            $"expected AuditReplaySkipped>=1, got {metrics2.AuditReplaySkipped}");
+
+        await disp2.DisposeAsync();
+        wal2.Dispose();
+    }
+
+    [Fact]
+    public async Task Replay_AllowsOnTrade_ForCommands_Above_BootDurableSeq()
+    {
+        // Mirror with watermark BELOW the trade's command seq: the
+        // gate must let the trade through so the audit log is repaired.
+        using var dir = new TempDir();
+        {
+            var wal = new FileChannelWriteAheadLog(dir.Path, 84,
+                NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+            // DurableOverride=0 prevents PR-4 truncation, preserving the
+            // WAL records phase 2 needs to replay.
+            var sink = new ManualPostTradeSink { DurableOverride = 0 };
+            var disp = BuildDispatcher(new InMemoryPersister(),
+                wal, new ChannelMetrics(84), sink);
+            var probe = disp.CreateTestProbe();
+            Assert.True(EnqueueSideOrder(disp, Side.Sell, "S-1", 0x10, 1UL, firm: 7, sessionId: "10101"));
+            Assert.True(EnqueueSideOrder(disp, Side.Buy, "B-1", 0x11, 2UL, firm: 8, sessionId: "10102"));
+            probe.DrainInbound();
+            wal.Dispose();
+        }
+
+        var metrics2 = new ChannelMetrics(84);
+        // Watermark=1 → command 2 (the trade) is NOT covered.
+        var sink2 = new ManualPostTradeSink { DurableOverride = 1 };
+        var wal2 = new FileChannelWriteAheadLog(dir.Path, 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
+        var persister2 = new InMemoryPersister();
+        var disp2 = BuildDispatcher(persister2, wal2, metrics2, sink2);
+
+        disp2.Start();
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (metrics2.WalReplays < 2 && DateTime.UtcNow < deadline)
+            Thread.Sleep(10);
+
+        Assert.Equal(0, metrics2.AuditReplaySkipped);
+        Assert.Equal(2, metrics2.WalReplays);
+
+        await disp2.DisposeAsync();
+        wal2.Dispose();
     }
 }
