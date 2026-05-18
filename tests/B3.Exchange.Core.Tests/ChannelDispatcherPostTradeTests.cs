@@ -11,7 +11,22 @@ public partial class ChannelDispatcherTests
     private sealed class RecordingPostTradeSink : IPostTradeSink
     {
         public List<PostTradeRecord> Records { get; } = new();
+        public List<long> Boundaries { get; } = new();
+        public int CheckpointCount { get; private set; }
+        private long _durable;
+        private long _pending;
         public void OnTrade(in PostTradeRecord record) => Records.Add(record);
+        public void OnCommandBoundary(long commandSeq)
+        {
+            Boundaries.Add(commandSeq);
+            if (commandSeq > _pending) _pending = commandSeq;
+        }
+        public void Checkpoint()
+        {
+            CheckpointCount++;
+            _durable = _pending;
+        }
+        public long DurableThroughCommandSeq => _durable;
     }
 
     [Fact]
