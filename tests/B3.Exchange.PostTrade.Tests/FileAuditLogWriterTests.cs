@@ -13,6 +13,50 @@ public class FileAuditLogWriterTests : IDisposable
         Directory.CreateDirectory(_root);
     }
 
+    [Fact]
+    public void Writer_Reopen_TruncatesTornTail_AndAppendsAreReadable()
+    {
+        // Write two clean records, then simulate a torn tail by appending
+        // a half-record of garbage. After reopening, the writer must
+        // truncate the torn tail so subsequent appends remain readable.
+        using (var w = new FileAuditLogWriter(_root, channelNumber: 5))
+        {
+            w.OnTrade(Make(1, Day0Nanos));
+            w.OnTrade(Make(2, Day0Nanos));
+        }
+        var path = Path.Combine(_root, "5", "fills-2026-05-18.log");
+        using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write))
+            fs.Write(new byte[AuditRecordCodec.RecordSize / 2], 0, AuditRecordCodec.RecordSize / 2);
+        var truncatedLen = new FileInfo(path).Length;
+
+        using (var w = new FileAuditLogWriter(_root, channelNumber: 5))
+            w.OnTrade(Make(3, Day0Nanos));
+
+        var finalLen = new FileInfo(path).Length;
+        Assert.True(finalLen < truncatedLen + AuditRecordCodec.RecordSize,
+            "torn tail should have been truncated before appending");
+        var read = AuditLogReader.ReadAll(path).Select(r => r.TradeId).ToList();
+        Assert.Equal(new uint[] { 1, 2, 3 }, read);
+    }
+
+    [Fact]
+    public void Writer_Reopen_RejectsHeaderWithChannelMismatch()
+    {
+        using (var w = new FileAuditLogWriter(_root, channelNumber: 6))
+            w.OnTrade(Make(1, Day0Nanos));
+        var path = Path.Combine(_root, "6", "fills-2026-05-18.log");
+        // Move the file under a different channel directory to simulate a
+        // operator misconfiguration; the writer must refuse to silently
+        // append records with the wrong channel number.
+        var otherDir = Path.Combine(_root, "60");
+        Directory.CreateDirectory(otherDir);
+        var moved = Path.Combine(otherDir, "fills-2026-05-18.log");
+        File.Move(path, moved);
+        var w2 = new FileAuditLogWriter(_root, channelNumber: 60);
+        Assert.Throws<InvalidDataException>(() => w2.OnTrade(Make(2, Day0Nanos)));
+        w2.Dispose();
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);

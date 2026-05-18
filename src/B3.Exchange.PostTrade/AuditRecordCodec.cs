@@ -66,6 +66,11 @@ public static class AuditRecordCodec
         // tradeDate ASCII YYYY-MM-DD; ASCII is fixed-width and locale-independent.
         var iso = tradeDate.ToString("yyyy-MM-dd");
         System.Text.Encoding.ASCII.GetBytes(iso, dst.Slice(12, 10));
+        // Reserved trailer bytes — kept zero so future readers can validate
+        // them strictly. Required because the writer reuses a single scratch
+        // buffer for headers and records, so leaving these unwritten would
+        // leak bytes from the previously encoded record after a rollover.
+        dst[22] = 0; dst[23] = 0;
     }
 
     /// <summary>
@@ -83,6 +88,8 @@ public static class AuditRecordCodec
         if (version != SchemaVersion)
             throw new InvalidDataException($"audit file schema version {version} unsupported (this build expects {SchemaVersion})");
         byte channel = src[8];
+        if (src[9] != 0 || src[10] != 0 || src[11] != 0 || src[22] != 0 || src[23] != 0)
+            throw new InvalidDataException("audit file reserved bytes non-zero");
         var iso = System.Text.Encoding.ASCII.GetString(src.Slice(12, 10));
         if (!DateOnly.TryParseExact(iso, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var date))
             throw new InvalidDataException($"audit file tradeDate field invalid: '{iso}'");

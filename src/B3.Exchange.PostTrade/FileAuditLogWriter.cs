@@ -53,6 +53,11 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         }
         int n = AuditRecordCodec.Encode(_scratch, in record);
         _stream!.Write(_scratch, 0, n);
+        // Flush the managed FileStream buffer to the OS on every record so
+        // the documented contract holds: post-trade records are at minimum
+        // OS-buffer-visible immediately, with fsync deferred to rotation /
+        // Checkpoint() / PR-4's durability loop.
+        _stream.Flush(flushToDisk: false);
         _recordsWritten++;
     }
 
@@ -79,18 +84,48 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         var channelDir = Path.Combine(_rootDir, _channelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture));
         Directory.CreateDirectory(channelDir);
         var path = Path.Combine(channelDir, $"fills-{newDate:yyyy-MM-dd}.log");
-        var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
-        // Only write the header on a brand-new file. An existing file is
-        // safe to keep appending to under the v1 schema because the writer
-        // never rewrites records — the recovery contract is "read until
-        // TryDecode returns false, that's where the log truncates to".
+        var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         if (fs.Length == 0)
         {
             AuditRecordCodec.WriteFileHeader(_scratch, _channelNumber, newDate);
             fs.Write(_scratch, 0, AuditRecordCodec.FileHeaderSize);
         }
+        else
+        {
+            // Recovery on append: validate the header, then scan forward to
+            // the last good record offset and truncate any torn tail before
+            // appending. Without this step, records appended after a torn
+            // tail would be permanently invisible to AuditLogReader, which
+            // (correctly) treats the first failed TryDecode as end-of-log.
+            long goodEnd = ScanLastGoodEndOffset(fs);
+            if (goodEnd != fs.Length)
+                fs.SetLength(goodEnd);
+        }
+        fs.Seek(0, SeekOrigin.End);
         _stream = fs;
         _currentDate = newDate;
+    }
+
+    private long ScanLastGoodEndOffset(FileStream fs)
+    {
+        fs.Seek(0, SeekOrigin.Begin);
+        Span<byte> hdr = stackalloc byte[AuditRecordCodec.FileHeaderSize];
+        if (fs.Read(hdr) != hdr.Length)
+            throw new InvalidDataException($"audit file '{fs.Name}' truncated in header");
+        var (channel, _) = AuditRecordCodec.ReadFileHeader(hdr);
+        if (channel != _channelNumber)
+            throw new InvalidDataException($"audit file '{fs.Name}' channel mismatch (file={channel}, writer={_channelNumber})");
+
+        long goodEnd = AuditRecordCodec.FileHeaderSize;
+        Span<byte> rec = stackalloc byte[AuditRecordCodec.RecordSize];
+        while (true)
+        {
+            int read = fs.Read(rec);
+            if (read != rec.Length) break;
+            if (!AuditRecordCodec.TryDecode(rec, out _)) break;
+            goodEnd += rec.Length;
+        }
+        return goodEnd;
     }
 
     private static DateOnly ToUtcDate(ulong nanosSinceUnixEpoch)
