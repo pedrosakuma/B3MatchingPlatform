@@ -12,7 +12,14 @@ internal sealed class RestingOrder
     public required Side Side { get; init; }
     public required long PriceMantissa { get; init; }
     public required uint EnteringFirm { get; init; }
-    public required ulong InsertTimestampNanos { get; init; }
+
+    /// <summary>
+    /// Wall-clock timestamp at which the order entered (or last re-entered)
+    /// the book. Mutable so iceberg replenishment can update it in-place to
+    /// the trade time without allocating a fresh <see cref="RestingOrder"/>.
+    /// Issue #211 follow-up.
+    /// </summary>
+    public ulong InsertTimestampNanos;
 
     /// <summary>
     /// TIF the order was originally accepted with (Day or Gtc — the only
