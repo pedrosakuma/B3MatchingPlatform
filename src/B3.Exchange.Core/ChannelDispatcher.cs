@@ -174,6 +174,23 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _replayMode;
 
     /// <summary>
+    /// Issue #329 PR-5: snapshot of the audit sink's persisted durability
+    /// watermark, captured BEFORE WAL replay rebuilds engine state.
+    /// During replay (and only during replay), <see cref="ChannelDispatcher.OnTrade"/>
+    /// skips <c>_postTradeSink.OnTrade</c> for any trade whose owning
+    /// command's seq is &lt;= this value — those trades are already
+    /// fsync'd to the audit log, so re-emitting them would produce
+    /// duplicates. Trades from commands with seq strictly greater than
+    /// this watermark fall through to the sink as normal, re-recording
+    /// any tail lost between the last audit fsync and the crash.
+    /// Reset to <see cref="long.MaxValue"/> outside replay so the gate
+    /// has no effect on the live path (the comparison <c>_lastAppliedSeq
+    /// &lt;= MaxValue</c> is short-circuited by the <c>_replayMode</c>
+    /// check at the call site).
+    /// </summary>
+    private long _bootAuditDurableSeq = long.MaxValue;
+
+    /// <summary>
     /// Issue #312: snapshot of the durability barrier the outbound ER
     /// for the currently-dispatching command must wait on. Captured
     /// after <see cref="WalAppendIfEnabled"/> stamps <c>_lastAppliedSeq</c>

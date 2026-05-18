@@ -446,7 +446,20 @@ public sealed partial class ChannelDispatcher
             SellOrderId: aggressorIsBuyForAudit ? e.RestingOrderId : e.AggressorOrderId);
         try
         {
-            _postTradeSink.OnTrade(record);
+            // Issue #329 PR-5: during WAL replay, skip trades whose owning
+            // command was already fsync'd to the audit log pre-crash. The
+            // sidecar-persisted watermark was captured into
+            // _bootAuditDurableSeq at the start of ReplayWalOnLoopThread
+            // (the live path leaves it at long.MaxValue so this branch
+            // collapses outside replay).
+            if (_replayMode && _lastAppliedSeq <= _bootAuditDurableSeq)
+            {
+                _metrics?.IncAuditReplaySkipped();
+            }
+            else
+            {
+                _postTradeSink.OnTrade(record);
+            }
         }
         catch (Exception ex)
         {

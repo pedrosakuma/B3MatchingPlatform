@@ -75,6 +75,56 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         // bound to avoid an OOB write in pathological cases).
         int maxFirmsPerBlock = Math.Min(indexBlockRecords * 2, ushort.MaxValue);
         _indexScratch = new byte[Math.Max(AuditIndexCodec.FileHeaderSize, AuditIndexCodec.BlockEntryFixedPrefix + (maxFirmsPerBlock * 4))];
+
+        // Issue #329 PR-5: recover the durability watermark from the sidecar
+        // so the dispatcher can gate WAL-replay OnTrade emissions (skip every
+        // trade whose producing command was already fsync'd to the audit log
+        // pre-crash). A missing/torn sidecar is treated as "watermark unknown
+        // = 0", forcing the replay path to re-emit conservatively. Any
+        // resulting duplicates are bounded by the [snapshot, crash] window.
+        long recovered = TryReadWatermarkSidecar();
+        _pendingCommandSeq = recovered;
+        _durableCommandSeq = recovered;
+    }
+
+    private string WatermarkSidecarPath
+        => Path.Combine(_rootDir, _channelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture), "audit-watermark.bin");
+
+    private long TryReadWatermarkSidecar()
+    {
+        var path = WatermarkSidecarPath;
+        if (!File.Exists(path)) return 0;
+        try
+        {
+            Span<byte> buf = stackalloc byte[AuditWatermarkCodec.FileSize];
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            int read = fs.Read(buf);
+            if (read != buf.Length) return 0;
+            return AuditWatermarkCodec.TryDecode(buf, out var seq) ? seq : 0;
+        }
+        catch (IOException)
+        {
+            return 0;
+        }
+    }
+
+    private void WriteWatermarkSidecar(long lastDurableCommandSeq)
+    {
+        var path = WatermarkSidecarPath;
+        var dir = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(dir);
+        var tmp = path + ".tmp";
+        Span<byte> buf = stackalloc byte[AuditWatermarkCodec.FileSize];
+        AuditWatermarkCodec.Encode(buf, lastDurableCommandSeq);
+        // Atomic update: write to tmp + fsync + rename. POSIX rename is
+        // atomic; Windows File.Move(overwrite: true) is too. A crash mid-
+        // write leaves the prior good sidecar (or no sidecar) intact.
+        using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            fs.Write(buf);
+            fs.Flush(flushToDisk: true);
+        }
+        File.Move(tmp, path, overwrite: true);
     }
 
     /// <summary>Total records successfully appended since construction. Useful
@@ -168,6 +218,14 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             FlushCurrentBlock();
             _stream?.Flush(flushToDisk: true);
             _indexStream?.Flush(flushToDisk: true);
+            // Issue #329 PR-5: persist the watermark sidecar so a post-crash
+            // boot can recover it and gate replay-mode OnTrade emissions.
+            // Order matters: sidecar update happens AFTER the .log/.idx
+            // fsyncs so the sidecar can never claim durability the underlying
+            // files don't already have. If the sidecar write itself throws
+            // we propagate without advancing _durableCommandSeq so the gate
+            // stays closed and the next Checkpoint retries.
+            WriteWatermarkSidecar(pending);
             // Advance only on success; if any Flush threw we propagate
             // without touching _durableCommandSeq so the gate stays closed.
             Volatile.Write(ref _durableCommandSeq, pending);
