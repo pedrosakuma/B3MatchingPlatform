@@ -9,15 +9,18 @@ namespace B3.Exchange.PostTrade;
 /// rather than wall-clock so the rollover is deterministic across replay
 /// and across time-warped scenario tests.
 ///
-/// Threading model: not thread-safe. Designed to be installed as the
-/// per-channel <see cref="IPostTradeSink"/> and invoked exclusively on
-/// the <c>ChannelDispatcher</c>'s single dispatch thread.
+/// Threading model: OnTrade and OnCommandBoundary are called exclusively on
+/// the <c>ChannelDispatcher</c>'s dispatch thread. Checkpoint MAY be called
+/// from another thread (the async snapshot writer's onSaved callback runs on
+/// the writer thread). A single private lock serializes Checkpoint against
+/// OnTrade/OnCommandBoundary; the lock is uncontended in steady state since
+/// Checkpoint fires at snapshot intervals.
 ///
-/// Durability: writes are flushed to the OS buffer on every record but
-/// NOT fsynced. <see cref="Checkpoint"/> calls <c>FileStream.Flush(true)</c>
-/// — wire it from PR-4's interval-bounded watermark loop. PR-2 leaves the
-/// dispatcher's hot path free of fsync to avoid a regression before the
-/// durability infrastructure exists.
+/// Durability watermark (issue #329 PR-4): each <see cref="OnCommandBoundary"/>
+/// records the engine's <c>commandSeq</c> as the highest seq covered by the
+/// records OnTrade'd so far. <see cref="Checkpoint"/> fsyncs both files and
+/// promotes that pending value into <see cref="DurableThroughCommandSeq"/>,
+/// which the WAL truncation gate reads before dropping WAL records.
 /// </summary>
 public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 {
@@ -26,11 +29,29 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     private readonly int _indexBlockRecords;
     private readonly byte[] _scratch;
     private readonly byte[] _indexScratch;
+    private readonly object _checkpointLock = new();
 
     private FileStream? _stream;
     private FileStream? _indexStream;
     private DateOnly _currentDate;
     private long _recordsWritten;
+
+    // Durability watermark (issue #329 PR-4). _pendingCommandSeq tracks the
+    // highest commandSeq tagged via OnCommandBoundary since the last Checkpoint;
+    // _durableCommandSeq is advanced to it on every successful Checkpoint.
+    // Read cross-thread by ChannelDispatcher's WAL truncation gate, hence
+    // Volatile/Interlocked access.
+    private long _pendingCommandSeq;
+    private long _durableCommandSeq;
+
+    // Issue #329 PR-4 (HIGH review finding): once an OnTrade write throws,
+    // the audit log has a known hole — every subsequent OnCommandBoundary
+    // and Checkpoint MUST refuse to advance the watermark so the WAL
+    // truncation gate stays closed and operators can recover from the
+    // on-disk WAL. Mirrors the WalAppendFailurePolicy.Halt model in
+    // ChannelDispatcher (issue #286). Sticky for the lifetime of this
+    // writer instance — only a restart/rebuild clears it.
+    private bool _writeFault;
 
     // Current in-progress index block. _blockFirmIds is kept sorted+distinct
     // (linear insertion — typical session has well below 64 firms per block,
@@ -66,38 +87,107 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 
     public void OnTrade(in PostTradeRecord record)
     {
-        var recordDate = ToUtcDate(record.TransactTimeNanos);
-        if (_stream is null || recordDate != _currentDate)
+        lock (_checkpointLock)
         {
-            RotateTo(recordDate);
+            // If a prior write already failed, refuse silently — the audit
+            // log is in a known-broken state and further writes would only
+            // deepen the hole. ChannelDispatcher's OnTrade catches and
+            // swallows post-trade sink exceptions, so throwing here would
+            // not even reach the operator; the deferred-truncate metric
+            // (bumped on every Checkpoint attempt below) is the alert path.
+            if (_writeFault) return;
+            try
+            {
+                var recordDate = ToUtcDate(record.TransactTimeNanos);
+                if (_stream is null || recordDate != _currentDate)
+                {
+                    RotateTo(recordDate);
+                }
+                if (_blockRecordCount == 0)
+                    _blockStartOffset = _stream!.Position;
+
+                int n = AuditRecordCodec.Encode(_scratch, in record);
+                _stream!.Write(_scratch, 0, n);
+                _stream.Flush(flushToDisk: false);
+                _recordsWritten++;
+
+                TrackFirm(record.BuyFirm);
+                TrackFirm(record.SellFirm);
+                _blockRecordCount++;
+                if (_blockRecordCount >= _indexBlockRecords)
+                    FlushCurrentBlock();
+            }
+            catch
+            {
+                // Poison the watermark for the rest of this writer's life.
+                // Any subsequent OnCommandBoundary/Checkpoint will refuse to
+                // advance _durableCommandSeq, keeping the WAL truncation
+                // gate permanently closed until the operator restarts.
+                _writeFault = true;
+                throw;
+            }
         }
-        if (_blockRecordCount == 0)
-            _blockStartOffset = _stream!.Position;
-
-        int n = AuditRecordCodec.Encode(_scratch, in record);
-        _stream!.Write(_scratch, 0, n);
-        _stream.Flush(flushToDisk: false);
-        _recordsWritten++;
-
-        TrackFirm(record.BuyFirm);
-        TrackFirm(record.SellFirm);
-        _blockRecordCount++;
-        if (_blockRecordCount >= _indexBlockRecords)
-            FlushCurrentBlock();
     }
 
-    /// <summary>Flushes OS buffers and forces <c>fsync</c> on the current
-    /// file (if any). PR-4 will call this from the durability-watermark
-    /// loop and from the operator-triggered checkpoint endpoint.</summary>
+    /// <summary>Tags every record OnTrade'd since the previous boundary as
+    /// "produced by <paramref name="commandSeq"/>". The watermark advances
+    /// from pending to durable on the next <see cref="Checkpoint"/> call.
+    /// Dispatch-thread-only; cheap (single store under the shared lock).
+    /// No-op when the writer is in write-fault state.</summary>
+    public void OnCommandBoundary(long commandSeq)
+    {
+        lock (_checkpointLock)
+        {
+            if (_writeFault) return;
+            // Monotonic: tolerate replay paths that resubmit lower seqs.
+            if (commandSeq > _pendingCommandSeq) _pendingCommandSeq = commandSeq;
+        }
+    }
+
+    /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
+    /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
+    /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
+    /// (the lock serializes against OnTrade/OnCommandBoundary on the
+    /// dispatch thread). If the fsync throws the watermark is NOT advanced
+    /// — callers must treat that as "audit not durable; defer truncation".
+    /// Throws when the writer is in write-fault state so the WAL truncation
+    /// gate stays closed.</summary>
     public void Checkpoint()
     {
-        // Make any in-progress block visible to readers BEFORE fsync so a
-        // crash immediately after Checkpoint() returns leaves a consistent
-        // pair of files behind.
-        FlushCurrentBlock();
-        _stream?.Flush(flushToDisk: true);
-        _indexStream?.Flush(flushToDisk: true);
+        lock (_checkpointLock)
+        {
+            if (_writeFault)
+            {
+                throw new IOException(
+                    "audit log writer in write-fault state — refusing to advance durability watermark; restart the host after investigating the prior OnTrade failure");
+            }
+            // Snapshot the pending boundary BEFORE the fsync — any
+            // concurrent OnCommandBoundary call would have to acquire
+            // this lock so the value is stable while we fsync.
+            long pending = _pendingCommandSeq;
+            FlushCurrentBlock();
+            _stream?.Flush(flushToDisk: true);
+            _indexStream?.Flush(flushToDisk: true);
+            // Advance only on success; if any Flush threw we propagate
+            // without touching _durableCommandSeq so the gate stays closed.
+            Volatile.Write(ref _durableCommandSeq, pending);
+        }
     }
+
+    /// <summary>Highest commandSeq whose OnTrade records are guaranteed
+    /// fsync'd to disk. Read cross-thread by the WAL truncation gate;
+    /// uses Volatile.Read for a torn-safe 64-bit read on ARM.</summary>
+    public long DurableThroughCommandSeq => Volatile.Read(ref _durableCommandSeq);
+
+    /// <summary>True once an OnTrade write has thrown; the writer is
+    /// permanently broken and the watermark will not advance. Exposed
+    /// for regression tests of the issue #329 PR-4 write-fault contract.</summary>
+    internal bool WriteFault => _writeFault;
+
+    /// <summary>Test-only hook to force the writer into write-fault state
+    /// without engineering a real I/O failure. Exercises the watermark
+    /// poisoning contract.</summary>
+    internal void ForceWriteFaultForTests() { lock (_checkpointLock) { _writeFault = true; } }
 
     private void TrackFirm(uint firmId)
     {
@@ -249,18 +339,21 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 
     public void Dispose()
     {
-        if (_stream is not null)
+        lock (_checkpointLock)
         {
-            FlushCurrentBlock();
-            _stream.Flush(flushToDisk: true);
-            _stream.Dispose();
-            _stream = null;
-        }
-        if (_indexStream is not null)
-        {
-            _indexStream.Flush(flushToDisk: true);
-            _indexStream.Dispose();
-            _indexStream = null;
+            if (_stream is not null)
+            {
+                FlushCurrentBlock();
+                _stream.Flush(flushToDisk: true);
+                _stream.Dispose();
+                _stream = null;
+            }
+            if (_indexStream is not null)
+            {
+                _indexStream.Flush(flushToDisk: true);
+                _indexStream.Dispose();
+                _indexStream = null;
+            }
         }
     }
 }

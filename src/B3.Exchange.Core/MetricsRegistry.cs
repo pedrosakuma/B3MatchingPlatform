@@ -196,6 +196,16 @@ public sealed class ChannelMetrics
     /// alert correctly.
     /// </summary>
     private long _walHaltRejects;
+    /// <summary>
+    /// Issue #329 PR-4: cumulative count of WAL truncation attempts
+    /// (sync or async snapshot-saved path) deferred because the
+    /// post-trade audit watermark had not yet caught up with the
+    /// snapshot's <c>LastAppliedSeq</c>, OR because the audit
+    /// Checkpoint itself threw. Operators alert on a sustained
+    /// non-zero rate — it indicates audit-log durability lag
+    /// pinning the WAL size open.
+    /// </summary>
+    private long _auditWalTruncateDeferred;
     public long WalAppends => Interlocked.Read(ref _walAppends);
     public long WalBytesAppended => Interlocked.Read(ref _walBytesAppended);
     public long WalTruncations => Interlocked.Read(ref _walTruncations);
@@ -217,6 +227,8 @@ public sealed class ChannelMetrics
     /// dispatcher has been WAL-halted. Always 0 unless the channel is
     /// configured with <see cref="WalAppendFailurePolicy.Halt"/>.</summary>
     public long WalHaltRejects => Interlocked.Read(ref _walHaltRejects);
+    /// <summary>Issue #329 PR-4: see <see cref="IncAuditWalTruncateDeferred"/>.</summary>
+    public long AuditWalTruncateDeferred => Interlocked.Read(ref _auditWalTruncateDeferred);
     public void IncWalAppend(long bytes)
     {
         Interlocked.Increment(ref _walAppends);
@@ -237,6 +249,10 @@ public sealed class ChannelMetrics
     }
     public void IncWalAppendFailure() => Interlocked.Increment(ref _walAppendFailures);
     public void IncWalHaltReject() => Interlocked.Increment(ref _walHaltRejects);
+    /// <summary>Issue #329 PR-4: bumped from <c>ChannelDispatcher</c>'s WAL
+    /// truncation gate when the audit watermark is behind the snapshot seq
+    /// (or the audit Checkpoint threw). See <see cref="_auditWalTruncateDeferred"/>.</summary>
+    public void IncAuditWalTruncateDeferred() => Interlocked.Increment(ref _auditWalTruncateDeferred);
 
     /// <summary>Issue #291: current on-disk WAL size in bytes
     /// (gauge). Updated by the dispatcher after every successful
@@ -720,6 +736,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_drops_on_full_total",
             "Issue #291: WAL Append() calls silently skipped because persistence.wal.maxBytes was reached and persistence.wal.onFull=drop. Distinct from exch_wal_append_failures_total so on-call can route a capacity-exhaustion alert separately from a generic IO-fault alert. Non-zero means the durability contract has been silently relaxed on this channel.",
             channels, c => c.WalDropsOnFull);
+        EmitCounter(sb, "exch_audit_wal_truncate_deferred_total",
+            "Issue #329 PR-4: WAL truncation attempts (sync or async snapshot-saved path) deferred because the post-trade audit watermark had not yet caught up with the snapshot's LastAppliedSeq, OR the audit-log Checkpoint itself threw. Always 0 when audit logging is disabled (the no-op sink reports DurableThroughCommandSeq=long.MaxValue). A sustained non-zero rate means audit-log durability lag is pinning the WAL size open and warrants investigation of audit storage latency.",
+            channels, c => c.AuditWalTruncateDeferred);
 
         // Issue #270: cross-channel consistency check. Counts owner
         // entries silently dropped at restore because their SessionId

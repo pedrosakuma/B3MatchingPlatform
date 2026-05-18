@@ -54,6 +54,46 @@ public readonly record struct PostTradeRecord(
 public interface IPostTradeSink
 {
     void OnTrade(in PostTradeRecord record);
+
+    /// <summary>
+    /// Tags every <see cref="OnTrade"/> emitted since the previous boundary
+    /// (or since construction) as belonging to <paramref name="commandSeq"/>.
+    /// Called by <c>ChannelDispatcher.OnAfterCommandFlushed</c> on the
+    /// dispatch thread once the engine has finished processing a command and
+    /// the corresponding UMDF packet has been published.
+    ///
+    /// <para>Implementations MUST be non-blocking — this runs on the engine
+    /// hot path. The <see cref="Checkpoint"/> method is the slow fsync hook.</para>
+    /// </summary>
+    void OnCommandBoundary(long commandSeq);
+
+    /// <summary>
+    /// Flushes any in-progress index block, calls <c>fsync</c> on the
+    /// underlying files, and advances <see cref="DurableThroughCommandSeq"/>
+    /// to the most recent boundary observed via <see cref="OnCommandBoundary"/>.
+    /// On exception the watermark is NOT advanced — callers (the WAL
+    /// truncation gate) must treat that as "audit not durable; defer".
+    ///
+    /// <para>Implementations MUST be safe to call from a thread other than
+    /// the dispatch thread (the async snapshot writer invokes it from its
+    /// dedicated writer thread). The expected concurrency cost is a brief
+    /// lock acquisition; the fsync itself runs under the lock so the
+    /// dispatch hot path stalls only for the fsync duration when both
+    /// happen to overlap.</para>
+    /// </summary>
+    void Checkpoint();
+
+    /// <summary>
+    /// Highest <c>commandSeq</c> for which every <see cref="OnTrade"/>
+    /// record produced by that command is guaranteed fsync'd to disk.
+    /// Read by the WAL truncation gate (<c>ChannelDispatcher.Wal.cs</c>):
+    /// truncation may only drop WAL records with seq &lt;= this value.
+    ///
+    /// <para>For the no-op sink this is <see cref="long.MaxValue"/> so a
+    /// dispatcher with audit disabled (the default) is never gated — the
+    /// pre-#329 truncate-everything behaviour is preserved exactly.</para>
+    /// </summary>
+    long DurableThroughCommandSeq { get; }
 }
 
 /// <summary>
@@ -67,4 +107,7 @@ public sealed class NullPostTradeSink : IPostTradeSink
     public static readonly NullPostTradeSink Instance = new();
     private NullPostTradeSink() { }
     public void OnTrade(in PostTradeRecord record) { }
+    public void OnCommandBoundary(long commandSeq) { }
+    public void Checkpoint() { }
+    public long DurableThroughCommandSeq => long.MaxValue;
 }

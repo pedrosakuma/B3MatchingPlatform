@@ -135,10 +135,21 @@ public sealed partial class ChannelDispatcher
     /// Truncates the WAL after a successful synchronous snapshot
     /// persist. Called from <c>OnAfterCommandFlushed</c> on the
     /// dispatch thread.
+    ///
+    /// <para>Issue #329 PR-4: gated on the post-trade audit watermark.
+    /// The truncate proceeds only when every WAL record up to
+    /// <paramref name="snapshotLastAppliedSeq"/> has produced trades
+    /// that are fsync'd to the audit log. If not, the truncate is
+    /// deferred — the WAL keeps growing until the next snapshot, at
+    /// which point we try again. The no-op audit sink reports
+    /// <see cref="long.MaxValue"/> so this is a no-op gate when audit
+    /// is disabled (default).</para>
     /// </summary>
-    private void TruncateWalAfterSyncSave()
+    private void TruncateWalAfterSyncSave(long snapshotLastAppliedSeq)
     {
         if (_wal is null) return;
+        if (!CheckpointAndGateAuditWatermark(snapshotLastAppliedSeq, async: false))
+            return;
         try
         {
             _wal.Truncate();
@@ -158,10 +169,16 @@ public sealed partial class ChannelDispatcher
     /// on the writer thread when async-writer mode is enabled. Truncates
     /// the WAL on that thread so the on-disk WAL only loses records that
     /// the matching snapshot has already absorbed.
+    ///
+    /// <para>Issue #329 PR-4: gated on the audit watermark (see
+    /// <see cref="TruncateWalAfterSyncSave(long)"/>). The audit sink's
+    /// Checkpoint is safe to call cross-thread.</para>
     /// </summary>
-    private void OnAsyncSnapshotSaved(ChannelStateSnapshot _)
+    private void OnAsyncSnapshotSaved(ChannelStateSnapshot snap)
     {
         if (_wal is null) return;
+        if (!CheckpointAndGateAuditWatermark(snap.LastAppliedSeq, async: true))
+            return;
         try
         {
             _wal.Truncate();
@@ -174,6 +191,39 @@ public sealed partial class ChannelDispatcher
                 "channel {ChannelNumber}: WAL truncation failed after async snapshot save",
                 ChannelNumber);
         }
+    }
+
+    /// <summary>
+    /// Issue #329 PR-4 audit-watermark gate. Forces an audit-log
+    /// <c>Checkpoint</c> (fsync) and returns true iff the watermark
+    /// covers <paramref name="snapshotLastAppliedSeq"/>. On Checkpoint
+    /// failure (I/O fault) the watermark stays put and we deny the
+    /// truncate — the WAL keeps the records the audit log might not have.
+    /// </summary>
+    private bool CheckpointAndGateAuditWatermark(long snapshotLastAppliedSeq, bool async)
+    {
+        try
+        {
+            _postTradeSink.Checkpoint();
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncAuditWalTruncateDeferred();
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: audit log Checkpoint failed ({Path}); WAL truncation deferred (snapshotSeq={SnapshotSeq})",
+                ChannelNumber, async ? "async" : "sync", snapshotLastAppliedSeq);
+            return false;
+        }
+        long durable = _postTradeSink.DurableThroughCommandSeq;
+        if (durable < snapshotLastAppliedSeq)
+        {
+            _metrics?.IncAuditWalTruncateDeferred();
+            _logger.LogWarning(
+                "channel {ChannelNumber}: WAL truncation deferred — audit watermark behind snapshot (durable={Durable}, snapshotSeq={SnapshotSeq}, path={Path})",
+                ChannelNumber, durable, snapshotLastAppliedSeq, async ? "async" : "sync");
+            return false;
+        }
+        return true;
     }
 
     /// <summary>

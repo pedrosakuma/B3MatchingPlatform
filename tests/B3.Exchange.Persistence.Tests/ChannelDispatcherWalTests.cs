@@ -89,7 +89,8 @@ public class ChannelDispatcherWalTests
         out CountingOutbound outbound,
         ChannelMetrics? metrics = null,
         SnapshotThrottlePolicy? throttle = null,
-        bool useAsyncSnapshotWriter = false)
+        bool useAsyncSnapshotWriter = false,
+        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null)
     {
         var localSink = sink = new NoOpPacketSink();
         var localOutbound = outbound = new CountingOutbound();
@@ -104,7 +105,8 @@ public class ChannelDispatcherWalTests
             persister: persister,
             snapshotThrottle: throttle,
             useAsyncSnapshotWriter: useAsyncSnapshotWriter,
-            wal: wal);
+            wal: wal,
+            postTradeSink: postTradeSink);
     }
 
     private static bool EnqueueOrder(ChannelDispatcher disp, SessionId session,

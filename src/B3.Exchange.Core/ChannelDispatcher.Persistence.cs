@@ -398,6 +398,11 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     private void OnAfterCommandFlushed(bool force = false)
     {
+        // Issue #329 PR-4: tag the command boundary on the audit sink so
+        // the durability watermark can advance on the next Checkpoint.
+        // Done before any early-return so the sink sees boundaries even
+        // when no persister is wired (cheap when the sink is the no-op).
+        _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
         if (_persister is null) return;
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (!force)
@@ -450,7 +455,7 @@ public sealed partial class ChannelDispatcher
             // the WAL on the dispatch thread. After this point the
             // on-disk WAL is empty and a crash falls through to the
             // (just-saved) snapshot for recovery.
-            TruncateWalAfterSyncSave();
+            TruncateWalAfterSyncSave(snap.LastAppliedSeq);
         }
         catch (Exception ex)
         {
