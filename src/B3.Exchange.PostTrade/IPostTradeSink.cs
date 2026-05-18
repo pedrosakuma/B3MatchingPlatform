@@ -46,7 +46,7 @@ public readonly record struct PostTradeRecord(
 /// in the watermark PR).
 ///
 /// Skeleton contract (#329 PR-1). Subsequent PRs add: append-only file
-/// writer with CRC32C + daily rollover (PR-2), firm sparse index (PR-3),
+/// writer with CRC32 (IEEE 802.3) + daily rollover (PR-2), firm sparse index (PR-3),
 /// durability watermark gating WAL truncation (PR-4), restart
 /// replay-into-audit-only mode (PR-5), and operator config / RUNBOOK
 /// (PR-6).
