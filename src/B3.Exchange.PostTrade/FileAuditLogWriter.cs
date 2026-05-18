@@ -172,6 +172,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         AuditIndexCodec.WriteFileHeader(_indexScratch, _channelNumber, newDate);
         ix.Write(_indexScratch, 0, AuditIndexCodec.FileHeaderSize);
         _indexStream = ix;
+        ix.Flush(flushToDisk: false);
         if (logStream.Length <= AuditRecordCodec.FileHeaderSize) return;
 
         long savedPos = logStream.Position;

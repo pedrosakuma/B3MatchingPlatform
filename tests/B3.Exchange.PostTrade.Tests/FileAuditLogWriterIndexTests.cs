@@ -162,4 +162,54 @@ public class FileAuditLogWriterIndexTests : IDisposable
         var got = AuditLogReader.ReadByFirm(logPath, firmId: 10).Select(r => r.TradeId).ToList();
         Assert.Equal(new uint[] { 1, 2, 3 }, got);
     }
+
+    [Fact]
+    public void ReadByFirm_BeforeBlockFlush_ScansUnindexedTail()
+    {
+        // Records are present in .log (each OnTrade flushes to OS buffer)
+        // but no block entry has been written to .idx yet because we are
+        // mid-block. ReadByFirm must still surface them via the unindexed
+        // suffix scan; otherwise live readers see a stale view.
+        using var w = new FileAuditLogWriter(_root, channelNumber: 9, indexBlockRecords: 64);
+        for (uint i = 1; i <= 5; i++) w.OnTrade(Make(i, 10, 20));
+        var logPath = Path.Combine(_root, "9", "fills-2026-05-18.log");
+        var idxPath = Path.ChangeExtension(logPath, ".idx");
+        // Sanity: .idx contains header only at this point.
+        Assert.Equal(AuditIndexCodec.FileHeaderSize, new FileInfo(idxPath).Length);
+        var got = AuditLogReader.ReadByFirm(logPath, firmId: 10).Select(r => r.TradeId).ToList();
+        Assert.Equal(new uint[] { 1, 2, 3, 4, 5 }, got);
+    }
+
+    [Fact]
+    public void ReadByFirm_MalformedIdxEntryMidFile_StillReturnsLaterRecords()
+    {
+        // Write 3 blocks (4+4+4 = 12 records) so the .idx has 3 entries,
+        // then corrupt the middle entry so the index parser stops there.
+        // The reader must still return records from the third block via
+        // the unindexed-suffix scan.
+        using (var w = new FileAuditLogWriter(_root, channelNumber: 10, indexBlockRecords: 4))
+        {
+            for (uint i = 1; i <= 4; i++) w.OnTrade(Make(i, 10, 20));
+            for (uint i = 5; i <= 8; i++) w.OnTrade(Make(i, 10, 30));
+            for (uint i = 9; i <= 12; i++) w.OnTrade(Make(i, 10, 40));
+        }
+        var logPath = Path.Combine(_root, "10", "fills-2026-05-18.log");
+        var idxPath = Path.ChangeExtension(logPath, ".idx");
+        // Corrupt the second block entry's recordCount to a value that
+        // makes the entry self-inconsistent (firmsBytes != firmCount*4).
+        // Layout per entry: header(24) + entry1(22) + entry2(22) + entry3(22).
+        var corruptOffset = AuditIndexCodec.FileHeaderSize + (AuditIndexCodec.BlockEntryFixedPrefix + 8) + 12;
+        using (var fs = new FileStream(idxPath, FileMode.Open, FileAccess.Write))
+        {
+            fs.Seek(corruptOffset, SeekOrigin.Begin);
+            fs.WriteByte(0xFF); fs.WriteByte(0xFF);
+        }
+
+        var got = AuditLogReader.ReadByFirm(logPath, firmId: 40).Select(r => r.TradeId).ToList();
+        Assert.Equal(new uint[] { 9, 10, 11, 12 }, got);
+        // And firm-10 (which appears in all three blocks) must still be
+        // fully visible: indexed block 1 + suffix scan covering blocks 2+3.
+        var firm10 = AuditLogReader.ReadByFirm(logPath, firmId: 10).Select(r => r.TradeId).ToList();
+        Assert.Equal(new uint[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, firm10);
+    }
 }
