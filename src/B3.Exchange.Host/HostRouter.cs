@@ -203,7 +203,7 @@ public sealed class HostRouter : IInboundCommandSink
         _logger.LogWarning("rejecting clOrdId={ClOrdId} from session {Session}: unknown securityId={SecurityId}",
             clOrdIdValue, session, secId);
         _outbound.WriteExecutionReportReject(session,
-            new RejectEvent(ClOrdId: clOrdIdValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
                 Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
             clOrdIdValue);
@@ -214,7 +214,7 @@ public sealed class HostRouter : IInboundCommandSink
         _logger.LogWarning("rejecting clOrdId={ClOrdId} from session {Session}: unknown orderId / OrigClOrdID",
             clOrdIdValue, session);
         _outbound.WriteExecutionReportReject(session,
-            new RejectEvent(ClOrdId: clOrdIdValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
                 Reason: RejectReason.UnknownOrderId, TransactTimeNanos: _nowNanos()),
             clOrdIdValue);

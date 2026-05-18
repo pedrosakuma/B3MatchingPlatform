@@ -309,8 +309,12 @@ public sealed partial class ChannelDispatcher
                 case WorkKind.DecodeError:
                     if (_hasCurrentSession)
                     {
+                        // RejectEvent.ClOrdId is unused by the encoder when
+                        // clOrdIdValue is passed explicitly (the encoder
+                        // prefers the ulong over ulong.TryParse(e.ClOrdId));
+                        // skip the alloc.
                         _outbound.WriteExecutionReportReject(_currentSession,
-                            new RejectEvent(_currentClOrdId.ToString(), 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
+                            new RejectEvent(string.Empty, 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
                             _currentClOrdId, CurrentDurability);
                         _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
                     }
