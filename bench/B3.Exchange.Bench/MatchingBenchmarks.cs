@@ -16,12 +16,18 @@ namespace B3.Exchange.Bench;
 /// sees a steady-state input. Runs against the host runtime (net10.0) by default.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 5, invocationCount: 1)]
 public class MatchingBenchmarks
 {
+    // Batch size per benchmark invocation. Large enough to push per-iteration
+    // time well above BenchmarkDotNet's minimum-iteration-time threshold, so
+    // the per-op CI tightens to a useful level (target < 5%).
+    private const int Batch = 2048;
+
     private MatchingEngine _engine = null!;
     private NoOpSink _sink = null!;
-    private long _prebuiltCancelOrderId;
+    private long[] _cancelOrderIds = null!;
+    private long _basePx;
+    private long _aggressorQty;
 
     [Params(10, 100)]
     public int CrossLevels;
@@ -31,9 +37,14 @@ public class MatchingBenchmarks
     {
         _sink = new NoOpSink();
         _engine = new MatchingEngine(new[] { BenchInstruments.Petr4 }, _sink, NullLogger<MatchingEngine>.Instance);
+        _cancelOrderIds = new long[Batch];
+        _basePx = BenchInstruments.Px(32.00m);
+        _aggressorQty = 100L * CrossLevels;
     }
 
     // ---------- NewOrder_NoCross ----------
+    // Submits Batch distinct LIMIT bids at descending prices so each one rests
+    // (never crosses) on a previously-empty book.
 
     [IterationSetup(Target = nameof(NewOrder_NoCross))]
     public void Setup_NoCross()
@@ -42,23 +53,28 @@ public class MatchingBenchmarks
         _sink.Reset();
     }
 
-    [Benchmark]
+    [Benchmark(OperationsPerInvoke = Batch)]
     public void NewOrder_NoCross()
     {
-        var cmd = new NewOrderCommand(
-            ClOrdId: "C1",
-            SecurityId: BenchInstruments.PetrSecId,
-            Side: Side.Buy,
-            Type: OrderType.Limit,
-            Tif: TimeInForce.Day,
-            PriceMantissa: BenchInstruments.Px(32.00m),
-            Quantity: 100,
-            EnteringFirm: 7,
-            EnteredAtNanos: 0);
-        _engine.Submit(cmd);
+        for (int i = 0; i < Batch; i++)
+        {
+            _engine.Submit(new NewOrderCommand(
+                ClOrdId: "C",
+                SecurityId: BenchInstruments.PetrSecId,
+                Side: Side.Buy,
+                Type: OrderType.Limit,
+                Tif: TimeInForce.Day,
+                PriceMantissa: _basePx - i,
+                Quantity: 100,
+                EnteringFirm: 7,
+                EnteredAtNanos: 0));
+        }
     }
 
     // ---------- NewOrder_FullCross ----------
+    // Each invocation runs Batch aggressor sweeps against a freshly-built book
+    // of CrossLevels resting bids. Setup pre-stages Batch * CrossLevels makers
+    // so the measured loop is purely the sweep cost.
 
     [IterationSetup(Target = nameof(NewOrder_FullCross))]
     public void Setup_FullCross()
@@ -66,69 +82,82 @@ public class MatchingBenchmarks
         _engine.ResetForChannelReset();
         _sink.Reset();
 
-        // Build N resting bids descending from 32.00 by 1 tick. Aggressor (sell, market IOC)
-        // will sweep all of them in a single Submit().
-        long basePx = BenchInstruments.Px(32.00m);
-        for (int i = 0; i < CrossLevels; i++)
+        // Stage Batch independent price bands so each aggressor sweep finds
+        // its own CrossLevels-deep book to consume. Bands are spaced so they
+        // never cross each other.
+        long band = _basePx;
+        for (int s = 0; s < Batch; s++)
+        {
+            for (int i = 0; i < CrossLevels; i++)
+            {
+                _engine.Submit(new NewOrderCommand(
+                    ClOrdId: "M",
+                    SecurityId: BenchInstruments.PetrSecId,
+                    Side: Side.Buy,
+                    Type: OrderType.Limit,
+                    Tif: TimeInForce.Day,
+                    PriceMantissa: band - i,
+                    Quantity: 100,
+                    EnteringFirm: 8,
+                    EnteredAtNanos: 0));
+            }
+            band -= CrossLevels;
+        }
+    }
+
+    [Benchmark(OperationsPerInvoke = Batch)]
+    public void NewOrder_FullCross()
+    {
+        for (int s = 0; s < Batch; s++)
         {
             _engine.Submit(new NewOrderCommand(
-                ClOrdId: $"M{i}",
+                ClOrdId: "AGG",
                 SecurityId: BenchInstruments.PetrSecId,
-                Side: Side.Buy,
-                Type: OrderType.Limit,
-                Tif: TimeInForce.Day,
-                PriceMantissa: basePx - i * 1, // 1 mantissa = 1 tick (0.0001) — we use Px so /10000.
-                Quantity: 100,
-                EnteringFirm: 8,
+                Side: Side.Sell,
+                Type: OrderType.Market,
+                Tif: TimeInForce.IOC,
+                PriceMantissa: 0,
+                Quantity: _aggressorQty,
+                EnteringFirm: 7,
                 EnteredAtNanos: 0));
         }
     }
 
-    [Benchmark]
-    public void NewOrder_FullCross()
-    {
-        var aggressor = new NewOrderCommand(
-            ClOrdId: "AGG",
-            SecurityId: BenchInstruments.PetrSecId,
-            Side: Side.Sell,
-            Type: OrderType.Market,
-            Tif: TimeInForce.IOC,
-            PriceMantissa: 0,
-            Quantity: 100L * CrossLevels,
-            EnteringFirm: 7,
-            EnteredAtNanos: 0);
-        _engine.Submit(aggressor);
-    }
-
     // ---------- Cancel_RestingOrder ----------
+    // Pre-seeds Batch resting orders; benchmark cancels each one once.
 
     [IterationSetup(Target = nameof(Cancel_RestingOrder))]
     public void Setup_Cancel()
     {
         _engine.ResetForChannelReset();
         _sink.Reset();
-        // Submit one resting order and remember its id (NoOpSink discards events,
-        // so we use the engine's own sequential allocator: first order = 1).
-        _engine.Submit(new NewOrderCommand(
-            ClOrdId: "R1",
-            SecurityId: BenchInstruments.PetrSecId,
-            Side: Side.Buy,
-            Type: OrderType.Limit,
-            Tif: TimeInForce.Day,
-            PriceMantissa: BenchInstruments.Px(32.00m),
-            Quantity: 100,
-            EnteringFirm: 7,
-            EnteredAtNanos: 0));
-        _prebuiltCancelOrderId = _engine.PeekNextOrderId - 1;
+        long firstId = _engine.PeekNextOrderId;
+        for (int i = 0; i < Batch; i++)
+        {
+            _engine.Submit(new NewOrderCommand(
+                ClOrdId: "R",
+                SecurityId: BenchInstruments.PetrSecId,
+                Side: Side.Buy,
+                Type: OrderType.Limit,
+                Tif: TimeInForce.Day,
+                PriceMantissa: _basePx - i,
+                Quantity: 100,
+                EnteringFirm: 7,
+                EnteredAtNanos: 0));
+            _cancelOrderIds[i] = firstId + i;
+        }
     }
 
-    [Benchmark]
+    [Benchmark(OperationsPerInvoke = Batch)]
     public void Cancel_RestingOrder()
     {
-        _engine.Cancel(new CancelOrderCommand(
-            ClOrdId: "X1",
-            SecurityId: BenchInstruments.PetrSecId,
-            OrderId: _prebuiltCancelOrderId,
-            EnteredAtNanos: 0));
+        for (int i = 0; i < Batch; i++)
+        {
+            _engine.Cancel(new CancelOrderCommand(
+                ClOrdId: "X",
+                SecurityId: BenchInstruments.PetrSecId,
+                OrderId: _cancelOrderIds[i],
+                EnteredAtNanos: 0));
+        }
     }
 }
