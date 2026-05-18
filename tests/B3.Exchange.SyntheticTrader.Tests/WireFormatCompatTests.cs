@@ -188,4 +188,24 @@ public class WireFormatCompatTests
         Assert.Equal(clOrd, er.ClOrdId);
         Assert.Equal(secId, er.SecurityId);
     }
+
+    [Fact]
+    public void BusinessMessageReject_HostEncodes_SynthTraderDecodesIdentical()
+    {
+        Span<byte> frame = stackalloc byte[BusinessMessageRejectEncoder.TotalSize(0)];
+        const uint refSeq = 0xABCD1234u;
+        const ulong refId = 0xDEADBEEFCAFEBABEUL;
+        BusinessMessageRejectEncoder.EncodeBusinessMessageReject(frame,
+            sessionId: 1, msgSeqNum: 2, sendingTimeNanos: 3,
+            refMsgType: 17, refSeqNum: refSeq, businessRejectRefId: refId,
+            businessRejectReason: BusinessMessageRejectEncoder.Reason.SystemBusy,
+            textAscii: ReadOnlySpan<byte>.Empty);
+
+        var body = frame.Slice(SbeHeaderSize, BusinessMessageRejectEncoder.BusinessRejectBlock);
+        var bmr = EntryPointClient.DecodeBusinessMessageReject(body);
+        Assert.Equal((byte)17, bmr.RefMsgType);
+        Assert.Equal(refSeq, bmr.RefSeqNum);
+        Assert.Equal(refId, bmr.BusinessRejectRefId);
+        Assert.Equal(BusinessMessageRejectEncoder.Reason.SystemBusy, bmr.BusinessRejectReason);
+    }
 }

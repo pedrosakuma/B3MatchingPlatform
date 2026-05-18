@@ -84,6 +84,7 @@ public sealed class EntryPointClient : IAsyncDisposable
         EntryPointFrameReader.TidExecutionReportCancel => 182,
         EntryPointFrameReader.TidExecutionReportTrade => 174,
         EntryPointFrameReader.TidExecutionReportReject => 164,
+        EntryPointFrameReader.TidBusinessMessageReject => 36,
         _ => -1,
     };
 
@@ -105,6 +106,17 @@ public sealed class EntryPointClient : IAsyncDisposable
     public event Action<ExecReportTrade>? OnTrade;
     public event Action<ExecReportCancel>? OnCancel;
     public event Action<ExecReportReject>? OnReject;
+    /// <summary>
+    /// Fires when the gateway emits a session-layer <c>BusinessMessageReject</c>
+    /// (templateId 206) against an inbound business message — e.g. wrong
+    /// sessionID in the business header, throttle exceeded, or varData
+    /// validation failure. Distinct from <see cref="OnReject"/>, which
+    /// fires only on <c>ExecutionReport.Reject</c> (templateId 207, an
+    /// engine-level rejection). Before issue #326 these frames were
+    /// silently ignored on the recv loop, leaving tests with no signal
+    /// when the gateway rejected an order pre-engine.
+    /// </summary>
+    public event Action<BusinessMessageReject>? OnBusinessReject;
     public event Action<string>? OnDisconnect;
 
     public bool IsOpen => Interlocked.Read(ref _isOpen) == 1;
@@ -319,6 +331,19 @@ public sealed class EntryPointClient : IAsyncDisposable
         OrderId: BinaryPrimitives.ReadInt64LittleEndian(body.Slice(ErRejectOrderId, 8)),
         OrigClOrdId: BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(ErRejectOrigClOrdId, 8)),
         RejectReason: body[ErRejectReason]);
+
+    /// <summary>Decodes a <c>BusinessMessageReject</c> (templateId 206)
+    /// fixed block. Body layout (V0): OutboundBusinessHeader(18) +
+    /// refMsgType(1) + padding(1) + refSeqNum(uint32 @20) +
+    /// businessRejectRefID(uint64 @24) + businessRejectReason(uint32 @32).
+    /// Text varData is intentionally skipped here — callers that need it
+    /// can subscribe to <see cref="OnBusinessReject"/> and parse the raw
+    /// frame separately.</summary>
+    internal static BusinessMessageReject DecodeBusinessMessageReject(ReadOnlySpan<byte> body) => new(
+        RefMsgType: body.Length > 18 ? body[18] : (byte)0,
+        RefSeqNum: body.Length >= 24 ? BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(20, 4)) : 0u,
+        BusinessRejectRefId: body.Length >= 32 ? BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(24, 8)) : 0UL,
+        BusinessRejectReason: body.Length >= 36 ? BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(32, 4)) : 0u);
 
     private bool Enqueue(byte[] frame)
     {
@@ -555,6 +580,13 @@ public sealed class EntryPointClient : IAsyncDisposable
                         OnReject?.Invoke(er);
                         break;
                     }
+                case EntryPointFrameReader.TidBusinessMessageReject:
+                    {
+                        var bmr = DecodeBusinessMessageReject(slice);
+                        _logWarn?.Invoke($"recv BMR refMsgType={bmr.RefMsgType} refSeqNum={bmr.RefSeqNum} refId={bmr.BusinessRejectRefId} reason={bmr.BusinessRejectReason}");
+                        OnBusinessReject?.Invoke(bmr);
+                        break;
+                    }
                 default:
                     _logDebug?.Invoke($"recv ignored tid={templateId} v={version}");
                     break;
@@ -621,3 +653,4 @@ public readonly record struct ExecReportTrade(ulong ClOrdId, long SecurityId, Or
     long LastQty, long LastPxMantissa, long LeavesQty, long CumQty);
 public readonly record struct ExecReportCancel(ulong ClOrdId, long SecurityId, OrderSide Side, long OrderId);
 public readonly record struct ExecReportReject(ulong ClOrdId, long SecurityId, long OrderId, ulong OrigClOrdId, byte RejectReason);
+public readonly record struct BusinessMessageReject(byte RefMsgType, uint RefSeqNum, ulong BusinessRejectRefId, uint BusinessRejectReason);
