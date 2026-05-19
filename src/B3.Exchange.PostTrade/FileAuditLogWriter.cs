@@ -1,3 +1,5 @@
+using Microsoft.Win32.SafeHandles;
+
 namespace B3.Exchange.PostTrade;
 
 /// <summary>
@@ -12,9 +14,12 @@ namespace B3.Exchange.PostTrade;
 /// Threading model: OnTrade and OnCommandBoundary are called exclusively on
 /// the <c>ChannelDispatcher</c>'s dispatch thread. Checkpoint MAY be called
 /// from another thread (the async snapshot writer's onSaved callback runs on
-/// the writer thread). A single private lock serializes Checkpoint against
-/// OnTrade/OnCommandBoundary; the lock is uncontended in steady state since
-/// Checkpoint fires at snapshot intervals.
+/// the writer thread). A single private state lock serializes mutations of
+/// the FileStream / counters; the slow <c>fsync</c> portion of Checkpoint is
+/// executed OUTSIDE the lock against the underlying <see cref="SafeFileHandle"/>
+/// via <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/> so the
+/// dispatch thread's next OnTrade does not have to wait for storage
+/// (issue #349).
 ///
 /// Durability watermark (issue #329 PR-4): each <see cref="OnCommandBoundary"/>
 /// records the engine's <c>commandSeq</c> as the highest seq covered by the
@@ -29,10 +34,12 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     private readonly int _indexBlockRecords;
     private readonly byte[] _scratch;
     private readonly byte[] _indexScratch;
-    private readonly object _checkpointLock = new();
+    private readonly object _stateLock = new();
 
     private FileStream? _stream;
     private FileStream? _indexStream;
+    private SafeFileHandle? _streamHandle;
+    private SafeFileHandle? _indexStreamHandle;
     private DateOnly _currentDate;
     private long _recordsWritten;
 
@@ -137,7 +144,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 
     public void OnTrade(in PostTradeRecord record)
     {
-        lock (_checkpointLock)
+        lock (_stateLock)
         {
             // If a prior write already failed, refuse silently — the audit
             // log is in a known-broken state and further writes would only
@@ -186,7 +193,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// No-op when the writer is in write-fault state.</summary>
     public void OnCommandBoundary(long commandSeq)
     {
-        lock (_checkpointLock)
+        lock (_stateLock)
         {
             if (_writeFault) return;
             // Monotonic: tolerate replay paths that resubmit lower seqs.
@@ -202,9 +209,32 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// — callers must treat that as "audit not durable; defer truncation".
     /// Throws when the writer is in write-fault state so the WAL truncation
     /// gate stays closed.</summary>
+    /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
+    /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
+    /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
+    /// (the lock serializes against OnTrade/OnCommandBoundary on the
+    /// dispatch thread). If the fsync throws the watermark is NOT advanced
+    /// — callers must treat that as "audit not durable; defer truncation".
+    /// Throws when the writer is in write-fault state so the WAL truncation
+    /// gate stays closed.
+    ///
+    /// <para>Issue #349: the slow <c>fsync</c> syscalls run OUTSIDE the
+    /// state lock against pinned <see cref="SafeFileHandle"/> refs (via
+    /// <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/>). The state
+    /// lock is held only for: bail-on-fault check, FlushCurrentBlock,
+    /// user-space buffer flush, snapshot pending, AddRef the handles —
+    /// all O(1) memcpy/syscall work. The dispatch thread can keep
+    /// OnTrade-ing during the storage fsync without being stalled.
+    /// Handle lifetime is anchored by <see cref="SafeHandle.DangerousAddRef"/>
+    /// so a concurrent rotation/dispose can't pull the fd from under us.</para></summary>
     public void Checkpoint()
     {
-        lock (_checkpointLock)
+        long pending;
+        SafeFileHandle? streamHandle = null;
+        SafeFileHandle? indexHandle = null;
+        bool streamRef = false;
+        bool indexRef = false;
+        lock (_stateLock)
         {
             if (_writeFault)
             {
@@ -214,10 +244,25 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             // Snapshot the pending boundary BEFORE the fsync — any
             // concurrent OnCommandBoundary call would have to acquire
             // this lock so the value is stable while we fsync.
-            long pending = _pendingCommandSeq;
+            pending = _pendingCommandSeq;
             FlushCurrentBlock();
-            _stream?.Flush(flushToDisk: true);
-            _indexStream?.Flush(flushToDisk: true);
+            // Push FileStream user-space buffer down to the OS while we
+            // hold the lock; the slow disk fsync happens below outside
+            // the lock against the SafeFileHandle directly.
+            _stream?.Flush(flushToDisk: false);
+            _indexStream?.Flush(flushToDisk: false);
+            streamHandle = _streamHandle;
+            indexHandle = _indexStreamHandle;
+            // Anchor the handles for the duration of the fsync so a
+            // concurrent OnTrade-triggered RotateTo (or Dispose) can't
+            // close the underlying fd while we're flushing it.
+            if (streamHandle is not null) streamHandle.DangerousAddRef(ref streamRef);
+            if (indexHandle is not null) indexHandle.DangerousAddRef(ref indexRef);
+        }
+        try
+        {
+            if (streamRef) RandomAccess.FlushToDisk(streamHandle!);
+            if (indexRef) RandomAccess.FlushToDisk(indexHandle!);
             // Issue #329 PR-5: persist the watermark sidecar so a post-crash
             // boot can recover it and gate replay-mode OnTrade emissions.
             // Order matters: sidecar update happens AFTER the .log/.idx
@@ -226,8 +271,20 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             // we propagate without advancing _durableCommandSeq so the gate
             // stays closed and the next Checkpoint retries.
             WriteWatermarkSidecar(pending);
-            // Advance only on success; if any Flush threw we propagate
-            // without touching _durableCommandSeq so the gate stays closed.
+        }
+        finally
+        {
+            if (streamRef) streamHandle!.DangerousRelease();
+            if (indexRef) indexHandle!.DangerousRelease();
+        }
+        // Advance only on success; if any Flush/sidecar threw we
+        // propagated above without touching _durableCommandSeq so the
+        // WAL truncation gate stays closed. Re-check _writeFault — a
+        // concurrent OnTrade may have failed during the unlocked fsync
+        // window; if so do not promote the watermark.
+        lock (_stateLock)
+        {
+            if (_writeFault) return;
             Volatile.Write(ref _durableCommandSeq, pending);
         }
     }
@@ -245,7 +302,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// <summary>Test-only hook to force the writer into write-fault state
     /// without engineering a real I/O failure. Exercises the watermark
     /// poisoning contract.</summary>
-    internal void ForceWriteFaultForTests() { lock (_checkpointLock) { _writeFault = true; } }
+    internal void ForceWriteFaultForTests() { lock (_stateLock) { _writeFault = true; } }
 
     private void TrackFirm(uint firmId)
     {
@@ -278,12 +335,14 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             _stream.Flush(flushToDisk: true);
             _stream.Dispose();
             _stream = null;
+            _streamHandle = null;
         }
         if (_indexStream is not null)
         {
             _indexStream.Flush(flushToDisk: true);
             _indexStream.Dispose();
             _indexStream = null;
+            _indexStreamHandle = null;
         }
         var channelDir = Path.Combine(_rootDir, _channelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture));
         Directory.CreateDirectory(channelDir);
@@ -303,6 +362,10 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         }
         fs.Seek(0, SeekOrigin.End);
         _stream = fs;
+        // Cache the underlying SafeFileHandle so Checkpoint can call
+        // RandomAccess.FlushToDisk outside the state lock (issue #349).
+        // The handle is owned by the FileStream; Dispose releases it.
+        _streamHandle = fs.SafeFileHandle;
         _currentDate = newDate;
         _blockRecordCount = 0;
         _blockFirmIds.Clear();
@@ -320,6 +383,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         AuditIndexCodec.WriteFileHeader(_indexScratch, _channelNumber, newDate);
         ix.Write(_indexScratch, 0, AuditIndexCodec.FileHeaderSize);
         _indexStream = ix;
+        _indexStreamHandle = ix.SafeFileHandle;
         ix.Flush(flushToDisk: false);
         if (logStream.Length <= AuditRecordCodec.FileHeaderSize) return;
 
@@ -413,7 +477,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// .idx) are still counted toward the deletion total per file.</para>
     ///
     /// <para>Safe to call from any thread: the method acquires the same
-    /// <c>_checkpointLock</c> as <see cref="Checkpoint"/> / <see cref="Dispose"/>
+    /// <c>_stateLock</c> as <see cref="Checkpoint"/> / <see cref="Dispose"/>
     /// so it never races the active stream. The active day is identified
     /// by <c>_currentDate</c> under the lock to avoid a TOCTOU window.</para>
     /// </summary>
@@ -425,7 +489,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         if (!Directory.Exists(channelDir)) return 0;
         var cutoff = todayUtc.AddDays(-retentionDays);
         int deleted = 0;
-        lock (_checkpointLock)
+        lock (_stateLock)
         {
             foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.*"))
             {
@@ -475,7 +539,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 
     public void Dispose()
     {
-        lock (_checkpointLock)
+        lock (_stateLock)
         {
             if (_stream is not null)
             {
@@ -483,12 +547,14 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
                 _stream.Flush(flushToDisk: true);
                 _stream.Dispose();
                 _stream = null;
+                _streamHandle = null;
             }
             if (_indexStream is not null)
             {
                 _indexStream.Flush(flushToDisk: true);
                 _indexStream.Dispose();
                 _indexStream = null;
+                _indexStreamHandle = null;
             }
         }
     }
