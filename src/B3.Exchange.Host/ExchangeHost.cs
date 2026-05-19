@@ -38,6 +38,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<B3.Exchange.PostTrade.FileAuditLogWriter> _auditWriters = new();
     private readonly List<Timer> _auditRetentionTimers = new();
     private readonly Dictionary<byte, EodExportContext> _eodExportByChannel = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(byte Channel, DateOnly Date), byte> _eodExportInFlight = new();
     private readonly MetricsRegistry _metrics = new();
     private readonly StartupReadinessProbe _startupProbe = new("startup");
     private readonly ShutdownReadinessProbe _shutdownProbe = new("shutdown");
@@ -701,22 +702,55 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// configured (operator should treat as 404); otherwise the export
     /// result so the endpoint can surface row count / sha256 / path.</returns>
     /// <remarks>
-    /// Exceptions thrown by <c>EodFillsExporter.Export</c> propagate to the
-    /// caller — the HTTP endpoint translates them into structured 4xx/5xx
-    /// responses. The exporter is stateless and safe to call concurrently
-    /// for distinct (channel, date) pairs; serialization for the same
-    /// (channel, date) is the operator's responsibility.
+    /// Concurrent calls for the SAME <c>(channel, date)</c> are serialized
+    /// here — the second caller throws <see cref="EodExportInProgressException"/>
+    /// so the endpoint can surface a 409 Conflict without partially
+    /// publishing two interleaved CSV / .done pairs. Different
+    /// <c>(channel, date)</c> pairs run concurrently (the underlying
+    /// exporter is stateless). Other exceptions from
+    /// <c>EodFillsExporter.Export</c> propagate to the caller.
     /// </remarks>
     internal B3.Exchange.PostTrade.EodFillsExportResult? TriggerEodExport(byte channelNumber, DateOnly businessDate)
     {
         if (!_eodExportByChannel.TryGetValue(channelNumber, out var ctx)) return null;
-        return ctx.Exporter.Export(
-            ctx.AuditRootDir,
-            ctx.DropRootDir,
-            channelNumber,
-            businessDate,
-            secId => ctx.Symbols.TryGetValue(secId, out var sym) ? sym : null,
-            DateTime.UtcNow);
+        var key = (channelNumber, businessDate);
+        if (!_eodExportInFlight.TryAdd(key, 0))
+        {
+            throw new EodExportInProgressException(channelNumber, businessDate);
+        }
+        try
+        {
+            return ctx.Exporter.Export(
+                ctx.AuditRootDir,
+                ctx.DropRootDir,
+                channelNumber,
+                businessDate,
+                secId => ctx.Symbols.TryGetValue(secId, out var sym) ? sym : null,
+                DateTime.UtcNow);
+        }
+        finally
+        {
+            _eodExportInFlight.TryRemove(key, out _);
+        }
+    }
+
+    /// <summary>
+    /// Thrown by <see cref="TriggerEodExport"/> when another export for
+    /// the same <c>(channel, date)</c> is already in flight. The HTTP
+    /// endpoint translates this into a 409 Conflict so concurrent
+    /// operators never observe a CSV / .done pair whose bytes came from
+    /// different exporter runs.
+    /// </summary>
+    internal sealed class EodExportInProgressException : InvalidOperationException
+    {
+        public byte Channel { get; }
+        public DateOnly Date { get; }
+        public EodExportInProgressException(byte channel, DateOnly date)
+            : base($"EOD export already in progress for channel={channel} date={date:yyyy-MM-dd}")
+        {
+            Channel = channel;
+            Date = date;
+        }
     }
 
     /// <summary>

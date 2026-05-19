@@ -455,7 +455,7 @@ public sealed class PostTradeAuditConfig
     /// <c>EodFillsExporter</c> (issue #330). Layout:
     /// <c>{EodDropDir}/{channelNumber}/{YYYY-MM-DD}/fills.csv</c> + sibling
     /// <c>fills.csv.done</c>. Empty (default) ⇒ the
-    /// <c>POST /admin/post-trade/eod-export</c> endpoint returns 503 for
+    /// <c>POST /admin/post-trade/eod-export</c> endpoint returns 404 for
     /// this channel and the daily-reset auto-trigger (PR-3) skips it.
     /// Operators typically point this at a different mount than
     /// <see cref="DataDir"/> so downstream reconciliation jobs can drain

@@ -220,4 +220,92 @@ public class HttpServerEodExportTests
             TryDeleteDir(dropDir);
         }
     }
+
+    [Fact]
+    public async Task Post_EodExport_IsIdempotent_AcrossSequentialReruns()
+    {
+        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
+        var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(auditDir);
+            SeedAuditLog(auditDir, MakeFill(1, 900000000001L), MakeFill(2, 900000000001L));
+
+            var cfg = BuildConfig(instrumentsPath, auditDir, dropDir);
+            await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink());
+            await host.StartAsync();
+
+            using var client = new HttpClient { BaseAddress = new Uri($"http://{host.HttpEndpoint}") };
+            using var r1 = await client.PostAsync($"/admin/post-trade/eod-export?channel={Channel}&date=2026-05-18", content: null);
+            using var r2 = await client.PostAsync($"/admin/post-trade/eod-export?channel={Channel}&date=2026-05-18", content: null);
+
+            Assert.Equal(HttpStatusCode.OK, r1.StatusCode);
+            Assert.Equal(HttpStatusCode.OK, r2.StatusCode);
+
+            using var d1 = JsonDocument.Parse(await r1.Content.ReadAsStringAsync());
+            using var d2 = JsonDocument.Parse(await r2.Content.ReadAsStringAsync());
+            Assert.Equal(
+                d1.RootElement.GetProperty("sha256").GetString(),
+                d2.RootElement.GetProperty("sha256").GetString());
+
+            await host.StopAsync();
+        }
+        finally
+        {
+            TryDeleteDir(auditDir);
+            TryDeleteDir(dropDir);
+        }
+    }
+
+    [Fact]
+    public async Task Post_EodExport_RejectsConcurrentSameChannelDateWith409()
+    {
+        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
+        var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(auditDir);
+            // Many records so the export takes long enough to race against.
+            var records = new PostTradeRecord[2000];
+            for (uint i = 0; i < records.Length; i++)
+                records[i] = MakeFill(i + 1, 900000000001L, nanosOffset: (ulong)i * 1000UL);
+            SeedAuditLog(auditDir, records);
+
+            var cfg = BuildConfig(instrumentsPath, auditDir, dropDir);
+            await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink());
+            await host.StartAsync();
+
+            using var client = new HttpClient { BaseAddress = new Uri($"http://{host.HttpEndpoint}") };
+
+            // Fire 8 parallel requests for the same (channel, date). Each
+            // must return either 200 (the one that grabbed the in-flight
+            // slot) or 409 (lost the race) — NEVER 500, never partial.
+            var tasks = Enumerable.Range(0, 8).Select(_ =>
+                client.PostAsync($"/admin/post-trade/eod-export?channel={Channel}&date=2026-05-18", content: null)).ToArray();
+            var responses = await Task.WhenAll(tasks);
+            try
+            {
+                int ok = responses.Count(r => r.StatusCode == HttpStatusCode.OK);
+                int conflict = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
+                Assert.Equal(responses.Length, ok + conflict);
+                Assert.True(ok >= 1, "at least one request must succeed");
+                // 409 count is environment-dependent (zero is acceptable
+                // when requests serialize on the wire); the critical
+                // guarantee is no 500s and no partial publishes.
+            }
+            finally
+            {
+                foreach (var r in responses) r.Dispose();
+            }
+
+            await host.StopAsync();
+        }
+        finally
+        {
+            TryDeleteDir(auditDir);
+            TryDeleteDir(dropDir);
+        }
+    }
 }

@@ -526,6 +526,12 @@ public sealed class HttpServer : IAsyncDisposable
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             return Results.Text($"audit log not found for channel={channel} date={date:yyyy-MM-dd}\n", "text/plain");
         }
+        catch (ExchangeHost.EodExportInProgressException)
+        {
+            _log?.Invoke($"admin: eod-export channel={channel} date={date:yyyy-MM-dd} rejected: already in progress");
+            ctx.Response.StatusCode = StatusCodes.Status409Conflict;
+            return Results.Text($"eod-export already in progress for channel={channel} date={date:yyyy-MM-dd}\n", "text/plain");
+        }
         catch (Exception ex)
         {
             _log?.Invoke($"admin: eod-export channel={channel} date={date:yyyy-MM-dd} failed: {ex.GetType().Name}: {ex.Message}");
