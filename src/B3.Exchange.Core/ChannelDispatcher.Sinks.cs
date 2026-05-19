@@ -305,6 +305,24 @@ public sealed partial class ChannelDispatcher
     public void OnOrderCanceled(in OrderCanceledEvent e)
     {
         AssertOnLoopThread();
+
+        // Issue #357: an IOC/FOK aggressor that found zero crossing
+        // liquidity is cancelled by the engine to give the originating
+        // session a definitive terminal ER. The order never rested on
+        // the public book, so we skip the MBO DeleteOrder frame and
+        // route the ER directly via the active command context (the
+        // requester is the aggressor; no registry entry to evict).
+        if (e.Reason == CancelReason.IocUnmatched)
+        {
+            if (_hasCurrentSession)
+            {
+                _outbound.WriteExecutionReportPassiveCancel(_currentSession, _currentClOrdId, e.OrderId, e,
+                    _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
+                _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
+            }
+            return;
+        }
+
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;

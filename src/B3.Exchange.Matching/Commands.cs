@@ -158,6 +158,12 @@ public enum CancelReason : byte
     /// in the uncross is removed when the auction phase resolves.
     /// Issue #232 / Onda M5.</summary>
     AuctionExpired,
+    /// <summary>IOC/FOK aggressor that found zero crossing liquidity on
+    /// submission (no fills, never rested on the book). Issue #357. The
+    /// integration layer emits only an <c>ExecutionReport_Cancel</c> back
+    /// to the originating session — no MBO frame, since the order was
+    /// never visible on the public book.</summary>
+    IocUnmatched,
 }
 
 /// <summary>
