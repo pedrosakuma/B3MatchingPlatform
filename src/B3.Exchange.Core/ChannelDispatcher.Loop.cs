@@ -250,7 +250,7 @@ public sealed partial class ChannelDispatcher
                             _currentClOrdId = prioClOrd;
                             _crossSweepFilledQty = 0;
                             BeginAggressor(sweepLeg.Quantity);
-                            _engine.Submit(sweepLeg);
+                            _engine.SubmitCrossSweep(sweepLeg);
                             long swept = _crossSweepFilledQty.GetValueOrDefault();
                             _crossSweepFilledQty = null;
 

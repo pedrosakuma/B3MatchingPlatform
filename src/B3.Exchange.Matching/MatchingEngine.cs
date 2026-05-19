@@ -746,7 +746,22 @@ public sealed class MatchingEngine
         }
     }
 
-    public void Submit(NewOrderCommand cmd)
+    public void Submit(NewOrderCommand cmd) => SubmitImpl(cmd, emitUnmatchedIocClose: true);
+
+    /// <summary>
+    /// Internal entry point used by <c>ChannelDispatcher</c> for the
+    /// AgainstBook cross sweep leg (#218 / Onda L · L5). Semantically
+    /// identical to <see cref="Submit(NewOrderCommand)"/> except that a
+    /// zero-fill IOC outcome does NOT emit an
+    /// <see cref="CancelReason.IocUnmatched"/> closure event: the cross
+    /// workflow continues with phase-2 / phase-3 submissions reusing the
+    /// same per-leg ClOrdID and would observe a contradictory terminal
+    /// cancel for an order that is still active in the same cross.
+    /// Refs #357.
+    /// </summary>
+    public void SubmitCrossSweep(NewOrderCommand cmd) => SubmitImpl(cmd, emitUnmatchedIocClose: false);
+
+    private void SubmitImpl(NewOrderCommand cmd, bool emitUnmatchedIocClose)
     {
         EnterDispatch();
         try
@@ -920,7 +935,7 @@ public sealed class MatchingEngine
                 RestForAuction(cmd, book);
                 return;
             }
-            ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose: true);
+            ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose);
         }
         finally { ExitDispatch(); }
     }
