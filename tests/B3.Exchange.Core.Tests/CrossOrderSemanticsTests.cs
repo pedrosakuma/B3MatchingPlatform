@@ -167,6 +167,12 @@ public class CrossOrderSemanticsTests
         // Residual sell leg is fully consumed by internal print → no
         // resting sell remains. The buy cross-residual rested first then
         // was filled by sell — final: book empty, no News for sell rests.
+
+        // Issue #357 regression: the cross-sweep IOC leg must NOT emit
+        // an IocUnmatched cancel even when the opposing public book is
+        // empty — the prioritized leg is still active in phase-2/3 of
+        // the same cross workflow under the same ClOrdID.
+        Assert.DoesNotContain(s.Cancels, c => c.Reason == CancelReason.IocUnmatched);
     }
 
     [Fact]

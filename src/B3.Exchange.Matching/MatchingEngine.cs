@@ -746,7 +746,22 @@ public sealed class MatchingEngine
         }
     }
 
-    public void Submit(NewOrderCommand cmd)
+    public void Submit(NewOrderCommand cmd) => SubmitImpl(cmd, emitUnmatchedIocClose: true);
+
+    /// <summary>
+    /// Internal entry point used by <c>ChannelDispatcher</c> for the
+    /// AgainstBook cross sweep leg (#218 / Onda L · L5). Semantically
+    /// identical to <see cref="Submit(NewOrderCommand)"/> except that a
+    /// zero-fill IOC outcome does NOT emit an
+    /// <see cref="CancelReason.IocUnmatched"/> closure event: the cross
+    /// workflow continues with phase-2 / phase-3 submissions reusing the
+    /// same per-leg ClOrdID and would observe a contradictory terminal
+    /// cancel for an order that is still active in the same cross.
+    /// Refs #357.
+    /// </summary>
+    public void SubmitCrossSweep(NewOrderCommand cmd) => SubmitImpl(cmd, emitUnmatchedIocClose: false);
+
+    private void SubmitImpl(NewOrderCommand cmd, bool emitUnmatchedIocClose)
     {
         EnterDispatch();
         try
@@ -920,7 +935,7 @@ public sealed class MatchingEngine
                 RestForAuction(cmd, book);
                 return;
             }
-            ExecuteAggressor(cmd, rules, book);
+            ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose);
         }
         finally { ExitDispatch(); }
     }
@@ -1163,13 +1178,14 @@ public sealed class MatchingEngine
                 RestForAuction(replacement, book);
                 return;
             }
-            ExecuteAggressor(replacement, rules, book);
+            ExecuteAggressor(replacement, rules, book, emitUnmatchedIocClose: false);
         }
         finally { ExitDispatch(); }
     }
 
-    private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
-        => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++);
+    private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book,
+        bool emitUnmatchedIocClose)
+        => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++, emitUnmatchedIocClose);
 
     /// <summary>
     /// Issue #228 (Onda M · M1): rest the order on the book without any
@@ -1403,7 +1419,7 @@ public sealed class MatchingEngine
         => t == OrderType.Market || t == OrderType.MarketWithLeftover;
 
     private void ExecuteAggressorWithOrderId(NewOrderCommand cmd, InstrumentTradingRules rules,
-        LimitOrderBook book, long aggressorOrderIdForTrades)
+        LimitOrderBook book, long aggressorOrderIdForTrades, bool emitUnmatchedIocClose)
     {
         long aggressorRemaining = cmd.Quantity;
         bool isMarket = IsMarketLike(cmd.Type);
@@ -1605,8 +1621,28 @@ public sealed class MatchingEngine
             if (cmd.Tif == TimeInForce.IOC || cmd.Tif == TimeInForce.FOK)
             {
                 // FOK reaches here only via the pre-check (impossible for it to
-                // partially fill); IOC remainder is silently dropped from the book
-                // perspective — no MBO event needed for an order that never rested.
+                // partially fill); IOC remainder is silently dropped from the
+                // public-book perspective (no MBO event for an order that
+                // never rested). Issue #357: when this branch is reached on a
+                // *new* IOC/FOK submission (not via Replace or stop trigger)
+                // and STP did not pre-cancel the aggressor, emit a closure
+                // event so the originating session receives an
+                // ExecutionReport_Cancel acknowledging the terminal state.
+                // We only signal the zero-fills case here; partial-fill
+                // remainders are still implicitly closed by the last
+                // ER_Trade carrying LeavesQty=0 in cum/leaves accounting.
+                if (emitUnmatchedIocClose && !stpAggressorCanceled && !anyTrade)
+                {
+                    _sink.OnOrderCanceled(new OrderCanceledEvent(
+                        SecurityId: book.SecurityId,
+                        OrderId: aggressorOrderIdForTrades,
+                        Side: cmd.Side,
+                        PriceMantissa: cmd.PriceMantissa,
+                        RemainingQuantityAtCancel: aggressorRemaining,
+                        TransactTimeNanos: cmd.EnteredAtNanos,
+                        Reason: CancelReason.IocUnmatched,
+                        RptSeq: NextRptSeq()));
+                }
                 return;
             }
 
@@ -1868,7 +1904,7 @@ public sealed class MatchingEngine
         if (triggered.Type == OrderType.Market && book.BestLevel(LimitOrderBook.Opposite(triggered.Side)) is null)
             return;
 
-        ExecuteAggressorWithOrderId(triggered, rules, book, s.OrderId);
+        ExecuteAggressorWithOrderId(triggered, rules, book, s.OrderId, emitUnmatchedIocClose: false);
     }
 
     private void Reject(string clOrdId, long securityId, long orderId, RejectReason r, ulong txn)
