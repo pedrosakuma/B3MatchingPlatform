@@ -5,29 +5,20 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <RootNamespace>B3.Exchange.Bench</RootNamespace>
-    <AssemblyName>B3.Exchange.Bench</AssemblyName>
+    <RootNamespace>B3.Exchange.PerfProfile342</RootNamespace>
+    <AssemblyName>PerfProfile342</AssemblyName>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
-    <!-- BenchmarkDotNet emits some warnings (e.g. about ReadyToRun) we don't care about. -->
-    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
-    <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
-    <ProjectReference Include="..\..\src\B3.Exchange.PostTrade\B3.Exchange.PostTrade.csproj" />
+    <ProjectReference Include="..\..\bench\B3.Exchange.Bench\B3.Exchange.Bench.csproj" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="BenchmarkDotNet" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <!-- Issue #342: standalone perf-profile harness reuses the bench types. -->
-    <InternalsVisibleTo Include="PerfProfile342" />
   </ItemGroup>
 
 </Project>
