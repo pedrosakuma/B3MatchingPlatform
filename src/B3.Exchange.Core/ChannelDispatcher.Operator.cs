@@ -1,5 +1,7 @@
 namespace B3.Exchange.Core;
 
+using Microsoft.Extensions.Logging;
+
 /// <summary>
 /// Operator-command facet of <see cref="ChannelDispatcher"/> (issue #168
 /// split): the producer-side <c>EnqueueOperator*</c> APIs (channel-reset,
@@ -230,9 +232,31 @@ public sealed partial class ChannelDispatcher
                     {
                         var bust = new B3.Exchange.PostTrade.BustRecord(
                             op.TradeId, op.AttemptTransactTimeNanos,
-                            result.MatchedFill.SecurityId, op.ReasonCode, op.BusterFirm, op.CorrelationId);
-                        _postTradeSink.OnBust(bust, op.TradeDate);
-                        _bustDedup!.Add(op.TradeId, op.CorrelationId, op.TradeDate);
+                            result.MatchedFill.SecurityId, op.ReasonCode, op.BusterFirm, op.CorrelationId,
+                            DeclaredTradeDateDays: tradeDateDaysSinceEpoch);
+                        // ADR 0008 §3 routing: under the per-channel
+                        // post-trade lock, decide pre-EOD vs post-EOD
+                        // based on the existence of the target day's
+                        // fills.csv.done sidecar; this closes the race
+                        // with EodFillsExporter (which holds the same
+                        // lock between its cancelled-set scan and the
+                        // .done rename).
+                        DateOnly bustFileDate = op.TradeDate;
+                        bool isPostEod = false;
+                        lock (PostTradeRoutingLock)
+                        {
+                            if (_dropRootDir != null
+                                && File.Exists(Path.Combine(_dropRootDir,
+                                    ChannelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                                    op.TradeDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                                    "fills.csv.done")))
+                            {
+                                bustFileDate = DateOnly.FromDateTime(DateTime.UtcNow);
+                                isPostEod = true;
+                            }
+                            _postTradeSink.OnBust(bust, bustFileDate);
+                            _bustDedup!.Add(op.TradeId, op.CorrelationId, op.TradeDate);
+                        }
                         // Emit TradeBust_57 frame; price/size echo come from the
                         // matched fill so consumers see the same data the
                         // original Trade_53 carried.
@@ -249,6 +273,22 @@ public sealed partial class ChannelDispatcher
                             _nowNanos(), rptSeq);
                         Commit(written);
                         FlushPacket();
+                        // ADR 0008 §4: post-EOD busts publish/refresh
+                        // amendments.csv for the original trade's day so
+                        // external consumers see the late correction.
+                        if (isPostEod && _amendmentsPublisher != null && _auditRootDir != null && _dropRootDir != null)
+                        {
+                            try
+                            {
+                                _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, ChannelNumber, op.TradeDate, DateTime.UtcNow);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex,
+                                    "amendments.csv publish failed for channel={Channel} date={Date}; bust persisted but downstream consumers will only see it on next operator retry or restart",
+                                    ChannelNumber, op.TradeDate);
+                            }
+                        }
                         break;
                     }
                 case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:

@@ -130,10 +130,39 @@ public class AuditRecordCodecTests
     }
 
     [Fact]
+    public void EncodeBust_V3_RoundTripsDeclaredTradeDate()
+    {
+        // ADR 0008 PR-4: declaredTradeDate (LocalMktDate days since
+        // 1970-01-01) survives a v3 encode/decode round-trip.
+        var src = SampleBust() with { DeclaredTradeDateDays = 20597 };
+        Span<byte> buf = stackalloc byte[AuditRecordCodec.BustRecordSize];
+        AuditRecordCodec.EncodeBust(buf, in src);
+        Assert.True(AuditRecordCodec.TryDecodeBust(buf, out var dst));
+        Assert.Equal(20597, dst.DeclaredTradeDateDays);
+        Assert.Equal(src, dst);
+    }
+
+    [Fact]
+    public void TryGetRecordSize_AcceptsBothV2AndV3BustLengths()
+    {
+        // ADR 0008 PR-4: schema bump V2→V3 added declaredTradeDate to
+        // BustRecord (recordLen 40→44). The dispatcher and the writer's
+        // recovery scan both call TryGetRecordSize per-record, so the
+        // size table must keep accepting v2-on-disk records to honour
+        // the per-file-header schema view.
+        Assert.True(AuditRecordCodec.TryGetRecordSize(AuditRecordCodec.BustRecordV2Len, out var v2Size, out var v2Kind));
+        Assert.Equal(AuditRecordCodec.BustRecordV2Size, v2Size);
+        Assert.Equal(AuditRecordKind.Bust, v2Kind);
+        Assert.True(AuditRecordCodec.TryGetRecordSize(AuditRecordCodec.BustRecordV3Len, out var v3Size, out var v3Kind));
+        Assert.Equal(AuditRecordCodec.BustRecordV3Size, v3Size);
+        Assert.Equal(AuditRecordKind.Bust, v3Kind);
+    }
+
+    [Fact]
     public void Bust_HasExpectedOnDiskSize()
     {
-        Assert.Equal(44, AuditRecordCodec.BustRecordSize);
-        Assert.Equal(40u, AuditRecordCodec.BustRecordLen);
+        Assert.Equal(48, AuditRecordCodec.BustRecordSize);
+        Assert.Equal(44u, AuditRecordCodec.BustRecordLen);
     }
 
     [Fact]

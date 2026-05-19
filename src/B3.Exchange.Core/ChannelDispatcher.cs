@@ -229,6 +229,17 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly B3.Exchange.PostTrade.IPostTradeSink _postTradeSink;
     private readonly string? _auditRootDir;
     private readonly B3.Exchange.PostTrade.BustDedupIndex? _bustDedup;
+    private readonly string? _dropRootDir;
+    private readonly B3.Exchange.PostTrade.IAmendmentsPublisher? _amendmentsPublisher;
+    /// <summary>
+    /// ADR 0008 §3 routing race-window closure: shared lock between
+    /// the dispatch thread (which checks fills.csv.done existence and
+    /// writes the bust record) and the EOD exporter (which scans the
+    /// audit log for cancelled fills then renames its .done sidecar).
+    /// Exposed so <see cref="ExchangeHost.TriggerEodExport"/> can take
+    /// the same monitor across the scan→publish window.
+    /// </summary>
+    public object PostTradeRoutingLock { get; } = new();
     // Throttle bookkeeping (issue #267). Mutated only on the dispatch
     // loop thread → no Interlocked needed.
     private long _commandsSincePersist;
@@ -351,7 +362,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         IReadOnlyList<long>? seedSecurityIds = null,
         B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null,
         string? auditRootDir = null,
-        B3.Exchange.PostTrade.BustDedupIndex? bustDedup = null)
+        B3.Exchange.PostTrade.BustDedupIndex? bustDedup = null,
+        string? dropRootDir = null,
+        B3.Exchange.PostTrade.IAmendmentsPublisher? amendmentsPublisher = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -374,6 +387,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _postTradeSink = postTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;
         _auditRootDir = auditRootDir;
         _bustDedup = bustDedup;
+        _dropRootDir = dropRootDir;
+        _amendmentsPublisher = amendmentsPublisher;
         _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist

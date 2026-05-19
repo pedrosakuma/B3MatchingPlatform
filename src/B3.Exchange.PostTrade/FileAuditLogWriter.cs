@@ -492,7 +492,8 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             Span<byte> hdr = stackalloc byte[AuditRecordCodec.FileHeaderSize];
             if (logStream.Read(hdr) != hdr.Length) return;
             var (_, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(hdr);
-            bool schemaIsV2 = schemaVersion == AuditRecordCodec.SchemaVersionV2;
+            bool schemaIsHeterogeneous = schemaVersion == AuditRecordCodec.SchemaVersionV2
+                || schemaVersion == AuditRecordCodec.SchemaVersionV3;
 
             Span<byte> buffer = stackalloc byte[AuditRecordCodec.MaxRecordSize];
             Span<byte> lenPrefix = stackalloc byte[4];
@@ -515,7 +516,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
                 long recordStart = logStream.Position;
                 int recordSize;
                 bool isFill;
-                if (!schemaIsV2)
+                if (!schemaIsHeterogeneous)
                 {
                     int read = logStream.Read(buffer.Slice(0, AuditRecordCodec.RecordSize));
                     if (read != AuditRecordCodec.RecordSize) break;
@@ -530,7 +531,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
                     if (recsInBlock >= _indexBlockRecords) FlushBlock();
                     continue;
                 }
-                // v2 dispatch
+                // v2/v3 dispatch
                 int peeked = logStream.Read(lenPrefix);
                 if (peeked == 0) break;
                 if (peeked < 4) break;
@@ -584,15 +585,17 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         if (channel != _channelNumber)
             throw new InvalidDataException($"audit file '{fs.Name}' channel mismatch (file={channel}, writer={_channelNumber})");
         // ADR 0008 §1 per-day schema view: writer accepts files of any
-        // schema it understands (V1 from pre-PR-2 days, V2 from PR-2
-        // onward). The recovery scan dispatches by recordLen so v2 files
-        // with mixed fill/bust/reject-attempt records are scanned
-        // correctly. Refuse anything we don't recognise.
+        // schema it understands (V1 from pre-PR-2 days, V2 from PR-2,
+        // V3 from PR-4 onward). The recovery scan dispatches by
+        // recordLen so v2/v3 files with mixed fill/bust/reject-attempt
+        // records are scanned correctly. Refuse anything we don't
+        // recognise.
         if (schemaVersion != AuditRecordCodec.SchemaVersionV1
-            && schemaVersion != AuditRecordCodec.SchemaVersionV2)
+            && schemaVersion != AuditRecordCodec.SchemaVersionV2
+            && schemaVersion != AuditRecordCodec.SchemaVersionV3)
             throw new InvalidDataException(
                 $"audit file '{fs.Name}' unsupported schema v{schemaVersion} "
-                + $"(writer understands v{AuditRecordCodec.SchemaVersionV1} and v{AuditRecordCodec.SchemaVersionV2})");
+                + $"(writer understands v{AuditRecordCodec.SchemaVersionV1}, v{AuditRecordCodec.SchemaVersionV2}, v{AuditRecordCodec.SchemaVersionV3})");
 
         long goodEnd = AuditRecordCodec.FileHeaderSize;
         Span<byte> buffer = stackalloc byte[AuditRecordCodec.MaxRecordSize];
