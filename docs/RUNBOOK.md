@@ -1180,7 +1180,7 @@ curl -sS -X POST \
 | --- | --- |
 | `200 OK` | Export succeeded. Body is a JSON object with `csvPath`, `rowCount`, `sha256` (matches the value in `.done`). |
 | `400 Bad Request` | Missing or malformed `channel` / `date` query parameter. `date` must be `YYYY-MM-DD` (UTC business date). |
-| `404 Not Found` | Either the channel has no `eodDropDir` configured, or no `fills-YYYY-MM-DD.log` exists for that channel and date (the response body distinguishes the two). |
+| `404 Not Found` | The channel has no EOD export wired (either `postTradeAudit.enabled=false`, `postTradeAudit.dataDir` empty, or `postTradeAudit.eodDropDir` empty), or no `fills-YYYY-MM-DD.log` exists for that channel and date. The response body distinguishes the cases. |
 | `409 Conflict` | Another export for the same `(channel, date)` is already in progress. The in-flight guard is per-tuple, so different `(channel, date)` pairs can run in parallel. |
 | `500 Internal Server Error` | Unhandled exception during projection (disk full, audit-log CRC failure, permission flip). The body carries the exception type and message; no partial file is published. |
 | `503 Service Unavailable` | Host has not finished `StartAsync` (the trigger is not yet wired). |

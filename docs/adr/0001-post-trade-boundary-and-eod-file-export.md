@@ -166,12 +166,14 @@ We adopt **three concentric decisions**:
 
 ### 3. EOD file drop, BVBG-like
 
-- Once a trading session closes (operator-triggered via a new
-  `/admin/post-trade/eod-export?date=YYYY-MM-DD` endpoint, or
-  scheduler-driven via the phase scheduler from #321 when the
-  configured close phase fires), the per-trade log for that date is
-  projected into one or more **drop files** in a configured
-  directory `config.postTrade.dropDir`.
+- Once a trading session closes (operator-triggered via the
+  `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD`
+  endpoint, or chained from the existing
+  `DailyResetScheduler` / `POST /admin/daily-reset` rollover —
+  see *D+0 vs D+1 cycle* below for the as-shipped wiring), the
+  per-trade log for that date is projected into one or more
+  **drop files** in the per-channel directory configured by
+  `channels[].postTradeAudit.eodDropDir`.
 - **Format v1 is CSV.** Header + rows, columns frozen at:
   ```
   tradeId, ts, symbol, aggressorSide, qty, price, buyClOrdId, sellClOrdId, buyFirm, sellFirm
@@ -200,8 +202,8 @@ We adopt **three concentric decisions**:
   sequence, hash) so downstream consumers that ingest real BVBG can
   reuse their parser. Not built until a consumer demands it; the
   file-name convention reserves the path
-  `<dropDir>/<YYYYMMDD>/fills.csv` so adding `fills.xml` later is
-  non-breaking.
+  `<eodDropDir>/<channel>/<YYYY-MM-DD>/fills.csv` so adding
+  `fills.xml` later is non-breaking.
 - **No REST query endpoint.** Downstream tools poll the drop
   directory (or subscribe to a filesystem notification). The
   matching simulator is not on the live recon path; it produces
@@ -234,37 +236,49 @@ We adopt **three concentric decisions**:
   callback; wiring it as an *additional* automatic trigger
   (separate from `DailyResetScheduler`) is future integration
   work, not blocking the post-trade module.
-- The file lands in `<dropDir>/<YYYYMMDD>/`.
+- The file lands in `<eodDropDir>/<channel>/<YYYY-MM-DD>/`.
 - **D+1 (next morning):** trading-host's recon tool reads
   matching's D+0 drop and diffs against its own statement. Match =
   same trade count, same notional sum to the cent, no orphan
   `tradeId`s. Mismatch surfaces immediately, before the day's
   trading reopens.
 - **Reprocessing:** the export is idempotent — pointing the operator
-  endpoint at a past date rewrites the drop file deterministically
-  from the audit log. **Atomic publish semantics — hard
-  requirement.** A consumer that polls the drop directory must
-  never observe a partial or truncated file. Therefore:
-  - The export writes to a staging path
-    `<dropDir>/<YYYYMMDD>/.fills.csv.tmp-<pid>-<nonce>`.
-  - On success: `fsync` the staging file, `rename(2)` to
-    `fills.csv`, `fsync` the directory.
+  endpoint at a past `(channel, date)` rewrites the drop file
+  deterministically from the audit log. **Atomic publish semantics
+  — hard requirement.** A consumer that polls the drop directory
+  must never observe a partial or torn file, nor a stale `.done`
+  paired with a fresh CSV. Therefore (as shipped by #330 PR-1,
+  ordering fixed in review):
+  - The export stages both files to `.tmp-<pid>-<nonce>` paths in
+    the target `<eodDropDir>/<channel>/<YYYY-MM-DD>/` directory.
+  - On success the publish sequence is:
+    1. Delete any prior `fills.csv.done`, then `fsync` the
+       directory — this is what guarantees a polling consumer never
+       sees a stale `.done` next to a fresh CSV.
+    2. `rename(2)` the staged CSV to `fills.csv`, then `fsync` the
+       directory.
+    3. `rename(2)` the staged sidecar to `fills.csv.done`, then
+       `fsync` the directory.
+  - **Consumer contract:** `fills.csv.done` is the gate — its
+    presence (carrying `{ rowCount, sha256, generatedAt }`) is the
+    only signal that `fills.csv` is final. A `.csv` without a
+    matching `.done` is either still being written or a leftover
+    from a crashed run; consumers must ignore it.
   - On any failure mid-write (disk full, audit-log CRC failure
     detected during projection, process crash): the staging file
-    is removed on next operator-triggered rerun or on host
-    startup; the previously successful `fills.csv` from a prior
-    run remains untouched and consumable.
-  - A sidecar `fills.csv.done` is written **last**, after the
-    rename, carrying `{ rowCount, sha256, generatedAt }`. Its
-    presence is the consumer-visible signal that the file is
-    final; consumers wait for `.done` before reading. Rerunning
-    overwrites both `fills.csv` and `fills.csv.done` atomically
-    (rename ordering: data file first, then `.done`).
+    is removed on the next operator-triggered rerun or on host
+    startup. There is **no rollback** of step 1 — once the prior
+    `.done` is gone, no `.csv` is published until the rerun
+    completes successfully. This is intentional: the alternative
+    (keep the prior pair and republish only on success) makes the
+    `.done` gate weaker because a successful CSV rename + failed
+    `.done` rename would leave a stale `.done` describing the
+    *previous* CSV.
   - Failed exports surface via the operator endpoint's HTTP
     response (and a structured log line) — never via a partial
     file on disk. Audit-log corruption discovered during
-    projection is a hard failure: the export aborts, no file is
-    overwritten, and the operator gets a clear error pointing at
+    projection is a hard failure: the export aborts, no `.done`
+    is published, and the operator gets a clear error pointing at
     the offending audit record offset.
 
 ## Consequences
@@ -274,7 +288,7 @@ We adopt **three concentric decisions**:
 - The architecture stops conflating operator admin with post-trade
   clearing. Adding more clearing artifacts later (instrument dumps,
   price files, position aggregates) is a matter of dropping more
-  files in `dropDir`, not adding more REST endpoints.
+  files in `eodDropDir`, not adding more REST endpoints.
 - Recon decouples from matching uptime: a recon tool can run the
   next morning while matching is down for maintenance, because the
   artifact is on disk.

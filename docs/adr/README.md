@@ -35,4 +35,4 @@ changes, a new ADR supersedes the old one.
 
 | #    | Title                                                          | Status   |
 |------|----------------------------------------------------------------|----------|
-| 0001 | Post-trade boundary and EOD file export                        | Proposed |
+| 0001 | Post-trade boundary and EOD file export                        | Accepted |
