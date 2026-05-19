@@ -292,8 +292,36 @@ public sealed partial class ChannelDispatcher
                         break;
                     }
                 case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:
-                    // No new write, no UMDF emit.
-                    break;
+                    {
+                        // No new audit write, no UMDF emit. BUT: if the
+                        // original accept was a post-EOD bust whose
+                        // amendments.csv publish failed (logged-only
+                        // failure under §4), this is the operator's
+                        // retry — re-run the publish so the missing
+                        // row finally lands. AmendmentsPublisher
+                        // regenerates the file in full from the audit
+                        // log so this is naturally idempotent: if the
+                        // original publish succeeded the new file is
+                        // byte-identical except for `generatedAt`.
+                        if (_amendmentsPublisher != null && _auditRootDir != null && _dropRootDir != null
+                            && File.Exists(Path.Combine(_dropRootDir,
+                                ChannelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                                op.TradeDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                                "fills.csv.done")))
+                        {
+                            try
+                            {
+                                _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, ChannelNumber, op.TradeDate, DateTime.UtcNow);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex,
+                                    "amendments.csv republish on idempotent replay failed for channel={Channel} date={Date}; further retries required",
+                                    ChannelNumber, op.TradeDate);
+                            }
+                        }
+                        break;
+                    }
                 case B3.Exchange.PostTrade.BustValidationKind.MissingDay:
                     // No audit-log write (ADR §2.3).
                     break;
