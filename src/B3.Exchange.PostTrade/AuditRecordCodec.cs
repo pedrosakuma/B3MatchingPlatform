@@ -13,7 +13,9 @@ namespace B3.Exchange.PostTrade;
 /// <code>
 ///   magic "B3PT" (4)
 ///   schemaVersion (uint16)   1 = fills only (legacy)
-///                            2 = fills + busts + reject-attempts (ADR 0008)
+///                            2 = fills + busts + reject-attempts (ADR 0008 PR-1/PR-2)
+///                            3 = bust extended with declaredTradeDate
+///                                (ADR 0008 PR-4, post-EOD routing)
 ///   reserved      (uint16)
 ///   channelNumber (uint8)
 ///   pad           (3 bytes)
@@ -37,9 +39,9 @@ namespace B3.Exchange.PostTrade;
 ///   buyOrderId         (int64)
 ///   sellOrderId        (int64)
 /// </code>
-/// The fill body is bit-identical between v1 and v2 — there is NO
+/// The fill body is bit-identical between v1, v2 and v3 — there is NO
 /// discriminator byte at the head of a fill body. v1 files contain
-/// only fill records (any other recordLen is corruption); v2 files
+/// only fill records (any other recordLen is corruption); v2/v3 files
 /// dispatch by recordLen (see <see cref="PeekRecordLen"/>).
 ///
 /// Bust record body (schema v2, recordLen = 40, total = 44 bytes,
@@ -55,6 +57,24 @@ namespace B3.Exchange.PostTrade;
 ///   reasonCode                (uint16) see ADR 0008 §2.2
 ///   busterFirm                (uint32)
 ///   correlationId             (uint64)
+/// </code>
+///
+/// Bust record body (schema v3, recordLen = 44, total = 48 bytes,
+/// ADR 0008 PR-4 — adds the declared trade date so post-EOD busts
+/// living in a different day's file can still be attributed back to
+/// the original fill's day):
+/// <code>
+///   recordLen                 (uint32) always 44
+///   crc32                    (uint32) over the body that follows
+///   recordType                (uint8)  always 0x02
+///   reserved                  (uint8)  always 0
+///   cancelledTradeId          (uint32)
+///   bustTransactTimeNanos     (uint64)
+///   securityId                (int64)  echo from original fill
+///   reasonCode                (uint16) see ADR 0008 §2.2
+///   busterFirm                (uint32)
+///   correlationId             (uint64)
+///   declaredTradeDate         (int32)  LocalMktDate (days since 1970-01-01)
 /// </code>
 ///
 /// Reject-attempt record body (schema v2, recordLen = 36, total = 40
@@ -85,19 +105,28 @@ namespace B3.Exchange.PostTrade;
 public static class AuditRecordCodec
 {
     /// <summary>The schema version this build writes for newly-created
-    /// audit files. ADR 0008 / issue #369 PR-2 bumps the default to V2;
-    /// existing V1 files remain readable on resume (per-day schema view
-    /// per ADR 0008 §1) and the writer's recovery path dispatches on the
-    /// per-file header version.</summary>
-    public const ushort SchemaVersion = SchemaVersionV2;
+    /// audit files. ADR 0008 / issue #369 PR-4 bumps the default to V3
+    /// (bust records gain a declaredTradeDate field). Existing V1 and V2
+    /// files remain readable on resume (per-day schema view per ADR
+    /// 0008 §1); the writer's recovery path dispatches on the per-file
+    /// header version.</summary>
+    public const ushort SchemaVersion = SchemaVersionV3;
 
     /// <summary>Legacy fills-only schema (issue #329).</summary>
     public const ushort SchemaVersionV1 = 1;
 
-    /// <summary>ADR 0008 / issue #369 schema. Adds bust + reject-attempt
-    /// records on the same stream; fill body is byte-for-byte identical
-    /// to v1.</summary>
+    /// <summary>ADR 0008 / issue #369 PR-1/PR-2 schema. Adds bust +
+    /// reject-attempt records on the same stream; fill body is
+    /// byte-for-byte identical to v1. Bust body is 36 bytes (no
+    /// declaredTradeDate).</summary>
     public const ushort SchemaVersionV2 = 2;
+
+    /// <summary>ADR 0008 / issue #369 PR-4 schema. Extends the bust
+    /// body with a declaredTradeDate (int32 LocalMktDate) so post-EOD
+    /// busts (which land in <c>fills-&lt;bustToday&gt;.log</c>, not the
+    /// original day's log) still carry the link back to the original
+    /// fill's day required by §4 amendments rebuild.</summary>
+    public const ushort SchemaVersionV3 = 3;
 
     public const int FileHeaderSize = 24;
 
@@ -106,11 +135,25 @@ public static class AuditRecordCodec
     public const int RecordSize = RecordBodySize + 8; // +4 recordLen +4 crc32
     public const uint FillRecordLen = (uint)(RecordSize - 4); // 81
 
-    // Bust (ADR 0008 §1.1).
-    public const int BustRecordBodySize = 36;
-    public const int BustRecordSize = BustRecordBodySize + 8; // 44
-    public const uint BustRecordLen = (uint)(BustRecordSize - 4); // 40
+    // Bust v2 (ADR 0008 §1.1) — legacy on-disk shape, still decoded for
+    // backwards compatibility with files written by PR-1/PR-2 builds.
+    public const int BustRecordV2BodySize = 36;
+    public const int BustRecordV2Size = BustRecordV2BodySize + 8; // 44
+    public const uint BustRecordV2Len = (uint)(BustRecordV2Size - 4); // 40
+
+    // Bust v3 (ADR 0008 PR-4) — adds declaredTradeDate (int32) at the tail.
+    public const int BustRecordV3BodySize = 40;
+    public const int BustRecordV3Size = BustRecordV3BodySize + 8; // 48
+    public const uint BustRecordV3Len = (uint)(BustRecordV3Size - 4); // 44
     public const byte RecordTypeBust = 0x02;
+
+    // Compatibility aliases — old code (and external callers) used the
+    // BustRecord* constants without a version suffix. They now point at
+    // the current default (V3) write layout; readers MUST use the
+    // versioned constants explicitly so they keep decoding V2 files.
+    public const int BustRecordBodySize = BustRecordV3BodySize;
+    public const int BustRecordSize = BustRecordV3Size;
+    public const uint BustRecordLen = BustRecordV3Len;
 
     // Reject-attempt (ADR 0008 §2.5).
     public const int RejectAttemptRecordBodySize = 32;
@@ -136,8 +179,8 @@ public static class AuditRecordCodec
     {
         if (dst.Length < FileHeaderSize)
             throw new ArgumentException($"buffer too small ({dst.Length}<{FileHeaderSize})", nameof(dst));
-        if (schemaVersion is not (SchemaVersionV1 or SchemaVersionV2))
-            throw new ArgumentOutOfRangeException(nameof(schemaVersion), schemaVersion, "supported versions: 1, 2");
+        if (schemaVersion is not (SchemaVersionV1 or SchemaVersionV2 or SchemaVersionV3))
+            throw new ArgumentOutOfRangeException(nameof(schemaVersion), schemaVersion, "supported versions: 1, 2, 3");
         BinaryPrimitives.WriteUInt32LittleEndian(dst.Slice(0, 4), MagicB3PT);
         BinaryPrimitives.WriteUInt16LittleEndian(dst.Slice(4, 2), schemaVersion);
         BinaryPrimitives.WriteUInt16LittleEndian(dst.Slice(6, 2), 0);
@@ -167,8 +210,8 @@ public static class AuditRecordCodec
         if (magic != MagicB3PT)
             throw new InvalidDataException($"audit file magic mismatch: 0x{magic:X8}");
         var version = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(4, 2));
-        if (version is not (SchemaVersionV1 or SchemaVersionV2))
-            throw new InvalidDataException($"audit file schema version {version} unsupported (this build accepts {SchemaVersionV1} or {SchemaVersionV2})");
+        if (version is not (SchemaVersionV1 or SchemaVersionV2 or SchemaVersionV3))
+            throw new InvalidDataException($"audit file schema version {version} unsupported (this build accepts {SchemaVersionV1}, {SchemaVersionV2} or {SchemaVersionV3})");
         byte channel = src[8];
         if (src[9] != 0 || src[10] != 0 || src[11] != 0 || src[22] != 0 || src[23] != 0)
             throw new InvalidDataException("audit file reserved bytes non-zero");
@@ -205,8 +248,12 @@ public static class AuditRecordCodec
                 totalSize = RecordSize;
                 kind = AuditRecordKind.Fill;
                 return true;
-            case BustRecordLen:
-                totalSize = BustRecordSize;
+            case BustRecordV2Len:
+                totalSize = BustRecordV2Size;
+                kind = AuditRecordKind.Bust;
+                return true;
+            case BustRecordV3Len:
+                totalSize = BustRecordV3Size;
                 kind = AuditRecordKind.Bust;
                 return true;
             case RejectAttemptRecordLen:
@@ -305,15 +352,16 @@ public static class AuditRecordCodec
     // writer extension lands in PR-2.
     // -----------------------------------------------------------------
 
-    /// <summary>Encodes a <see cref="BustRecord"/> (ADR 0008 §1.1) into
-    /// <paramref name="dst"/>. Returns the number of bytes written
-    /// (always <see cref="BustRecordSize"/>).</summary>
+    /// <summary>Encodes a <see cref="BustRecord"/> (ADR 0008 §1.1 +
+    /// PR-4 extension) into <paramref name="dst"/> using the v3 layout
+    /// (recordLen=44, body carries declaredTradeDate). Returns the number
+    /// of bytes written (always <see cref="BustRecordV3Size"/>).</summary>
     public static int EncodeBust(Span<byte> dst, in BustRecord record)
     {
-        if (dst.Length < BustRecordSize)
-            throw new ArgumentException($"buffer too small ({dst.Length}<{BustRecordSize})", nameof(dst));
+        if (dst.Length < BustRecordV3Size)
+            throw new ArgumentException($"buffer too small ({dst.Length}<{BustRecordV3Size})", nameof(dst));
 
-        var body = dst.Slice(8, BustRecordBodySize);
+        var body = dst.Slice(8, BustRecordV3BodySize);
         int p = 0;
         body[p] = RecordTypeBust; p += 1;
         body[p] = 0; p += 1;
@@ -323,31 +371,68 @@ public static class AuditRecordCodec
         BinaryPrimitives.WriteUInt16LittleEndian(body.Slice(p, 2), record.ReasonCode); p += 2;
         BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(p, 4), record.BusterFirm); p += 4;
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(p, 8), record.CorrelationId); p += 8;
-        if (p != BustRecordBodySize)
-            throw new InvalidOperationException($"BUG: encoded {p} bust body bytes, expected {BustRecordBodySize}");
+        BinaryPrimitives.WriteInt32LittleEndian(body.Slice(p, 4), record.DeclaredTradeDateDays); p += 4;
+        if (p != BustRecordV3BodySize)
+            throw new InvalidOperationException($"BUG: encoded {p} bust body bytes, expected {BustRecordV3BodySize}");
 
-        BinaryPrimitives.WriteUInt32LittleEndian(dst.Slice(0, 4), BustRecordLen);
+        BinaryPrimitives.WriteUInt32LittleEndian(dst.Slice(0, 4), BustRecordV3Len);
         var crc = ComputeCrc(body);
         BinaryPrimitives.WriteUInt32LittleEndian(dst.Slice(4, 4), crc);
-        return BustRecordSize;
+        return BustRecordV3Size;
     }
 
-    /// <summary>Decodes one bust record. Same failure semantics as
-    /// <see cref="TryDecode"/>: returns false on short buffer, wrong
-    /// length prefix, recordType mismatch, or CRC failure.</summary>
+    /// <summary>Decodes one bust record. Dispatches by the leading
+    /// recordLen field between the v2 layout (36-byte body, no
+    /// declaredTradeDate — legacy files written by PR-1/PR-2) and the
+    /// v3 layout (40-byte body, includes declaredTradeDate — PR-4 and
+    /// later). v2-decoded records carry <c>DeclaredTradeDateDays =
+    /// <see cref="BustRecord.DeclaredTradeDateAbsent"/></c> so callers
+    /// can detect "field not on disk".
+    /// Same failure semantics as <see cref="TryDecode"/>: returns false
+    /// on short buffer, wrong length prefix, recordType mismatch, or
+    /// CRC failure.</summary>
     public static bool TryDecodeBust(ReadOnlySpan<byte> src, out BustRecord record)
     {
         record = default;
-        if (src.Length < BustRecordSize) return false;
+        if (src.Length < 8) return false;
         uint declaredLen = BinaryPrimitives.ReadUInt32LittleEndian(src.Slice(0, 4));
-        if (declaredLen != BustRecordLen) return false;
-        uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(src.Slice(4, 4));
-        var body = src.Slice(8, BustRecordBodySize);
-        if (ComputeCrc(body) != storedCrc) return false;
+        if (declaredLen == BustRecordV3Len) return TryDecodeBustV3(src, out record);
+        if (declaredLen == BustRecordV2Len) return TryDecodeBustV2(src, out record);
+        return false;
+    }
 
-        // Cross-check the leading recordType byte against the dispatched
-        // length (defence-in-depth per ADR 0008 §1). A mismatch is
-        // treated as corruption.
+    private static bool TryDecodeBustV3(ReadOnlySpan<byte> src, out BustRecord record)
+    {
+        record = default;
+        if (src.Length < BustRecordV3Size) return false;
+        uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(src.Slice(4, 4));
+        var body = src.Slice(8, BustRecordV3BodySize);
+        if (ComputeCrc(body) != storedCrc) return false;
+        if (body[0] != RecordTypeBust) return false;
+        if (body[1] != 0) return false;
+
+        int p = 2;
+        uint cancelledTradeId = BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(p, 4)); p += 4;
+        ulong bustTs = BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(p, 8)); p += 8;
+        long secId = BinaryPrimitives.ReadInt64LittleEndian(body.Slice(p, 8)); p += 8;
+        ushort reasonCode = BinaryPrimitives.ReadUInt16LittleEndian(body.Slice(p, 2)); p += 2;
+        uint busterFirm = BinaryPrimitives.ReadUInt32LittleEndian(body.Slice(p, 4)); p += 4;
+        ulong correlationId = BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(p, 8)); p += 8;
+        int declaredTradeDateDays = BinaryPrimitives.ReadInt32LittleEndian(body.Slice(p, 4)); p += 4;
+        _ = p;
+
+        record = new BustRecord(cancelledTradeId, bustTs, secId, reasonCode,
+            busterFirm, correlationId, declaredTradeDateDays);
+        return true;
+    }
+
+    private static bool TryDecodeBustV2(ReadOnlySpan<byte> src, out BustRecord record)
+    {
+        record = default;
+        if (src.Length < BustRecordV2Size) return false;
+        uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(src.Slice(4, 4));
+        var body = src.Slice(8, BustRecordV2BodySize);
+        if (ComputeCrc(body) != storedCrc) return false;
         if (body[0] != RecordTypeBust) return false;
         if (body[1] != 0) return false;
 
@@ -360,7 +445,8 @@ public static class AuditRecordCodec
         ulong correlationId = BinaryPrimitives.ReadUInt64LittleEndian(body.Slice(p, 8)); p += 8;
         _ = p;
 
-        record = new BustRecord(cancelledTradeId, bustTs, secId, reasonCode, busterFirm, correlationId);
+        record = new BustRecord(cancelledTradeId, bustTs, secId, reasonCode,
+            busterFirm, correlationId, BustRecord.DeclaredTradeDateAbsent);
         return true;
     }
 
@@ -431,15 +517,28 @@ public enum AuditRecordKind : byte
     RejectAttempt = AuditRecordCodec.RecordTypeRejectAttempt,
 }
 
-/// <summary>Bust record body (ADR 0008 §1.1). On disk the record is
-/// CRC-framed by <see cref="AuditRecordCodec.EncodeBust"/>.</summary>
+/// <summary>Bust record body (ADR 0008 §1.1 + PR-4 extension). On disk
+/// the record is CRC-framed by <see cref="AuditRecordCodec.EncodeBust"/>
+/// using the v3 layout (recordLen=44). Legacy v2 records (recordLen=40,
+/// no declaredTradeDate on disk) decode into a <c>BustRecord</c> whose
+/// <see cref="DeclaredTradeDateDays"/> is
+/// <see cref="DeclaredTradeDateAbsent"/>.</summary>
 public readonly record struct BustRecord(
     uint CancelledTradeId,
     ulong BustTransactTimeNanos,
     long SecurityId,
     ushort ReasonCode,
     uint BusterFirm,
-    ulong CorrelationId);
+    ulong CorrelationId,
+    int DeclaredTradeDateDays = BustRecord.DeclaredTradeDateAbsent)
+{
+    /// <summary>Sentinel for "field not present on disk" — emitted by
+    /// the v2 decoder so callers can distinguish a legacy bust (no
+    /// declared trade date) from a v3 bust that happens to declare
+    /// 1970-01-01. Negative values are otherwise unused: LocalMktDate
+    /// is days since the Unix epoch and cannot be negative.</summary>
+    public const int DeclaredTradeDateAbsent = -1;
+}
 
 /// <summary>Reject-attempt record body (ADR 0008 §2.5). On disk the
 /// record is CRC-framed by

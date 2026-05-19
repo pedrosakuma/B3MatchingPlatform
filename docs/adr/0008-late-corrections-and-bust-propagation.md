@@ -98,7 +98,8 @@ This ADR therefore owns:
     records; no upgrade tool is needed and a v2 file that
     contains only fills compares equal to its v1 predecessor
     modulo the file header.
-  - `recordLen == 40` → Bust body (§1.1).
+  - `recordLen == 40` → Bust body, schema v2 (§1.1, pre-PR-4).
+  - `recordLen == 44` → Bust body, schema v3 (§1.1, PR-4 onward).
   - `recordLen == 36` → Reject-attempt body (§2.5).
   - any other value → reader treats the file as corrupt and
     surfaces the offset, same policy as a CRC failure.
@@ -109,15 +110,16 @@ This ADR therefore owns:
   dispatch; a mismatch is treated as corruption. The leading
   byte is inside the CRC-covered body.
 - Existing v1 files (any day that was opened before the v2
-  upgrade) are read by the v2 reader using a **per-day schema
+  upgrade) are read by the v2/v3 reader using a **per-day schema
   view**: if the file header says `schemaVersion=1`, the reader
   decodes only fill records (`recordLen == 81`) and refuses any
-  other value as corruption. New files (opened after the upgrade)
-  carry `schemaVersion=2` and the full dispatch table. This
-  mirrors the "old days are read with their original schema"
-  guarantee in ADR 0001 §2.
+  other value as corruption. New files (opened after the
+  PR-4 schema bump) carry `schemaVersion=3`; PR-2-era files carry
+  `schemaVersion=2` and continue to be read with their original
+  schema. This mirrors the "old days are read with their
+  original schema" guarantee in ADR 0001 §2.
 
-#### 1.1 Bust record body (schema v2, type=0x02, `recordLen` = 40)
+#### 1.1 Bust record body (schema v3, type=0x02, `recordLen` = 44)
 
 Fixed-width, little-endian, exactly as for fills:
 
@@ -135,12 +137,29 @@ busterFirm            (uint32)  — operator identity (always the host's
                                   operator firm constant for simulator;
                                   reserved for a future per-operator surface)
 correlationId         (uint64)  — operator-supplied idempotency key (see §2.1)
+declaredTradeDate     (int32)   — LocalMktDate (days since 1970-01-01) of
+                                  the original fill being busted; PR-4
+                                  addition so post-EOD busts (which land
+                                  in fills-<bustToday>.log, not the
+                                  original day's file) still attribute
+                                  back to the original day for §4
+                                  amendments-file regeneration
 ```
 
-Total body length: 1 + 1 + 4 + 8 + 8 + 2 + 4 + 8 = **36 bytes**.
-On-disk record: 4 (`recordLen`) + 4 (`crc32`) + 36 = **44 bytes**;
-`recordLen` reads as **40** (= `crc(4) + body(36)`), matching the
+Total body length: 1 + 1 + 4 + 8 + 8 + 2 + 4 + 8 + 4 = **40 bytes**.
+On-disk record: 4 (`recordLen`) + 4 (`crc32`) + 40 = **48 bytes**;
+`recordLen` reads as **44** (= `crc(4) + body(40)`), matching the
 v1 framing convention.
+
+**v2 backwards compatibility** (per the per-day schema view above):
+PR-2-era v2 bust records on disk have `recordLen == 40`, omit the
+trailing `declaredTradeDate` field (body = 36 bytes, on-disk = 44
+bytes), and are decoded into in-memory `BustRecord`s with
+`DeclaredTradeDateDays = -1` (the `BustRecord.DeclaredTradeDateAbsent`
+sentinel). `BustDedupIndex.LoadFromAuditFiles` falls back to the
+file-name day in that case — for v2 records the writer contract
+(OnBust appends to `fills-<tradeDate>.log`) made the file-name day
+always equal to the trade's day.
 
 - `cancelledTradeId` is the **only** field the projection looks at;
   the other fields are for diagnostics and forward-compat with

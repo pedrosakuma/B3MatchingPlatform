@@ -65,9 +65,17 @@ public sealed class BustDedupIndex
             {
                 if (entry.Kind != AuditRecordKind.Bust) continue;
                 var bust = entry.Bust;
-                // The file-name day IS the busted trade's day (writer
-                // contract: OnBust appends to fills-<tradeDate>.log).
-                index._byTradeId[bust.CancelledTradeId] = new Entry(bust.CorrelationId, fileDate.Value);
+                // ADR 0008 v3 BustRecord carries the original trade's
+                // day (declaredTradeDate) so post-EOD busts — written
+                // to fills-<bustToday>.log, not fills-<tradeDate>.log —
+                // still attribute correctly. v2 records leave the field
+                // as Absent (-1); fall back to the file-name day, which
+                // for v2 always equals the trade's day per the PR-2
+                // writer contract.
+                var resolvedDate = bust.DeclaredTradeDateDays >= 0
+                    ? DateOnly.FromDayNumber(bust.DeclaredTradeDateDays + EpochUnixDayNumber)
+                    : fileDate.Value;
+                index._byTradeId[bust.CancelledTradeId] = new Entry(bust.CorrelationId, resolvedDate);
             }
         }
         return index;
@@ -80,4 +88,9 @@ public sealed class BustDedupIndex
         if (!name.StartsWith("fills-", StringComparison.Ordinal)) return null;
         return DateOnly.TryParseExact(name.AsSpan("fills-".Length), "yyyy-MM-dd", out var d) ? d : null;
     }
+
+    // Number of days between DateOnly.MinValue (0001-01-01) and the Unix
+    // epoch (1970-01-01). BustRecord.DeclaredTradeDateDays uses the
+    // SBE LocalMktDate convention (days since 1970-01-01).
+    private static readonly int EpochUnixDayNumber = new DateOnly(1970, 1, 1).DayNumber;
 }

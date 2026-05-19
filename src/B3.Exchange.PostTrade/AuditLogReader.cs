@@ -147,7 +147,8 @@ public static class AuditLogReader
         // The writer's invariant (firm-sparse .idx covers fill records
         // only — non-fill records are written outside any open block)
         // means recordCount in each .idx entry still counts fills only.
-        bool schemaIsV2 = schemaVersion == AuditRecordCodec.SchemaVersionV2;
+        bool schemaIsHeterogeneous = schemaVersion == AuditRecordCodec.SchemaVersionV2
+            || schemaVersion == AuditRecordCodec.SchemaVersionV3;
 
         var buffer = new byte[AuditRecordCodec.MaxRecordSize];
         // 1) Indexed candidates — seek directly to each block. Each entry
@@ -176,7 +177,7 @@ public static class AuditLogReader
             fs.Seek(indexedEndOffset, SeekOrigin.Begin);
             while (true)
             {
-                if (!schemaIsV2)
+                if (!schemaIsHeterogeneous)
                 {
                     int read = ReadFully(fs, buffer, 0, AuditRecordCodec.RecordSize);
                     if (read == 0) break;
@@ -187,7 +188,7 @@ public static class AuditLogReader
                     continue;
                 }
 
-                // v2: peek recordLen (4 bytes), read remaining body, dispatch.
+                // v2/v3: peek recordLen (4 bytes), read remaining body, dispatch.
                 int peeked = ReadFully(fs, buffer, 0, 4);
                 if (peeked == 0) break;
                 if (peeked < 4) break;

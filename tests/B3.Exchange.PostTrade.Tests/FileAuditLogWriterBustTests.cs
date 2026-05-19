@@ -118,7 +118,7 @@ public class FileAuditLogWriterBustTests : IDisposable
     }
 
     [Fact]
-    public void NewFilesUseSchemaV2_AndAreReadableAfterReopen()
+    public void NewFilesUseSchemaV3_AndAreReadableAfterReopen()
     {
         using (var w = new FileAuditLogWriter(_root, channelNumber: 11))
         {
@@ -126,12 +126,12 @@ public class FileAuditLogWriterBustTests : IDisposable
             w.OnBust(MakeBust(1, correlationId: 99UL), Day0);
         }
         var path = Path.Combine(_root, "11", "fills-2026-05-18.log");
-        // Spot-check the header byte for the schema-v2 marker.
+        // Spot-check the header byte for the schema-v3 marker.
         var bytes = File.ReadAllBytes(path);
         Assert.True(bytes.Length > AuditRecordCodec.FileHeaderSize);
         // schemaVersion lives at the start of the header (per codec layout).
         var (_, _, sv) = AuditRecordCodec.ReadFileHeader(bytes.AsSpan(0, AuditRecordCodec.FileHeaderSize));
-        Assert.Equal(AuditRecordCodec.SchemaVersionV2, sv);
+        Assert.Equal(AuditRecordCodec.SchemaVersionV3, sv);
 
         // Reopen and append more — should not truncate anything.
         using (var w = new FileAuditLogWriter(_root, channelNumber: 11))

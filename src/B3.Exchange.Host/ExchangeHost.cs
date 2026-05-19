@@ -285,12 +285,20 @@ public sealed class ExchangeHost : IAsyncDisposable
             // the audit writer is wired (otherwise there are no files).
             B3.Exchange.PostTrade.BustDedupIndex? bustDedup = null;
             string? auditRootDir = null;
+            string? dropRootDir = null;
+            B3.Exchange.PostTrade.IAmendmentsPublisher? amendmentsPublisher = null;
             if (auditWriter != null && ch.PostTradeAudit?.DataDir is { } dataDir && !string.IsNullOrWhiteSpace(dataDir))
             {
                 auditRootDir = dataDir;
                 int retention = ch.PostTradeAudit.RetentionDays;
                 bustDedup = B3.Exchange.PostTrade.BustDedupIndex.LoadFromAuditFiles(
                     dataDir, ch.ChannelNumber, retention, DateOnly.FromDateTime(DateTime.UtcNow));
+                if (!string.IsNullOrWhiteSpace(ch.PostTradeAudit.EodDropDir))
+                {
+                    dropRootDir = ch.PostTradeAudit.EodDropDir;
+                    amendmentsPublisher = new B3.Exchange.PostTrade.AmendmentsPublisher(
+                        _loggerFactory.CreateLogger<B3.Exchange.PostTrade.AmendmentsPublisher>());
+                }
             }
 
             var disp = new ChannelDispatcher(
@@ -317,7 +325,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray(),
                 postTradeSink: auditWriter,
                 auditRootDir: auditRootDir,
-                bustDedup: bustDedup);
+                bustDedup: bustDedup,
+                dropRootDir: dropRootDir,
+                amendmentsPublisher: amendmentsPublisher);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -347,7 +357,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                     var exporterLogger = _loggerFactory.CreateLogger<B3.Exchange.PostTrade.EodFillsExporter>();
                     var exporter = new B3.Exchange.PostTrade.EodFillsExporter(exporterLogger);
                     _eodExportByChannel[ch.ChannelNumber] = new EodExportContext(
-                        exporter, audit.DataDir, audit.EodDropDir, symbols);
+                        exporter, audit.DataDir, audit.EodDropDir, symbols, disp.PostTradeRoutingLock);
                     _logger.LogInformation(
                         "channel {ChannelNumber}: EOD fills export enabled (dropDir={DropDir})",
                         ch.ChannelNumber, audit.EodDropDir);
@@ -836,13 +846,22 @@ public sealed class ExchangeHost : IAsyncDisposable
         }
         try
         {
-            return ctx.Exporter.Export(
-                ctx.AuditRootDir,
-                ctx.DropRootDir,
-                channelNumber,
-                businessDate,
-                secId => ctx.Symbols.TryGetValue(secId, out var sym) ? sym : null,
-                DateTime.UtcNow);
+            // ADR 0008 §3 race-window closure: hold the per-channel
+            // post-trade routing lock across the full export so any
+            // bust accepted concurrently either (a) lands in the
+            // pre-EOD file before the cancelled-set scan, or (b) is
+            // routed to the post-EOD path because it observes the
+            // new .done sidecar after we release the lock.
+            lock (ctx.RoutingLock)
+            {
+                return ctx.Exporter.Export(
+                    ctx.AuditRootDir,
+                    ctx.DropRootDir,
+                    channelNumber,
+                    businessDate,
+                    secId => ctx.Symbols.TryGetValue(secId, out var sym) ? sym : null,
+                    DateTime.UtcNow);
+            }
         }
         finally
         {
@@ -879,7 +898,8 @@ public sealed class ExchangeHost : IAsyncDisposable
         B3.Exchange.PostTrade.EodFillsExporter Exporter,
         string AuditRootDir,
         string DropRootDir,
-        IReadOnlyDictionary<long, string> Symbols);
+        IReadOnlyDictionary<long, string> Symbols,
+        object RoutingLock);
 
     /// <summary>
     /// Issue #270: parses the <c>persistence.orphanSessionPolicy</c>
