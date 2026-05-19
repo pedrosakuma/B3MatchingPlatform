@@ -81,8 +81,64 @@ public sealed class ExchangeHost : IAsyncDisposable
     public int TriggerDailyReset(string reason = "operator-trigger")
     {
         var listener = _listener;
-        if (listener is null) return -1;
-        return listener.TerminateAllSessions(reason);
+        int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason);
+        // Issue #330 PR-3: chain the EOD fills export for every channel
+        // with eodDropDir configured (yesterday UTC). Failures are
+        // logged and swallowed so a CSV problem on one channel never
+        // hides the listener-termination count from the operator.
+        TriggerEodExportForAllChannels(reason);
+        return terminated;
+    }
+
+    /// <summary>
+    /// Issue #330 PR-3: iterate every channel with an EOD export
+    /// configured and project yesterday's UTC business day's audit log
+    /// into the CSV drop. Per-channel failures (e.g. missing audit log
+    /// for a quiet day) are logged at warn level and swallowed so a
+    /// single failing channel never aborts the daily rollover for the
+    /// rest. Called from both the scheduled timer and the
+    /// <c>/admin/daily-reset</c> HTTP endpoint via
+    /// <see cref="TriggerDailyReset"/>.
+    /// </summary>
+    private void TriggerEodExportForAllChannels(string reason)
+    {
+        if (_eodExportByChannel.Count == 0) return;
+        // Project the just-closed UTC business day. Using yesterday UTC
+        // matches the audit writer's day-boundary semantics — the
+        // currently-open day's audit file is still being written, so
+        // operators export the last sealed day.
+        var businessDate = DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-1);
+        foreach (var channel in _eodExportByChannel.Keys.ToList())
+        {
+            try
+            {
+                var result = TriggerEodExport(channel, businessDate);
+                if (result is { } r)
+                {
+                    _logger.LogInformation(
+                        "daily-reset ({Reason}): channel={Channel} date={Date} EOD export rows={Rows} sha256={Sha}",
+                        reason, channel, businessDate, r.RowCount, r.Sha256Hex);
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                _logger.LogWarning(
+                    "daily-reset ({Reason}): channel={Channel} date={Date} EOD export skipped — no audit log for that day",
+                    reason, channel, businessDate);
+            }
+            catch (EodExportInProgressException)
+            {
+                _logger.LogWarning(
+                    "daily-reset ({Reason}): channel={Channel} date={Date} EOD export skipped — already in progress",
+                    reason, channel, businessDate);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "daily-reset ({Reason}): channel={Channel} date={Date} EOD export FAILED",
+                    reason, channel, businessDate);
+            }
+        }
     }
 
     /// <summary>Firm + session credentials parsed from <c>HostConfig</c>.
@@ -455,7 +511,11 @@ public sealed class ExchangeHost : IAsyncDisposable
             _dailyReset = new DailyResetScheduler(
                 drCfg.Schedule,
                 drCfg.Timezone,
-                action: () => _listener?.TerminateAllSessions("daily-reset"),
+                // Both the scheduled timer and /admin/daily-reset go
+                // through TriggerDailyReset so the listener-terminate +
+                // EOD-export chaining (#330 PR-3) is identical for
+                // automated and manual rollovers.
+                action: () => TriggerDailyReset("daily-reset"),
                 logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
             _dailyReset.Start();
         }
