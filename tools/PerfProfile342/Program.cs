@@ -11,13 +11,19 @@ using Microsoft.Extensions.Logging.Abstractions;
 // Usage:
 //   PerfProfile342 <scenario> [--depth N] [--seconds S]
 //
-// Scenarios:
-//   full-cross    Aggressor sweeps a depth-N book each iteration (matches
-//                 MatchingBenchmarks.NewOrder_FullCross).
-//   mid-depth     Rests an order at the middle of a depth-N book each
-//                 iteration (quote-stuffing / mid-book POST flow; the
-//                 scenario the #342 follow-up comment asks for).
-//   no-cross      Rests at descending prices on empty book (matches
+// Scenarios (each iteration rebuilds the book so memory stays bounded;
+// the profile therefore includes book-building time alongside the named
+// hot path — that is intentional for the #342 gate which cares about
+// the *aggregate* SortedDictionary cost across insert + cross paths):
+//   full-cross    Builds a depth-N book then a single aggressor sweeps
+//                 the whole side. Wider scope than
+//                 MatchingBenchmarks.NewOrder_FullCross, which measures
+//                 the sweep in isolation.
+//   mid-depth    Builds a depth-N book on even offsets, then POSTs a
+//                 single resting order at an odd offset guaranteed to
+//                 fall between two existing levels (forces a real
+//                 mid-book insert into SortedDictionary).
+//   no-cross    Rests at descending prices on empty book (matches
 //                 MatchingBenchmarks.NewOrder_NoCross).
 
 if (args.Length == 0)
@@ -84,8 +90,10 @@ static long RunFor(string scenario, int depth, MatchingEngine engine, NoOpSink s
                 {
                     engine.Submit(MakeOrder(Side.Buy, OrderType.Limit, TimeInForce.Day, basePx - i * 2, 100, firm: 8));
                 }
-                // POST at mid-depth — odd ticks fall between resting evens.
-                long midPx = basePx - depth + 1;
+                // POST at mid-depth — odd offset guaranteed to fall between
+                // two even-offset resting levels regardless of `depth` parity.
+                int midOffset = (depth - 1) | 1;
+                long midPx = basePx - midOffset;
                 engine.Submit(MakeOrder(Side.Buy, OrderType.Limit, TimeInForce.Day, midPx, 100, firm: 7));
                 iterations++;
             }

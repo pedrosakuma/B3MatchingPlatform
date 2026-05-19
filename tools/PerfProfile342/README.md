@@ -11,13 +11,18 @@ can attach to a process whose CPU is dominated by `MatchingEngine` work.
 
 ## Scenarios
 
-| Scenario     | What it does                                                                       | Mirrors                              |
-| ------------ | ---------------------------------------------------------------------------------- | ------------------------------------ |
-| `full-cross` | Builds a depth-N book, then a single aggressor sweeps the whole side               | `MatchingBenchmarks.NewOrder_FullCross` |
-| `mid-depth`  | Builds a depth-N book (even ticks), then POSTs a single resting order at mid-book  | quote-stuffing / mid-book POST flow  |
-| `no-cross`   | Inserts N resting orders at descending prices on an empty book                     | `MatchingBenchmarks.NewOrder_NoCross`   |
+| Scenario     | What it does                                                                        |
+| ------------ | ----------------------------------------------------------------------------------- |
+| `full-cross` | Builds a depth-N book, then a single aggressor sweeps the whole side                |
+| `mid-depth`  | Builds a depth-N book on even ticks, then POSTs a single resting order at an odd offset guaranteed to land between two existing levels |
+| `no-cross`   | Inserts N resting orders at descending prices on an empty book                      |
 
 Each iteration calls `engine.ResetForChannelReset()` so memory stays bounded.
+**Note:** `full-cross` and `mid-depth` include book-building time inside the
+profiling window (intentional — the #342 gate cares about aggregate
+SortedDictionary cost across insert + cross paths). If you need the
+isolated sweep cost, use `MatchingBenchmarks.NewOrder_FullCross` (BDN)
+instead.
 
 ## Usage
 
