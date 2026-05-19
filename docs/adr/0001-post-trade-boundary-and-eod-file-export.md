@@ -1,6 +1,8 @@
 # ADR 0001 — Post-trade boundary and EOD file export
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented by #329 series for the audit log
+  and #330 series for the EOD CSV drop; see *Implementation status*
+  below).
 - **Date:** 2026-05-16
 - **Supersedes:** —
 - **Superseded by:** —
@@ -208,20 +210,30 @@ We adopt **three concentric decisions**:
 ### D+0 vs D+1 cycle
 
 - **D+0 (intraday close):** EOD export runs after a session-close
-  trigger. **In v1 the trigger is one of**:
-  - a new operator endpoint
-    `/admin/post-trade/eod-export?date=YYYY-MM-DD`, or
+  trigger. **As of issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330)
+  the trigger is either**:
+  - the operator endpoint
+    `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD`
+    (re-issue / backfill path), or
   - the existing `DailyResetScheduler` /
-    `/admin/daily-reset` flow (see `docs/RUNBOOK.md` section 2),
-    which is the closest thing to a "session is over" hook the
-    host has today.
+    `POST /admin/daily-reset` flow, which chains the per-channel
+    export for **yesterday UTC** after terminating sessions and
+    draining dispatcher inbound queues.
 
-  The `PhaseScheduler` from #321 / PR #324 currently only enqueues
+  Both paths share the same `EodFillsExporter` codepath and the
+  same `ExchangeHost.TriggerEodExport` in-flight guard, so a
+  scheduled tick and a manual rerun for the same `(channel, date)`
+  can't race into a torn publish.
+
+  See `docs/RUNBOOK.md` §2.5 (daily-reset) and §7.9 (EOD CSV drop)
+  for the operator-facing surface, status-code matrix, file
+  layout, and consumer contract.
+
+  The `PhaseScheduler` from #321 / PR #324 still only enqueues
   phase / `Uncross` actions and has **no** generic post-close
-  callback (see `src/B3.Exchange.Host/PhaseScheduler.cs`); wiring
-  it as the automatic export trigger is **future integration
-  work** for issue B (or a follow-up issue), not a current
-  capability this ADR can assume.
+  callback; wiring it as an *additional* automatic trigger
+  (separate from `DailyResetScheduler`) is future integration
+  work, not blocking the post-trade module.
 - The file lands in `<dropDir>/<YYYYMMDD>/`.
 - **D+1 (next morning):** trading-host's recon tool reads
   matching's D+0 drop and diffs against its own statement. Match =
@@ -288,10 +300,38 @@ We adopt **three concentric decisions**:
 - **Close #327** as `not planned` — wrong shape. Link this ADR.
 - **Open A — per-trade audit log:** infra-only, no HTTP, no export.
   Implements section 2 above. Blocks B.
+  → **Shipped** as issue [#329](https://github.com/pedrosakuma/B3MatchingPlatform/issues/329)
+  (PR series #329 PR-1..PR-6). Operational surface in
+  `docs/RUNBOOK.md` §7.8.
 - **Open B — EOD fills file export (BVBG-like):** projects A into
   `dropDir`. Implements section 3 above. Closes
   B3TradingPlatform#274 via the file drop.
+  → **Shipped** as issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330)
+  (PR series #359 exporter, #360 operator endpoint, #361 daily-reset
+  chaining, this PR docs). Operational surface in
+  `docs/RUNBOOK.md` §7.9.
 - Both labelled `area:post-trade` so the new boundary is visible.
+
+### Implementation status (as of 2026-05)
+
+Acceptance criteria from sections 2 and 3 above are met:
+
+| Criterion | Status | Where |
+| --- | --- | --- |
+| Per-trade audit log written on the dispatch thread, daily-rolled by UTC, CRC-protected | ✅ #329 PR-1..PR-3 | `src/B3.Exchange.PostTrade/FileAuditLogWriter.cs` |
+| Independent retention from WAL (configurable `retentionDays`) | ✅ #329 PR-6 | `FileAuditLogWriter.PruneOldDays`, RUNBOOK §7.8 |
+| Durability watermark coupling audit checkpoint to WAL truncation gate | ✅ #329 PR-5 (sidecar) + PR-6 | `audit-watermark.bin`, RUNBOOK §7.8 |
+| EOD CSV drop with frozen v1 column shape | ✅ #330 PR-1 | `src/B3.Exchange.PostTrade/EodFillsExporter.cs`, RUNBOOK §7.9 |
+| Atomic publish (stage → fsync → rename CSV → rename `.done`) with no torn-file consumer visibility | ✅ #330 PR-1 (ordering fixed in review) | `EodFillsExporter.Export`, RUNBOOK §7.9 |
+| Operator trigger `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD` with in-flight guard | ✅ #330 PR-2 | `src/B3.Exchange.Host/HttpServer.HandleEodExport`, RUNBOOK §7.9 |
+| `DailyResetScheduler` + `/admin/daily-reset` chain the EOD export for yesterday UTC | ✅ #330 PR-3 | `ExchangeHost.TriggerDailyReset`, RUNBOOK §2.5 + §7.9 |
+| Idempotent rerun (same inputs → byte-identical CSV) | ✅ #330 PR-1 + test | `EodFillsExporterTests`, RUNBOOK §7.9 |
+
+The deferred items in *Open questions* (signing, XML envelope,
+multi-firm split, compression, schema registry, exact retention
+defaults, session-time business-date boundary) remain explicit
+non-decisions and are not blocked by anything in the current
+shipped surface.
 
 ## Alternatives considered
 
@@ -353,7 +393,11 @@ the decision:
 ## References
 
 - `docs/RUNBOOK.md` — current operator endpoints; the `/admin/*`
-  surface this ADR draws a line around.
+  surface this ADR draws a line around. §7.8 documents the audit
+  log shipped by #329; §7.9 documents the EOD CSV drop shipped by
+  #330 (operator endpoint, file layout, atomic publish contract,
+  consumer rules); §2.5 documents the `DailyResetScheduler` /
+  `/admin/daily-reset` chaining.
 - `docs/EXCHANGE-SIMULATOR.md` — `wal` config block; this ADR keeps
   it untouched.
 - `src/B3.Exchange.Core/ChannelDispatcher.Operator.cs` — comment
