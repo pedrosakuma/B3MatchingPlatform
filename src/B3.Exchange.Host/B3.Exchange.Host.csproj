@@ -23,6 +23,7 @@
     <ProjectReference Include="..\B3.Exchange.Gateway\B3.Exchange.Gateway.csproj" />
     <ProjectReference Include="..\B3.Exchange.Core\B3.Exchange.Core.csproj" />
     <ProjectReference Include="..\B3.Exchange.Persistence\B3.Exchange.Persistence.csproj" />
+    <ProjectReference Include="..\B3.Exchange.PostTrade\B3.Exchange.PostTrade.csproj" />
   </ItemGroup>
 
   <ItemGroup>
