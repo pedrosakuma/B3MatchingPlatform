@@ -963,6 +963,16 @@ abandon the on-disk state.
 
 ### 7.8 Post-trade audit log (issue [#329](https://github.com/pedrosakuma/B3MatchingPlatform/issues/329))
 
+> ⚠️ **Status (as of this section landing): the writer/dispatcher
+> plumbing is fully implemented and unit-tested, but
+> `FileAuditLogWriter` is not yet constructed by `ExchangeHost`. A
+> default host run still uses `NullPostTradeSink`, so no audit files
+> are written and the recovery procedure below has nothing to
+> replay against.** Operators wanting to exercise the audit log
+> today must construct the writer programmatically and pass it as
+> the `postTradeSink` when wiring `ChannelDispatcher`. Host config
+> + factory + retention timer are tracked as a follow-up.
+
 The post-trade audit log is the legally-authoritative per-trade record
 the simulator emits alongside the wire-published `Trade_53` /
 `ER_Trade` frames. **It is a separate durability domain from the WAL:**
