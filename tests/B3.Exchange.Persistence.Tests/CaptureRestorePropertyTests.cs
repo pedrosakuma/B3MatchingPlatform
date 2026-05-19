@@ -86,6 +86,7 @@ public class CaptureRestorePropertyTests
     // ---------------------------------------------------------------
     public abstract record TestCmd;
     public sealed record NewLimit(bool IsBuy, int PriceTicks, int LotMultiple, bool Ioc) : TestCmd;
+    public sealed record NewIceberg(bool IsBuy, int PriceTicks, int LotMultiple, int VisibleLotMultiple) : TestCmd;
     public sealed record CancelNth(int Index) : TestCmd;
     public sealed record ReplaceNth(int Index, int NewPriceTicks, int NewLotMultiple) : TestCmd;
 
@@ -98,6 +99,17 @@ public class CaptureRestorePropertyTests
             from ioc in ArbMap.Default.GeneratorFor<bool>()
             select (TestCmd)new NewLimit(isBuy, priceTicks, lots, ioc);
 
+        // Iceberg requires Day/GTC TIF (engine rejects IOC/FOK +
+        // MaxFloor — see Commands.cs MaxFloor doc) and MaxFloor strictly
+        // less than total quantity to actually exercise the hidden
+        // reserve (MaxFloor == Quantity is a no-op degenerate iceberg).
+        private static Gen<TestCmd> NewIcebergGen =>
+            from isBuy in ArbMap.Default.GeneratorFor<bool>()
+            from priceTicks in Gen.Choose((int)MinPriceTicks, (int)MaxPriceTicks)
+            from totalLots in Gen.Choose(2, 10)
+            from visibleLots in Gen.Choose(1, totalLots - 1)
+            select (TestCmd)new NewIceberg(isBuy, priceTicks, totalLots, visibleLots);
+
         private static Gen<TestCmd> CancelGen =>
             from idx in Gen.Choose(0, 32)
             select (TestCmd)new CancelNth(idx);
@@ -108,13 +120,57 @@ public class CaptureRestorePropertyTests
             from lots in Gen.Choose(1, 10)
             select (TestCmd)new ReplaceNth(idx, priceTicks, lots);
 
-        // 8:1:1 weighting keeps the book populated; pure-cancel and
-        // pure-replace sequences leave nothing to assert on.
+        // Element-level shrinker. FsCheck's default array shrinker
+        // (used for TestCmd[]) removes elements first — that alone
+        // gives meaningful sequence minimization — but to also
+        // minimize the *values* inside each command we provide a
+        // per-element shrinker that walks numeric fields toward their
+        // minimum legal value and collapses NewIceberg → NewLimit.
+        // Without this the test would still find counter-examples but
+        // could not minimize them, defeating the point of property
+        // testing.
+        private static IEnumerable<TestCmd> Shrink(TestCmd cmd)
+        {
+            switch (cmd)
+            {
+                case NewLimit nl:
+                    if (nl.LotMultiple > 1) yield return nl with { LotMultiple = nl.LotMultiple - 1 };
+                    if (nl.PriceTicks > MinPriceTicks) yield return nl with { PriceTicks = (int)MinPriceTicks };
+                    if (nl.Ioc) yield return nl with { Ioc = false };
+                    break;
+                case NewIceberg ni:
+                    // Shrink toward a plain Day NewLimit (drops the
+                    // iceberg fields entirely so the counter-example
+                    // shows whether iceberg state is required).
+                    yield return new NewLimit(ni.IsBuy, ni.PriceTicks, ni.LotMultiple, Ioc: false);
+                    if (ni.LotMultiple > 2) yield return ni with { LotMultiple = ni.LotMultiple - 1, VisibleLotMultiple = Math.Min(ni.VisibleLotMultiple, ni.LotMultiple - 2) };
+                    if (ni.VisibleLotMultiple > 1) yield return ni with { VisibleLotMultiple = ni.VisibleLotMultiple - 1 };
+                    if (ni.PriceTicks > MinPriceTicks) yield return ni with { PriceTicks = (int)MinPriceTicks };
+                    break;
+                case CancelNth c:
+                    if (c.Index > 0) yield return c with { Index = 0 };
+                    break;
+                case ReplaceNth r:
+                    if (r.Index > 0) yield return r with { Index = 0 };
+                    if (r.NewLotMultiple > 1) yield return r with { NewLotMultiple = r.NewLotMultiple - 1 };
+                    if (r.NewPriceTicks > MinPriceTicks) yield return r with { NewPriceTicks = (int)MinPriceTicks };
+                    break;
+            }
+        }
+
+        // 8:1:1:1 weighting keeps the book populated; pure-cancel and
+        // pure-replace sequences leave nothing to assert on. Iceberg
+        // is rarer because it adds non-trivial validation overhead but
+        // is essential for exercising the HiddenQuantity / MaxFloor
+        // round-trip path through the snapshot.
         public static Arbitrary<TestCmd> Cmd() =>
-            Gen.Frequency<TestCmd>(
-                (8, NewLimitGen),
-                (1, CancelGen),
-                (1, ReplaceGen)).ToArbitrary();
+            Arb.From(
+                Gen.Frequency<TestCmd>(
+                    (7, NewLimitGen),
+                    (1, NewIcebergGen),
+                    (1, CancelGen),
+                    (1, ReplaceGen)),
+                Shrink);
     }
 
     // ---------------------------------------------------------------
@@ -140,6 +196,19 @@ public class CaptureRestorePropertyTests
                     Quantity: nl.LotMultiple * LotSize,
                     EnteringFirm: 100,
                     EnteredAtNanos: clock));
+                break;
+            case NewIceberg ni:
+                eng.Submit(new NewOrderCommand(
+                    ClOrdId: (++clOrd).ToString(),
+                    SecurityId: Sec,
+                    Side: ni.IsBuy ? Side.Buy : Side.Sell,
+                    Type: OrderType.Limit,
+                    Tif: TimeInForce.Day,
+                    PriceMantissa: ni.PriceTicks * TickMantissa,
+                    Quantity: ni.LotMultiple * LotSize,
+                    EnteringFirm: 100,
+                    EnteredAtNanos: clock)
+                { MaxFloor = (ulong)(ni.VisibleLotMultiple * LotSize) });
                 break;
             case CancelNth c:
                 {

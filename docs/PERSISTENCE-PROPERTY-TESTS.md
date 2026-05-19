@@ -19,16 +19,23 @@ CI runs each property with `MaxTest = 100`. Tune locally with the
 
 ## Generator surface
 
-The generator produces a `TestCmd` discriminated union with three
-variants, mixed at 8:1:1 (`NewLimit` : `CancelNth` : `ReplaceNth`).
-The weighting keeps the book populated; pure-cancel / pure-replace
+The generator produces a `TestCmd` discriminated union with four
+variants (`NewLimit`, `NewIceberg`, `CancelNth`, `ReplaceNth`). The
+weighting keeps the book populated; pure-cancel / pure-replace
 sequences would shrink to empty trivially and exercise nothing.
 
 | Variant | Fields |
 | --- | --- |
 | `NewLimit(IsBuy, PriceTicks, LotMultiple, Ioc)` | `PriceTicks ∈ [100, 10000]` (= `1.00` … `100.00`), `LotMultiple ∈ [1, 10]`, single instrument (`PETR4`, `LotSize = 100`, `TickSize = 0.01`). Always `OrderType.Limit`, `Tif ∈ {Day, IOC}`. |
+| `NewIceberg(IsBuy, PriceTicks, LotMultiple, VisibleLotMultiple)` | Same instrument; always `Tif = Day` (the engine rejects IOC + `MaxFloor` per [`Commands.cs`](../src/B3.Exchange.Matching/Commands.cs) `MaxFloor` doc). `VisibleLotMultiple ∈ [1, LotMultiple - 1]` so the visible slice is strictly smaller than the total quantity and the snapshot's `HiddenQuantity` field is exercised. |
 | `CancelNth(Index)` | Cancel the `Index mod N`-th currently resting order across both sides (or no-op if the book is empty). |
 | `ReplaceNth(Index, NewPriceTicks, NewLotMultiple)` | Same lookup as `CancelNth`; replaces with a freshly generated lot/price. |
+
+Mixed at 7:1:1:1 (`NewLimit` : `NewIceberg` : `CancelNth` : `ReplaceNth`).
+`NewIceberg` is rarer because the resting-iceberg state machine is a
+narrower surface; the weighting still produces ~10% iceberg orders
+across a 100-test run, enough to exercise the
+`MaxFloor` / `HiddenQuantity` round-trip path through the snapshot.
 
 `Apply` is the interpreter that materialises a real engine command
 from each variant and resolves `CancelNth` / `ReplaceNth` against
@@ -39,6 +46,23 @@ The generator surface is deliberately narrow so the properties have
 a high signal rate. Engine rejects (validation failures, unknown
 order ids) are valid no-ops — the round-trip invariants must hold
 either way — but waste generator budget.
+
+## Shrinking
+
+`Arbs.Cmd()` registers an explicit per-element shrinker via
+`Arb.From(gen, shrink)`. The default `Gen.ToArbitrary()` overload
+attaches *no* shrinker (FsCheck's API contract: that overload
+declares "shrink is not supported for this type"), so a custom
+shrinker is required for property failures to be minimized.
+
+The shrinker is intentionally simple: each `TestCmd` variant
+walks its numeric fields one step toward their minimum legal value
+(`LotMultiple → 1`, `PriceTicks → MinPriceTicks`, `Index → 0`),
+flips `Ioc → false` (so the failure foregrounds resting-order
+behaviour), and collapses `NewIceberg → NewLimit` so a counter-
+example surfaces whether the iceberg state is required to reproduce.
+Sequence-level shrinking (shortening the `TestCmd[]`) is provided
+by FsCheck's default array shrinker on top of this.
 
 ## Extending the generators
 
