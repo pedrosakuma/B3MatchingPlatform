@@ -100,18 +100,50 @@ public class MultiSessionReplayTests
         // firmA posts a resting bid; firmB hits it with a marketable IOC sell.
         // clOrdId reuse across sessions is allowed (issue note: the gateway
         // namespaces orders by (firm, clOrdId)).
-        // The 200ms script-time gap (=> 20ms wall-clock at speed=10) is
-        // deliberately wider than the original 2ms: under CI parallel
-        // contention, a 2ms gap let firmB's NewOrder reach the dispatch
-        // queue ahead of firmA's, turning the IOC sell into an
-        // unmatched cancel and starving the test of trade ERs.
-        var script = new[]
+        //
+        // #326: previous incarnations gated the two submits on a wall-clock
+        // gap (200ms script-time => 20ms wall). Under CI / parallel test
+        // contention this was unreliable — firmB's IOC could reach the
+        // dispatch queue ahead of firmA's resting bid, find no liquidity,
+        // and be silently dropped by the matching engine (an IOC with zero
+        // fills currently emits no ER back to the aggressor — tracked as a
+        // separate engine bug). To make the test deterministic we now gate
+        // firmB's submission on observing firmA's ER_New on the tape
+        // instead of guessing how long the round-trip takes.
+        var scriptA = new[]
         {
-            new ScriptEvent(0,   ScriptEventKind.New, 1, Petr, Side.Buy,  OrderType.Limit, Tif.Day, 100, 320000, 0, 1, "firmA"),
-            new ScriptEvent(200, ScriptEventKind.New, 1, Petr, Side.Sell, OrderType.Limit, Tif.IOC, 100, 320000, 0, 2, "firmB"),
+            new ScriptEvent(0, ScriptEventKind.New, 1, Petr, Side.Buy, OrderType.Limit, Tif.Day, 100, 320000, 0, 1, "firmA"),
+        };
+        var scriptB = new[]
+        {
+            new ScriptEvent(0, ScriptEventKind.New, 1, Petr, Side.Sell, OrderType.Limit, Tif.IOC, 100, 320000, 0, 2, "firmB"),
         };
 
-        await runner.RunAsync(script, cts.Token);
+        await runner.RunAsync(scriptA, cts.Token);
+
+        // Block until firmA's resting bid is acknowledged by the engine
+        // before unleashing firmB. Bounded by a generous wall-clock cap
+        // so a genuinely stuck dispatcher fails the test fast instead of
+        // hanging at the outer 90s cts.
+        var firmAGate = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < firmAGate)
+        {
+            var snap = sw.ToString();
+            if (snap.Contains("\"src\":\"er\"") &&
+                snap.Contains("\"session\":\"firmA\"") &&
+                snap.Contains("\"execType\":\"new\""))
+            {
+                break;
+            }
+            await Task.Delay(10, cts.Token);
+        }
+        Assert.True(
+            sw.ToString().Contains("\"session\":\"firmA\"") &&
+            sw.ToString().Contains("\"execType\":\"new\""),
+            $"firmA ER_New not observed within 10s; tape so far:\n  " +
+            string.Join("\n  ", sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)));
+
+        await runner.RunAsync(scriptB, cts.Token);
 
         // Wait for ER_Trade on BOTH sessions. Poll until both sides have
         // observed their own trade ER, not just any trade ER (the previous
