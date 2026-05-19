@@ -185,6 +185,33 @@ public class EodFillsExporterTests : IDisposable
     }
 
     [Fact]
+    public void Export_OnRerun_StaleDoneIsRemovedBeforeNewCsvIsPublished()
+    {
+        // Publish a first version.
+        WriteAudit(Make(1, Day0Nanos, secId: 1));
+        var v1 = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate, _ => "A", FixedGeneratedAt);
+        var v1Sha = v1.Sha256Hex;
+
+        // Append more records (changes the audit log content) then rerun.
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Make(2, Day0Nanos + 1_000UL, secId: 1));
+        }
+        var v2 = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate, _ => "A", FixedGeneratedAt.AddMinutes(5));
+
+        // Different content → different SHA.
+        Assert.NotEqual(v1Sha, v2.Sha256Hex);
+
+        // The published .done must describe the CURRENT csv (no stale signal).
+        var donePath = v2.CsvPath + ".done";
+        using var doc = JsonDocument.Parse(File.ReadAllText(donePath));
+        Assert.Equal(v2.Sha256Hex, doc.RootElement.GetProperty("sha256").GetString());
+        Assert.Equal(2, doc.RootElement.GetProperty("rowCount").GetInt64());
+    }
+
+    [Fact]
     public void Export_FailureMidWrite_LeavesPreviousOutputUntouchedAndCleansStaging()
     {
         // First, publish a "good" prior export so we can verify it survives.

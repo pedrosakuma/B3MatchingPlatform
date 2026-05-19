@@ -26,25 +26,36 @@ public readonly record struct EodFillsExportResult(string CsvPath, long RowCount
 /// consumer-visible "ready" signal.</para>
 ///
 /// <para><b>Atomic publish contract</b> (consumer must never see a partial
-/// file even during a rerun):</para>
+/// file or a stale signal — the <c>.done</c> sidecar must never sit next
+/// to a different generation's <c>fills.csv</c>):</para>
 /// <list type="number">
-/// <item>Write CSV to a staging file <c>.fills.csv.tmp-{pid}-{guid}</c>.</item>
-/// <item><c>fsync</c> the staging file's data via <see cref="FileStream.Flush(bool)"/>.</item>
-/// <item><c>rename(2)</c> staging to <c>fills.csv</c> (POSIX atomic).</item>
-/// <item><c>fsync</c> the parent directory via
-/// <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/> so the directory
-/// entry is durable (same <see cref="SafeFileHandle"/> pattern used in
-/// <see cref="FileAuditLogWriter.Checkpoint"/> after #356).</item>
-/// <item>Repeat 1–4 for the JSON <c>fills.csv.done</c> sidecar so the
-/// signal file is the LAST thing to land on disk.</item>
+/// <item>Write CSV to a staging file <c>.fills.csv.tmp-{pid}-{guid}</c>
+/// and <c>fsync</c> it via <see cref="FileStream.Flush(bool)"/>.</item>
+/// <item>Write the <c>.done</c> JSON to a sibling staging file and
+/// <c>fsync</c> it.</item>
+/// <item><b>Invalidate</b> any prior <c>fills.csv.done</c> by removing it
+/// and <c>fsync</c>'ing the parent dir. From this point a consumer polling
+/// for <c>.done</c> sees "not ready" until step 5 completes.</item>
+/// <item><c>rename(2)</c> the CSV staging file to <c>fills.csv</c> (POSIX
+/// atomic) and <c>fsync</c> the parent directory.</item>
+/// <item><c>rename(2)</c> the <c>.done</c> staging file to
+/// <c>fills.csv.done</c> and <c>fsync</c> the parent directory. The
+/// signal file is the LAST thing to land on disk and is always paired
+/// with the CSV whose bytes its <c>sha256</c> describes.</item>
 /// </list>
 ///
-/// <para>Failure modes: any exception during projection leaves the
-/// previously-published <c>fills.csv</c> / <c>.done</c> untouched and the
-/// staging file is best-effort deleted in a <see langword="finally"/>
-/// block. The exception is rethrown so the operator endpoint surfaces a
-/// 4xx/5xx with a structured payload — partial output never reaches the
-/// drop directory.</para>
+/// <para>Crash recovery: a crash between steps 3 and 5 leaves
+/// <c>fills.csv</c> with no <c>.done</c> — consumers correctly observe
+/// "not ready" and the next exporter run rebuilds both files. A crash
+/// between steps 4 and 5 leaves a new <c>fills.csv</c> with no
+/// <c>.done</c> — same recovery.</para>
+///
+/// <para>Failure modes (exception during projection): any in-process
+/// exception before step 3 leaves the previously-published
+/// <c>fills.csv</c> / <c>.done</c> pair untouched. After step 3 the old
+/// <c>.done</c> is gone and the operator must rerun — partial output
+/// never reaches the drop directory in either case. Staging files are
+/// best-effort deleted in a <see langword="finally"/> block.</para>
 ///
 /// <para>Idempotency: rerun for the same channel + date streams the audit
 /// log deterministically, so <c>fills.csv</c> is byte-identical run-to-run
@@ -121,8 +132,9 @@ public sealed class EodFillsExporter
         long rowCount;
         string sha256Hex;
 
-        // 1) Write CSV to staging + atomic publish.
+        // 1) Write CSV to staging (also computes SHA-256 streaming).
         var csvStaging = StagingPath(dropDir, "fills.csv");
+        string? doneStaging = null;
         try
         {
             using (var sha = SHA256.Create())
@@ -139,31 +151,41 @@ public sealed class EodFillsExporter
                 sha256Hex = ToHex(sha.Hash!);
             }
 
+            // 2) Write .done staging file (paired with the CSV staging).
+            // We do this BEFORE invalidating any prior .done so a failure
+            // here still leaves the previous (csv, .done) pair intact.
+            var donePayload = BuildDonePayload(rowCount, sha256Hex, generatedAtUtc);
+            doneStaging = StagingPath(dropDir, "fills.csv.done");
+            using (var fs = OpenStagingForWrite(doneStaging))
+            {
+                fs.Write(donePayload);
+                fs.Flush(flushToDisk: true);
+            }
+
             var csvFinal = Path.Combine(dropDir, "fills.csv");
+            var doneFinal = Path.Combine(dropDir, "fills.csv.done");
+
+            // 3) Invalidate any prior .done BEFORE publishing the new
+            // CSV so consumers can never observe a stale ready signal
+            // pointing at a freshly-replaced fills.csv. From here a
+            // crash before step 5 leaves no .done — consumers correctly
+            // poll "not ready" until the next exporter run.
+            if (File.Exists(doneFinal))
+            {
+                File.Delete(doneFinal);
+                FsyncDirectory(dropDir);
+            }
+
+            // 4) Publish the new CSV.
             File.Move(csvStaging, csvFinal, overwrite: true);
             FsyncDirectory(dropDir);
             csvStaging = null!; // staging file is gone; suppress finally-cleanup.
 
-            // 2) Write .done sidecar last so consumers polling for it
-            // never observe a present-but-stale signal.
-            var donePayload = BuildDonePayload(rowCount, sha256Hex, generatedAtUtc);
-            var doneStaging = StagingPath(dropDir, "fills.csv.done");
-            try
-            {
-                using (var fs = OpenStagingForWrite(doneStaging))
-                {
-                    fs.Write(donePayload);
-                    fs.Flush(flushToDisk: true);
-                }
-                var doneFinal = Path.Combine(dropDir, "fills.csv.done");
-                File.Move(doneStaging, doneFinal, overwrite: true);
-                FsyncDirectory(dropDir);
-                doneStaging = null!;
-            }
-            finally
-            {
-                BestEffortDelete(doneStaging);
-            }
+            // 5) Publish the new .done sidecar last — this is the
+            // consumer-visible ready signal.
+            File.Move(doneStaging, doneFinal, overwrite: true);
+            FsyncDirectory(dropDir);
+            doneStaging = null;
 
             if (unresolved.Count > 0)
             {
@@ -181,6 +203,7 @@ public sealed class EodFillsExporter
         finally
         {
             BestEffortDelete(csvStaging);
+            BestEffortDelete(doneStaging);
         }
     }
 
