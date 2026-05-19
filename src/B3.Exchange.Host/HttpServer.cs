@@ -41,6 +41,8 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly Action<string>? _log;
     private WebApplication? _app;
 
+    private static readonly DateOnly LocalMktDateEpoch = new(1970, 1, 1);
+
     public HttpServer(HttpConfig config, MetricsRegistry metrics,
         IReadOnlyList<IReadinessProbe> probes,
         IReadOnlyDictionary<byte, ChannelDispatcher> dispatchers,
@@ -514,6 +516,15 @@ public sealed class HttpServer : IAsyncDisposable
         {
             ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
             return Results.Text("missing or invalid 'tradeDate' (YYYY-MM-DD)\n", "text/plain");
+        }
+        // UMDF TradeBust_57 encodes tradeDate as LocalMktDate (uint16,
+        // days since 1970-01-01). Range-check up front so accepted
+        // requests never crash mid-dispatch after writing audit state.
+        int tradeDateDaysSinceEpoch = tradeDate.DayNumber - LocalMktDateEpoch.DayNumber;
+        if (tradeDateDaysSinceEpoch < 0 || tradeDateDaysSinceEpoch > ushort.MaxValue)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"'tradeDate' out of LocalMktDate range (1970-01-01..{LocalMktDateEpoch.AddDays(ushort.MaxValue):yyyy-MM-dd})\n", "text/plain");
         }
         if (!TryParseULong(q["correlationId"], out ulong correlationId) || correlationId == 0)
         {

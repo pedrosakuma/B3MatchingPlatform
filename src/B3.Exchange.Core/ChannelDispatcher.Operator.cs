@@ -10,6 +10,8 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
+    private static readonly DateOnly LocalMktDateEpoch = new(1970, 1, 1);
+
     private void ProcessBumpVersion()
     {
         // Atomic operator-initiated channel reset (issue #6). Order matters:
@@ -200,6 +202,22 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         try
         {
+            // UMDF TradeBust_57 carries tradeDate as LocalMktDate (uint16
+            // days since 1970-01-01); the reject-attempt record stores
+            // the same value as int32. DateOnly.DayNumber is days since
+            // 0001-01-01 so a normal date overflows ushort — convert
+            // relative to the Unix epoch and range-check BEFORE writing
+            // any audit/dedup state so we never persist a half-applied
+            // accept.
+            int tradeDateDaysSinceEpoch = op.TradeDate.DayNumber - LocalMktDateEpoch.DayNumber;
+            if (tradeDateDaysSinceEpoch < 0 || tradeDateDaysSinceEpoch > ushort.MaxValue)
+            {
+                completion?.TrySetException(new ArgumentOutOfRangeException(
+                    nameof(op.TradeDate),
+                    $"tradeDate {op.TradeDate:yyyy-MM-dd} outside LocalMktDate range (1970-01-01..{LocalMktDateEpoch.AddDays(ushort.MaxValue):yyyy-MM-dd})"));
+                return;
+            }
+
             var request = new B3.Exchange.PostTrade.BustRequest(
                 op.TradeId, op.TradeDate, op.CorrelationId, op.SecurityIdEcho,
                 op.ReasonCode, op.BusterFirm, op.AttemptTransactTimeNanos);
@@ -224,8 +242,7 @@ public sealed partial class ChannelDispatcher
                             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
                             + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength;
                         var dst = ReserveOrFlush(frameSize);
-                        // TradeDate to ushort days-since-epoch.
-                        ushort tradeDateDays = checked((ushort)op.TradeDate.DayNumber);
+                        ushort tradeDateDays = (ushort)tradeDateDaysSinceEpoch;
                         int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
                             result.MatchedFill.SecurityId, result.MatchedFill.PriceMantissa,
                             result.MatchedFill.Quantity, op.TradeId, tradeDateDays,
@@ -253,7 +270,7 @@ public sealed partial class ChannelDispatcher
                         };
                         var reject = new B3.Exchange.PostTrade.RejectAttemptRecord(
                             op.TradeId, op.AttemptTransactTimeNanos,
-                            op.TradeDate.DayNumber, code, op.BusterFirm, op.CorrelationId);
+                            tradeDateDaysSinceEpoch, code, op.BusterFirm, op.CorrelationId);
                         _postTradeSink.OnRejectAttempt(reject);
                         break;
                     }

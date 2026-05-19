@@ -11,9 +11,9 @@ namespace B3.Exchange.PostTrade;
 /// <c>{rootDir}/{channel}/</c> via
 /// <see cref="AuditLogReader.ReadAllEntries(string)"/> and filtering for
 /// <see cref="AuditRecordKind.Bust"/> records. Only files whose date
-/// falls within <c>[today - retentionDays + 1, today]</c> are inspected;
-/// older files are eligible for deletion by <c>PruneOldDays</c> and are
-/// therefore not authoritative.</para>
+/// falls within <c>[today - retentionDays, today]</c> are inspected;
+/// this window must match <see cref="FileAuditLogWriter.PruneOldDays"/>
+/// so every still-retained bust is reflected here on restart.</para>
 /// </summary>
 public sealed class BustDedupIndex
 {
@@ -34,7 +34,8 @@ public sealed class BustDedupIndex
     /// <summary>
     /// Rebuilds the index by scanning <c>{rootDir}/{channel}/fills-*.log</c>
     /// files whose embedded business date falls within
-    /// <c>[todayUtc - retentionDays + 1, todayUtc]</c>. When
+    /// <c>[todayUtc - retentionDays, todayUtc]</c> — the same window
+    /// <see cref="FileAuditLogWriter.PruneOldDays"/> preserves. When
     /// <paramref name="retentionDays"/> is 0 (= unlimited retention) every
     /// file under the channel directory is scanned.
     ///
@@ -52,7 +53,7 @@ public sealed class BustDedupIndex
         if (!Directory.Exists(channelDir)) return index;
 
         DateOnly? minDate = retentionDays > 0
-            ? todayUtc.AddDays(-(retentionDays - 1))
+            ? todayUtc.AddDays(-retentionDays)
             : null;
 
         foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.log"))

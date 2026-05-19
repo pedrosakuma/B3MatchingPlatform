@@ -61,8 +61,9 @@ public class BustDedupIndexTests : IDisposable
             w.OnTrade(Fill(2, Day0Nanos + OneDayNanos));
             w.OnBust(Bust(2, 200UL), Day0.AddDays(1));
         }
-        // retentionDays = 1 + today = Day0+1 → window = [Day0+1, Day0+1]
-        var index = BustDedupIndex.LoadFromAuditFiles(_root, channel: 4, retentionDays: 1, todayUtc: Day0.AddDays(1));
+        // PruneOldDays-aligned window: retentionDays=1 + today=Day0+2 →
+        // [Day0+1, Day0+2], so Day0's bust is outside and skipped.
+        var index = BustDedupIndex.LoadFromAuditFiles(_root, channel: 4, retentionDays: 1, todayUtc: Day0.AddDays(2));
         Assert.Equal(1, index.Count);
         Assert.False(index.TryGet(1, out _));
         Assert.True(index.TryGet(2, out _));
