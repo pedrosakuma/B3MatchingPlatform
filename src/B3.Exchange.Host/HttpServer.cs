@@ -35,6 +35,7 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly Func<IEnumerable<SessionDiagnostics>>? _sessionsProvider;
     private readonly IReadOnlyList<FirmInfo> _firms;
     private readonly Func<int>? _dailyResetTrigger;
+    private readonly Func<byte, DateOnly, B3.Exchange.PostTrade.EodFillsExportResult?>? _eodExportTrigger;
     private readonly IReadOnlyDictionary<byte, IChannelStatePersister> _persisters;
     private readonly IReadOnlyDictionary<byte, IChannelWriteAheadLog> _wals;
     private readonly Action<string>? _log;
@@ -49,7 +50,8 @@ public sealed class HttpServer : IAsyncDisposable
         Func<int>? dailyResetTrigger = null,
         IReadOnlyDictionary<byte, IChannelStatePersister>? persisters = null,
         IReadOnlyDictionary<byte, IChannelWriteAheadLog>? wals = null,
-        IReadOnlyDictionary<long, ChannelDispatcher>? instrumentRouting = null)
+        IReadOnlyDictionary<long, ChannelDispatcher>? instrumentRouting = null,
+        Func<byte, DateOnly, B3.Exchange.PostTrade.EodFillsExportResult?>? eodExportTrigger = null)
     {
         _config = config;
         _metrics = metrics;
@@ -61,6 +63,7 @@ public sealed class HttpServer : IAsyncDisposable
         _persisters = persisters ?? new Dictionary<byte, IChannelStatePersister>();
         _wals = wals ?? new Dictionary<byte, IChannelWriteAheadLog>();
         _instrumentRouting = instrumentRouting ?? new Dictionary<long, ChannelDispatcher>();
+        _eodExportTrigger = eodExportTrigger;
         _log = log;
     }
 
@@ -183,6 +186,24 @@ public sealed class HttpServer : IAsyncDisposable
             ctx.Response.StatusCode = StatusCodes.Status202Accepted;
             return Results.Text($"accepted daily-reset terminated={closed}\n", "text/plain");
         });
+
+        // Issue #330 PR-2: trigger the post-trade EOD fills CSV export
+        // for one channel + one UTC business date. The body of the request
+        // is ignored; query string carries the parameters so curl-shaped
+        // operator workflows match the rest of /admin/*.
+        //
+        //   POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD
+        //
+        // Returns 200 with a JSON body {csvPath, rowCount, sha256} on
+        // success; 400 on missing/invalid query params; 404 when the
+        // channel has no EOD export configured (postTradeAudit disabled
+        // or eodDropDir empty); 404 again (with a distinct reason) when
+        // the audit log for the requested date is missing; 500 with the
+        // exception type+message on any other failure. The endpoint is
+        // network-gated (no token auth) per the same convention as the
+        // rest of /admin/*; PR-3 wires the daily-reset auto-trigger.
+        app.MapPost("/admin/post-trade/eod-export", (HttpContext ctx) =>
+            HandleEodExport(ctx));
 
         // Issue #271: admin endpoints for snapshot management.
         //
@@ -472,6 +493,59 @@ public sealed class HttpServer : IAsyncDisposable
         _log?.Invoke($"admin: snapshot-get channel={channelNumber} returned snapshot version={snap.Version}");
         var json = System.Text.Json.JsonSerializer.Serialize(snap, AdminJsonOptions);
         return Results.Text(json, "application/json");
+    }
+
+    private IResult HandleEodExport(HttpContext ctx)
+    {
+        if (_eodExportTrigger is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text("eod-export not wired (host not started)\n", "text/plain");
+        }
+
+        var q = ctx.Request.Query;
+        if (!q.TryGetValue("channel", out var chRaw) || !byte.TryParse(chRaw.ToString(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var channel))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'channel' (expected byte 0..255)\n", "text/plain");
+        }
+        if (!q.TryGetValue("date", out var dateRaw) || !DateOnly.TryParseExact(dateRaw.ToString(), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var date))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'date' (expected YYYY-MM-DD UTC)\n", "text/plain");
+        }
+
+        B3.Exchange.PostTrade.EodFillsExportResult? result;
+        try
+        {
+            result = _eodExportTrigger(channel, date);
+        }
+        catch (FileNotFoundException ex)
+        {
+            _log?.Invoke($"admin: eod-export channel={channel} date={date:yyyy-MM-dd} audit log missing: {ex.FileName}");
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"audit log not found for channel={channel} date={date:yyyy-MM-dd}\n", "text/plain");
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"admin: eod-export channel={channel} date={date:yyyy-MM-dd} failed: {ex.GetType().Name}: {ex.Message}");
+            ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            return Results.Text($"eod-export failed: {ex.GetType().Name}: {ex.Message}\n", "text/plain");
+        }
+
+        if (result is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"channel {channel} has no EOD export configured (postTradeAudit.eodDropDir empty)\n", "text/plain");
+        }
+
+        _log?.Invoke($"admin: eod-export channel={channel} date={date:yyyy-MM-dd} rows={result.Value.RowCount} sha256={result.Value.Sha256Hex} path={result.Value.CsvPath}");
+        var payload = "{"
+            + "\"csvPath\":" + System.Text.Json.JsonSerializer.Serialize(result.Value.CsvPath)
+            + ",\"rowCount\":" + result.Value.RowCount.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + ",\"sha256\":\"" + result.Value.Sha256Hex + "\""
+            + "}\n";
+        return Results.Text(payload, "application/json");
     }
 
     private IResult HandleAdminReset(HttpContext ctx, int channelNumber)
