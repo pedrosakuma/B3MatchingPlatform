@@ -18,10 +18,18 @@ changes, a new ADR supersedes the old one.
 - Each ADR has a status header. Lifecycle:
   - **Proposed** — under review on a PR.
   - **Accepted** — merged on `main`. Default once merged.
+  - **Deferred** — the decision is to *not* act now, with a named
+    trigger that would reopen the question (typically "a concrete
+    consumer asks for it"). Distinct from *Rejected*: deferred
+    ADRs may be superseded by a real implementing ADR later. The
+    ADR records the agenda the implementing ADR would have to
+    cover, so reopening is a one-pass exercise.
+  - **Rejected** — kept for the record of *why* we did not go this
+    way. Useful next time the topic comes up. Distinct from
+    *Deferred*: a Rejected ADR records a decision against the
+    feature on its merits, not a wait for a consumer.
   - **Superseded by NNNN** — kept for history; do not edit content,
     only update the header to point at the superseding ADR.
-  - **Rejected** — kept for the record of *why* we did not go this
-    way. Useful next time the topic comes up.
 - ADRs are markdown, no required template, but conventionally:
   `Context`, `Decision`, `Consequences`, optionally `Alternatives
   considered` and `Open questions`.
@@ -37,4 +45,9 @@ changes, a new ADR supersedes the old one.
 |------|----------------------------------------------------------------|----------|
 | 0001 | Post-trade boundary and EOD file export                        | Accepted |
 | 0002 | Per-trade audit log shape                                      | Accepted |
+| 0003 | BVBG XML envelope (deferred)                                   | Deferred |
+| 0004 | Settlement cycle out of scope                                  | Rejected |
+| 0005 | Clearing boundary out of scope                                 | Rejected |
+| 0006 | Surveillance feed: trade-only, no new artifact in v1           | Accepted |
+| 0007 | Position aggregate per firm (deferred)                         | Deferred |
 | 0008 | Late corrections and bust propagation                          | Accepted |

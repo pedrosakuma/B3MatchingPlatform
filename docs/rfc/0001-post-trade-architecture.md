@@ -158,7 +158,7 @@ This RFC's working scope is therefore:
 | `ChannelDispatcher`                 | per-channel single-writer thread; orchestrates sinks; durability watermarks  | matching engine; sinks; WAL; post-trade sink                            |
 | **`B3.Exchange.PostTrade`** (new)   | persisted post-trade artifacts (audit log, drops, eventual feeds)             | filesystem (drops); optional streams; admin HTTP triggers               |
 | Trading host (`B3TradingPlatform`)  | position keeping, blotter, intraday risk, consumer-side statement, D+1 recon  | UMDF (live tape); EntryPoint (live ER); post-trade drop directory       |
-| Future surveillance / clearing      | their own simulators / stubs                                                  | post-trade drops; possibly an intraday feed (decision: ADR 0006)        |
+| Future surveillance / clearing      | their own simulators / stubs                                                  | post-trade drops; **no** simulator-side intraday feed ([ADR 0006](../adr/0006-surveillance-feed.md)); clearing not modelled ([ADR 0005](../adr/0005-clearing-boundary-out-of-scope.md)) |
 
 ### Boundary rules (normative)
 
@@ -188,15 +188,15 @@ channel is for, and which RFC decision (if any) is still pending.
 |------------------------------------------------------|--------------------------|------------------------------------------------------|---------------------------------------------------------------|
 | **UMDF** UDP multicast (`Trade_53` and friends)      | matching → all consumers | live public tape, snapshot recovery                  | Exists. Source of truth for *live* tape.                      |
 | **EntryPoint `ER_Trade`** TCP                        | matching → owning session| per-session fill notification                        | Exists. Source of truth for *live* per-firm fills.            |
-| **Per-trade audit log** (file, internal)             | matching → post-trade    | durable record of every trade for D+0/D+1 artifacts  | ADR 0001 §2; implementation tracked in #329. Future ADR 0002 will formalize shape. |
-| **EOD CSV drop** (`fills.csv` + `.done`)             | post-trade → consumers   | D+1 recon between trading host and matching          | ADR 0001 §3; implementation tracked in #330.                  |
-| **EOD BVBG XML envelope** (`fills.xml` + `.done`)    | post-trade → consumers   | wire-compatible with real BVBG ingesters             | Deferred. Future ADR 0003.                                    |
-| **Settlement instruction file** (per-firm, daily)    | post-trade → clearing    | feed for a clearing simulator (if it exists)         | Deferred. Future ADR 0004 (may also decide *not* to ship).    |
-| **Position aggregate dump** (per firm, per date)     | post-trade → consumers   | shortcut for downstream that does not want to fold trades into positions itself | Deferred. Future ADR 0007. |
-| **Surveillance feed** (intraday or EOD batch)        | post-trade → regulator   | regulatory monitoring (manipulation, spoofing, ramping) | Deferred. Future ADR 0006.                                  |
-| **Late corrections / bust artifact**                 | post-trade → consumers   | propagate a post-EOD bust to consumers that already consumed the drop | Deferred. Future ADR 0008.                  |
-| **Operator trade-correction / bust command**         | operator/admin → dispatcher → post-trade | authoritative inbound channel for trade busts; matching engine is unaware of busts otherwise, so they must enter post-trade through this explicit path and be appended as correction events on the audit stream | Deferred. Future ADR 0008 (paired with the outbound artifact above). |
-| **Reference-data / instrument master drop** (per date) | post-trade/instruments → consumers | day-locked security metadata so D+1 consumers can interpret `securityId` ↔ symbol consistently with the matching side that produced the fills | Deferred. Future ADR 0003 (or a new ADR if the BVBG envelope work does not subsume it). |
+| **Per-trade audit log** (file, internal)             | matching → post-trade    | durable record of every trade for D+0/D+1 artifacts  | Exists. [ADR 0001 §2](../adr/0001-post-trade-boundary-and-eod-file-export.md) (boundary); shape formalised by [ADR 0002](../adr/0002-per-trade-audit-log-shape.md) (fills-only v1); schema-v2 bust + reject-attempt records by [ADR 0008](../adr/0008-late-corrections-and-bust-propagation.md). |
+| **EOD CSV drop** (`fills.csv` + `.done`)             | post-trade → consumers   | D+1 recon between trading host and matching          | Exists. [ADR 0001 §3](../adr/0001-post-trade-boundary-and-eod-file-export.md); implementation shipped via #330 series. |
+| **EOD BVBG XML envelope** (`fills.xml` + `.done`)    | post-trade → consumers   | wire-compatible with real BVBG ingesters             | Not emitted. [ADR 0003](../adr/0003-bvbg-xml-envelope.md) (Deferred, no consumer). |
+| **Settlement instruction file** (per-firm, daily)    | post-trade → clearing    | feed for a clearing simulator (if it exists)         | Not emitted. [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md) (Rejected — out of scope). |
+| **Position aggregate dump** (per firm, per date)     | post-trade → consumers   | shortcut for downstream that does not want to fold trades into positions itself | Not emitted. [ADR 0007](../adr/0007-position-aggregate.md) (Deferred, no consumer). |
+| **Surveillance feed** (intraday or EOD batch)        | post-trade → regulator   | regulatory monitoring (manipulation, spoofing, ramping) | No separate artifact. [ADR 0006](../adr/0006-surveillance-feed.md) — surveillance reads `fills.csv` + `amendments.csv`; trade-only detection in scope, spoofing-class out of scope until audit log is extended. |
+| **Late corrections / bust artifact**                 | post-trade → consumers   | propagate a post-EOD bust to consumers that already consumed the drop | Spec'd. [ADR 0008 §4](../adr/0008-late-corrections-and-bust-propagation.md) — `amendments.csv` + `.done`, regenerated in full from the audit log; implementing PR pending. |
+| **Operator trade-correction / bust command**         | operator/admin → dispatcher → post-trade | authoritative inbound channel for trade busts; matching engine is unaware of busts otherwise, so they must enter post-trade through this explicit path and be appended as correction events on the audit stream | Spec'd. [ADR 0008 §2](../adr/0008-late-corrections-and-bust-propagation.md) — new `POST /admin/post-trade/bust` endpoint; legacy `/channel/{ch}/trade-bust/{tradeId}` kept as replay-only. Implementing PR pending. |
+| **Reference-data / instrument master drop** (per date) | post-trade/instruments → consumers | day-locked security metadata so D+1 consumers can interpret `securityId` ↔ symbol consistently with the matching side that produced the fills | Deferred. Carried by [ADR 0003](../adr/0003-bvbg-xml-envelope.md) §2.3 if BVBG ships; otherwise a future ADR. |
 | **Admin HTTP triggers**                              | operator → post-trade    | "run EOD now", "regen date X", "report status"       | Will land alongside #330; covered by ADR 0001 §3.             |
 
 The matrix is **deliberately not exhaustive of all possible
@@ -224,10 +224,14 @@ Decisions deferred to ADRs:
 - **ADR 0002** must decide whether the audit log carries any
   derived identifier beyond `tradeId` (e.g. a per-day sequence
   number useful for sparse indexing). Probably not necessary if
-  `tradeId` + `ts` is unique.
-- **ADR 0004** (if we ever model settlement) would need to define
+  `tradeId` + `ts` is unique. *(Decided in [ADR 0002 §1](../adr/0002-per-trade-audit-log-shape.md#1-record-shape):
+  no extra derived identifier; `tradeId` + `transactTimeNanos` is
+  sufficient.)*
+- ~~**ADR 0004** (if we ever model settlement) would need to define
   `settlementId` and its relation to `tradeId` (1:1 in the simple
-  case, 1:N if netting is modelled).
+  case, 1:N if netting is modelled).~~ *Closed by
+  [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md):
+  settlement is out of scope; `settlementId` stays unallocated.*
 
 ## 6. Time model
 
@@ -251,7 +255,9 @@ Rationale and trade-offs:
   simulator; real-fidelity is out of scope.
 - **Con:** future settlement T+2 logic, if added, would need to
   decide whether `T` is UTC-business-date or
-  São-Paulo-business-date; **ADR 0004** would resolve that.
+  São-Paulo-business-date; ~~**ADR 0004** would resolve that.~~
+  *Moot: closed by [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md)
+  — no settlement is modelled.*
 
 If at any point B3 session-time boundaries become important
 (e.g. a downstream consumer is doing strict same-day diff
@@ -278,7 +284,7 @@ relevant follow-up ADR.
 | Pre-EOD trade bust: operator busts a trade *before* the EOD drop is published                 | ~~Bust must enter post-trade through the operator/admin channel (see §4) and be appended as a correction event on the audit stream **before** the EOD projection runs; the projection then folds corrections in so the published `fills.csv` reflects the corrected state and no amendment file is needed for same-day busts.~~ **Constraint reversed by [ADR 0002 §7](../adr/0002-per-trade-audit-log-shape.md#7-correction-events-out-of-scope-for-v1-reverses-rfc-7-pre-eod-constraint):** v1 audit log is fills-only with no correction-event variant; pre-EOD busts produce a UMDF `TradeBust_57` frame only and are not folded into the EOD CSV. Re-promoted to ADR 0008 along with post-EOD bust semantics. | ~~ADR 0002 (audit shape must carry correction events); ADR 0008 (semantics).~~ ADR 0008 (both shape extension and semantics, when written). |
 | Duplicate bust / bust of unknown or already-busted trade                                      | Operator command must be idempotent on `tradeId`: repeated bust of the same trade is a no-op (logged), bust of an unknown or already-busted trade is rejected at the admin layer with a clear error. The audit log must record the *attempt* so the operator audit trail is complete even when the command was a no-op. | ADR 0008. |
 | Concurrent / repeated EOD export for the same date (scheduler fires while operator rerun is in flight, or two operator reruns overlap) | Export must be single-flight per `(channel, date)`; second concurrent request is rejected with HTTP 409 rather than racing the first. The `.done` sentinel must additionally bind to the exact data file via a generation token or content hash, so consumers that see a `.done` cannot read a `fills.csv` from a different run. | ADR 0001 §3 (refinement); ADR 0002 if the generation token is derived from the audit watermark. |
-| Future ADR 0004 (settlement) introduces fail-to-deliver scenarios                             | Out of scope of this RFC; deferred entirely.                                                                                  | ADR 0004 if/when written. |
+| ~~Future ADR 0004 (settlement) introduces fail-to-deliver scenarios~~ | ~~Out of scope of this RFC; deferred entirely.~~ *Closed by [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md): no settlement modelled, so no fail-to-deliver scenarios exist.* | [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md). |
 
 ## 8. ADR roadmap
 
@@ -289,20 +295,24 @@ updates as ADRs land or are explicitly rejected.
 |-----------|--------------------------------------------------------|----------------------------------------------------------------------------|---------------------------------|
 | ADR 0001  | Post-trade boundary + EOD file export                  | (already accepted; first child of this RFC)                                | **Accepted** (pre-RFC)          |
 | [ADR 0002](../adr/0002-per-trade-audit-log-shape.md) | Per-trade audit log shape                              | Implementation already on `main` (#329 series). Choice: **fills-only** in v1 — order-lifecycle extension deferred to a follow-up ADR if/when ADR 0006 needs it. Unblocks ADR 0008. | **Accepted** (retroactive).     |
-| ADR 0003  | BVBG XML envelope: when and how                        | Optional alternative format for the EOD drop. Non-blocking; written when a consumer asks for XML. May also subsume the reference-data drop row in §4 if the BVBG envelope already carries instrument master payloads. | Planned, not blocking.          |
-| ADR 0004  | Settlement cycle model (or lack of)                    | Decides whether the simulator ever emits settlement-instruction artifacts. Most likely outcome: *no, out of scope* — but recorded as an explicit decision. | Planned, low priority.          |
-| ADR 0005  | Clearing boundary                                      | Decides whether a `B3.Exchange.Clearing` module exists. Coupled with ADR 0004. | Planned, low priority.          |
-| ADR 0006  | Surveillance / regulatory feed shape                   | Decides intraday-stream vs EOD-batch surveillance feed; format, retention. **Scope caveat:** trade-only surveillance (wash trades, self-trades, price-impact heuristics) is reconstructable from a fills audit log; spoofing / layering / quote-stuffing detection requires order add/modify/cancel/phase context. If ADR 0002 ships fills-only, ADR 0006 must either (a) narrow its scope to trade-only surveillance, or (b) trigger a follow-up ADR extending the audit log before any spoofing-class detection is promised. | Planned, no immediate consumer. |
-| ADR 0007  | Position aggregate per firm                            | Optional shortcut for consumers that do not want to derive positions from the fills drop themselves. | Planned, no immediate consumer. |
+| [ADR 0003](../adr/0003-bvbg-xml-envelope.md) | BVBG XML envelope: when and how                        | Optional alternative format for the EOD drop. Non-blocking; deferred until a consumer asks for XML. May also subsume the reference-data drop row in §4 if revisited. | **Deferred** (no consumer).     |
+| [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md) | Settlement cycle model (or lack of)                    | Records as explicit decision that no settlement cycle is modelled. Aligned with §9. Coupled with ADR 0005. | **Rejected** (out of scope).    |
+| [ADR 0005](../adr/0005-clearing-boundary-out-of-scope.md) | Clearing boundary                                      | Records as explicit decision that no `B3.Exchange.Clearing` module exists. Coupled with ADR 0004. | **Rejected** (out of scope).    |
+| [ADR 0006](../adr/0006-surveillance-feed.md) | Surveillance / regulatory feed shape                   | No separate artifact; surveillance reads `fills.csv` + `amendments.csv`. v1 scope is **trade-only** detection (wash trades, self-trades, price-impact); spoofing / layering / quote-stuffing detection deferred to a follow-up ADR that extends the audit-log shape from ADR 0002. | **Accepted**.                   |
+| [ADR 0007](../adr/0007-position-aggregate.md) | Position aggregate per firm                            | Optional convenience artifact; deferred until a named consumer asks. Pure projection of `fills.csv` + `amendments.csv`, no new authoritative state. | **Deferred** (no consumer).     |
 | [ADR 0008](../adr/0008-late-corrections-and-bust-propagation.md) | Late corrections / bust propagation                    | How a post-EOD trade bust is propagated; amendment file format. Critical the moment the trade-bust endpoint is exercised post-EOD. Now also owns the audit-log schema-v2 extension (correction record variant), since ADR 0002 deferred that to here. | **Accepted** (spec; no implementing PR yet). |
 
 **Sequencing:**
 
-1. Land ADR 0002 first (blocks #329, which blocks #330).
+1. Land ADR 0002 first (blocks #329, which blocks #330). *(Done.)*
 2. ADR 0008 next, because the moment #330 ships and is used in
-   anger, late corrections become a real concern.
-3. ADRs 0003–0007 are written when a concrete consumer asks
-   for them. Until then, they remain "Planned" with no PR.
+   anger, late corrections become a real concern. *(Done as spec;
+   implementing PR pending.)*
+3. ADRs 0003 / 0004 / 0005 / 0006 / 0007 have all landed as
+   explicit *Accepted / Deferred / Rejected* decisions so the
+   roadmap is no longer a backlog of unanswered questions. None
+   ships code in this repo today; if a consumer materialises, the
+   relevant ADR is superseded by a new implementing ADR.
 
 ## 9. Explicitly out of scope of this RFC
 
@@ -311,10 +321,11 @@ Listed so future contributors do not assume they were missed.
 
 - **Active clearing module.** No novation simulation, no margin
   computation, no default management, no clearing-house
-  obligations. Deferred to ADR 0005 (which may decide to ship
-  nothing).
+  obligations. Decided by [ADR 0005](../adr/0005-clearing-boundary-out-of-scope.md)
+  (rejected — explicit non-feature).
 - **Custody / CSD integration.** No simulated securities depository,
-  no DvP, no settlement fails. Deferred to ADR 0004.
+  no DvP, no settlement fails. Decided by [ADR 0004](../adr/0004-settlement-cycle-out-of-scope.md)
+  (rejected — explicit non-feature).
 - **Corporate actions.** No dividends, splits, mergers, rights
   issues impacting positions or trade prices. Would need a
   separate RFC if ever in scope.
