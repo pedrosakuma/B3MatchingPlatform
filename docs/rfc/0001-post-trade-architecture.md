@@ -294,7 +294,7 @@ updates as ADRs land or are explicitly rejected.
 | ADR 0005  | Clearing boundary                                      | Decides whether a `B3.Exchange.Clearing` module exists. Coupled with ADR 0004. | Planned, low priority.          |
 | ADR 0006  | Surveillance / regulatory feed shape                   | Decides intraday-stream vs EOD-batch surveillance feed; format, retention. **Scope caveat:** trade-only surveillance (wash trades, self-trades, price-impact heuristics) is reconstructable from a fills audit log; spoofing / layering / quote-stuffing detection requires order add/modify/cancel/phase context. If ADR 0002 ships fills-only, ADR 0006 must either (a) narrow its scope to trade-only surveillance, or (b) trigger a follow-up ADR extending the audit log before any spoofing-class detection is promised. | Planned, no immediate consumer. |
 | ADR 0007  | Position aggregate per firm                            | Optional shortcut for consumers that do not want to derive positions from the fills drop themselves. | Planned, no immediate consumer. |
-| ADR 0008  | Late corrections / bust propagation                    | How a post-EOD trade bust is propagated; amendment file format. Critical the moment the trade-bust endpoint is exercised post-EOD. | Planned, **blocks any real D+1 recon flow that handles busts**. |
+| [ADR 0008](../adr/0008-late-corrections-and-bust-propagation.md) | Late corrections / bust propagation                    | How a post-EOD trade bust is propagated; amendment file format. Critical the moment the trade-bust endpoint is exercised post-EOD. Now also owns the audit-log schema-v2 extension (correction record variant), since ADR 0002 deferred that to here. | **Accepted** (spec; no implementing PR yet). |
 
 **Sequencing:**
 
