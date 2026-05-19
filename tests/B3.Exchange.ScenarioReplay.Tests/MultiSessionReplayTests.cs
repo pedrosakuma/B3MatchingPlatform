@@ -126,22 +126,24 @@ public class MultiSessionReplayTests
         // so a genuinely stuck dispatcher fails the test fast instead of
         // hanging at the outer 90s cts.
         var firmAGate = DateTime.UtcNow.AddSeconds(10);
+        string firmAGateSnap = string.Empty;
         while (DateTime.UtcNow < firmAGate)
         {
-            var snap = sw.ToString();
-            if (snap.Contains("\"src\":\"er\"") &&
-                snap.Contains("\"session\":\"firmA\"") &&
-                snap.Contains("\"execType\":\"new\""))
+            firmAGateSnap = capture.Snapshot();
+            if (firmAGateSnap.Contains("\"src\":\"er\"") &&
+                firmAGateSnap.Contains("\"session\":\"firmA\"") &&
+                firmAGateSnap.Contains("\"execType\":\"new\""))
             {
                 break;
             }
             await Task.Delay(10, cts.Token);
         }
+        firmAGateSnap = capture.Snapshot();
         Assert.True(
-            sw.ToString().Contains("\"session\":\"firmA\"") &&
-            sw.ToString().Contains("\"execType\":\"new\""),
+            firmAGateSnap.Contains("\"session\":\"firmA\"") &&
+            firmAGateSnap.Contains("\"execType\":\"new\""),
             $"firmA ER_New not observed within 10s; tape so far:\n  " +
-            string.Join("\n  ", sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)));
+            string.Join("\n  ", firmAGateSnap.Split('\n', StringSplitOptions.RemoveEmptyEntries)));
 
         await runner.RunAsync(scriptB, cts.Token);
 
@@ -158,7 +160,7 @@ public class MultiSessionReplayTests
         var deadline = DateTime.UtcNow.AddSeconds(60);
         while (DateTime.UtcNow < deadline)
         {
-            var snapLines = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            var snapLines = capture.Snapshot().Split('\n', StringSplitOptions.RemoveEmptyEntries);
             bool aNew = snapLines.Any(l => l.Contains("\"src\":\"er\"") && l.Contains("\"session\":\"firmA\"") && l.Contains("\"execType\":\"new\""));
             bool aTrade = snapLines.Any(l => l.Contains("\"src\":\"er\"") && l.Contains("\"session\":\"firmA\"") && l.Contains("\"execType\":\"trade\""));
             bool bTrade = snapLines.Any(l => l.Contains("\"src\":\"er\"") && l.Contains("\"session\":\"firmB\"") && l.Contains("\"execType\":\"trade\""));
@@ -167,8 +169,9 @@ public class MultiSessionReplayTests
             await Task.Delay(50, cts.Token);
         }
 
+        var finalSnap = capture.Snapshot();
         capture.Dispose();
-        var lines = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var lines = finalSnap.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
         // Dump captured tape on failure to make this test self-diagnosing
         // (the previous incarnations of #146 left no clue what was missing).
@@ -233,13 +236,13 @@ public class MultiSessionReplayTests
         var deadline = DateTime.UtcNow.AddSeconds(3);
         while (DateTime.UtcNow < deadline)
         {
-            if (sw.ToString().Contains("\"execType\":\"new\""))
+            if (capture.Snapshot().Contains("\"execType\":\"new\""))
                 break;
             await Task.Delay(50, cts.Token);
         }
 
+        var snapshot = capture.Snapshot();
         capture.Dispose();
-        var snapshot = sw.ToString();
         Assert.Contains("\"session\":\"only\"", snapshot);
         Assert.Contains("\"execType\":\"new\"", snapshot);
     }
