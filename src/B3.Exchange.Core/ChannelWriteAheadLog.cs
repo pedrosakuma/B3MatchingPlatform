@@ -96,28 +96,18 @@ public interface IChannelWriteAheadLog : IDurabilityBarrier
     /// and <c>onSaved</c> callback firing — a full <see cref="Truncate"/>
     /// in that window would silently drop the tail.
     ///
-    /// <para>Default implementation reads the surviving tail, calls
-    /// <see cref="Truncate"/>, then re-<see cref="Append"/>s the tail
-    /// — correct for in-memory fakes. File-backed implementations
-    /// should override with an atomic rewrite to avoid the
-    /// drop+re-append window.</para>
-    ///
-    /// <para>Single-writer contract identical to <see cref="Truncate"/>:
-    /// implementations may assume only one caller at a time but MUST
-    /// be safe to run concurrently with <see cref="Append"/> from the
-    /// dispatch thread (the file implementation serializes via its
-    /// internal write lock).</para>
+    /// <para><b>No default is provided on purpose.</b> Any naive
+    /// <c>ReadAll → Truncate → re-Append</c> default would be unsafe
+    /// for production implementations whose <see cref="Append"/> runs
+    /// on a different thread (the dispatch thread) than this call (the
+    /// async-snapshot writer thread): a record appended between
+    /// <see cref="ReadAll"/> and <see cref="Truncate"/> would be lost,
+    /// recreating the very race this method was introduced to close.
+    /// Implementations MUST serialize the rewrite atomically with
+    /// concurrent <see cref="Append"/> calls (the file implementation
+    /// uses its internal write lock and an atomic file rename).</para>
     /// </summary>
-    void TruncateThrough(long throughSeq)
-    {
-        var tail = new List<WalRecord>();
-        foreach (var rec in ReadAll())
-        {
-            if (rec.Seq > throughSeq) tail.Add(rec);
-        }
-        Truncate();
-        foreach (var rec in tail) Append(rec);
-    }
+    void TruncateThrough(long throughSeq);
 
     /// <summary>
     /// Issue #271: removes the underlying WAL artifact entirely (file,
