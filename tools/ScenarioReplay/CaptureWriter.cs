@@ -106,4 +106,20 @@ public sealed class CaptureWriter : IDisposable
             if (_ownsWriter) { try { _writer.Dispose(); } catch { } }
         }
     }
+
+    /// <summary>
+    /// Thread-safe snapshot of the underlying writer's accumulated text.
+    /// Tests poll the captured tape concurrently with receive-loop callbacks
+    /// writing new lines; reading <see cref="StringWriter.ToString"/> /
+    /// <see cref="System.Text.StringBuilder"/> directly is not safe under
+    /// concurrent writes. Takes the same gate <see cref="WriteLine{T}"/>
+    /// uses so readers always observe a consistent snapshot.
+    /// </summary>
+    public string Snapshot()
+    {
+        lock (_gate)
+        {
+            return _writer.ToString() ?? string.Empty;
+        }
+    }
 }
