@@ -261,4 +261,101 @@ public class EodFillsExporterTests : IDisposable
         // tradeId=1,ts,"WEIRD,""SYM""",...
         Assert.Contains(",\"WEIRD,\"\"SYM\"\"\",", line, StringComparison.Ordinal);
     }
+
+    // ADR 0008 §3a — pre-EOD bust folding: bust records targeting fills
+    // in the same day's log cause those fills to disappear from the
+    // projection entirely (not be negated). Reject-attempt records are
+    // operator audit-only and must not affect the export.
+
+    private static BustRecord MakeBust(uint cancelledTradeId, ulong attemptTs, long secId = 900_000_000_001L, uint busterFirm = 99, ulong correlationId = 4242UL)
+        => new(cancelledTradeId, attemptTs, secId, ReasonCode: 1, busterFirm, correlationId);
+
+    private static RejectAttemptRecord MakeReject(uint attemptedTradeId, ulong attemptTs, int declaredDate = 20597, uint busterFirm = 99, ulong correlationId = 5555UL)
+        => new(attemptedTradeId, attemptTs, declaredDate, RejectCode: 1, busterFirm, correlationId);
+
+    [Fact]
+    public void Export_PreEodFolding_OmitsBustedFills()
+    {
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Make(1, Day0Nanos, secId: 100));
+            w.OnTrade(Make(2, Day0Nanos + 1_000_000UL, secId: 100));
+            w.OnTrade(Make(3, Day0Nanos + 2_000_000UL, secId: 100));
+            // Cancel trade 2 in the same day's log (pre-EOD path).
+            w.OnBust(MakeBust(2, Day0Nanos + 3_000_000UL, secId: 100), BusinessDate);
+        }
+
+        var result = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate,
+            _ => "PETR4", FixedGeneratedAt);
+
+        Assert.Equal(2, result.RowCount);
+        var lines = File.ReadAllLines(result.CsvPath);
+        Assert.Equal(3, lines.Length); // header + 2 rows
+        Assert.Equal("1", lines[1].Split(',')[0]);
+        Assert.Equal("3", lines[2].Split(',')[0]); // tradeId=2 is gone entirely
+    }
+
+    [Fact]
+    public void Export_PreEodFolding_SkipsRejectAttempts()
+    {
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Make(1, Day0Nanos, secId: 100));
+            // Reject-attempt records are operator audit; they must never
+            // appear in the projection, nor cancel anything.
+            w.OnRejectAttempt(MakeReject(1, Day0Nanos + 500_000UL));
+            w.OnTrade(Make(2, Day0Nanos + 1_000_000UL, secId: 100));
+        }
+
+        var result = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate,
+            _ => "PETR4", FixedGeneratedAt);
+
+        Assert.Equal(2, result.RowCount);
+        var lines = File.ReadAllLines(result.CsvPath);
+        Assert.Equal(3, lines.Length);
+        Assert.Equal("1", lines[1].Split(',')[0]);
+        Assert.Equal("2", lines[2].Split(',')[0]);
+    }
+
+    [Fact]
+    public void Export_PreEodFolding_AllFillsBusted_EmitsHeaderOnly()
+    {
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Make(1, Day0Nanos, secId: 100));
+            w.OnTrade(Make(2, Day0Nanos + 1_000_000UL, secId: 100));
+            w.OnBust(MakeBust(1, Day0Nanos + 2_000_000UL, secId: 100), BusinessDate);
+            w.OnBust(MakeBust(2, Day0Nanos + 3_000_000UL, secId: 100), BusinessDate);
+        }
+
+        var result = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate,
+            _ => "PETR4", FixedGeneratedAt);
+
+        Assert.Equal(0, result.RowCount);
+        var lines = File.ReadAllLines(result.CsvPath);
+        Assert.Single(lines); // header only
+    }
+
+    [Fact]
+    public void Export_PreEodFolding_BustForUnknownTradeId_IsHarmless()
+    {
+        // The validator gates this in the dispatch path (UnknownTradeId
+        // never writes a Bust record), but defense-in-depth: a stray
+        // bust pointing at a tradeId that isn't in the day's fills
+        // simply has no effect.
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Make(1, Day0Nanos, secId: 100));
+            w.OnBust(MakeBust(99, Day0Nanos + 1_000_000UL, secId: 100), BusinessDate);
+        }
+
+        var result = NewExporter().Export(
+            _auditRoot, _dropRoot, Channel, BusinessDate,
+            _ => "PETR4", FixedGeneratedAt);
+
+        Assert.Equal(1, result.RowCount);
+    }
 }

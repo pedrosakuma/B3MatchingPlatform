@@ -212,9 +212,24 @@ public sealed class EodFillsExporter
         // Header — frozen by ADR 0001 / issue #330.
         sw.Write("tradeId,ts,symbol,aggressorSide,qty,price,buyClOrdId,sellClOrdId,buyFirm,sellFirm\n");
 
+        // ADR 0008 §3a — pre-EOD bust folding. The audit log for this
+        // business date may contain bust records (recordType=0x02) whose
+        // CancelledTradeId targets a fill that lives in this same file.
+        // The resulting fills.csv MUST NOT contain the busted fill at
+        // all (vs containing it then negating it), so first-pass walk
+        // builds the cancellation set, second-pass walk filters fills
+        // out of the projection. Reject-attempt records (type=0x03) are
+        // skipped entirely — they describe rejected operator commands
+        // and do not affect the published fills.
+        var cancelled = CollectCancelledTradeIds(auditLogPath);
+
         long rows = 0;
-        foreach (var r in AuditLogReader.ReadAll(auditLogPath))
+        foreach (var entry in AuditLogReader.ReadAllEntries(auditLogPath))
         {
+            if (entry.Kind != AuditRecordKind.Fill) continue;
+            var r = entry.Fill;
+            if (cancelled.Contains(r.TradeId)) continue;
+
             var sym = symbolLookup(r.SecurityId);
             if (string.IsNullOrEmpty(sym))
             {
@@ -245,6 +260,20 @@ public sealed class EodFillsExporter
             rows++;
         }
         return rows;
+    }
+
+    private static HashSet<uint> CollectCancelledTradeIds(string auditLogPath)
+    {
+        // Per-day memory: 4 bytes × #busts; bounded well under 1 MB for
+        // any realistic day (ADR 0008 §3a). Two-pass shape mirrors the
+        // existing exporter tests' streaming expectations.
+        var cancelled = new HashSet<uint>();
+        foreach (var entry in AuditLogReader.ReadAllEntries(auditLogPath))
+        {
+            if (entry.Kind == AuditRecordKind.Bust)
+                cancelled.Add(entry.Bust.CancelledTradeId);
+        }
+        return cancelled;
     }
 
     private static string FormatTimestampMicros(ulong transactTimeNanos)
