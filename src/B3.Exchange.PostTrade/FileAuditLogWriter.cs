@@ -436,7 +436,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         Span<byte> hdr = stackalloc byte[AuditRecordCodec.FileHeaderSize];
         if (fs.Read(hdr) != hdr.Length)
             throw new InvalidDataException($"audit file '{fs.Name}' truncated in header");
-        var (channel, _) = AuditRecordCodec.ReadFileHeader(hdr);
+        var (channel, _, _) = AuditRecordCodec.ReadFileHeader(hdr);
         if (channel != _channelNumber)
             throw new InvalidDataException($"audit file '{fs.Name}' channel mismatch (file={channel}, writer={_channelNumber})");
 

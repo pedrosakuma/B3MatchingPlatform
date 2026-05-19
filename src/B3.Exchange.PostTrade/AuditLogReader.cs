@@ -15,30 +15,81 @@ namespace B3.Exchange.PostTrade;
 public static class AuditLogReader
 {
     /// <summary>Opens <paramref name="path"/>, validates the file header,
-    /// and yields every record in order. Throws
+    /// and yields every fill record in order. Throws
     /// <see cref="InvalidDataException"/> on an unreadable header
     /// (mismatched magic/version/date) — that is unrecoverable corruption,
-    /// not a torn tail.</summary>
+    /// not a torn tail.
+    ///
+    /// **Schema-v2 files** (ADR 0008): bust and reject-attempt records
+    /// are silently skipped so this API keeps its v1-era "fills only"
+    /// contract. Callers that need the full event stream use
+    /// <see cref="ReadAllEntries(string)"/>.</summary>
     public static IEnumerable<PostTradeRecord> ReadAll(string path)
+    {
+        foreach (var entry in ReadAllEntries(path))
+        {
+            if (entry.Kind == AuditRecordKind.Fill)
+                yield return entry.Fill;
+        }
+    }
+
+    /// <summary>Opens <paramref name="path"/>, validates the file header,
+    /// and yields every record (fill / bust / reject-attempt) in the
+    /// order they were written. The per-file schema view (ADR 0008 §1)
+    /// applies: v1 files contain only fills (anything else is corruption
+    /// and ends the read); v2 files dispatch by <c>recordLen</c>.
+    ///
+    /// Torn-tail semantics are unchanged from <see cref="ReadAll(string)"/>:
+    /// short reads, unknown record lengths, recordType mismatches, and
+    /// CRC failures all terminate iteration cleanly rather than throwing,
+    /// matching the standard append-only-log convention.</summary>
+    public static IEnumerable<AuditEntry> ReadAllEntries(string path)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         var header = new byte[AuditRecordCodec.FileHeaderSize];
         int hr = ReadFully(fs, header, 0, header.Length);
         if (hr != header.Length)
             throw new InvalidDataException($"audit file '{path}' truncated in header (got {hr} bytes)");
-        _ = AuditRecordCodec.ReadFileHeader(header);
+        var (_, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(header);
 
-        var buffer = new byte[AuditRecordCodec.RecordSize];
+        var buffer = new byte[AuditRecordCodec.MaxRecordSize];
         while (true)
         {
-            int read = ReadFully(fs, buffer, 0, AuditRecordCodec.RecordSize);
-            if (read == 0)
+            // Peek the length prefix to dispatch record type.
+            int prefixRead = ReadFully(fs, buffer, 0, 4);
+            if (prefixRead == 0) yield break;
+            if (prefixRead < 4) yield break;
+            if (!AuditRecordCodec.TryPeekRecordLen(buffer.AsSpan(0, 4), out var recordLen))
                 yield break;
-            if (read < AuditRecordCodec.RecordSize)
+            if (!AuditRecordCodec.TryGetRecordSize(recordLen, out var totalSize, out var kind))
                 yield break;
-            if (!AuditRecordCodec.TryDecode(buffer, out var record))
+            // v1 files only ever carry fills; anything else is corruption.
+            if (schemaVersion == AuditRecordCodec.SchemaVersionV1 && kind != AuditRecordKind.Fill)
                 yield break;
-            yield return record;
+
+            int bodyRead = ReadFully(fs, buffer, 4, totalSize - 4);
+            if (bodyRead < totalSize - 4) yield break;
+
+            switch (kind)
+            {
+                case AuditRecordKind.Fill:
+                    if (!AuditRecordCodec.TryDecode(buffer.AsSpan(0, totalSize), out var fill))
+                        yield break;
+                    yield return new AuditEntry(in fill);
+                    break;
+                case AuditRecordKind.Bust:
+                    if (!AuditRecordCodec.TryDecodeBust(buffer.AsSpan(0, totalSize), out var bust))
+                        yield break;
+                    yield return new AuditEntry(in bust);
+                    break;
+                case AuditRecordKind.RejectAttempt:
+                    if (!AuditRecordCodec.TryDecodeRejectAttempt(buffer.AsSpan(0, totalSize), out var rej))
+                        yield break;
+                    yield return new AuditEntry(in rej);
+                    break;
+                default:
+                    yield break;
+            }
         }
     }
 
@@ -86,7 +137,7 @@ public static class AuditLogReader
         int hr = ReadFully(fs, header, 0, header.Length);
         if (hr != header.Length)
             throw new InvalidDataException($"audit file '{logPath}' truncated in header (got {hr} bytes)");
-        _ = AuditRecordCodec.ReadFileHeader(header);
+        var (_, _, _) = AuditRecordCodec.ReadFileHeader(header);
 
         var buffer = new byte[AuditRecordCodec.RecordSize];
         // 1) Indexed candidates — seek directly to each block.
