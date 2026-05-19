@@ -82,12 +82,52 @@ public sealed class ExchangeHost : IAsyncDisposable
     {
         var listener = _listener;
         int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason);
+        // Issue #330 PR-3 (review BLOCKING): drain per-channel inbound
+        // queues before reading yesterday's audit log. TerminateAllSessions
+        // only closes live FIXP transports; commands already decoded and
+        // enqueued on the dispatcher Channel keep flowing through
+        // ProcessOne → _postTradeSink.OnTrade after this call returns. If
+        // a fill with TransactTime in yesterday's UTC window is still in
+        // flight when EodFillsExporter starts reading, we'd export an
+        // incomplete CSV. Mirror the graceful-shutdown phase-3 drain
+        // (ExchangeHost.StopAsync) but keep it synchronous so the
+        // /admin/daily-reset response stays simple.
+        DrainDispatcherInboundForRollover(reason);
         // Issue #330 PR-3: chain the EOD fills export for every channel
         // with eodDropDir configured (yesterday UTC). Failures are
         // logged and swallowed so a CSV problem on one channel never
         // hides the listener-termination count from the operator.
         TriggerEodExportForAllChannels(reason);
         return terminated;
+    }
+
+    private void DrainDispatcherInboundForRollover(string reason)
+    {
+        if (_dispatchers.Count == 0) return;
+        int graceMs = Math.Max(0, _config.Shutdown.DrainGraceMs);
+        int pollMs = Math.Max(1, _config.Shutdown.DrainPollMs);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int residual = 0;
+        while (true)
+        {
+            residual = 0;
+            foreach (var d in _dispatchers) residual += d.InboundQueueDepth;
+            if (residual == 0) break;
+            if (sw.ElapsedMilliseconds >= graceMs) break;
+            Thread.Sleep(pollMs);
+        }
+        if (residual == 0)
+        {
+            _logger.LogInformation(
+                "daily-reset ({Reason}): drain phase=ok duration={DurationMs}ms",
+                reason, sw.ElapsedMilliseconds);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "daily-reset ({Reason}): drain phase=grace-expired duration={DurationMs}ms residual={Residual} — EOD export may miss in-flight fills",
+                reason, sw.ElapsedMilliseconds, residual);
+        }
     }
 
     /// <summary>
