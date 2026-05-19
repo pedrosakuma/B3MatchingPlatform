@@ -395,6 +395,84 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         return DateOnly.FromDateTime(dt);
     }
 
+    /// <summary>
+    /// Issue #329 PR-6: delete on-disk audit files for UTC business
+    /// dates older than <c>todayUtc - retentionDays</c>. Files matching
+    /// the pattern <c>fills-YYYY-MM-DD.log</c> / <c>fills-YYYY-MM-DD.idx</c>
+    /// under the channel directory are removed in pairs; malformed or
+    /// non-date filenames are ignored. The currently-open day (i.e. the
+    /// one this writer is actively appending to) is never pruned even if
+    /// the calendar has rolled — operators must let the writer rotate first.
+    /// The watermark sidecar (<c>audit-watermark.bin</c>) is per-channel,
+    /// not per-day, and is intentionally NOT pruned.
+    ///
+    /// <para><paramref name="retentionDays"/> must be &gt;= 1. Pass the
+    /// compliance-mandated horizon (e.g. 5 years for B3 fills) or a
+    /// shorter operator value during development. Returns the number of
+    /// (.log, .idx) pairs deleted; partial pairs (an orphan .log or
+    /// .idx) are still counted toward the deletion total per file.</para>
+    ///
+    /// <para>Safe to call from any thread: the method acquires the same
+    /// <c>_checkpointLock</c> as <see cref="Checkpoint"/> / <see cref="Dispose"/>
+    /// so it never races the active stream. The active day is identified
+    /// by <c>_currentDate</c> under the lock to avoid a TOCTOU window.</para>
+    /// </summary>
+    public int PruneOldDays(DateOnly todayUtc, int retentionDays)
+    {
+        if (retentionDays < 1)
+            throw new ArgumentOutOfRangeException(nameof(retentionDays), "retentionDays must be >= 1");
+        var channelDir = Path.Combine(_rootDir, _channelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (!Directory.Exists(channelDir)) return 0;
+        var cutoff = todayUtc.AddDays(-retentionDays);
+        int deleted = 0;
+        lock (_checkpointLock)
+        {
+            foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.*"))
+            {
+                var name = Path.GetFileName(path);
+                if (!TryParseFillsDate(name, out var date, out var ext)) continue;
+                if (ext != ".log" && ext != ".idx") continue;
+                // Never delete the currently-open day even if it falls
+                // before the cutoff (e.g. a clock skew or aggressive
+                // retentionDays=1 during development).
+                if (_stream is not null && date == _currentDate) continue;
+                if (date >= cutoff) continue;
+                try
+                {
+                    File.Delete(path);
+                    deleted++;
+                }
+                catch (IOException)
+                {
+                    // Best-effort: file in use or transient FS error;
+                    // the next prune pass will retry.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Permissions issue — leave for the operator.
+                }
+            }
+        }
+        return deleted;
+    }
+
+    private static bool TryParseFillsDate(string fileName, out DateOnly date, out string ext)
+    {
+        date = default;
+        ext = string.Empty;
+        // Expected: fills-YYYY-MM-DD.log | fills-YYYY-MM-DD.idx
+        const string prefix = "fills-";
+        if (!fileName.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        int dot = fileName.LastIndexOf('.');
+        if (dot <= prefix.Length) return false;
+        var dateSpan = fileName.AsSpan(prefix.Length, dot - prefix.Length);
+        if (!DateOnly.TryParseExact(dateSpan, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out date))
+            return false;
+        ext = fileName[dot..];
+        return true;
+    }
+
     public void Dispose()
     {
         lock (_checkpointLock)

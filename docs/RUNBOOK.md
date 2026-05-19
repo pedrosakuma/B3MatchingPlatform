@@ -153,7 +153,7 @@ when the bounded queue is full (`DropWrite`).
 | --- | --- | --- |
 | `/channel/{ch}/snapshot-now` | POST | Force the next snapshot rotation tick to fire. Useful for triggering a recovery-bootstrap window for a freshly connected MD consumer. |
 | `/channel/{ch}/bump-version` | POST | Advance the channel's `SessionVerId` (snapshot generation), forcing consumers to re-bootstrap. |
-| `/channel/{ch}/trade-bust/{tradeId}` | POST | Publish a `TradeBust_57` (trade reversal) on the incremental channel. Required query: `securityId`. Optional: `priceMantissa`, `size`, `tradeDate` (LocalMktDate; days since 1970-01-01, default = today UTC). The simulator does not retain a per-trade audit log — the operator supplies the echo fields the consumer audits. The bust frame is stamped with the engine's next `RptSeq` so the per-instrument sequence stays dense. |
+| `/channel/{ch}/trade-bust/{tradeId}` | POST | Publish a `TradeBust_57` (trade reversal) on the incremental channel. Required query: `securityId`. Optional: `priceMantissa`, `size`, `tradeDate` (LocalMktDate; days since 1970-01-01, default = today UTC). The bust does not reach back into the post-trade audit log (issue #329) — the operator supplies the echo fields the consumer audits, and operators reconcile against the original `fills-YYYY-MM-DD.log` record offline. The bust frame is stamped with the engine's next `RptSeq` so the per-instrument sequence stays dense. |
 
 ### 2.5 Daily reset — `/admin/daily-reset`
 
@@ -961,7 +961,116 @@ with a forward-version error. Switch the format *before* the schema
 bump, or use `/admin/channels/{ch}/snapshot/reset?force=true` to
 abandon the on-disk state.
 
-### 7.8 Common persistence headaches
+### 7.8 Post-trade audit log (issue [#329](https://github.com/pedrosakuma/B3MatchingPlatform/issues/329))
+
+> ⚠️ **Status (as of this section landing): the writer/dispatcher
+> plumbing is fully implemented and unit-tested, but
+> `FileAuditLogWriter` is not yet constructed by `ExchangeHost`. A
+> default host run still uses `NullPostTradeSink`, so no audit files
+> are written and the recovery procedure below has nothing to
+> replay against.** Operators wanting to exercise the audit log
+> today must construct the writer programmatically and pass it as
+> the `postTradeSink` when wiring `ChannelDispatcher`. Host config
+> + factory + retention timer are tracked as a follow-up.
+
+The post-trade audit log is the legally-authoritative per-trade record
+the simulator emits alongside the wire-published `Trade_53` /
+`ER_Trade` frames. **It is a separate durability domain from the WAL:**
+the WAL exists to recover engine state on restart and is deliberately
+short-lived (truncated on every successful snapshot); the audit log is
+append-only, daily-rolled by UTC business date, and intended to be
+retained for the compliance horizon (typically 5 years for B3 fills).
+
+**On-disk layout** (one set per channel, under
+`{auditDir}/{channel}/`):
+
+| File | Purpose |
+| --- | --- |
+| `fills-YYYY-MM-DD.log` | CRC32-protected, length-prefixed audit records; the schema is versioned in the file header. |
+| `fills-YYYY-MM-DD.idx` | Sparse firm index (PR-3, #346): one block entry per N records, keyed by both `buyFirm` and `sellFirm` so per-firm filtered scans skip irrelevant blocks. |
+| `audit-watermark.bin` | Per-channel sidecar (20 B): magic `B3PW` + schema v1 + `lastDurableCommandSeq` + CRC32. Persisted atomically (`.tmp` + fsync + rename) on every successful `Checkpoint`. |
+
+**Durability watermark (PRs #347 / #350).** `ChannelDispatcher`
+publishes a `commandSeq` boundary to the audit sink after every
+flushed command. `Checkpoint` fsyncs the `.log` and `.idx`, then
+writes the sidecar atomically, then advances the in-memory
+`DurableThroughCommandSeq`. The WAL truncation gate refuses to drop
+any record whose `commandSeq` exceeds this watermark, so a crash
+between `OnTrade` and a successful `Checkpoint` is recovered by WAL
+replay rather than silently dropped. On boot the writer seeds the
+watermark from the sidecar; the dispatcher captures it once at the
+start of replay and skips re-emitting any trade whose owning command
+is at or below it — preventing duplicate audit records when the WAL
+contains commands that were already fsync'd to the audit log
+pre-crash. A missing or corrupt sidecar collapses to "watermark
+unknown = 0", which is conservative: every replayed trade is
+re-emitted (idempotency is enforced by the file-pair pattern; the
+worst-case overshoot is bounded by the `[snapshot, crash]` window).
+
+**Retention (PR-6).** `FileAuditLogWriter.PruneOldDays(todayUtc,
+retentionDays)` deletes `fills-YYYY-MM-DD.{log,idx}` pairs whose
+date is *strictly before* `todayUtc - retentionDays`. The currently
+open day is never pruned, the per-channel watermark sidecar is never
+pruned, and unrelated / malformed filenames are ignored. The method
+is safe to call from any thread (it shares the `_checkpointLock`
+that serializes `Checkpoint`/`Dispose`). Operators wire it on a
+daily timer or invoke it ad-hoc from a maintenance job; the writer
+itself never schedules deletion automatically.
+
+```csharp
+// Daily prune from a maintenance job (5-year retention horizon).
+writer.PruneOldDays(DateOnly.FromDateTime(DateTime.UtcNow), retentionDays: 5 * 365);
+```
+
+**Recovery procedure (post-crash).**
+
+1. Start the host. The dispatcher loads the latest snapshot, then
+   replays the WAL through the matching engine — but emits *only*
+   the audit log (UMDF and ER outbound are stubbed during replay).
+2. For each replayed command, the audit gate compares the command's
+   `commandSeq` against `_bootAuditDurableSeq`:
+   - `commandSeq <= watermark` → trade was already on disk pre-crash,
+     the duplicate emission is suppressed and the
+     `exch_audit_replay_skipped_total` counter is bumped.
+   - `commandSeq > watermark` → the audit log has a hole; the gate
+     lets the trade through so the on-disk log is repaired.
+3. After replay finishes, the dispatcher transitions to live mode and
+   the WAL truncation gate proceeds normally (truncating up to the
+   newly-advanced audit watermark on the next snapshot save).
+4. Operator confirmation: `exch_audit_replay_skipped_total` should
+   be > 0 on any boot that found a non-empty WAL; a 0 reading
+   combined with replayed records means either no trades happened in
+   the recovered window OR the sidecar was missing/torn (also
+   surfaced by `exch_wal_replays_total > 0` with the sidecar
+   absent on disk). The second case is safe — duplicates within the
+   replay window are tolerated — but it is worth investigating the
+   underlying fsync / I/O failure that destroyed the sidecar.
+
+**Audit log vs WAL — quick comparison:**
+
+| Property | WAL (`channel-N.wal`) | Audit log (`fills-YYYY-MM-DD.log`) |
+| --- | --- | --- |
+| Lifetime | Transient — truncated on every successful snapshot, gated by the audit watermark. | Long-lived — kept until `PruneOldDays` deletes the day. |
+| Recovery role | Rebuilds engine state alongside the snapshot. | Reconstructs the trade history; not used to rebuild the engine. |
+| Schema versioning | Bumped via `SnapshotMigrations` chain. | Forward-compatible file header version field. |
+| Failure mode | A halted WAL stops the channel (`exch_wal_halt_rejects_total`). | A failed write makes the writer sticky-faulted; the watermark refuses to advance and the WAL stops truncating, surfacing the issue as backpressure rather than silent loss. |
+| Retention knob | `snapshotThrottle.everyN` + WAL truncation. | `PruneOldDays(today, retentionDays)`. |
+
+**Benchmarks.** Hot-path overhead is tracked by
+`PostTradeAuditBenchmarks` in `bench/B3.Exchange.Bench/`:
+
+```bash
+dotnet run -c Release --project bench/B3.Exchange.Bench -- \
+  --filter '*PostTradeAudit*'
+```
+
+Two scenarios: steady-state append (no fsync per record — the
+default operating mode) and pessimistic per-call `Checkpoint` (an
+upper bound on per-trade audit overhead). Compare numbers across PRs
+that touch the dispatcher hot path or the writer to catch
+regressions before they land.
+
+### 7.9 Common persistence headaches
 
 * **"Channel boots empty after restart."** Check
   `exch_snapshot_load_seconds` — `0` means `TryLoad` returned null.
@@ -999,6 +1108,7 @@ abandon the on-disk state.
 | Mass-cancel / CoD plumbing | `src/B3.Exchange.Gateway/OrderOwnershipMap.cs`, `FixpSession.cs` (CoD) |
 | Per-channel matching | `src/B3.Exchange.Core/ChannelDispatcher.cs`, `src/B3.Exchange.Matching/MatchingEngine.cs` |
 | State persistence | `src/B3.Exchange.Persistence/FileChannelStatePersister.cs`, `BinaryChannelStateSnapshotCodec.cs`, `FileChannelWriteAheadLog.cs`; migration framework in `src/B3.Exchange.Core/SnapshotMigrations.cs` |
+| Post-trade audit log | `src/B3.Exchange.PostTrade/FileAuditLogWriter.cs`, `AuditRecordCodec.cs`, `AuditIndexCodec.cs`, `AuditWatermarkCodec.cs` |
 | UMDF wire encoders | `src/B3.Umdf.WireEncoder/` |
 | Synthetic trader strategies | `src/B3.Exchange.SyntheticTrader/MarketMakerStrategy.cs`, `NoiseTakerStrategy.cs` |
 
