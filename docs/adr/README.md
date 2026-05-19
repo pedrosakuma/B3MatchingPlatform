@@ -37,3 +37,4 @@ changes, a new ADR supersedes the old one.
 |------|----------------------------------------------------------------|----------|
 | 0001 | Post-trade boundary and EOD file export                        | Accepted |
 | 0002 | Per-trade audit log shape                                      | Accepted |
+| 0008 | Late corrections and bust propagation                          | Accepted |
