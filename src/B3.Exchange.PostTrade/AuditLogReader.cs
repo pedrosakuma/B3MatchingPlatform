@@ -137,7 +137,18 @@ public static class AuditLogReader
         int hr = ReadFully(fs, header, 0, header.Length);
         if (hr != header.Length)
             throw new InvalidDataException($"audit file '{logPath}' truncated in header (got {hr} bytes)");
-        var (_, _, _) = AuditRecordCodec.ReadFileHeader(header);
+        var (_, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(header);
+        // ADR 0008 §1 / issue #369 PR-1: the firm-sparse index assumes
+        // uniform fixed-width fill records. v2 files can carry variable-
+        // length bust/reject-attempt records, which would desync the
+        // 85-byte fixed-stride scan below and silently under-report. PR-2
+        // teaches both the index codec and this reader to handle mixed
+        // record sizes; until then, refuse v2 firm-filtered reads
+        // explicitly rather than returning a partial result.
+        if (schemaVersion != AuditRecordCodec.SchemaVersionV1)
+            throw new NotSupportedException(
+                $"ReadByFirm does not yet support schema v{schemaVersion} (PR-2 will add mixed-record dispatch); "
+                + "use ReadAllEntries for the time being");
 
         var buffer = new byte[AuditRecordCodec.RecordSize];
         // 1) Indexed candidates — seek directly to each block.

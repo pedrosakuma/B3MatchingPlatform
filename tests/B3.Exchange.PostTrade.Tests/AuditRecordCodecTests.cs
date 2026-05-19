@@ -141,8 +141,11 @@ public class AuditRecordCodecTests
     {
         var buf = new byte[AuditRecordCodec.BustRecordSize];
         AuditRecordCodec.EncodeBust(buf, SampleBust());
-        // Flip the leading recordType byte (offset 8 = first body byte).
+        // Flip the leading recordType byte (offset 8 = first body byte)
+        // and re-compute the CRC so the decoder reaches the explicit
+        // recordType cross-check rather than short-circuiting on CRC.
         buf[8] = 0x99;
+        RewriteBodyCrc(buf, bodyOffset: 8, bodyLen: AuditRecordCodec.BustRecordBodySize);
         Assert.False(AuditRecordCodec.TryDecodeBust(buf, out _));
     }
 
@@ -185,6 +188,7 @@ public class AuditRecordCodecTests
         var buf = new byte[AuditRecordCodec.RejectAttemptRecordSize];
         AuditRecordCodec.EncodeRejectAttempt(buf, SampleRejectAttempt());
         buf[8] = 0x99;
+        RewriteBodyCrc(buf, bodyOffset: 8, bodyLen: AuditRecordCodec.RejectAttemptRecordBodySize);
         Assert.False(AuditRecordCodec.TryDecodeRejectAttempt(buf, out _));
     }
 
@@ -212,17 +216,46 @@ public class AuditRecordCodecTests
         // ADR 0008 §1 invariant: a v2 file that contains only fills is
         // bit-identical to its v1 predecessor modulo the file header.
         // The fill body has no discriminator byte, so this property
-        // falls out of the codec design — pinning it with a test keeps
-        // future record-type extensions from accidentally regressing it.
+        // falls out of the codec design — pinning it with two encodes
+        // + a byte-vector compare keeps future record-type extensions
+        // from accidentally regressing it.
         var fill = Sample();
-        Span<byte> fillBytes = stackalloc byte[AuditRecordCodec.RecordSize];
-        AuditRecordCodec.Encode(fillBytes, in fill);
+        var fillBytesA = new byte[AuditRecordCodec.RecordSize];
+        var fillBytesB = new byte[AuditRecordCodec.RecordSize];
+        AuditRecordCodec.Encode(fillBytesA, in fill);
+        AuditRecordCodec.Encode(fillBytesB, in fill);
+        Assert.Equal(fillBytesA, fillBytesB);
 
-        // Body identical regardless of file header version (header is
-        // written separately by the file writer; the per-record bytes
-        // here are version-agnostic).
-        Assert.Equal((uint)AuditRecordCodec.RecordSize - 4, AuditRecordCodec.FillRecordLen);
-        Assert.True(AuditRecordCodec.TryGetRecordSize(AuditRecordCodec.FillRecordLen, out _, out var kind));
-        Assert.Equal(AuditRecordKind.Fill, kind);
+        // Compose full v1 and v2 files (header + same fill) and assert
+        // the bodies past the file header match byte-for-byte.
+        var dateA = new DateOnly(2026, 5, 19);
+        var dateB = new DateOnly(2026, 5, 19);
+        var fileV1 = new byte[AuditRecordCodec.FileHeaderSize + AuditRecordCodec.RecordSize];
+        var fileV2 = new byte[AuditRecordCodec.FileHeaderSize + AuditRecordCodec.RecordSize];
+        AuditRecordCodec.WriteFileHeader(fileV1, 7, dateA, AuditRecordCodec.SchemaVersionV1);
+        AuditRecordCodec.WriteFileHeader(fileV2, 7, dateB, AuditRecordCodec.SchemaVersionV2);
+        AuditRecordCodec.Encode(fileV1.AsSpan(AuditRecordCodec.FileHeaderSize), in fill);
+        AuditRecordCodec.Encode(fileV2.AsSpan(AuditRecordCodec.FileHeaderSize), in fill);
+
+        // Bodies (past file header) MUST match byte-for-byte.
+        var bodyV1 = fileV1.AsSpan(AuditRecordCodec.FileHeaderSize).ToArray();
+        var bodyV2 = fileV2.AsSpan(AuditRecordCodec.FileHeaderSize).ToArray();
+        Assert.Equal(bodyV1, bodyV2);
+
+        // Headers MUST differ on exactly the schemaVersion byte (offset 4).
+        Assert.NotEqual(fileV1[4], fileV2[4]);
+        Assert.Equal((byte)AuditRecordCodec.SchemaVersionV1, fileV1[4]);
+        Assert.Equal((byte)AuditRecordCodec.SchemaVersionV2, fileV2[4]);
+    }
+
+    /// <summary>Recomputes the framed-record CRC after the body has
+    /// been mutated by a test, so the decoder under test reaches the
+    /// post-CRC validation (e.g. recordType cross-check) rather than
+    /// short-circuiting at the CRC step.</summary>
+    private static void RewriteBodyCrc(byte[] buf, int bodyOffset, int bodyLen)
+    {
+        Span<byte> hash = stackalloc byte[4];
+        System.IO.Hashing.Crc32.Hash(buf.AsSpan(bodyOffset, bodyLen), hash);
+        hash.CopyTo(buf.AsSpan(4, 4));
     }
 }
