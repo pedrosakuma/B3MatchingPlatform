@@ -79,6 +79,7 @@ public class WalSizeCapDispatcherTests
         }
         public IReadOnlyList<WalRecord> ReadAll() => Array.Empty<WalRecord>();
         public void Truncate() { }
+        public void TruncateThrough(long throughSeq) { }
         public void Dispose() { }
     }
 
