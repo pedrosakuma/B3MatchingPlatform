@@ -37,6 +37,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<Timer> _snapshotTimers = new();
     private readonly List<B3.Exchange.PostTrade.FileAuditLogWriter> _auditWriters = new();
     private readonly List<Timer> _auditRetentionTimers = new();
+    private readonly Dictionary<byte, EodExportContext> _eodExportByChannel = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(byte Channel, DateOnly Date), byte> _eodExportInFlight = new();
     private readonly MetricsRegistry _metrics = new();
     private readonly StartupReadinessProbe _startupProbe = new("startup");
     private readonly ShutdownReadinessProbe _shutdownProbe = new("shutdown");
@@ -221,6 +223,23 @@ public sealed class ExchangeHost : IAsyncDisposable
                 _logger.LogInformation(
                     "channel {ChannelNumber}: post-trade audit log enabled at {DataDir} (retentionDays={RetentionDays})",
                     ch.ChannelNumber, audit.DataDir, audit.RetentionDays);
+
+                if (!string.IsNullOrWhiteSpace(audit.EodDropDir))
+                {
+                    // Snapshot the symbol map at startup. InstrumentLoader
+                    // already de-duplicates symbols per channel so the
+                    // dictionary is unambiguous; unknown securityIds (e.g.
+                    // delisted between runs) fall back to the numeric id
+                    // inside EodFillsExporter.
+                    var symbols = instruments.ToDictionary(i => i.SecurityId, i => i.Symbol);
+                    var exporterLogger = _loggerFactory.CreateLogger<B3.Exchange.PostTrade.EodFillsExporter>();
+                    var exporter = new B3.Exchange.PostTrade.EodFillsExporter(exporterLogger);
+                    _eodExportByChannel[ch.ChannelNumber] = new EodExportContext(
+                        exporter, audit.DataDir, audit.EodDropDir, symbols);
+                    _logger.LogInformation(
+                        "channel {ChannelNumber}: EOD fills export enabled (dropDir={DropDir})",
+                        ch.ChannelNumber, audit.EodDropDir);
+                }
                 if (audit.RetentionDays > 0)
                 {
                     var capturedWriter = auditWriter;
@@ -422,7 +441,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 dailyResetTrigger: () => TriggerDailyReset("http-trigger"),
                 persisters: _persistersByChannel,
                 wals: _walsByChannel,
-                instrumentRouting: routing);
+                instrumentRouting: routing,
+                eodExportTrigger: TriggerEodExport);
             await _http.StartAsync().ConfigureAwait(false);
         }
 
@@ -671,6 +691,79 @@ public sealed class ExchangeHost : IAsyncDisposable
             audit.DataDir,
             ch.ChannelNumber);
     }
+
+    /// <summary>
+    /// Issue #330 PR-2: trigger the EOD fills CSV export for a channel
+    /// and UTC business date. Wired into
+    /// <c>POST /admin/post-trade/eod-export?channel=N&amp;date=YYYY-MM-DD</c>
+    /// and (PR-3) the daily-reset scheduler.
+    /// </summary>
+    /// <returns><see langword="null"/> when the channel has no EOD export
+    /// configured (operator should treat as 404); otherwise the export
+    /// result so the endpoint can surface row count / sha256 / path.</returns>
+    /// <remarks>
+    /// Concurrent calls for the SAME <c>(channel, date)</c> are serialized
+    /// here — the second caller throws <see cref="EodExportInProgressException"/>
+    /// so the endpoint can surface a 409 Conflict without partially
+    /// publishing two interleaved CSV / .done pairs. Different
+    /// <c>(channel, date)</c> pairs run concurrently (the underlying
+    /// exporter is stateless). Other exceptions from
+    /// <c>EodFillsExporter.Export</c> propagate to the caller.
+    /// </remarks>
+    internal B3.Exchange.PostTrade.EodFillsExportResult? TriggerEodExport(byte channelNumber, DateOnly businessDate)
+    {
+        if (!_eodExportByChannel.TryGetValue(channelNumber, out var ctx)) return null;
+        var key = (channelNumber, businessDate);
+        if (!_eodExportInFlight.TryAdd(key, 0))
+        {
+            throw new EodExportInProgressException(channelNumber, businessDate);
+        }
+        try
+        {
+            return ctx.Exporter.Export(
+                ctx.AuditRootDir,
+                ctx.DropRootDir,
+                channelNumber,
+                businessDate,
+                secId => ctx.Symbols.TryGetValue(secId, out var sym) ? sym : null,
+                DateTime.UtcNow);
+        }
+        finally
+        {
+            _eodExportInFlight.TryRemove(key, out _);
+        }
+    }
+
+    /// <summary>
+    /// Thrown by <see cref="TriggerEodExport"/> when another export for
+    /// the same <c>(channel, date)</c> is already in flight. The HTTP
+    /// endpoint translates this into a 409 Conflict so concurrent
+    /// operators never observe a CSV / .done pair whose bytes came from
+    /// different exporter runs.
+    /// </summary>
+    internal sealed class EodExportInProgressException : InvalidOperationException
+    {
+        public byte Channel { get; }
+        public DateOnly Date { get; }
+        public EodExportInProgressException(byte channel, DateOnly date)
+            : base($"EOD export already in progress for channel={channel} date={date:yyyy-MM-dd}")
+        {
+            Channel = channel;
+            Date = date;
+        }
+    }
+
+    /// <summary>
+    /// Per-channel EOD export wiring captured at host startup. Held in
+    /// <c>_eodExportByChannel</c> so the HTTP endpoint and (PR-3) the
+    /// daily-reset auto-trigger can resolve it without rebuilding the
+    /// symbol map on every call.
+    /// </summary>
+    private sealed record EodExportContext(
+        B3.Exchange.PostTrade.EodFillsExporter Exporter,
+        string AuditRootDir,
+        string DropRootDir,
+        IReadOnlyDictionary<long, string> Symbols);
 
     /// <summary>
     /// Issue #270: parses the <c>persistence.orphanSessionPolicy</c>
