@@ -1242,6 +1242,188 @@ so safe-to-rerun on any failure.
   the drop rate is unacceptable, or switch `asyncWriter=false` to
   enforce zero-RPO at the cost of a slower dispatch loop.
 
+### 7.11 Late corrections — operator bust (issue [#369](https://github.com/pedrosakuma/B3MatchingPlatform/issues/369))
+
+Per-trade reversal flow for post-trade life-cycle events
+([ADR 0008](./adr/0008-late-corrections-and-bust-propagation.md)).
+Builds on §7.8 (audit log) and §7.9 (EOD export); requires
+`postTradeAudit.enabled=true` AND `postTradeAudit.eodDropDir` set on
+the channel.
+
+**One HTTP surface, two routing paths.** Operators always call the
+same endpoint; the dispatcher decides between `pre-EOD` (bust folded
+out of `fills.csv`) and `post-EOD` (bust appended to
+`amendments.csv`) based on whether the day's `fills.csv.done`
+sidecar already exists at the moment the bust is processed. The
+decision is made under the per-channel routing lock that
+`/admin/post-trade/eod-export` holds across its run, so no race can
+land a bust in the wrong file.
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:8080/admin/post-trade/bust'\
+'?channel=84'\
+'&tradeId=4242'\
+'&tradeDate=2026-05-18'\
+'&correlationId=900001'\
+'&busterFirm=99'\
+'&reason=5'\
+'&securityId=900000000001'
+```
+
+| Query | Required | Meaning |
+| --- | --- | --- |
+| `channel` | yes | UMDF channel number (0..255). |
+| `tradeId` | yes | The engine `TradeId` of the trade to cancel (1..uint32). |
+| `tradeDate` | yes | `YYYY-MM-DD` of the original trade's business date. Range-checked against LocalMktDate (1970-01-01..2149-06-06). |
+| `correlationId` | yes | Operator-supplied dedup key (`> 0`). Replaying with the same `(tradeId, tradeDate, correlationId)` is an idempotent 200. A different correlationId for the same `tradeId` is a 409. |
+| `reason` | no | `ushort` reason code echoed on `TradeBust_57` and in the audit record (default `0`). |
+| `securityId` | no | Echo check — server rejects the bust with 422 if the matched fill's security id differs. |
+| `busterFirm` | no | `uint` operator firm id stamped in the audit record (default `0`). |
+
+**Status code matrix** (mirrors ADR §2.3):
+
+| Code | Meaning |
+| --- | --- |
+| `200 {"status":"busted"}` | Accepted; `TradeBust_57` emitted on the channel, audit record persisted, routing decided per §7.11.1 below. |
+| `200 {"status":"idempotent-replay"}` + `X-Idempotent: true` | Same `(tradeId, correlationId, tradeDate)` already accepted. No new audit write, no UMDF emit; for post-EOD targets the publisher re-runs to repair any previously-failed `amendments.csv` publish. |
+| `400` | Missing or invalid query param. |
+| `404` | Unknown channel, or channel without `postTradeAudit.eodDropDir`. |
+| `409` | `tradeId` already busted with a *different* `correlationId` (body carries the existing one). |
+| `410` | `fills-{tradeDate}.log` missing for the channel (audit was off that day, or wrong date). |
+| `422` `unknown-trade-id` | `tradeId` not found in the day's audit log. |
+| `422` `security-id-mismatch` | `securityId` echo doesn't match the matched fill's. |
+| `503` | Inbound queue full or bust-v2 not wired. |
+| `504` | Dispatcher took longer than the phase-change timeout to complete validation. |
+
+#### 7.11.1 Pre-EOD vs post-EOD routing
+
+The dispatcher's routing decision happens under the same lock the
+EOD exporter holds, so it can never observe a partial publish:
+
+```
+                       ┌──────────────────────────────────────┐
+                       │ POST /admin/post-trade/bust          │
+                       └──────────────┬───────────────────────┘
+                                      │
+                            BustValidator.Validate
+                                      │
+                  ┌───────────────────┼───────────────────┐
+                  │ Accept            │ Idempotent        │ 4xx
+                  ▼                   ▼                   ▼
+        lock(PostTradeRoutingLock):    no-op +           write
+          if fills.csv.done exists    optional           reject-attempt
+            → post-EOD                amendments         to audit log
+          else                         republish         (no UMDF emit)
+            → pre-EOD
+          append BustRecord
+          dedup.Add(...)
+          emit TradeBust_57
+        ───────────────────────────
+        if post-EOD: AmendmentsPublisher.Publish(...)
+```
+
+| Path | `fills.csv.done` at decision time | Bust audit file | Visible artifact for consumers |
+| --- | --- | --- | --- |
+| Pre-EOD | absent | `fills-{tradeDate}.log` (same day as the original trade) | None until EOD runs; then `fills.csv` is published **without** the bust target — the row is folded out. |
+| Post-EOD | present | `fills-{UTC-today}.log` | `amendments.csv` next to the day's `fills.csv` — one row per accepted post-EOD bust whose target is in `fills.csv`. |
+
+The exporter (§7.9) at EOD time walks `fills-{tradeDate}.log`,
+builds the cancelled-trade set from every `BustRecord`, and writes
+`fills.csv` with those trades omitted. Reject-attempt records
+(`code=1/2/3`) are skipped entirely.
+
+#### 7.11.2 `amendments.csv` layout
+
+Sibling of `fills.csv` on the same drop directory; **only emitted
+when at least one post-EOD bust references a trade present in
+`fills.csv`**. A pre-EOD bust never produces an amendment row — the
+consumer never saw the original fill, so there is nothing to amend.
+
+```
+{eodDropDir}/{channel}/{YYYY-MM-DD}/
+  fills.csv         # §7.9 — base trade tape (folded)
+  fills.csv.done    # §7.9
+  amendments.csv      # ADR 0008 §4 — late corrections
+  amendments.csv.done # { rowCount, sha256, generatedAt }
+```
+
+CSV schema:
+
+```
+cancelTradeId,bustTransactTime,reasonCode,correlationId,sha256OfOriginalFillRow
+```
+
+* `bustTransactTime` — ISO-8601 UTC microsecond.
+* `sha256OfOriginalFillRow` — lower-case hex SHA-256 over the bytes
+  of the corresponding row in `fills.csv`, from the first byte of
+  the row through and including the row-terminating `\n`. Consumers
+  recompute the digest locally to confirm they are amending the
+  same bytes the producer signed.
+* Rows are sorted by `bustTransactTime` ascending so consumers can
+  apply them in a deterministic order.
+
+**Atomic publish** mirrors §7.9 step-for-step
+(stage → fsync → delete old `.done` → rename CSV → fsync dir
+→ rename `.done` → fsync dir). Each call to the publisher
+**regenerates the file in full from the audit log** — there is no
+append path — so a torn write can never leave a partial row visible,
+and rerunning the post-EOD bust (idempotent replay) re-runs the
+publisher and converges on the same bytes (except for `generatedAt`).
+
+#### 7.11.3 Recovery — failed amendments publish
+
+If `AmendmentsPublisher.Publish` throws after the bust is already
+written to the audit log (disk full, drop dir permission flip), the
+HTTP response is still `200 busted` — the bust *is* durable. The
+dispatcher logs the failure as `amendments.csv publish failed ...`
+but the consumer-visible artifact is missing.
+
+Operator remediation:
+
+1. Resolve the underlying I/O fault (free disk, fix perms).
+2. **Replay the same `/admin/post-trade/bust` with the same
+   correlation id.** The validator returns `idempotent-replay` and
+   the dispatcher re-invokes `AmendmentsPublisher.Publish`, which
+   regenerates the file from the audit log and lands the missing
+   row. No engine state mutates on the retry.
+
+A host restart will *not* fix the missing amendments file on its
+own — `AmendmentsPublisher.Publish` only runs as part of bust
+processing, never at boot.
+
+#### 7.11.4 Worked example
+
+```bash
+# Channel 84, audit + drop wired per §7.9.
+# Three trades happened today; trade #2 was a fat-finger.
+
+# Pre-EOD: operator busts trade #2 before EOD runs.
+curl -sS -X POST 'http://127.0.0.1:8080/admin/post-trade/bust?channel=84&tradeId=2&tradeDate=2026-05-19&correlationId=11&busterFirm=99'
+# 200 {"status":"busted","channel":84,"tradeId":2,"correlationId":11}
+
+# EOD export.
+curl -sS -X POST 'http://127.0.0.1:8080/admin/post-trade/eod-export?channel=84&date=2026-05-19'
+# 200 {"rowCount":2,"csvPath":"/drop/84/2026-05-19/fills.csv", ...}
+# fills.csv = header + trade #1 + trade #3 (trade #2 folded out)
+# No amendments.csv yet.
+
+# Post-EOD: a settlement issue prompts the operator to bust trade #3
+# the next day. fills.csv.done already exists.
+curl -sS -X POST 'http://127.0.0.1:8080/admin/post-trade/bust?channel=84&tradeId=3&tradeDate=2026-05-19&correlationId=22&busterFirm=99'
+# 200 {"status":"busted","channel":84,"tradeId":3,"correlationId":22}
+# amendments.csv now present, listing trade #3 with sha256 of its row
+# in fills.csv. The published fills.csv is NOT rewritten.
+```
+
+**Failure modes a consumer can observe:**
+
+| Symptom | Cause | Remediation |
+| --- | --- | --- |
+| `.csv` exists, no `.done` | Publish crashed between rename-csv and rename-done. | Consumer must ignore. Operator replay (same correlationId) re-runs the publisher and converges. |
+| `amendments.csv` row's sha256 doesn't match `fills.csv` row | `fills.csv` was modified (manual edit, restore from backup) after the amendment was emitted. | Re-export `fills.csv` (§7.9) and re-run the most recent bust(s) to regenerate `amendments.csv` against the new bytes. |
+| Pre-EOD bust returned `200 busted` but `fills.csv` still has the trade | Bust was accepted AFTER the exporter's lock window — i.e. someone triggered `/eod-export` between the bust enqueue and processing. | Re-run `/eod-export` for that channel + date; the exporter is idempotent and will fold the bust out on the second pass. |
+| `404 unknown channel ...` or `404 ... eodDropDir` | Channel not wired for post-trade. | Check `postTradeAudit.enabled` + `eodDropDir` in the channel config and restart. |
+
 ---
 
 ## 8. Where to look in the code
@@ -1255,6 +1437,7 @@ so safe-to-rerun on any failure.
 | Per-channel matching | `src/B3.Exchange.Core/ChannelDispatcher.cs`, `src/B3.Exchange.Matching/MatchingEngine.cs` |
 | State persistence | `src/B3.Exchange.Persistence/FileChannelStatePersister.cs`, `BinaryChannelStateSnapshotCodec.cs`, `FileChannelWriteAheadLog.cs`; migration framework in `src/B3.Exchange.Core/SnapshotMigrations.cs` |
 | Post-trade audit log | `src/B3.Exchange.PostTrade/FileAuditLogWriter.cs`, `AuditRecordCodec.cs`, `AuditIndexCodec.cs`, `AuditWatermarkCodec.cs` |
+| Late-correction (bust) flow | `src/B3.Exchange.PostTrade/BustValidator.cs`, `BustDedupIndex.cs`, `AmendmentsPublisher.cs`; `src/B3.Exchange.Core/ChannelDispatcher.Operator.cs` (routing) |
 | UMDF wire encoders | `src/B3.Umdf.WireEncoder/` |
 | Synthetic trader strategies | `src/B3.Exchange.SyntheticTrader/MarketMakerStrategy.cs`, `NoiseTakerStrategy.cs` |
 

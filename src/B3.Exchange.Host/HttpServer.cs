@@ -219,8 +219,8 @@ public sealed class HttpServer : IAsyncDisposable
         //   securityId     - optional long echo (server validates against the fill)
         //   busterFirm     - optional uint operator firm id (default 0)
         // Status codes mirror ADR §2.3.
-        app.MapPost("/admin/post-trade/bust", async (HttpContext ctx) =>
-            await HandlePostTradeBustAsync(ctx).ConfigureAwait(false));
+        app.MapPost("/admin/post-trade/bust",
+            (Delegate)(async (HttpContext ctx) => await HandlePostTradeBustAsync(ctx).ConfigureAwait(false)));
 
         // Issue #271: admin endpoints for snapshot management.
         //

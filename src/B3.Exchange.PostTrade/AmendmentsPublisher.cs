@@ -82,7 +82,13 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
         // 2) Build SHA-256 lookup for each cancelled tradeId by scanning
         // the published fills.csv once. The hash byte-range is defined
         // as "first byte of the row through and including the row-
-        // terminating LF" (ADR 0008 §4 sha256OfOriginalFillRow).
+        // terminating LF" (ADR 0008 §4 sha256OfOriginalFillRow). A
+        // missing entry means the bust's target fill is NOT in the
+        // published fills.csv — either because it was folded out by
+        // the same-day pre-EOD bust path, or because the consumer
+        // version of fills.csv predates the trade. In both cases the
+        // consumer has nothing to amend, so the row is skipped (an
+        // empty-hash row would just be noise).
         var fillsCsvPath = Path.Combine(dropDir, "fills.csv");
         Dictionary<uint, string> tradeIdToHash = busts.Count == 0
             ? new Dictionary<uint, string>()
@@ -104,6 +110,8 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
                     long rows = 0;
                     foreach (var b in busts)
                     {
+                        if (!tradeIdToHash.TryGetValue(b.CancelledTradeId, out var h))
+                            continue; // see §2: skip rows whose original fill is not in fills.csv
                         sw.Write(b.CancelledTradeId.ToString(CultureInfo.InvariantCulture));
                         sw.Write(',');
                         sw.Write(FormatTimestampMicros(b.BustTransactTimeNanos));
@@ -112,7 +120,7 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
                         sw.Write(',');
                         sw.Write(b.CorrelationId.ToString(CultureInfo.InvariantCulture));
                         sw.Write(',');
-                        sw.Write(tradeIdToHash.TryGetValue(b.CancelledTradeId, out var h) ? h : string.Empty);
+                        sw.Write(h);
                         sw.Write('\n');
                         rows++;
                     }
