@@ -10,7 +10,7 @@ namespace B3.Exchange.Bench;
 /// synchronously on the dispatch thread for every matched trade, so
 /// any per-call regression directly inflates engine latency.
 ///
-/// <para>Two scenarios:</para>
+/// <para>Scenarios:</para>
 /// <list type="bullet">
 ///   <item><b>OnTrade_NoCheckpoint</b> — steady-state append cost. No
 ///   fsync runs (writer batches via <c>FileStream</c>'s OS buffer); this
@@ -18,6 +18,11 @@ namespace B3.Exchange.Bench;
 ///   <item><b>OnTrade_PerCallCheckpoint</b> — worst-case durability
 ///   (fsync after every record). Models a paranoid "fsync-per-trade"
 ///   policy and pins the upper bound on per-trade audit overhead.</item>
+///   <item><b>OnTrade_WithBackgroundCheckpoint</b> — issue #349: a
+///   background thread runs <see cref="FileAuditLogWriter.Checkpoint"/>
+///   in a tight loop while OnTrade fires on the bench thread. The fsync
+///   inside Checkpoint holds the shared lock for the full I/O latency;
+///   any spike here is the tail-latency hit the issue is sizing.</item>
 /// </list>
 ///
 /// <para>The benchmark writes to a temp directory under
@@ -33,6 +38,9 @@ public class PostTradeAuditBenchmarks
     private string _root = null!;
     private FileAuditLogWriter _writer = null!;
     private FileAuditLogWriter _checkpointingWriter = null!;
+    private FileAuditLogWriter _contentionWriter = null!;
+    private CancellationTokenSource? _contentionCts;
+    private Task? _contentionTask;
     private PostTradeRecord _record;
     private ulong _ts;
     private uint _tradeId;
@@ -44,16 +52,39 @@ public class PostTradeAuditBenchmarks
         Directory.CreateDirectory(_root);
         _writer = new FileAuditLogWriter(_root, channelNumber: 1);
         _checkpointingWriter = new FileAuditLogWriter(_root, channelNumber: 2);
+        _contentionWriter = new FileAuditLogWriter(_root, channelNumber: 3);
         _ts = (ulong)(new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc) - DateTime.UnixEpoch).Ticks * 100UL;
         _tradeId = 1;
         _record = NextRecord();
+
+        // Background checkpoint thread for the contention benchmark.
+        // Loops Checkpoint() with no sleep so the dispatch-thread path
+        // contends with the fsync on (almost) every iteration — this is
+        // the worst-case shape of the tail-latency hit issue #349 is
+        // trying to characterize.
+        _contentionCts = new CancellationTokenSource();
+        var ct = _contentionCts.Token;
+        var w = _contentionWriter;
+        _contentionTask = Task.Factory.StartNew(() =>
+        {
+            // Seed at least one record so Checkpoint has something to fsync.
+            try { w.OnTrade(NextRecord()); } catch { }
+            while (!ct.IsCancellationRequested)
+            {
+                try { w.Checkpoint(); } catch { /* writer disposed */ break; }
+            }
+        }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     [GlobalCleanup]
     public void Cleanup()
     {
+        _contentionCts?.Cancel();
+        try { _contentionTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
         _writer.Dispose();
         _checkpointingWriter.Dispose();
+        _contentionWriter.Dispose();
+        _contentionCts?.Dispose();
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
     }
 
@@ -71,6 +102,16 @@ public class PostTradeAuditBenchmarks
         _checkpointingWriter.Checkpoint();
     }
 
+    [Benchmark]
+    public void OnTrade_WithBackgroundCheckpoint()
+    {
+        // Bench thread = "dispatch thread"; background task =
+        // "async-snapshot writer thread" calling Checkpoint. Any
+        // contention shows up as inflated mean/p99 here vs the
+        // NoCheckpoint baseline.
+        _contentionWriter.OnTrade(NextRecord());
+    }
+
     private PostTradeRecord NextRecord()
     {
         var id = ++_tradeId;
@@ -85,3 +126,4 @@ public class PostTradeAuditBenchmarks
             BuyOrderId: 5000 + id, SellOrderId: 6000 + id);
     }
 }
+
