@@ -77,19 +77,24 @@ contract is self-contained:
 
 | Property | Provided by |
 | --- | --- |
-| Every executed trade appears exactly once per trade-date | [ADR 0002 §3](0002-per-trade-audit-log-shape.md#3-write-protocol) (durable per-trade append) + [ADR 0001 §3](0001-post-trade-boundary-and-eod-file-export.md) (full-day projection) |
+| Every executed-and-not-busted trade appears exactly once per trade-date in `fills.csv`; every post-EOD bust appears in `amendments.csv` for the original trade-date | [ADR 0002 §3](0002-per-trade-audit-log-shape.md#3-write-protocol) (durable per-trade append) + [ADR 0001 §3](0001-post-trade-boundary-and-eod-file-export.md) (full-day projection) + [ADR 0008 §3](0008-late-corrections-and-bust-propagation.md) (pre/post split: pre-EOD busts are folded out of `fills.csv`, post-EOD busts surface as `amendments.csv` rows). Consumers needing the *attempted* execution history independent of busts must read the v2 audit log directly. |
 | `buyFirm` + `sellFirm` + `securityId` + `priceMantissa` + `size` per fill | [ADR 0002 §1](0002-per-trade-audit-log-shape.md#1-record-shape) |
 | Aggressor side (`aggressorIsBuyer`) | [ADR 0002 §1](0002-per-trade-audit-log-shape.md#1-record-shape) |
-| Trade-date is San Paulo business-date | [RFC 0001 §6](../rfc/0001-post-trade-architecture.md) |
+| Trade-date is **UTC business date** (per [RFC 0001 §6](../rfc/0001-post-trade-architecture.md#6-time-model) and [ADR 0001 §2](0001-post-trade-boundary-and-eod-file-export.md)) | [ADR 0001 §2](0001-post-trade-boundary-and-eod-file-export.md) |
 | Post-EOD bust visible to surveillance | [ADR 0008 §4](0008-late-corrections-and-bust-propagation.md) `amendments.csv` |
-| Pre-EOD bust folded into `fills.csv` | [ADR 0008 §3](0008-late-corrections-and-bust-propagation.md) split |
+| Pre-EOD bust folded into `fills.csv` (busted fill removed; no amendment row) | [ADR 0008 §3](0008-late-corrections-and-bust-propagation.md) split |
 | Files are immutable once `.done` is published | [ADR 0001 §3](0001-post-trade-boundary-and-eod-file-export.md) |
 
 A wash-trade detector, for example, joins `fills.csv` on
-`(buyFirm, sellFirm, securityId)` within a time window; the audit
-log retains nanosecond `transactTimeNanos` ([ADR 0002 §1](0002-per-trade-audit-log-shape.md#1-record-shape))
-and that field propagates to `fills.csv` ([ADR 0001 §3](0001-post-trade-boundary-and-eod-file-export.md)).
-No new artifact is needed.
+`(buyFirm, sellFirm, securityId)` within a time window using the
+microsecond-precision `ts` column the exporter writes
+([ADR 0001 §3](0001-post-trade-boundary-and-eod-file-export.md)).
+If a detector needs nanosecond timestamps or the audit trail of
+busted-and-removed fills, it reads the audit log directly
+(`transactTimeNanos` lives in the [ADR 0002 §1](0002-per-trade-audit-log-shape.md#1-record-shape)
+record body); ADR 0001's CSV projection truncates that to
+microseconds. No new artifact is needed for the trade-only
+detection class promised here.
 
 ## 4. What this ADR does *not* commit to
 
