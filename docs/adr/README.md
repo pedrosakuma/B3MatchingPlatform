@@ -37,4 +37,9 @@ changes, a new ADR supersedes the old one.
 |------|----------------------------------------------------------------|----------|
 | 0001 | Post-trade boundary and EOD file export                        | Accepted |
 | 0002 | Per-trade audit log shape                                      | Accepted |
+| 0003 | BVBG XML envelope (deferred)                                   | Deferred |
+| 0004 | Settlement cycle out of scope                                  | Rejected |
+| 0005 | Clearing boundary out of scope                                 | Rejected |
+| 0006 | Surveillance feed: trade-only, no new artifact in v1           | Accepted |
+| 0007 | Position aggregate per firm (deferred)                         | Deferred |
 | 0008 | Late corrections and bust propagation                          | Accepted |
