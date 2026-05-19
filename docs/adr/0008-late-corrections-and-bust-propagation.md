@@ -82,67 +82,106 @@ This ADR therefore owns:
   fills and busts; a v1 reader refuses v2 files outright on header
   validation (already enforced by `ReadFileHeader` —
   see `src/B3.Exchange.PostTrade/AuditRecordCodec.cs:87-89`).
-- Add a **1-byte record-type discriminator** as the first byte of
-  the record body (immediately after `recordLen` + `crc32`):
-  - `0x01` — **Fill** (existing 77-byte body shape; total
-    on-disk record stays 85 bytes for backward semantic
-    compatibility with v1 dumps modulo the new leading byte).
-  - `0x02` — **Bust** (new shape; see §1.1).
-  - All other values → reader treats the file as corrupt and
+- **Framing rule (unchanged from v1, ratified by v2).** Every
+  record on disk is `recordLen` (uint32 LE) + `crc32` (uint32 LE)
+  + body, where `recordLen` counts `crc32 + body` (i.e.
+  `RecordSize - 4`). The existing v1 fill writes
+  `recordLen = 81` (`crc(4) + body(77)`); v2 adds bust records
+  with `recordLen = 40` (`crc(4) + body(36)`) and reject-attempt
+  records with `recordLen = 36` (`crc(4) + body(32)`, see §2.5).
+  See `AuditRecordCodec.cs:123-124` for the v1 reference.
+- **Record-type discrimination is by `recordLen`, NOT by a leading
+  body byte for fills.** A v2 reader peeks `recordLen` first and
+  dispatches to the type-specific decoder:
+  - `recordLen == 81` → Fill body, **byte-for-byte identical to
+    v1**. v1 dumps and v2 files contain bit-identical fill
+    records; no upgrade tool is needed and a v2 file that
+    contains only fills compares equal to its v1 predecessor
+    modulo the file header.
+  - `recordLen == 40` → Bust body (§1.1).
+  - `recordLen == 36` → Reject-attempt body (§2.5).
+  - any other value → reader treats the file as corrupt and
     surfaces the offset, same policy as a CRC failure.
-- The discriminator sits **inside** the CRC-covered body, so a
-  flipped discriminator byte is caught by the existing per-record
-  CRC32. `recordLen` continues to carry the body byte count so
-  variable-length records (fill vs bust) can coexist on the
-  same stream.
+
+  As defence in depth, bust and reject-attempt bodies carry a
+  leading `recordType` byte (`0x02` and `0x03` respectively) that
+  the decoder cross-checks against the `recordLen`-derived
+  dispatch; a mismatch is treated as corruption. The leading
+  byte is inside the CRC-covered body.
 - Existing v1 files (any day that was opened before the v2
   upgrade) are read by the v2 reader using a **per-day schema
   view**: if the file header says `schemaVersion=1`, the reader
-  assumes every record is a fill and does not look for the
-  discriminator. New files (opened after the upgrade) carry
-  `schemaVersion=2` and the discriminator. This mirrors the
-  "old days are read with their original schema" guarantee in
-  ADR 0001 §2.
+  decodes only fill records (`recordLen == 81`) and refuses any
+  other value as corruption. New files (opened after the upgrade)
+  carry `schemaVersion=2` and the full dispatch table. This
+  mirrors the "old days are read with their original schema"
+  guarantee in ADR 0001 §2.
 
-#### 1.1 Bust record body (schema v2, type=0x02)
+#### 1.1 Bust record body (schema v2, type=0x02, `recordLen` = 40)
 
 Fixed-width, little-endian, exactly as for fills:
 
 ```
-recordType       (uint8)   = 0x02
-reserved         (uint8)   = 0
-cancelledTradeId (uint32)  — tradeId of the fill being busted
-bustTransactTimeNanos (uint64) — engine clock at the moment the operator
-                                 command was accepted
-securityId       (int64)   — echo from the original fill; lets readers
-                             reject mismatches without dereferencing
-                             the fill index
-reasonCode       (uint16)  — see §2.2
-busterFirm       (uint32)  — operator identity (always the host's
-                             operator firm constant for simulator;
-                             reserved for a future per-operator surface)
-correlationId    (uint64)  — operator-supplied idempotency key (see §2.1)
+recordType            (uint8)   = 0x02
+reserved              (uint8)   = 0
+cancelledTradeId      (uint32)  — tradeId of the fill being busted
+bustTransactTimeNanos (uint64)  — engine clock at the moment the operator
+                                  command was accepted
+securityId            (int64)   — echo from the original fill; lets readers
+                                  reject mismatches without dereferencing
+                                  the fill index
+reasonCode            (uint16)  — see §2.2
+busterFirm            (uint32)  — operator identity (always the host's
+                                  operator firm constant for simulator;
+                                  reserved for a future per-operator surface)
+correlationId         (uint64)  — operator-supplied idempotency key (see §2.1)
 ```
 
-Total body length: 1 + 1 + 4 + 8 + 8 + 2 + 4 + 8 = **36 bytes**
-(vs 77 for fills). On-disk record: 4 + 4 + 36 = **44 bytes** for a
-bust record (`recordLen` will read as 36 ≠ the fixed 77 of v1).
+Total body length: 1 + 1 + 4 + 8 + 8 + 2 + 4 + 8 = **36 bytes**.
+On-disk record: 4 (`recordLen`) + 4 (`crc32`) + 36 = **44 bytes**;
+`recordLen` reads as **40** (= `crc(4) + body(36)`), matching the
+v1 framing convention.
 
 - `cancelledTradeId` is the **only** field the projection looks at;
   the other fields are for diagnostics and forward-compat with
   per-operator audit and reason-code analytics.
-- A bust record's `transactTimeNanos` controls the file partition
-  the same way a fill's does (ADR 0002 §6). A bust always lands in
-  the file for the day the bust *happened*, which is **not
-  necessarily** the day the original fill happened — see §4.
+- A bust record's `bustTransactTimeNanos` controls the file
+  partition the same way a fill's does (ADR 0002 §6). A bust
+  always lands in the file for the day the bust *happened*,
+  which is **not necessarily** the day the original fill happened
+  — see §3 and §5 for how the projection decisions key off the
+  *original fill's* day instead.
 
 ### 2. Operator command contract
 
+#### 2.0 Endpoint split (backwards-compat)
+
+The existing `POST /channel/{ch}/trade-bust/{tradeId}` endpoint
+(issue #15) is kept **as-is** for backwards compatibility: no
+required `correlationId`, no validation against the audit log,
+no audit-log write, response stays HTTP 202, payload format
+unchanged. Documented as "legacy replay-only" in the RUNBOOK;
+operators using only the wire-tape replay use case keep
+working. Existing tests do not need to migrate.
+
+The strict contract specified by §2.1–§2.5 lives on a new URL:
+
+```
+POST /admin/post-trade/bust?channel=N&tradeId=T&tradeDate=YYYY-MM-DD
+    &correlationId=C[&reason=R][&securityId=S][&priceMantissa=P][&size=Q]
+```
+
+Only the new endpoint writes audit records, performs validation,
+and feeds the EOD projection. The legacy endpoint is documented
+as **non-canonical** — operators that need D+1 recon correctness
+must use the new endpoint. A future ADR may deprecate the legacy
+URL once consumers have migrated, but this ADR does not.
+
 #### 2.1 Idempotency
 
-- The HTTP endpoint gains a required `correlationId` query
-  parameter (u64). The same `(channel, tradeId, correlationId)`
-  triple is a **no-op on repeat**:
+- The new endpoint requires a `correlationId` query parameter
+  (u64). The same `(channel, tradeId, correlationId)` triple is a
+  **no-op on repeat**:
   - If the bust has already been written to the audit log with
     the same `correlationId`, the second call returns HTTP 200
     with body `idempotent-replay` and the response header
@@ -152,6 +191,16 @@ bust record (`recordLen` will read as 36 ≠ the fixed 77 of v1).
   - A second call with a **different** `correlationId` for the
     same `(channel, tradeId)` is rejected with HTTP 409
     (`already-busted`) — see §2.3.
+- Dedup lookup: the host maintains a per-channel
+  `Dictionary<uint, ulong>` mapping `tradeId → correlationId`
+  for the **currently active rolling window of audit days** (every
+  audit `.log` file under the channel's `audit/{ch}/` directory
+  whose date is `>= todayUtc - retentionDays + 1`, or all of them
+  when `retentionDays = 0`). The map is rebuilt at startup by
+  scanning the active days' bust records via the v2 reader; from
+  then on every accepted bust updates the map in memory. Cost:
+  one `Dictionary` entry per bust per channel — bounded by the
+  retention horizon, and busts are inherently rare events.
 - Rationale: operators retry on network failure all the time. A
   bust that *appears* to have failed must be safe to retry. The
   correlation id is what lets the host distinguish "retry of the
@@ -176,115 +225,227 @@ behaviour. They exist so post-incident reviews can filter the
 audit stream without parsing free text. The endpoint accepts
 `?reason=N` (default `99`).
 
-#### 2.3 Reject conditions
+#### 2.3 Validation precondition: original-day artifacts must exist
+
+Before ANY audit-log write, UMDF emission, or amendments-file
+write, the host validates that:
+
+1. The channel exists (else HTTP 404).
+2. `fills-<tradeDate>.log` is present and readable under
+   `audit/{ch}/` (else HTTP 410 `gone`, body: "restore the
+   original day's audit log before retrying"). This applies
+   regardless of pre-EOD or post-EOD because every consequence
+   of the bust (audit body, projection fold, amendment row)
+   needs the original fill to be locatable.
+3. The `tradeId` exists in that day's `.log`, has not already
+   been busted with a different `correlationId`, and the
+   `securityId` echo (when supplied) matches the original fill.
+4. `tradeDate` is the day of the original fill (NOT the day of
+   the bust). For cross-day busts the operator MUST supply
+   `tradeDate` explicitly — the endpoint does not default it.
+
+Reject-table summary:
 
 | Condition                                            | HTTP | Audit log? |
 |------------------------------------------------------|------|------------|
-| `tradeId` unknown for `(channel, date)`              | 422  | No — no anchor for the record |
-| `tradeId` already busted with a *different* `correlationId` | 409  | No — original bust already records the operator audit |
-| `securityId` echo does not match the original fill   | 422  | No |
-| `tradeDate` does not match the day the fill was written | 422  | No |
 | Channel does not exist                               | 404  | n/a |
 | Malformed / missing required parameters              | 400  | n/a |
-| Same `(channel, tradeId, correlationId)` triple replay | 200 (`idempotent-replay`) | No (already recorded) |
-| Valid first-time bust                                | 200 (`busted`) | **Yes** — fill-followed-by-bust on the stream |
+| `fills-<tradeDate>.log` not on disk (purged / never written) | 410  | n/a — no `.log` to write to |
+| `tradeId` unknown for `(channel, tradeDate)`         | 422  | **Yes (§2.5)** — reject-attempt record in TODAY's `.log` |
+| `tradeId` already busted with a *different* `correlationId` | 409  | **Yes (§2.5)** — reject-attempt record in TODAY's `.log` |
+| `securityId` echo does not match the original fill   | 422  | **Yes (§2.5)** — reject-attempt record in TODAY's `.log` |
+| Same `(channel, tradeId, correlationId)` triple replay | 200 (`idempotent-replay`) | No (original bust already recorded) |
+| Valid first-time bust                                | 200 (`busted`) | **Yes** — bust record in `<tradeDate>`'s `.log` |
 
-Validation source: the host looks the `tradeId` up via
-`AuditLogReader` over `fills-<tradeDate>.log` (the firm-sparse
-index gives a bounded read; for the validation path a full-scan
-fallback is acceptable since the operator surface is low-rate). If
-the file is not on disk (operator pruned it, host moved
-machines), the endpoint returns HTTP 410 (`gone`) with a body
-documenting that bust-replay-against-archived-day requires
-restoring the file first.
+Validation source for (3): `AuditLogReader` over
+`fills-<tradeDate>.log` plus the in-memory dedup map from §2.1.
+The firm-sparse index gives a bounded read; for the validation
+path a full-scan fallback is acceptable since the operator
+surface is low-rate. The decoder skips bust and reject-attempt
+records (it cares only about fills for this lookup).
 
 #### 2.4 UMDF frame is still published
 
-Independent of audit-log accounting, every accepted bust still
-publishes one `TradeBust_57` incremental frame (unchanged from
-issue #15). The audit-log write happens **first** under the same
-dispatch-thread invocation, so a successful UMDF emission implies
-a durably-pending audit record (the next `Checkpoint()` fsyncs it
-along with everything else).
+For an **accepted** bust (the last row of the §2.3 table),
+the host publishes one `TradeBust_57` incremental frame
+identical to the existing #15 behaviour, on the channel's
+incremental stream, under the dispatcher's current
+`SequenceVersion` and next `RptSeq`. Sequencing on the
+dispatch thread: audit-log write → UMDF frame → amendments-file
+write (post-EOD only, see §4). A failure at any step short-
+circuits the next; the audit log is the canonical record.
 
-### 3. Pre-EOD bust: fold into the projection
+Rejected attempts do **not** publish a UMDF frame — the wire
+sees an accepted bust only when the simulator endorses it.
 
-- A bust accepted **before** the EOD projection for that day has
-  run is folded into the projection: the resulting
-  `fills.csv` does **not** contain the busted fill at all (vs
-  containing it then negating it). Rationale: D+1 recon on the
-  consumer side becomes a single-pass match-and-tick exercise; no
-  amendment file is needed for same-day busts.
+#### 2.5 Reject-attempt audit record (schema v2, type=0x03, `recordLen` = 36)
+
+Per RFC §7's duplicate-bust row, the operator audit trail must
+be complete even when the command was a no-op or a hard reject.
+This record captures the **attempt**, lands in **today's** audit
+file (the day the attempt arrived, NOT the original fill's day,
+because for unknown-tradeId attempts there IS no original-fill
+day to anchor against), and never produces a UMDF frame or an
+amendments-file row.
+
+```
+recordType            (uint8)   = 0x03
+reserved              (uint8)   = 0
+attemptedTradeId      (uint32)
+attemptTransactTimeNanos (uint64) — engine clock at command receipt
+declaredTradeDate     (int32)   — LocalMktDate (days since 1970-01-01)
+                                  the operator declared; 0 if absent
+rejectCode            (uint16)  — 1=unknown, 2=already-busted-different-correlationId,
+                                  3=securityId mismatch, 4=missing-day (only when
+                                  channel exists; 410 path)
+busterFirm            (uint32)
+correlationId         (uint64)
+```
+
+Total body length: 1 + 1 + 4 + 8 + 4 + 2 + 4 + 8 = **32 bytes**.
+On-disk record: 4 + 4 + 32 = **40 bytes**; `recordLen` reads as
+**36** (= `crc(4) + body(32)`). Distinguished from a bust record
+(`recordLen = 40`) by the framing dispatch in §1.
+
+Reject-attempt records are **invisible** to the EOD projection
+(EodFillsExporter filters by recordType) and to the amendments
+writer. They exist solely for the operator audit trail.
+
+### 3. Pre-EOD vs post-EOD: keyed on the *original fill's* day
+
+- The split between "fold into projection" (§3a) and "write
+  amendments file" (§3b) is decided by whether
+  `audit/{ch}/{tradeDate}/fills.csv.done` exists at command-time,
+  where `tradeDate` is the day of the **original fill** (not the
+  day the bust arrived). This is the only key that yields the
+  right behaviour for cross-day busts (§5).
+- The host checks the sentinel under a short per-channel lock so
+  a concurrent EOD export cannot race with a bust accepted
+  fractions of a second before the export's `.done` rename. If
+  the sentinel appears between the check and the projection
+  read, the bust is treated as post-EOD (the late-arriving case)
+  and routed to the amendments path. The EOD exporter holds the
+  same per-channel lock between its own cancelled-set scan and
+  its `.done` rename, so the window is closed.
+
+#### 3a. Pre-EOD path (no `fills.csv.done` yet for `tradeDate`)
+
+- The bust record is appended to `fills-<tradeDate>.log` (the
+  day of the original fill, NOT the day the bust arrived — this
+  is an explicit override of §1.1's "bust always lands in the
+  bust's day" rule for the pre-EOD case, see Cross-day-busts
+  carve-out below).
+- The EOD projection for that day, when it runs, folds the
+  cancellation into the output: the resulting `fills.csv`
+  does **not** contain the busted fill at all (vs containing it
+  then negating it). Rationale: D+1 recon on the consumer side
+  becomes a single-pass match-and-tick exercise; no amendment
+  file is needed for same-day busts.
 - The projection is the existing `EodFillsExporter`. It already
-  walks `fills-YYYY-MM-DD.log`; the v2 reader exposes both record
-  types via an enumerator that yields either `Fill` or `Bust`. The
-  projection builds an in-memory `HashSet<uint>` of cancelled
-  `tradeId`s in a first pass, then in the second pass writes a
-  fill row only if its `tradeId` is not in the set.
+  walks `fills-YYYY-MM-DD.log`; the v2 reader exposes the
+  record-type dispatch, the projection builds an in-memory
+  `HashSet<uint>` of cancelled `tradeId`s from bust records in a
+  first pass, then in the second pass writes a fill row only if
+  its `tradeId` is not in the set. Reject-attempt records (§2.5)
+  are skipped entirely.
 - Per-day memory cost: 4 bytes × number of pre-EOD busts. For any
   realistic day this is bounded well below 1 MB; single-pass with
   a streaming filter is also viable but the two-pass shape is
   simpler and matches existing exporter tests.
-- A bust whose `tradeId` is not present in the day's fills (or
-  refers to a different day's fills) is logged at WARN by the
-  exporter and ignored. This case should not happen given §2.3's
-  validation, but the projection stays defensive.
 
-### 4. Post-EOD bust: amendments file, never rewrite
+#### 3b. Post-EOD path (`fills.csv.done` exists for `tradeDate`)
 
-- A bust accepted **after** the EOD CSV for the day was published
-  (i.e. after `fills.csv.done` exists for that channel+date) must
-  not rewrite `fills.csv`. Consumers may have already ingested
-  the original file; silently changing it would break the
-  immutability contract that `fills.csv.done` implies.
-- Instead, a sibling file is written on a separate atomic-rename
-  staged-then-promoted path:
-  - `audit/{ch}/{date}/amendments.csv` — one row per post-EOD
-    bust, in append-only order.
-  - `audit/{ch}/{date}/amendments.csv.done` — sentinel updated
-    whenever a new amendment row is durably appended. Atomic
-    replace via `File.Move(..., overwrite: true)`. Carries the
-    sha256 of the current `amendments.csv` content so consumers
-    can detect a partial read by comparing observed-vs-claimed
-    digest.
+- The bust record is appended to `fills-<bustToday>.log` per
+  §1.1's default rule (the day the bust *happened*). The
+  original day's `.log` is not touched — append-only is
+  preserved across days that have already been exported.
+- The amendments file for `tradeDate` is updated per §4. This
+  is the only post-EOD consumer-visible artifact.
+
+### 4. Post-EOD amendments file shape and publish protocol
+
+- A bust accepted on the post-EOD path (§3b) writes one row to
+  `audit/{ch}/{tradeDate}/amendments.csv` and updates the
+  sibling `amendments.csv.done` sentinel. Consumers may have
+  already ingested `fills.csv`; silently changing it would break
+  the immutability contract that `fills.csv.done` implies.
 - **`amendments.csv` columns** (header on row 0):
   ```
   cancelTradeId,bustTransactTime,reasonCode,correlationId,sha256OfOriginalFillRow
   ```
-  The `sha256OfOriginalFillRow` lets a consumer that has
-  `fills.csv` in hand prove the amendment targets the exact row
-  it's about to drop, defending against the (unlikely) case of
-  parallel file corruption.
+  Encoding: UTF-8, no BOM, `\n` (LF) row terminator, no trailing
+  whitespace — same conventions as `fills.csv` (see
+  `EodFillsExporter.WriteCsv`).
+- **`sha256OfOriginalFillRow` is defined precisely as:** the
+  SHA-256 of the contiguous byte slice in the published
+  `fills.csv` starting at the first byte of the target row
+  (the byte after the preceding `\n`, or byte 0 for row 0 — but
+  row 0 is the header so this case does not occur) through and
+  **including** the row-terminating `\n`. This matches the byte
+  range a consumer can compute from a single forward scan of the
+  published file. Hex-encoded lowercase in `amendments.csv`.
+- The publish protocol mirrors `EodFillsExporter`'s
+  delete-old-`.done`-before-replace pattern (see
+  `EodFillsExporter.cs:168-187`):
+  1. Read the current full state from the audit log (all bust
+     records targeting `tradeDate` that have already been
+     written, including the one just appended). The amendments
+     file is **regenerated in full** from the audit log on every
+     update — not literally appended — so a torn write cannot
+     leave a partial row visible.
+  2. Stage the new `amendments.csv` content to
+     `amendments.csv.staging.<pid>.<ts>` and fsync.
+  3. Compute SHA-256 of the staged content; stage
+     `amendments.csv.done` carrying that digest, fsync.
+  4. If a prior `amendments.csv.done` exists at the final path,
+     delete it first and fsync the directory. From this point a
+     crash leaves no `.done` — consumers correctly poll "not
+     ready" until the next bust republishes.
+  5. `File.Move` the CSV staging file over the final path,
+     fsync the directory.
+  6. `File.Move` the `.done` staging file over the final path,
+     fsync the directory.
+
+  This sequence guarantees consumers never observe an
+  `amendments.csv` body whose SHA-256 does not match the
+  `amendments.csv.done` digest. The cost (re-serialise the full
+  amendments set per update) is bounded by the small expected
+  number of post-EOD busts per day.
 - **Reconciliation rule:** the consumer applies amendments
-  exactly once, ordered by `bustTransactTime` ascending. For each
-  amendment:
+  exactly once, ordered by `bustTransactTime` ascending. For
+  each amendment:
   1. Locate the row in `fills.csv` where `tradeId == cancelTradeId`.
-  2. Compute the sha256 of that row's serialised bytes and check
-     it matches `sha256OfOriginalFillRow`. Mismatch → fail loudly.
+  2. Compute SHA-256 of that row per the byte-range definition
+     above and check it matches `sha256OfOriginalFillRow`.
+     Mismatch → fail loudly; do not silently apply.
   3. Remove that row from the consumer's working ledger. The
      `fills.csv` file on disk is **not** modified.
-- A bust may arrive for a day whose `fills.csv` has been **purged**
-  by host retention (ADR 0002 §8). In that case the audit-log
-  bust record is still written, the UMDF frame is still
-  published, but the amendments file write fails (since the
-  parent directory is gone) and surfaces HTTP 410 to the
-  operator. Operator must restore the day's audit log + CSV from
-  backup before re-running the bust.
+- An amendments-file write that fails after the audit record is
+  already written leaves the system in a consistent state:
+  `DurableThroughCommandSeq` is not advanced past the bust's
+  command until the next `Checkpoint()`, and on retry the
+  in-memory dedup map (§2.1) recognises the same
+  `(channel, tradeId, correlationId)` triple and re-runs only
+  the amendments-file publish. The bust is therefore
+  end-to-end-idempotent across crash boundaries.
 
 ### 5. Cross-day busts
 
 - A bust may target a `tradeId` from an earlier day (e.g. `T-1`
-  fill busted at `T`). Per §1.1, the bust record lands in the file
-  for the day the bust *happened* (`T`), so the audit log of
-  day `T-1` is **not** rewritten — append-only is preserved.
-- The projection for day `T-1`'s EOD CSV was published yesterday
-  and is also not rewritten — see §4. The amendment is written to
-  `audit/{ch}/T-1/amendments.csv`. The bust record lives in two
-  audit files: as a v2 bust record in `T`'s `.log` (the canonical
-  audit), and as an `amendments.csv` row in `T-1`'s drop
-  directory (the consumer-facing projection).
-- The endpoint requires `tradeDate=T-1` so the validation in §2.3
-  routes the amendments file write to the correct directory.
+  fill busted at `T`). Per §2.3, the operator MUST supply
+  `tradeDate=T-1` explicitly. The endpoint routes by §3:
+  - If `T-1`'s `fills.csv.done` does not exist yet (unusual
+    case — the export job ran late), §3a applies: the bust is
+    appended to `fills-T-1.log` and folded into the eventual
+    EOD projection.
+  - If `T-1`'s `fills.csv.done` already exists (the common
+    case — T-1 ran yesterday), §3b applies: the bust is
+    appended to `fills-T.log` (today's audit) and a row is
+    added to `audit/{ch}/T-1/amendments.csv`.
+- A bust record never lives in two audit `.log` files: the
+  per-day partition is unambiguous per §3a/§3b. The bust's
+  `tradeDate` (an operator-supplied input) is the routing key;
+  the bust's `bustTransactTimeNanos` is just a timestamp.
 
 ### 6. Consumer migration
 
