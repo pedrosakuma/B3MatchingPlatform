@@ -1,6 +1,8 @@
 # ADR 0001 — Post-trade boundary and EOD file export
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented by #329 series for the audit log
+  and #330 series for the EOD CSV drop; see *Implementation status*
+  below).
 - **Date:** 2026-05-16
 - **Supersedes:** —
 - **Superseded by:** —
@@ -164,12 +166,14 @@ We adopt **three concentric decisions**:
 
 ### 3. EOD file drop, BVBG-like
 
-- Once a trading session closes (operator-triggered via a new
-  `/admin/post-trade/eod-export?date=YYYY-MM-DD` endpoint, or
-  scheduler-driven via the phase scheduler from #321 when the
-  configured close phase fires), the per-trade log for that date is
-  projected into one or more **drop files** in a configured
-  directory `config.postTrade.dropDir`.
+- Once a trading session closes (operator-triggered via the
+  `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD`
+  endpoint, or chained from the existing
+  `DailyResetScheduler` / `POST /admin/daily-reset` rollover —
+  see *D+0 vs D+1 cycle* below for the as-shipped wiring), the
+  per-trade log for that date is projected into one or more
+  **drop files** in the per-channel directory configured by
+  `channels[].postTradeAudit.eodDropDir`.
 - **Format v1 is CSV.** Header + rows, columns frozen at:
   ```
   tradeId, ts, symbol, aggressorSide, qty, price, buyClOrdId, sellClOrdId, buyFirm, sellFirm
@@ -198,8 +202,8 @@ We adopt **three concentric decisions**:
   sequence, hash) so downstream consumers that ingest real BVBG can
   reuse their parser. Not built until a consumer demands it; the
   file-name convention reserves the path
-  `<dropDir>/<YYYYMMDD>/fills.csv` so adding `fills.xml` later is
-  non-breaking.
+  `<eodDropDir>/<channel>/<YYYY-MM-DD>/fills.csv` so adding
+  `fills.xml` later is non-breaking.
 - **No REST query endpoint.** Downstream tools poll the drop
   directory (or subscribe to a filesystem notification). The
   matching simulator is not on the live recon path; it produces
@@ -208,51 +212,73 @@ We adopt **three concentric decisions**:
 ### D+0 vs D+1 cycle
 
 - **D+0 (intraday close):** EOD export runs after a session-close
-  trigger. **In v1 the trigger is one of**:
-  - a new operator endpoint
-    `/admin/post-trade/eod-export?date=YYYY-MM-DD`, or
+  trigger. **As of issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330)
+  the trigger is either**:
+  - the operator endpoint
+    `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD`
+    (re-issue / backfill path), or
   - the existing `DailyResetScheduler` /
-    `/admin/daily-reset` flow (see `docs/RUNBOOK.md` section 2),
-    which is the closest thing to a "session is over" hook the
-    host has today.
+    `POST /admin/daily-reset` flow, which chains the per-channel
+    export for **yesterday UTC** after terminating sessions and
+    draining dispatcher inbound queues.
 
-  The `PhaseScheduler` from #321 / PR #324 currently only enqueues
+  Both paths share the same `EodFillsExporter` codepath and the
+  same `ExchangeHost.TriggerEodExport` in-flight guard, so a
+  scheduled tick and a manual rerun for the same `(channel, date)`
+  can't race into a torn publish.
+
+  See `docs/RUNBOOK.md` §2.5 (daily-reset) and §7.9 (EOD CSV drop)
+  for the operator-facing surface, status-code matrix, file
+  layout, and consumer contract.
+
+  The `PhaseScheduler` from #321 / PR #324 still only enqueues
   phase / `Uncross` actions and has **no** generic post-close
-  callback (see `src/B3.Exchange.Host/PhaseScheduler.cs`); wiring
-  it as the automatic export trigger is **future integration
-  work** for issue B (or a follow-up issue), not a current
-  capability this ADR can assume.
-- The file lands in `<dropDir>/<YYYYMMDD>/`.
+  callback; wiring it as an *additional* automatic trigger
+  (separate from `DailyResetScheduler`) is future integration
+  work, not blocking the post-trade module.
+- The file lands in `<eodDropDir>/<channel>/<YYYY-MM-DD>/`.
 - **D+1 (next morning):** trading-host's recon tool reads
   matching's D+0 drop and diffs against its own statement. Match =
   same trade count, same notional sum to the cent, no orphan
   `tradeId`s. Mismatch surfaces immediately, before the day's
   trading reopens.
 - **Reprocessing:** the export is idempotent — pointing the operator
-  endpoint at a past date rewrites the drop file deterministically
-  from the audit log. **Atomic publish semantics — hard
-  requirement.** A consumer that polls the drop directory must
-  never observe a partial or truncated file. Therefore:
-  - The export writes to a staging path
-    `<dropDir>/<YYYYMMDD>/.fills.csv.tmp-<pid>-<nonce>`.
-  - On success: `fsync` the staging file, `rename(2)` to
-    `fills.csv`, `fsync` the directory.
+  endpoint at a past `(channel, date)` rewrites the drop file
+  deterministically from the audit log. **Atomic publish semantics
+  — hard requirement.** A consumer that polls the drop directory
+  must never observe a partial or torn file, nor a stale `.done`
+  paired with a fresh CSV. Therefore (as shipped by #330 PR-1,
+  ordering fixed in review):
+  - The export stages both files to `.tmp-<pid>-<nonce>` paths in
+    the target `<eodDropDir>/<channel>/<YYYY-MM-DD>/` directory.
+  - On success the publish sequence is:
+    1. Delete any prior `fills.csv.done`, then `fsync` the
+       directory — this is what guarantees a polling consumer never
+       sees a stale `.done` next to a fresh CSV.
+    2. `rename(2)` the staged CSV to `fills.csv`, then `fsync` the
+       directory.
+    3. `rename(2)` the staged sidecar to `fills.csv.done`, then
+       `fsync` the directory.
+  - **Consumer contract:** `fills.csv.done` is the gate — its
+    presence (carrying `{ rowCount, sha256, generatedAt }`) is the
+    only signal that `fills.csv` is final. A `.csv` without a
+    matching `.done` is either still being written or a leftover
+    from a crashed run; consumers must ignore it.
   - On any failure mid-write (disk full, audit-log CRC failure
     detected during projection, process crash): the staging file
-    is removed on next operator-triggered rerun or on host
-    startup; the previously successful `fills.csv` from a prior
-    run remains untouched and consumable.
-  - A sidecar `fills.csv.done` is written **last**, after the
-    rename, carrying `{ rowCount, sha256, generatedAt }`. Its
-    presence is the consumer-visible signal that the file is
-    final; consumers wait for `.done` before reading. Rerunning
-    overwrites both `fills.csv` and `fills.csv.done` atomically
-    (rename ordering: data file first, then `.done`).
+    is removed on the next operator-triggered rerun or on host
+    startup. There is **no rollback** of step 1 — once the prior
+    `.done` is gone, no `.csv` is published until the rerun
+    completes successfully. This is intentional: the alternative
+    (keep the prior pair and republish only on success) makes the
+    `.done` gate weaker because a successful CSV rename + failed
+    `.done` rename would leave a stale `.done` describing the
+    *previous* CSV.
   - Failed exports surface via the operator endpoint's HTTP
     response (and a structured log line) — never via a partial
     file on disk. Audit-log corruption discovered during
-    projection is a hard failure: the export aborts, no file is
-    overwritten, and the operator gets a clear error pointing at
+    projection is a hard failure: the export aborts, no `.done`
+    is published, and the operator gets a clear error pointing at
     the offending audit record offset.
 
 ## Consequences
@@ -262,7 +288,7 @@ We adopt **three concentric decisions**:
 - The architecture stops conflating operator admin with post-trade
   clearing. Adding more clearing artifacts later (instrument dumps,
   price files, position aggregates) is a matter of dropping more
-  files in `dropDir`, not adding more REST endpoints.
+  files in `eodDropDir`, not adding more REST endpoints.
 - Recon decouples from matching uptime: a recon tool can run the
   next morning while matching is down for maintenance, because the
   artifact is on disk.
@@ -288,10 +314,38 @@ We adopt **three concentric decisions**:
 - **Close #327** as `not planned` — wrong shape. Link this ADR.
 - **Open A — per-trade audit log:** infra-only, no HTTP, no export.
   Implements section 2 above. Blocks B.
+  → **Shipped** as issue [#329](https://github.com/pedrosakuma/B3MatchingPlatform/issues/329)
+  (PR series #329 PR-1..PR-6). Operational surface in
+  `docs/RUNBOOK.md` §7.8.
 - **Open B — EOD fills file export (BVBG-like):** projects A into
   `dropDir`. Implements section 3 above. Closes
   B3TradingPlatform#274 via the file drop.
+  → **Shipped** as issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330)
+  (PR series #359 exporter, #360 operator endpoint, #361 daily-reset
+  chaining, this PR docs). Operational surface in
+  `docs/RUNBOOK.md` §7.9.
 - Both labelled `area:post-trade` so the new boundary is visible.
+
+### Implementation status (as of 2026-05)
+
+Acceptance criteria from sections 2 and 3 above are met:
+
+| Criterion | Status | Where |
+| --- | --- | --- |
+| Per-trade audit log written on the dispatch thread, daily-rolled by UTC, CRC-protected | ✅ #329 PR-1..PR-3 | `src/B3.Exchange.PostTrade/FileAuditLogWriter.cs` |
+| Independent retention from WAL (configurable `retentionDays`) | ✅ #329 PR-6 | `FileAuditLogWriter.PruneOldDays`, RUNBOOK §7.8 |
+| Durability watermark coupling audit checkpoint to WAL truncation gate | ✅ #329 PR-5 (sidecar) + PR-6 | `audit-watermark.bin`, RUNBOOK §7.8 |
+| EOD CSV drop with frozen v1 column shape | ✅ #330 PR-1 | `src/B3.Exchange.PostTrade/EodFillsExporter.cs`, RUNBOOK §7.9 |
+| Atomic publish (stage → fsync → rename CSV → rename `.done`) with no torn-file consumer visibility | ✅ #330 PR-1 (ordering fixed in review) | `EodFillsExporter.Export`, RUNBOOK §7.9 |
+| Operator trigger `POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD` with in-flight guard | ✅ #330 PR-2 | `src/B3.Exchange.Host/HttpServer.HandleEodExport`, RUNBOOK §7.9 |
+| `DailyResetScheduler` + `/admin/daily-reset` chain the EOD export for yesterday UTC | ✅ #330 PR-3 | `ExchangeHost.TriggerDailyReset`, RUNBOOK §2.5 + §7.9 |
+| Idempotent rerun (same inputs → byte-identical CSV) | ✅ #330 PR-1 + test | `EodFillsExporterTests`, RUNBOOK §7.9 |
+
+The deferred items in *Open questions* (signing, XML envelope,
+multi-firm split, compression, schema registry, exact retention
+defaults, session-time business-date boundary) remain explicit
+non-decisions and are not blocked by anything in the current
+shipped surface.
 
 ## Alternatives considered
 
@@ -353,7 +407,11 @@ the decision:
 ## References
 
 - `docs/RUNBOOK.md` — current operator endpoints; the `/admin/*`
-  surface this ADR draws a line around.
+  surface this ADR draws a line around. §7.8 documents the audit
+  log shipped by #329; §7.9 documents the EOD CSV drop shipped by
+  #330 (operator endpoint, file layout, atomic publish contract,
+  consumer rules); §2.5 documents the `DailyResetScheduler` /
+  `/admin/daily-reset` chaining.
 - `docs/EXCHANGE-SIMULATOR.md` — `wal` config block; this ADR keeps
   it untouched.
 - `src/B3.Exchange.Core/ChannelDispatcher.Operator.cs` — comment

@@ -81,9 +81,12 @@ See §4 for tuning recipes.
 > (audit log, EOD fills export, future clearing files) live on a
 > separate boundary and are **file-based**, not REST — see
 > [ADR 0001](./adr/0001-post-trade-boundary-and-eod-file-export.md).
-> If you are looking for "where do I download yesterday's fills",
-> the answer is "a configured drop directory once the post-trade
-> module ships", not an endpoint on this surface.
+> The one exception is the **trigger** for the EOD export
+> (`POST /admin/post-trade/eod-export?channel=N&date=YYYY-MM-DD`,
+> documented in §7.9 below): it lives under `/admin/*` because it is
+> an operator-only action against the running host. The **artifact
+> it produces** is a CSV in a configured drop directory, not a REST
+> body.
 
 ### 2.1 Liveness & readiness
 
@@ -167,9 +170,19 @@ Per-spec daily rollover (#GAP-09 / #47):
 * Every live FIXP session is sent `Terminate(FINISHED)`.
 * Clients reconnect with `Negotiate` + `Establish(nextSeqNo=1)`.
 * Sequence numbers reset; retransmission buffers are cleared.
+* **Post-trade rollover (issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330)).**
+  After session termination, the handler waits for the per-channel
+  dispatcher inbound queues to drain (bounded by
+  `shutdown.drainGraceMs`, same knob the graceful-shutdown path
+  uses), then chains the EOD CSV export for **yesterday UTC** on
+  every channel that has `postTradeAudit.eodDropDir` configured.
+  See §7.9 for the file layout, atomic publish contract, and
+  failure modes.
 
 The same code path is wired to the optional scheduled trigger (set
-`hostConfig.dailyReset` to enable; absent ⇒ admin-trigger only).
+`hostConfig.dailyReset` to enable; absent ⇒ admin-trigger only), so
+both the cron-style scheduler and the operator `curl` produce
+identical artifacts.
 
 ---
 
@@ -1077,7 +1090,133 @@ upper bound on per-trade audit overhead). Compare numbers across PRs
 that touch the dispatcher hot path or the writer to catch
 regressions before they land.
 
-### 7.9 Common persistence headaches
+### 7.9 EOD fills export — CSV drop (issue [#330](https://github.com/pedrosakuma/B3MatchingPlatform/issues/330))
+
+Projects the per-trade audit log (§7.8) for a given business date
+into a CSV "drop" file that downstream recon tools poll. This is
+the **post-trade boundary** described by
+[ADR 0001](./adr/0001-post-trade-boundary-and-eod-file-export.md) —
+file-based, not REST. The `/admin/post-trade/eod-export` trigger is
+operator-only and lives on the admin surface for ergonomics; the
+artifact it produces is on disk.
+
+**Opt-in per channel** via the `postTradeAudit.eodDropDir` field
+(added by issue #330 PR-2). The channel must also have
+`postTradeAudit.enabled=true` (§7.8) — without an audit log there
+is nothing to project:
+
+```jsonc
+"channels": [{
+  "channelNumber": 1,
+  // ... transport, instruments, persistence ...
+  "postTradeAudit": {
+    "enabled": true,
+    "dataDir": "/var/lib/b3matching/audit",
+    "eodDropDir": "/var/lib/b3matching/drop",
+    "retentionDays": 1825
+  }
+}]
+```
+
+If `eodDropDir` is empty, the channel has no export configured and
+the trigger returns `404` for that channel (other channels still
+run).
+
+**On-disk layout** (one set per channel per business date):
+
+```
+{eodDropDir}/{channel}/{YYYY-MM-DD}/
+  fills.csv        # data
+  fills.csv.done   # sidecar with { rowCount, sha256, generatedAt }
+```
+
+The CSV columns are frozen at the ADR 0001 v1 shape:
+
+```
+tradeId, ts, symbol, aggressorSide, qty, price, buyClOrdId, sellClOrdId, buyFirm, sellFirm
+```
+
+`ts` is ISO-8601 UTC with microsecond precision. `aggressorSide`
+is taker-relative (`B`/`S`, matching UMDF `Trade_53` semantics).
+Internal crosses (same firm on both sides) emit one row with
+`buyFirm == sellFirm`. `symbol` is resolved from each channel's
+instrument map; trades on unknown securityIds fall back to the
+numeric `securityId` as the symbol so the row is never lost.
+
+**Atomic publish contract** (every consumer must rely on these
+invariants):
+
+1. The exporter stages `fills.csv` and `fills.csv.done` to
+   `.tmp-<pid>-<nonce>` paths in the same directory.
+2. The previous `.done` (if any) is deleted, then the directory
+   is fsync'd — this is what guarantees a polling consumer never
+   sees a stale `.done` next to a fresh CSV.
+3. The CSV is renamed into place and fsync'd.
+4. The `.done` sidecar is renamed last and fsync'd.
+
+**Consumers MUST wait for `fills.csv.done` before reading
+`fills.csv`.** A `.csv` without a matching `.done` is either
+still being written or a leftover from a crashed export run.
+
+**Idempotency.** Rerunning the export for the same `(channel,
+date)` produces a byte-identical CSV (same input → deterministic
+output). Only the `generatedAt` field inside `.done` differs.
+This is the intended recovery / re-issue path for operators.
+
+**Operator trigger — `POST /admin/post-trade/eod-export`.**
+Synchronous: blocks until the staging + fsync + rename cycle
+completes (typical CSV is small — a few MB at most for a busy
+channel — so wall-clock is sub-second on local SSD, low single
+digits on networked drops).
+
+```bash
+# Re-issue yesterday's drop for channel 1.
+curl -sS -X POST \
+  "http://127.0.0.1:8080/admin/post-trade/eod-export?channel=1&date=2026-05-18"
+# {"csvPath":"/var/lib/b3matching/drop/1/2026-05-18/fills.csv","rowCount":12345,"sha256":"…"}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200 OK` | Export succeeded. Body is a JSON object with `csvPath`, `rowCount`, `sha256` (matches the value in `.done`). |
+| `400 Bad Request` | Missing or malformed `channel` / `date` query parameter. `date` must be `YYYY-MM-DD` (UTC business date). |
+| `404 Not Found` | The channel has no EOD export wired (either `postTradeAudit.enabled=false`, `postTradeAudit.dataDir` empty, or `postTradeAudit.eodDropDir` empty), or no `fills-YYYY-MM-DD.log` exists for that channel and date. The response body distinguishes the cases. |
+| `409 Conflict` | Another export for the same `(channel, date)` is already in progress. The in-flight guard is per-tuple, so different `(channel, date)` pairs can run in parallel. |
+| `500 Internal Server Error` | Unhandled exception during projection (disk full, audit-log CRC failure, permission flip). The body carries the exception type and message; no partial file is published. |
+| `503 Service Unavailable` | Host has not finished `StartAsync` (the trigger is not yet wired). |
+
+**Scheduled trigger — `POST /admin/daily-reset` and
+`DailyResetScheduler`.** Both go through the same code path (see
+§2.5): terminate sessions → drain dispatcher inbound queues →
+chain the per-channel EOD export for **yesterday UTC**. Per-channel
+failures (missing audit log for a quiet day → warning; race with an
+operator manual rerun → warning; other exceptions → error) are
+isolated so one channel never blocks siblings. Yesterday-UTC is
+chosen because the currently-open day's audit file is still being
+written by the dispatcher — operators always export the last
+**sealed** day at rollover.
+
+**Auth model.** Same as every other `/admin/*` endpoint: there is
+no application-level auth. Operators must network-gate the HTTP
+listener (bind to loopback, route through a reverse proxy, restrict
+by k8s NetworkPolicy, etc.). See §1.1 / §2 for the listener bind
+address.
+
+**Failure modes a consumer can observe:**
+
+| Symptom | Cause | Remediation |
+| --- | --- | --- |
+| `.csv` exists, no `.done` | Export run crashed mid-publish, or the host was killed between steps 3 and 4 above. | The consumer must ignore the file. Rerun the trigger; the rename is idempotent and the `.done` will appear once the rerun completes. |
+| `.done` lists a `sha256` that doesn't match `sha256sum fills.csv` | The CSV was modified after publish (manual edit, restore from backup). | Re-run the export to overwrite both files from the authoritative audit log. |
+| Trigger returns `404` "audit log not found" but the operator expected trades | Either the date is wrong (UTC vs local), or `postTradeAudit.enabled` was off on that day, or `dataDir` was different. | Check `{dataDir}/{channel}/fills-{date}.log` directly; verify the config in effect at the relevant historical moment. |
+| Trigger returns `409` and never clears | A scheduler tick is mid-flight (typically sub-second). If it persists for minutes, the dispatcher is stuck. | Check host logs for `daily-reset (...): drain phase=grace-expired` and `eod-export ... failed` lines; investigate the audit writer's sticky-fault state (§7.8). |
+
+**Failure-mode invariant:** a consumer that respects the
+`.done` gate never observes a partial, torn, or stale CSV. The
+exporter holds no state — every run reads the audit log fresh —
+so safe-to-rerun on any failure.
+
+### 7.10 Common persistence headaches
 
 * **"Channel boots empty after restart."** Check
   `exch_snapshot_load_seconds` — `0` means `TryLoad` returned null.
