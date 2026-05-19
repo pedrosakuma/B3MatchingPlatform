@@ -153,6 +153,122 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
+    /// ADR 0008 PR-2: schedules an operator bust through the post-trade
+    /// validator + audit-log path. The dispatch thread runs
+    /// <see cref="B3.Exchange.PostTrade.BustValidator"/> against the
+    /// (per-channel) audit files and the in-memory dedup index; on accept
+    /// it writes a bust record + emits TradeBust_57, on reject it writes
+    /// a reject-attempt record + returns the validator's verdict via the
+    /// supplied <paramref name="completion"/> source. Returns <c>false</c>
+    /// if the inbound queue is full or the channel is WAL-halted; in
+    /// both cases the completion source is faulted.
+    /// </summary>
+    public bool EnqueueOperatorBustV2(
+        uint tradeId, DateOnly tradeDate, ulong correlationId,
+        ushort reasonCode, uint busterFirm, long? securityIdEcho,
+        ulong attemptTransactTimeNanos,
+        TaskCompletionSource<OperatorBustV2Outcome> completion)
+    {
+        ArgumentNullException.ThrowIfNull(completion);
+        if (_auditRootDir is null || _bustDedup is null)
+        {
+            completion.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} bust-v2 endpoint requires audit-log configuration; not wired"));
+            return false;
+        }
+        if (RejectIfWalHalted(WorkKind.OperatorBustV2))
+        {
+            completion.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; OperatorBustV2 rejected"));
+            return false;
+        }
+        var payload = new OperatorBustV2(tradeId, tradeDate, correlationId, reasonCode,
+            busterFirm, securityIdEcho, attemptTransactTimeNanos);
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBustV2, default, 0, false,
+            0, 0, null, null, null, null,
+            BustV2: payload, BustCompletion: completion)))
+        {
+            return true;
+        }
+        completion.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; OperatorBustV2 rejected"));
+        return false;
+    }
+
+    private void ProcessOperatorBustV2(OperatorBustV2 op, TaskCompletionSource<OperatorBustV2Outcome>? completion)
+    {
+        AssertOnLoopThread();
+        try
+        {
+            var request = new B3.Exchange.PostTrade.BustRequest(
+                op.TradeId, op.TradeDate, op.CorrelationId, op.SecurityIdEcho,
+                op.ReasonCode, op.BusterFirm, op.AttemptTransactTimeNanos);
+            var result = B3.Exchange.PostTrade.BustValidator.Validate(
+                _auditRootDir!, ChannelNumber, request, _bustDedup!);
+
+            switch (result.Kind)
+            {
+                case B3.Exchange.PostTrade.BustValidationKind.Accept:
+                    {
+                        var bust = new B3.Exchange.PostTrade.BustRecord(
+                            op.TradeId, op.AttemptTransactTimeNanos,
+                            result.MatchedFill.SecurityId, op.ReasonCode, op.BusterFirm, op.CorrelationId);
+                        _postTradeSink.OnBust(bust, op.TradeDate);
+                        _bustDedup!.Add(op.TradeId, op.CorrelationId, op.TradeDate);
+                        // Emit TradeBust_57 frame; price/size echo come from the
+                        // matched fill so consumers see the same data the
+                        // original Trade_53 carried.
+                        uint rptSeq = _engine.AllocateNextRptSeq();
+                        _packetWritten = 0;
+                        int frameSize = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+                            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+                            + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength;
+                        var dst = ReserveOrFlush(frameSize);
+                        // TradeDate to ushort days-since-epoch.
+                        ushort tradeDateDays = checked((ushort)op.TradeDate.DayNumber);
+                        int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
+                            result.MatchedFill.SecurityId, result.MatchedFill.PriceMantissa,
+                            result.MatchedFill.Quantity, op.TradeId, tradeDateDays,
+                            _nowNanos(), rptSeq);
+                        Commit(written);
+                        FlushPacket();
+                        break;
+                    }
+                case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:
+                    // No new write, no UMDF emit.
+                    break;
+                case B3.Exchange.PostTrade.BustValidationKind.MissingDay:
+                    // No audit-log write (ADR §2.3).
+                    break;
+                case B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId:
+                case B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation:
+                case B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch:
+                    {
+                        ushort code = result.Kind switch
+                        {
+                            B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId => (ushort)1,
+                            B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation => (ushort)2,
+                            B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch => (ushort)3,
+                            _ => (ushort)0,
+                        };
+                        var reject = new B3.Exchange.PostTrade.RejectAttemptRecord(
+                            op.TradeId, op.AttemptTransactTimeNanos,
+                            op.TradeDate.DayNumber, code, op.BusterFirm, op.CorrelationId);
+                        _postTradeSink.OnRejectAttempt(reject);
+                        break;
+                    }
+            }
+
+            completion?.TrySetResult(new OperatorBustV2Outcome(result.Kind, result.ExistingCorrelationId));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Operator command (gap-functional §5 / issue #201): transitions the
     /// supplied instrument to the requested <see cref="TradingPhase"/>. The
     /// transition is applied on the dispatch thread; if it changes the

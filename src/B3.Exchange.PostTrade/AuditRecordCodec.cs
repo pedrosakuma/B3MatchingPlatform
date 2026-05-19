@@ -85,10 +85,11 @@ namespace B3.Exchange.PostTrade;
 public static class AuditRecordCodec
 {
     /// <summary>The schema version this build writes for newly-created
-    /// audit files. Existing v1 files are accepted on read and on
-    /// resume; the writer never bumps an in-place header
-    /// (per-day schema view, ADR 0008 §1).</summary>
-    public const ushort SchemaVersion = SchemaVersionV1;
+    /// audit files. ADR 0008 / issue #369 PR-2 bumps the default to V2;
+    /// existing V1 files remain readable on resume (per-day schema view
+    /// per ADR 0008 §1) and the writer's recovery path dispatches on the
+    /// per-file header version.</summary>
+    public const ushort SchemaVersion = SchemaVersionV2;
 
     /// <summary>Legacy fills-only schema (issue #329).</summary>
     public const ushort SchemaVersionV1 = 1;

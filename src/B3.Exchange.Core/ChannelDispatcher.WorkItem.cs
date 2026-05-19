@@ -10,7 +10,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2 }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -36,6 +36,7 @@ public sealed partial class ChannelDispatcher
         "OperatorUncrossAuction",
         "OperatorHaltInstrument",
         "OperatorResumeInstrument",
+        "OperatorBustV2",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -63,6 +64,8 @@ public sealed partial class ChannelDispatcher
         OperatorHalt? Halt = null,
         OperatorResume? Resume = null,
         TaskCompletionSource<HaltOutcome>? HaltCompletion = null,
+        OperatorBustV2? BustV2 = null,
+        TaskCompletionSource<OperatorBustV2Outcome>? BustCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -111,6 +114,31 @@ public sealed partial class ChannelDispatcher
     /// Issue #322: operator-triggered resume payload.
     /// </summary>
     internal sealed record OperatorResume(long SecurityId);
+
+    /// <summary>
+    /// ADR 0008 PR-2: operator bust request payload (post-trade audit
+    /// path). Distinct from <see cref="OperatorTradeBust"/> (which is the
+    /// legacy fire-and-forget replay path that does no validation and no
+    /// audit-log write): this one runs through the dedup/validator before
+    /// optionally emitting a TradeBust_57 frame and writing a bust or
+    /// reject-attempt record to the post-trade audit log.
+    /// </summary>
+    internal sealed record OperatorBustV2(
+        uint TradeId,
+        DateOnly TradeDate,
+        ulong CorrelationId,
+        ushort ReasonCode,
+        uint BusterFirm,
+        long? SecurityIdEcho,
+        ulong AttemptTransactTimeNanos);
+
+    /// <summary>ADR 0008 PR-2: surfaced back to the HTTP handler so the
+    /// 200/4xx/5xx mapping can happen at the edge. The validator-kind
+    /// field carries the validator's verdict 1:1; <see cref="ExistingCorrelationId"/>
+    /// is populated only for <see cref="BustValidationKind.AlreadyBustedDifferentCorrelation"/>.</summary>
+    public readonly record struct OperatorBustV2Outcome(
+        B3.Exchange.PostTrade.BustValidationKind Kind,
+        ulong ExistingCorrelationId);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 

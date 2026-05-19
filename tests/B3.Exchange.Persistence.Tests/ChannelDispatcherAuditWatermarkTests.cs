@@ -83,6 +83,8 @@ public class ChannelDispatcherAuditWatermarkTests
             if (commandSeq > _pending) _pending = commandSeq;
         }
         public void Checkpoint() => CheckpointCount++;
+        public void OnBust(in BustRecord record, DateOnly tradeDate) { }
+        public void OnRejectAttempt(in RejectAttemptRecord record) { }
         // When DurableOverride >= 0 the test pins the watermark; otherwise we
         // honour OnCommandBoundary as the durable seq (i.e. Checkpoint trivially
         // promotes pending → durable).

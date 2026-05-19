@@ -94,6 +94,25 @@ public interface IPostTradeSink
     /// pre-#329 truncate-everything behaviour is preserved exactly.</para>
     /// </summary>
     long DurableThroughCommandSeq { get; }
+
+    /// <summary>
+    /// Appends an operator-issued trade-bust audit record to the audit log
+    /// for <paramref name="tradeDate"/> (ADR 0008 §1, §3). Unlike
+    /// <see cref="OnTrade"/>, busts are not tied to the current dispatch
+    /// day — they reference a historical fill — so implementations MUST
+    /// be capable of writing to a day other than the currently-open log
+    /// (cross-day write). Called on the <c>ChannelDispatcher</c> dispatch
+    /// thread after the operator-bust validator has accepted the request.
+    /// </summary>
+    void OnBust(in BustRecord record, DateOnly tradeDate);
+
+    /// <summary>
+    /// Appends a reject-attempt audit record to TODAY's audit log
+    /// (ADR 0008 §2.5). Records every accepted-but-rejected operator
+    /// bust attempt so the audit trail explains 4xx HTTP responses.
+    /// Called on the dispatch thread.
+    /// </summary>
+    void OnRejectAttempt(in RejectAttemptRecord record);
 }
 
 /// <summary>
@@ -109,5 +128,7 @@ public sealed class NullPostTradeSink : IPostTradeSink
     public void OnTrade(in PostTradeRecord record) { }
     public void OnCommandBoundary(long commandSeq) { }
     public void Checkpoint() { }
+    public void OnBust(in BustRecord record, DateOnly tradeDate) { }
+    public void OnRejectAttempt(in RejectAttemptRecord record) { }
     public long DurableThroughCommandSeq => long.MaxValue;
 }

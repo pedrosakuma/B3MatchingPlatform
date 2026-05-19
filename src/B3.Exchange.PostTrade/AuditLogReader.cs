@@ -138,20 +138,23 @@ public static class AuditLogReader
         if (hr != header.Length)
             throw new InvalidDataException($"audit file '{logPath}' truncated in header (got {hr} bytes)");
         var (_, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(header);
-        // ADR 0008 §1 / issue #369 PR-1: the firm-sparse index assumes
-        // uniform fixed-width fill records. v2 files can carry variable-
-        // length bust/reject-attempt records, which would desync the
-        // 85-byte fixed-stride scan below and silently under-report. PR-2
-        // teaches both the index codec and this reader to handle mixed
-        // record sizes; until then, refuse v2 firm-filtered reads
-        // explicitly rather than returning a partial result.
-        if (schemaVersion != AuditRecordCodec.SchemaVersionV1)
-            throw new NotSupportedException(
-                $"ReadByFirm does not yet support schema v{schemaVersion} (PR-2 will add mixed-record dispatch); "
-                + "use ReadAllEntries for the time being");
+        // ADR 0008 / issue #369 PR-2: schema-aware dispatch in both the
+        // indexed-block and unindexed-suffix paths. Bust and reject-
+        // attempt records sit on the same stream as fills (per ADR 0008
+        // §1) but have different sizes (44 / 40 bytes vs 85 for a fill);
+        // the v1-era fixed 85-byte stride would either CRC-fail on the
+        // first non-fill or read past it into the next record's body.
+        // The writer's invariant (firm-sparse .idx covers fill records
+        // only — non-fill records are written outside any open block)
+        // means recordCount in each .idx entry still counts fills only.
+        bool schemaIsV2 = schemaVersion == AuditRecordCodec.SchemaVersionV2;
 
-        var buffer = new byte[AuditRecordCodec.RecordSize];
-        // 1) Indexed candidates — seek directly to each block.
+        var buffer = new byte[AuditRecordCodec.MaxRecordSize];
+        // 1) Indexed candidates — seek directly to each block. Each entry
+        // in the .idx represents a contiguous run of fill records (the
+        // writer flushes any open fill block before writing a non-fill
+        // record, see ADR 0008 PR-2), so a fixed 85-byte stride is still
+        // correct here.
         foreach (var (offset, recordCount) in candidates)
         {
             fs.Seek((long)offset, SeekOrigin.Begin);
@@ -159,27 +162,50 @@ public static class AuditLogReader
             {
                 int read = ReadFully(fs, buffer, 0, AuditRecordCodec.RecordSize);
                 if (read < AuditRecordCodec.RecordSize) break;
-                if (!AuditRecordCodec.TryDecode(buffer, out var record)) break;
+                if (!AuditRecordCodec.TryDecode(buffer.AsSpan(0, AuditRecordCodec.RecordSize), out var record)) break;
                 if (record.BuyFirm == firmId || record.SellFirm == firmId)
                     yield return record;
             }
         }
 
         // 2) Unindexed suffix — anything past the last byte the index claims
-        // to cover. Critical for correctness when (a) the index is stale by
-        // an in-progress block, (b) a malformed entry forced us to stop
-        // trusting the index mid-file, or (c) no index exists at all.
+        // to cover. On v2 files this stream is heterogeneous (fills + bust
+        // + reject-attempt records); peek the recordLen and dispatch.
         if (indexedEndOffset < fs.Length)
         {
             fs.Seek(indexedEndOffset, SeekOrigin.Begin);
             while (true)
             {
-                int read = ReadFully(fs, buffer, 0, AuditRecordCodec.RecordSize);
-                if (read == 0) break;
-                if (read < AuditRecordCodec.RecordSize) break;
-                if (!AuditRecordCodec.TryDecode(buffer, out var record)) break;
-                if (record.BuyFirm == firmId || record.SellFirm == firmId)
-                    yield return record;
+                if (!schemaIsV2)
+                {
+                    int read = ReadFully(fs, buffer, 0, AuditRecordCodec.RecordSize);
+                    if (read == 0) break;
+                    if (read < AuditRecordCodec.RecordSize) break;
+                    if (!AuditRecordCodec.TryDecode(buffer.AsSpan(0, AuditRecordCodec.RecordSize), out var record)) break;
+                    if (record.BuyFirm == firmId || record.SellFirm == firmId)
+                        yield return record;
+                    continue;
+                }
+
+                // v2: peek recordLen (4 bytes), read remaining body, dispatch.
+                int peeked = ReadFully(fs, buffer, 0, 4);
+                if (peeked == 0) break;
+                if (peeked < 4) break;
+                if (!AuditRecordCodec.TryPeekRecordLen(buffer.AsSpan(0, 4), out uint recordLen)) break;
+                if (!AuditRecordCodec.TryGetRecordSize(recordLen, out int onDiskSize, out var kind)) break;
+                int restRead = ReadFully(fs, buffer, 4, onDiskSize - 4);
+                if (restRead < onDiskSize - 4) break;
+                if (kind == AuditRecordKind.Fill)
+                {
+                    if (!AuditRecordCodec.TryDecode(buffer.AsSpan(0, onDiskSize), out var record)) break;
+                    if (record.BuyFirm == firmId || record.SellFirm == firmId)
+                        yield return record;
+                }
+                // bust / reject-attempt records: skip (fills-only API).
+                // CRC validation happens in the type-specific TryDecode in
+                // ReadAllEntries; here we trust the recordLen dispatch and
+                // continue. A bit-flip in a skipped record will most likely
+                // surface as a bad recordLen on the next iteration.
             }
         }
     }
