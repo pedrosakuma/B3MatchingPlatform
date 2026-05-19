@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using System.Collections.Generic;
 
 namespace B3.Exchange.Core;
 
@@ -85,6 +86,38 @@ public interface IChannelWriteAheadLog : IDurabilityBarrier
     /// contains records that are not yet reflected in the snapshot.
     /// </summary>
     void Truncate();
+
+    /// <summary>
+    /// Issue #348: drops every record with <c>Seq &lt;= throughSeq</c>
+    /// and KEEPS every record with <c>Seq &gt; throughSeq</c>. Used by
+    /// the async-snapshot path where the dispatch thread may have
+    /// appended records past the snapshot's <c>LastAppliedSeq</c>
+    /// between <see cref="BackgroundSnapshotWriter"/>'s <c>Submit</c>
+    /// and <c>onSaved</c> callback firing — a full <see cref="Truncate"/>
+    /// in that window would silently drop the tail.
+    ///
+    /// <para>Default implementation reads the surviving tail, calls
+    /// <see cref="Truncate"/>, then re-<see cref="Append"/>s the tail
+    /// — correct for in-memory fakes. File-backed implementations
+    /// should override with an atomic rewrite to avoid the
+    /// drop+re-append window.</para>
+    ///
+    /// <para>Single-writer contract identical to <see cref="Truncate"/>:
+    /// implementations may assume only one caller at a time but MUST
+    /// be safe to run concurrently with <see cref="Append"/> from the
+    /// dispatch thread (the file implementation serializes via its
+    /// internal write lock).</para>
+    /// </summary>
+    void TruncateThrough(long throughSeq)
+    {
+        var tail = new List<WalRecord>();
+        foreach (var rec in ReadAll())
+        {
+            if (rec.Seq > throughSeq) tail.Add(rec);
+        }
+        Truncate();
+        foreach (var rec in tail) Append(rec);
+    }
 
     /// <summary>
     /// Issue #271: removes the underlying WAL artifact entirely (file,

@@ -597,39 +597,135 @@ public sealed class FileChannelWriteAheadLog : IChannelWriteAheadLog, IDisposabl
     {
         lock (_writeLock)
         {
+            TruncateLocked();
+        }
+    }
+
+    private void TruncateLocked()
+    {
+        if (_appendStream is not null)
+        {
+            _appendStream.Dispose();
+            _appendStream = null;
+        }
+        // Atomic truncate: write empty file to tmp, rename over.
+        var tmp = System.IO.Path.Combine(_dataDir,
+            string.Format(CultureInfo.InvariantCulture, WalTempFileNameFormat, _channelNumber));
+        try
+        {
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Flush(flushToDisk: true);
+            }
+            File.Move(tmp, _path, overwrite: true);
+            FsyncDirectory(_dataDir);
+            Interlocked.Exchange(ref _currentSize, 0);
+            // Issue #312: every previously-appended record is now
+            // either durable (it was fsynced into the old file
+            // before snapshot persist asked us to truncate) or
+            // intentionally discarded — either way it can't be
+            // replayed any more, so it counts as "durable" for
+            // any caller still waiting on its seq. Advancing
+            // _durableSeq here unblocks them instead of letting
+            // them spin until the fsync thread notices the empty
+            // file.
+            AdvanceDurableSeqOnTruncate();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: failed to truncate WAL at {Path}",
+                _channelNumber, _path);
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Issue #348: atomic prefix truncate — drops every record with
+    /// <c>Seq &lt;= throughSeq</c> and KEEPS every record with
+    /// <c>Seq &gt; throughSeq</c>. Closes the async-snapshot race
+    /// where the dispatch thread could append a record past the
+    /// snapshot's <c>LastAppliedSeq</c> between
+    /// <see cref="BackgroundSnapshotWriter"/>'s <c>Submit</c> and
+    /// <c>onSaved</c> callback firing; a full <see cref="Truncate"/>
+    /// in that window would silently drop the tail and a subsequent
+    /// crash would lose it.
+    ///
+    /// <para>Implementation: under <c>_writeLock</c>, reads the
+    /// surviving tail via <see cref="ReadAll"/>, writes a fresh tmp
+    /// file containing only the kept records, atomically renames
+    /// over the live WAL, fsyncs the directory. Equivalent to
+    /// <see cref="Truncate"/> when no records survive (kept=0); a
+    /// no-op when every record is above the cutoff.</para>
+    /// </summary>
+    public void TruncateThrough(long throughSeq)
+    {
+        lock (_writeLock)
+        {
+            // Snapshot the surviving tail BEFORE we touch the file —
+            // ReadAll opens its own FileStream with FileShare.Read, so
+            // this is safe even while _appendStream is still open. We
+            // close _appendStream below so the rename can succeed on
+            // Windows (Move-with-overwrite refuses an open file).
+            var all = ReadAll();
+            var kept = new List<WalRecord>(all.Count);
+            foreach (var rec in all)
+            {
+                if (rec.Seq > throughSeq) kept.Add(rec);
+            }
+            if (kept.Count == all.Count)
+            {
+                // Cutoff is below every record on disk → nothing to do.
+                return;
+            }
+            if (kept.Count == 0)
+            {
+                // Equivalent to a full truncate.
+                TruncateLocked();
+                return;
+            }
             if (_appendStream is not null)
             {
                 _appendStream.Dispose();
                 _appendStream = null;
             }
-            // Atomic truncate: write empty file to tmp, rename over.
             var tmp = System.IO.Path.Combine(_dataDir,
                 string.Format(CultureInfo.InvariantCulture, WalTempFileNameFormat, _channelNumber));
             try
             {
+                long newSize = 0;
+                Span<byte> crcBytes = stackalloc byte[8];
                 using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
+                    foreach (var rec in kept)
+                    {
+                        var json = JsonSerializer.SerializeToUtf8Bytes(rec, WalJsonContext.Default.WalRecord);
+                        uint crc = Crc32C.Compute(json);
+                        WriteHexUtf8(crc, crcBytes);
+                        fs.Write(json, 0, json.Length);
+                        fs.WriteByte(CrcSeparator);
+                        fs.Write(crcBytes);
+                        fs.WriteByte((byte)'\n');
+                        newSize += json.Length + 1 + 8 + 1;
+                    }
                     fs.Flush(flushToDisk: true);
                 }
                 File.Move(tmp, _path, overwrite: true);
                 FsyncDirectory(_dataDir);
-                Interlocked.Exchange(ref _currentSize, 0);
-                // Issue #312: every previously-appended record is now
-                // either durable (it was fsynced into the old file
-                // before snapshot persist asked us to truncate) or
-                // intentionally discarded — either way it can't be
-                // replayed any more, so it counts as "durable" for
-                // any caller still waiting on its seq. Advancing
-                // _durableSeq here unblocks them instead of letting
-                // them spin until the fsync thread notices the empty
-                // file.
+                Interlocked.Exchange(ref _currentSize, newSize);
+                // The kept tail records were already durable before
+                // this call (they were fsynced on Append), so the
+                // post-rewrite durable seq is the highest seq in the
+                // surviving tail — which is also _pendingSeq's value
+                // (or higher) for any caller still parked.
                 AdvanceDurableSeqOnTruncate();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "channel {ChannelNumber}: failed to truncate WAL at {Path}",
-                    _channelNumber, _path);
+                    "channel {ChannelNumber}: failed to prefix-truncate WAL at {Path} (throughSeq={ThroughSeq}, kept={Kept})",
+                    _channelNumber, _path, throughSeq, kept.Count);
                 try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
                 throw;
             }

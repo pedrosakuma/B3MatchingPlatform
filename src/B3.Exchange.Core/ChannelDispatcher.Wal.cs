@@ -192,7 +192,13 @@ public sealed partial class ChannelDispatcher
         if (!watermarkOk) return;
         try
         {
-            _wal.Truncate();
+            // Issue #348: prefix-truncate, NOT full truncate. Between
+            // BackgroundSnapshotWriter.Submit(snap) and this onSaved
+            // callback firing, the dispatch thread may have appended
+            // records with Seq > snap.LastAppliedSeq that are NOT
+            // covered by the just-saved snapshot. A full Truncate()
+            // would drop them and a subsequent crash would lose them.
+            _wal.TruncateThrough(snap.LastAppliedSeq);
             _metrics?.IncWalTruncation();
             _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
         }
