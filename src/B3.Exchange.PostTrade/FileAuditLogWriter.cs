@@ -436,9 +436,20 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         Span<byte> hdr = stackalloc byte[AuditRecordCodec.FileHeaderSize];
         if (fs.Read(hdr) != hdr.Length)
             throw new InvalidDataException($"audit file '{fs.Name}' truncated in header");
-        var (channel, _) = AuditRecordCodec.ReadFileHeader(hdr);
+        var (channel, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(hdr);
         if (channel != _channelNumber)
             throw new InvalidDataException($"audit file '{fs.Name}' channel mismatch (file={channel}, writer={_channelNumber})");
+        // ADR 0008 §1 per-day schema view: this build's writer only emits
+        // v1 records, so refuse to extend an existing file at a different
+        // schema. Critical safety net: without this check, the v1 fixed-
+        // width scan below would stop at the first non-fill record in a
+        // v2 file and the caller would SetLength() to that point, silently
+        // truncating valid bust/reject-attempt records. PR-2 replaces this
+        // with a schema-aware recovery path.
+        if (schemaVersion != AuditRecordCodec.SchemaVersion)
+            throw new InvalidDataException(
+                $"audit file '{fs.Name}' schema {schemaVersion} != writer schema {AuditRecordCodec.SchemaVersion}; "
+                + "refusing to extend (would risk truncating non-fill records)");
 
         long goodEnd = AuditRecordCodec.FileHeaderSize;
         Span<byte> rec = stackalloc byte[AuditRecordCodec.RecordSize];
