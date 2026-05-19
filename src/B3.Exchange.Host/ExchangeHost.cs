@@ -35,6 +35,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
     private readonly List<Timer> _snapshotTimers = new();
+    private readonly List<B3.Exchange.PostTrade.FileAuditLogWriter> _auditWriters = new();
+    private readonly List<Timer> _auditRetentionTimers = new();
     private readonly MetricsRegistry _metrics = new();
     private readonly StartupReadinessProbe _startupProbe = new("startup");
     private readonly ShutdownReadinessProbe _shutdownProbe = new("shutdown");
@@ -170,8 +172,10 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             var persister = BuildPersister(ch);
             var wal = BuildWal(ch);
+            var auditWriter = BuildPostTradeAuditWriter(ch);
             if (persister != null) _persistersByChannel[ch.ChannelNumber] = persister;
             if (wal != null) _walsByChannel[ch.ChannelNumber] = wal;
+            if (auditWriter != null) _auditWriters.Add(auditWriter);
             // Issue #270: cross-channel consistency check on restore.
             // Resolve the policy here so the dispatcher can stay
             // host-agnostic (it just gets a predicate + enum).
@@ -198,7 +202,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                 walAppendFailurePolicy: ch.Persistence?.Wal?.ResolveOnAppendFailure() ?? B3.Exchange.Core.WalAppendFailurePolicy.Continue,
                 sessionExists: sessionExists,
                 orphanPolicy: orphanPolicy,
-                seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray());
+                seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray(),
+                postTradeSink: auditWriter);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)
@@ -209,6 +214,41 @@ public sealed class ExchangeHost : IAsyncDisposable
             }
             _logger.LogInformation("channel {ChannelNumber}: {InstrumentCount} instruments → {Group}:{Port}",
                 ch.ChannelNumber, instruments.Count, ch.IncrementalGroup, ch.IncrementalPort);
+
+            if (auditWriter != null)
+            {
+                var audit = ch.PostTradeAudit!;
+                _logger.LogInformation(
+                    "channel {ChannelNumber}: post-trade audit log enabled at {DataDir} (retentionDays={RetentionDays})",
+                    ch.ChannelNumber, audit.DataDir, audit.RetentionDays);
+                if (audit.RetentionDays > 0)
+                {
+                    var capturedWriter = auditWriter;
+                    int retentionDays = audit.RetentionDays;
+                    byte chNum = ch.ChannelNumber;
+                    var retentionLogger = _loggerFactory.CreateLogger<B3.Exchange.PostTrade.FileAuditLogWriter>();
+                    var timer = new Timer(_ =>
+                    {
+                        try
+                        {
+                            int deleted = capturedWriter.PruneOldDays(
+                                DateOnly.FromDateTime(DateTime.UtcNow), retentionDays);
+                            if (deleted > 0)
+                            {
+                                retentionLogger.LogInformation(
+                                    "channel {ChannelNumber}: pruned {Count} expired audit file(s) (retentionDays={RetentionDays})",
+                                    chNum, deleted, retentionDays);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            retentionLogger.LogWarning(ex,
+                                "channel {ChannelNumber}: audit log retention prune failed", chNum);
+                        }
+                    }, null, TimeSpan.FromMinutes(1), TimeSpan.FromHours(24));
+                    _auditRetentionTimers.Add(timer);
+                }
+            }
 
             if (ch.Snapshot != null)
             {
@@ -606,6 +646,33 @@ public sealed class ExchangeHost : IAsyncDisposable
     }
 
     /// <summary>
+    /// Builds the per-channel post-trade audit log writer
+    /// (issues #329 / #352). Returns <c>null</c> when the channel
+    /// has no <c>postTradeAudit</c> block or <c>enabled=false</c>,
+    /// in which case the dispatcher falls back to
+    /// <see cref="B3.Exchange.PostTrade.NullPostTradeSink"/>.
+    /// </summary>
+    private B3.Exchange.PostTrade.FileAuditLogWriter? BuildPostTradeAuditWriter(ChannelConfig ch)
+    {
+        if (ch.PostTradeAudit is not { Enabled: true } audit) return null;
+        if (string.IsNullOrWhiteSpace(audit.DataDir))
+        {
+            _logger.LogWarning(
+                "channel {ChannelNumber}: postTradeAudit.enabled=true but dataDir is empty; skipping audit log",
+                ch.ChannelNumber);
+            return null;
+        }
+        if (audit.RetentionDays < 0)
+        {
+            throw new InvalidOperationException(
+                $"channel {ch.ChannelNumber}: postTradeAudit.retentionDays must be >= 0 (got {audit.RetentionDays}); use 0 to disable automatic retention");
+        }
+        return new B3.Exchange.PostTrade.FileAuditLogWriter(
+            audit.DataDir,
+            ch.ChannelNumber);
+    }
+
+    /// <summary>
     /// Issue #270: parses the <c>persistence.orphanSessionPolicy</c>
     /// JSON string into the <see cref="OrphanSessionPolicy"/> enum
     /// expected by <see cref="ChannelDispatcher"/>. Defaults to
@@ -709,6 +776,19 @@ public sealed class ExchangeHost : IAsyncDisposable
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
+        // Dispose audit-log retention timers and writers AFTER the
+        // dispatchers have drained: the dispatcher's final
+        // OnCommandBoundary/Checkpoint must run before the writer is
+        // closed so the on-disk watermark matches the last appended
+        // record.
+        foreach (var t in _auditRetentionTimers) await t.DisposeAsync().ConfigureAwait(false);
+        _auditRetentionTimers.Clear();
+        foreach (var w in _auditWriters)
+        {
+            try { w.Dispose(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "audit writer dispose threw"); }
+        }
+        _auditWriters.Clear();
         foreach (var s in _ownedSinks) s.Dispose();
         _retransmitPersister?.Dispose();
         // Issue #290: release dataDir locks last so any persister/WAL

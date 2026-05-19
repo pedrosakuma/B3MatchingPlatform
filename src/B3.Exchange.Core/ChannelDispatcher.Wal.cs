@@ -147,9 +147,16 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     private void TruncateWalAfterSyncSave(long snapshotLastAppliedSeq)
     {
+        // Issue #329 PR-4 / #352 follow-up: the audit-log Checkpoint
+        // (fsync .log/.idx + write watermark sidecar) MUST run after
+        // every successful snapshot save regardless of whether a WAL
+        // is configured — otherwise audit-only channels never fsync
+        // their per-trade data and never advance the durability
+        // watermark. The WAL truncation itself remains gated on _wal
+        // being non-null AND the watermark covering the snapshot seq.
+        bool watermarkOk = CheckpointAndGateAuditWatermark(snapshotLastAppliedSeq, async: false);
         if (_wal is null) return;
-        if (!CheckpointAndGateAuditWatermark(snapshotLastAppliedSeq, async: false))
-            return;
+        if (!watermarkOk) return;
         try
         {
             _wal.Truncate();
@@ -176,9 +183,13 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     private void OnAsyncSnapshotSaved(ChannelStateSnapshot snap)
     {
+        // Issue #329 PR-4 / #352 follow-up: Checkpoint the audit sink
+        // even when no WAL is configured (see TruncateWalAfterSyncSave
+        // above for the same rationale). The audit sink's Checkpoint
+        // is safe to call cross-thread.
+        bool watermarkOk = CheckpointAndGateAuditWatermark(snap.LastAppliedSeq, async: true);
         if (_wal is null) return;
-        if (!CheckpointAndGateAuditWatermark(snap.LastAppliedSeq, async: true))
-            return;
+        if (!watermarkOk) return;
         try
         {
             _wal.Truncate();

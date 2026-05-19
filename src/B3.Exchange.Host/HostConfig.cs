@@ -328,6 +328,19 @@ public sealed class ChannelConfig
     /// intact. Omit to keep the legacy stateless boot.
     /// </summary>
     [JsonPropertyName("persistence")] public PersistenceConfig? Persistence { get; set; }
+
+    /// <summary>
+    /// Optional per-channel post-trade audit log (issue #329 / wiring
+    /// follow-up #352). When present and <see cref="PostTradeAuditConfig.Enabled"/>
+    /// is <c>true</c>, the dispatcher writes a per-day append-only
+    /// audit record per <c>OnTrade</c> under
+    /// <c>{DataDir}/{channel}/fills-YYYY-MM-DD.log</c> (plus a sparse
+    /// <c>.idx</c> firm index) and persists a watermark sidecar so
+    /// post-crash WAL replay can suppress duplicate audit emissions.
+    /// Omit (or set <c>enabled=false</c>) to keep the legacy
+    /// no-audit-log behaviour (<c>NullPostTradeSink</c>).
+    /// </summary>
+    [JsonPropertyName("postTradeAudit")] public PostTradeAuditConfig? PostTradeAudit { get; set; }
 }
 
 /// <summary>
@@ -404,6 +417,39 @@ public sealed class PersistenceConfig
     /// reduction documented in issue #266.
     /// </summary>
     [JsonPropertyName("format")] public string? Format { get; set; }
+}
+
+/// <summary>
+/// Per-channel post-trade audit log config (issue #329 / wiring
+/// follow-up #352). The audit log is an independent durability
+/// domain from snapshots/WAL: it appends one record per
+/// <c>OnTrade</c>, rolls daily by UTC business date, and is
+/// intended to be retained for the compliance horizon (typically
+/// 5 years for B3 fills). See RUNBOOK §7.8 for the on-disk layout
+/// and watermark contract.
+/// </summary>
+public sealed class PostTradeAuditConfig
+{
+    /// <summary>Master switch. <c>false</c> (default) ⇒ no audit
+    /// log files are written; the dispatcher uses
+    /// <c>NullPostTradeSink</c>.</summary>
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+
+    /// <summary>Root directory for audit files. The writer creates
+    /// <c>{DataDir}/{channelNumber}/</c> if missing. Operators must
+    /// mount a durable volume separate from the WAL/snapshot volume
+    /// when the compliance horizon exceeds the WAL retention.</summary>
+    [JsonPropertyName("dataDir")] public string DataDir { get; set; } = "";
+
+    /// <summary>Number of UTC days of audit log files to keep on
+    /// disk. <c>0</c> (default) disables automatic retention — the
+    /// host writes audit files but never deletes them, leaving
+    /// retention to an external operator job. When set to a
+    /// positive value, the host runs a daily timer that calls
+    /// <c>FileAuditLogWriter.PruneOldDays(todayUtc, retentionDays)</c>;
+    /// files for the currently-open day and the watermark sidecar
+    /// are never pruned.</summary>
+    [JsonPropertyName("retentionDays")] public int RetentionDays { get; set; }
 }
 
 /// <summary>

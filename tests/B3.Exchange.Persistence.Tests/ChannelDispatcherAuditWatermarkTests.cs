@@ -210,6 +210,45 @@ public class ChannelDispatcherAuditWatermarkTests
     }
 
     [Fact]
+    public void AuditCheckpoint_RunsAfterSnapshotSave_EvenWithoutWal()
+    {
+        // Issue #352 follow-up (PR #353 review): the audit sink must
+        // be Checkpointed after every successful snapshot save even
+        // when no WAL is configured. Pre-fix, TruncateWalAfterSyncSave
+        // returned immediately on `_wal is null`, so audit-only
+        // channels never fsync'd .log/.idx or advanced the watermark.
+        var persister = new InMemoryPersister();
+        var metrics = new ChannelMetrics(84);
+        var sink = new ManualPostTradeSink();
+        var disp = new ChannelDispatcher(
+            channelNumber: 84,
+            engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
+            packetSink: new NoOpPacketSink(),
+            outbound: new NoOpOutbound(),
+            logger: NullLogger<ChannelDispatcher>.Instance,
+            metrics: metrics,
+            persister: persister,
+            snapshotThrottle: null,
+            useAsyncSnapshotWriter: false,
+            wal: null,
+            postTradeSink: sink);
+        var probe = disp.CreateTestProbe();
+
+        Assert.True(EnqueueOrder(disp, "CL-1", 0x1, 1UL));
+        probe.DrainInbound();
+
+        // Snapshot must have run AND the audit sink Checkpointed,
+        // even though no WAL was configured. WAL-related metrics
+        // stay at zero (there is no WAL to truncate or defer).
+        Assert.Equal(1, persister.SaveCount);
+        Assert.True(sink.CheckpointCount >= 1,
+            $"expected audit Checkpoint to run, got CheckpointCount={sink.CheckpointCount}");
+        Assert.Equal(0, metrics.WalTruncations);
+        Assert.Equal(0, metrics.AuditWalTruncateDeferred);
+    }
+
+
+    [Fact]
     public void Dispatcher_ForwardsCommandSeq_ToSinkBoundaries()
     {
         // Pins the contract that OnCommandBoundary fires after every command

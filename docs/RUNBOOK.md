@@ -963,15 +963,24 @@ abandon the on-disk state.
 
 ### 7.8 Post-trade audit log (issue [#329](https://github.com/pedrosakuma/B3MatchingPlatform/issues/329))
 
-> ⚠️ **Status (as of this section landing): the writer/dispatcher
-> plumbing is fully implemented and unit-tested, but
-> `FileAuditLogWriter` is not yet constructed by `ExchangeHost`. A
-> default host run still uses `NullPostTradeSink`, so no audit files
-> are written and the recovery procedure below has nothing to
-> replay against.** Operators wanting to exercise the audit log
-> today must construct the writer programmatically and pass it as
-> the `postTradeSink` when wiring `ChannelDispatcher`. Host config
-> + factory + retention timer are tracked as a follow-up.
+Opt-in via the per-channel `postTradeAudit` config block (issue
+[#352](https://github.com/pedrosakuma/B3MatchingPlatform/issues/352)):
+
+```jsonc
+"channels": [{
+  "channelNumber": 1,
+  // ... transport, instruments, persistence ...
+  "postTradeAudit": {
+    "enabled": true,
+    "dataDir": "/var/lib/b3matching/audit",
+    "retentionDays": 1825   // 5 years; 0 disables auto-prune
+  }
+}]
+```
+
+When the block is absent or `enabled=false`, the dispatcher uses
+`NullPostTradeSink` and no audit files are written (preserving the
+pre-#352 behaviour).
 
 The post-trade audit log is the legally-authoritative per-trade record
 the simulator emits alongside the wire-published `Trade_53` /
@@ -1013,14 +1022,12 @@ date is *strictly before* `todayUtc - retentionDays`. The currently
 open day is never pruned, the per-channel watermark sidecar is never
 pruned, and unrelated / malformed filenames are ignored. The method
 is safe to call from any thread (it shares the `_checkpointLock`
-that serializes `Checkpoint`/`Dispose`). Operators wire it on a
-daily timer or invoke it ad-hoc from a maintenance job; the writer
-itself never schedules deletion automatically.
-
-```csharp
-// Daily prune from a maintenance job (5-year retention horizon).
-writer.PruneOldDays(DateOnly.FromDateTime(DateTime.UtcNow), retentionDays: 5 * 365);
-```
+that serializes `Checkpoint`/`Dispose`). When the host is
+configured with `postTradeAudit.retentionDays > 0`, a per-channel
+24h `Timer` (started ~1 minute after boot, then every 24h) invokes
+`PruneOldDays` automatically and logs the deletion count at
+`Information` when > 0. Set `retentionDays=0` to disable the timer
+and manage retention from an external operator job.
 
 **Recovery procedure (post-crash).**
 
