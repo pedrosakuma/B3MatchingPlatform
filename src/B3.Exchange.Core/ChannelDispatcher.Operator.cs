@@ -10,6 +10,8 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
+    private static readonly DateOnly LocalMktDateEpoch = new(1970, 1, 1);
+
     private void ProcessBumpVersion()
     {
         // Atomic operator-initiated channel reset (issue #6). Order matters:
@@ -150,6 +152,137 @@ public sealed partial class ChannelDispatcher
         return _inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorTradeBust, default, 0, false,
             0, 0, null, null, null, null,
             TradeBust: new OperatorTradeBust(securityId, priceMantissa, size, tradeId, tradeDate)));
+    }
+
+    /// <summary>
+    /// ADR 0008 PR-2: schedules an operator bust through the post-trade
+    /// validator + audit-log path. The dispatch thread runs
+    /// <see cref="B3.Exchange.PostTrade.BustValidator"/> against the
+    /// (per-channel) audit files and the in-memory dedup index; on accept
+    /// it writes a bust record + emits TradeBust_57, on reject it writes
+    /// a reject-attempt record + returns the validator's verdict via the
+    /// supplied <paramref name="completion"/> source. Returns <c>false</c>
+    /// if the inbound queue is full or the channel is WAL-halted; in
+    /// both cases the completion source is faulted.
+    /// </summary>
+    public bool EnqueueOperatorBustV2(
+        uint tradeId, DateOnly tradeDate, ulong correlationId,
+        ushort reasonCode, uint busterFirm, long? securityIdEcho,
+        ulong attemptTransactTimeNanos,
+        TaskCompletionSource<OperatorBustV2Outcome> completion)
+    {
+        ArgumentNullException.ThrowIfNull(completion);
+        if (_auditRootDir is null || _bustDedup is null)
+        {
+            completion.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} bust-v2 endpoint requires audit-log configuration; not wired"));
+            return false;
+        }
+        if (RejectIfWalHalted(WorkKind.OperatorBustV2))
+        {
+            completion.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; OperatorBustV2 rejected"));
+            return false;
+        }
+        var payload = new OperatorBustV2(tradeId, tradeDate, correlationId, reasonCode,
+            busterFirm, securityIdEcho, attemptTransactTimeNanos);
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorBustV2, default, 0, false,
+            0, 0, null, null, null, null,
+            BustV2: payload, BustCompletion: completion)))
+        {
+            return true;
+        }
+        completion.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; OperatorBustV2 rejected"));
+        return false;
+    }
+
+    private void ProcessOperatorBustV2(OperatorBustV2 op, TaskCompletionSource<OperatorBustV2Outcome>? completion)
+    {
+        AssertOnLoopThread();
+        try
+        {
+            // UMDF TradeBust_57 carries tradeDate as LocalMktDate (uint16
+            // days since 1970-01-01); the reject-attempt record stores
+            // the same value as int32. DateOnly.DayNumber is days since
+            // 0001-01-01 so a normal date overflows ushort — convert
+            // relative to the Unix epoch and range-check BEFORE writing
+            // any audit/dedup state so we never persist a half-applied
+            // accept.
+            int tradeDateDaysSinceEpoch = op.TradeDate.DayNumber - LocalMktDateEpoch.DayNumber;
+            if (tradeDateDaysSinceEpoch < 0 || tradeDateDaysSinceEpoch > ushort.MaxValue)
+            {
+                completion?.TrySetException(new ArgumentOutOfRangeException(
+                    nameof(op.TradeDate),
+                    $"tradeDate {op.TradeDate:yyyy-MM-dd} outside LocalMktDate range (1970-01-01..{LocalMktDateEpoch.AddDays(ushort.MaxValue):yyyy-MM-dd})"));
+                return;
+            }
+
+            var request = new B3.Exchange.PostTrade.BustRequest(
+                op.TradeId, op.TradeDate, op.CorrelationId, op.SecurityIdEcho,
+                op.ReasonCode, op.BusterFirm, op.AttemptTransactTimeNanos);
+            var result = B3.Exchange.PostTrade.BustValidator.Validate(
+                _auditRootDir!, ChannelNumber, request, _bustDedup!);
+
+            switch (result.Kind)
+            {
+                case B3.Exchange.PostTrade.BustValidationKind.Accept:
+                    {
+                        var bust = new B3.Exchange.PostTrade.BustRecord(
+                            op.TradeId, op.AttemptTransactTimeNanos,
+                            result.MatchedFill.SecurityId, op.ReasonCode, op.BusterFirm, op.CorrelationId);
+                        _postTradeSink.OnBust(bust, op.TradeDate);
+                        _bustDedup!.Add(op.TradeId, op.CorrelationId, op.TradeDate);
+                        // Emit TradeBust_57 frame; price/size echo come from the
+                        // matched fill so consumers see the same data the
+                        // original Trade_53 carried.
+                        uint rptSeq = _engine.AllocateNextRptSeq();
+                        _packetWritten = 0;
+                        int frameSize = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+                            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+                            + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength;
+                        var dst = ReserveOrFlush(frameSize);
+                        ushort tradeDateDays = (ushort)tradeDateDaysSinceEpoch;
+                        int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
+                            result.MatchedFill.SecurityId, result.MatchedFill.PriceMantissa,
+                            result.MatchedFill.Quantity, op.TradeId, tradeDateDays,
+                            _nowNanos(), rptSeq);
+                        Commit(written);
+                        FlushPacket();
+                        break;
+                    }
+                case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:
+                    // No new write, no UMDF emit.
+                    break;
+                case B3.Exchange.PostTrade.BustValidationKind.MissingDay:
+                    // No audit-log write (ADR §2.3).
+                    break;
+                case B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId:
+                case B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation:
+                case B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch:
+                    {
+                        ushort code = result.Kind switch
+                        {
+                            B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId => (ushort)1,
+                            B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation => (ushort)2,
+                            B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch => (ushort)3,
+                            _ => (ushort)0,
+                        };
+                        var reject = new B3.Exchange.PostTrade.RejectAttemptRecord(
+                            op.TradeId, op.AttemptTransactTimeNanos,
+                            tradeDateDaysSinceEpoch, code, op.BusterFirm, op.CorrelationId);
+                        _postTradeSink.OnRejectAttempt(reject);
+                        break;
+                    }
+            }
+
+            completion?.TrySetResult(new OperatorBustV2Outcome(result.Kind, result.ExistingCorrelationId));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
     }
 
     /// <summary>

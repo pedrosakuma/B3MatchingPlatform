@@ -201,6 +201,99 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         }
     }
 
+    /// <summary>ADR 0008 PR-2: appends a bust audit record. When
+    /// <paramref name="tradeDate"/> matches the currently-open log day the
+    /// write is inline against <c>_stream</c>; otherwise a transient handle
+    /// is opened to that day's <c>fills-YYYY-MM-DD.log</c>, the record is
+    /// appended, fsynced, and the handle disposed. The .idx sidecar is
+    /// NOT updated (only fill records contribute to the firm-sparse index;
+    /// busts are queried via the v2 ReadAllEntries path).</summary>
+    public void OnBust(in BustRecord record, DateOnly tradeDate)
+    {
+        lock (_stateLock)
+        {
+            if (_writeFault) return;
+            try
+            {
+                Span<byte> buf = stackalloc byte[AuditRecordCodec.BustRecordSize];
+                int n = AuditRecordCodec.EncodeBust(buf, in record);
+                if (_stream is not null && tradeDate == _currentDate)
+                {
+                    // Same-day inline: end any open fill block first so the
+                    // .idx invariant ("entries cover contiguous fill runs")
+                    // is preserved across the non-fill insertion.
+                    FlushCurrentBlock();
+                    _stream.Write(buf.Slice(0, n));
+                    _stream.Flush(flushToDisk: false);
+                    return;
+                }
+                // Cross-day write: open/create, fsync, close.
+                AppendNonFillToOtherDay(tradeDate, buf.Slice(0, n));
+            }
+            catch
+            {
+                _writeFault = true;
+                throw;
+            }
+        }
+    }
+
+    /// <summary>ADR 0008 PR-2 / §2.5: appends a reject-attempt audit
+    /// record to TODAY's log (the day of <c>AttemptTransactTimeNanos</c>)
+    /// so the audit trail explains the corresponding 4xx HTTP reply.
+    /// </summary>
+    public void OnRejectAttempt(in RejectAttemptRecord record)
+    {
+        lock (_stateLock)
+        {
+            if (_writeFault) return;
+            try
+            {
+                var recordDate = ToUtcDate(record.AttemptTransactTimeNanos);
+                Span<byte> buf = stackalloc byte[AuditRecordCodec.RejectAttemptRecordSize];
+                int n = AuditRecordCodec.EncodeRejectAttempt(buf, in record);
+                if (_stream is null || recordDate != _currentDate)
+                {
+                    // OnRejectAttempt is dispatched on the dispatch thread,
+                    // so a rotation to today's log is the natural action:
+                    // future fills land on the same day. Mirrors OnTrade's
+                    // RotateTo path.
+                    RotateTo(recordDate);
+                }
+                FlushCurrentBlock();
+                _stream!.Write(buf.Slice(0, n));
+                _stream.Flush(flushToDisk: false);
+            }
+            catch
+            {
+                _writeFault = true;
+                throw;
+            }
+        }
+    }
+
+    private void AppendNonFillToOtherDay(DateOnly tradeDate, ReadOnlySpan<byte> recordBytes)
+    {
+        var channelDir = Path.Combine(_rootDir, _channelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(channelDir);
+        var logPath = Path.Combine(channelDir, $"fills-{tradeDate:yyyy-MM-dd}.log");
+        using var fs = new FileStream(logPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (fs.Length == 0)
+        {
+            Span<byte> header = stackalloc byte[AuditRecordCodec.FileHeaderSize];
+            AuditRecordCodec.WriteFileHeader(header, _channelNumber, tradeDate);
+            fs.Write(header);
+        }
+        else
+        {
+            long goodEnd = ScanLastGoodEndOffset(fs);
+            if (goodEnd != fs.Length) fs.SetLength(goodEnd);
+        }
+        fs.Seek(0, SeekOrigin.End);
+        fs.Write(recordBytes);
+        fs.Flush(flushToDisk: true);
+    }
+
     /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
     /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
     /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
@@ -387,41 +480,92 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         ix.Flush(flushToDisk: false);
         if (logStream.Length <= AuditRecordCodec.FileHeaderSize) return;
 
+        // Schema-aware rebuild (ADR 0008 PR-2): on v2 files the stream is
+        // heterogeneous (fills + bust + reject-attempt records); only fills
+        // contribute to the firm-sparse index. A non-fill record at any
+        // position simply terminates the current fill block (writer
+        // invariant: non-fill records are written outside any open block).
         long savedPos = logStream.Position;
         try
         {
-            logStream.Seek(AuditRecordCodec.FileHeaderSize, SeekOrigin.Begin);
-            Span<byte> rec = stackalloc byte[AuditRecordCodec.RecordSize];
+            logStream.Seek(0, SeekOrigin.Begin);
+            Span<byte> hdr = stackalloc byte[AuditRecordCodec.FileHeaderSize];
+            if (logStream.Read(hdr) != hdr.Length) return;
+            var (_, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(hdr);
+            bool schemaIsV2 = schemaVersion == AuditRecordCodec.SchemaVersionV2;
+
+            Span<byte> buffer = stackalloc byte[AuditRecordCodec.MaxRecordSize];
+            Span<byte> lenPrefix = stackalloc byte[4];
             long blockStart = logStream.Position;
             int recsInBlock = 0;
             var firmsInBlock = new List<uint>();
-            while (true)
+
+            void FlushBlock()
             {
-                if (recsInBlock == 0) blockStart = logStream.Position;
-                int read = logStream.Read(rec);
-                if (read != rec.Length) break;
-                if (!AuditRecordCodec.TryDecode(rec, out var decoded)) break;
-                int idx;
-                idx = firmsInBlock.BinarySearch(decoded.BuyFirm);
-                if (idx < 0) firmsInBlock.Insert(~idx, decoded.BuyFirm);
-                idx = firmsInBlock.BinarySearch(decoded.SellFirm);
-                if (idx < 0) firmsInBlock.Insert(~idx, decoded.SellFirm);
-                recsInBlock++;
-                if (recsInBlock >= _indexBlockRecords)
-                {
-                    var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(firmsInBlock);
-                    int n = AuditIndexCodec.EncodeBlockEntry(_indexScratch, (ulong)blockStart, (ushort)recsInBlock, span);
-                    ix.Write(_indexScratch, 0, n);
-                    recsInBlock = 0;
-                    firmsInBlock.Clear();
-                }
-            }
-            if (recsInBlock > 0)
-            {
+                if (recsInBlock == 0) return;
                 var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(firmsInBlock);
                 int n = AuditIndexCodec.EncodeBlockEntry(_indexScratch, (ulong)blockStart, (ushort)recsInBlock, span);
                 ix.Write(_indexScratch, 0, n);
+                recsInBlock = 0;
+                firmsInBlock.Clear();
             }
+
+            while (true)
+            {
+                long recordStart = logStream.Position;
+                int recordSize;
+                bool isFill;
+                if (!schemaIsV2)
+                {
+                    int read = logStream.Read(buffer.Slice(0, AuditRecordCodec.RecordSize));
+                    if (read != AuditRecordCodec.RecordSize) break;
+                    if (!AuditRecordCodec.TryDecode(buffer.Slice(0, AuditRecordCodec.RecordSize), out var decodedV1)) break;
+                    if (recsInBlock == 0) blockStart = recordStart;
+                    int idx;
+                    idx = firmsInBlock.BinarySearch(decodedV1.BuyFirm);
+                    if (idx < 0) firmsInBlock.Insert(~idx, decodedV1.BuyFirm);
+                    idx = firmsInBlock.BinarySearch(decodedV1.SellFirm);
+                    if (idx < 0) firmsInBlock.Insert(~idx, decodedV1.SellFirm);
+                    recsInBlock++;
+                    if (recsInBlock >= _indexBlockRecords) FlushBlock();
+                    continue;
+                }
+                // v2 dispatch
+                int peeked = logStream.Read(lenPrefix);
+                if (peeked == 0) break;
+                if (peeked < 4) break;
+                if (!AuditRecordCodec.TryPeekRecordLen(lenPrefix, out uint recordLen)) break;
+                if (!AuditRecordCodec.TryGetRecordSize(recordLen, out recordSize, out var kind)) break;
+                lenPrefix.CopyTo(buffer);
+                int bodyRead = logStream.Read(buffer.Slice(4, recordSize - 4));
+                if (bodyRead != recordSize - 4) break;
+                isFill = kind == AuditRecordKind.Fill;
+                if (!isFill)
+                {
+                    bool ok = kind switch
+                    {
+                        AuditRecordKind.Bust => AuditRecordCodec.TryDecodeBust(buffer.Slice(0, recordSize), out _),
+                        AuditRecordKind.RejectAttempt => AuditRecordCodec.TryDecodeRejectAttempt(buffer.Slice(0, recordSize), out _),
+                        _ => false,
+                    };
+                    if (!ok) break;
+                    // Non-fill record ends any open block (writer invariant
+                    // guarantees this didn't happen mid-block, but flush
+                    // defensively to keep rebuild idempotent).
+                    FlushBlock();
+                    continue;
+                }
+                if (!AuditRecordCodec.TryDecode(buffer.Slice(0, recordSize), out var decoded)) break;
+                if (recsInBlock == 0) blockStart = recordStart;
+                int idxV2;
+                idxV2 = firmsInBlock.BinarySearch(decoded.BuyFirm);
+                if (idxV2 < 0) firmsInBlock.Insert(~idxV2, decoded.BuyFirm);
+                idxV2 = firmsInBlock.BinarySearch(decoded.SellFirm);
+                if (idxV2 < 0) firmsInBlock.Insert(~idxV2, decoded.SellFirm);
+                recsInBlock++;
+                if (recsInBlock >= _indexBlockRecords) FlushBlock();
+            }
+            FlushBlock();
             ix.Flush(flushToDisk: false);
         }
         finally
@@ -439,26 +583,49 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         var (channel, _, schemaVersion) = AuditRecordCodec.ReadFileHeader(hdr);
         if (channel != _channelNumber)
             throw new InvalidDataException($"audit file '{fs.Name}' channel mismatch (file={channel}, writer={_channelNumber})");
-        // ADR 0008 §1 per-day schema view: this build's writer only emits
-        // v1 records, so refuse to extend an existing file at a different
-        // schema. Critical safety net: without this check, the v1 fixed-
-        // width scan below would stop at the first non-fill record in a
-        // v2 file and the caller would SetLength() to that point, silently
-        // truncating valid bust/reject-attempt records. PR-2 replaces this
-        // with a schema-aware recovery path.
-        if (schemaVersion != AuditRecordCodec.SchemaVersion)
+        // ADR 0008 §1 per-day schema view: writer accepts files of any
+        // schema it understands (V1 from pre-PR-2 days, V2 from PR-2
+        // onward). The recovery scan dispatches by recordLen so v2 files
+        // with mixed fill/bust/reject-attempt records are scanned
+        // correctly. Refuse anything we don't recognise.
+        if (schemaVersion != AuditRecordCodec.SchemaVersionV1
+            && schemaVersion != AuditRecordCodec.SchemaVersionV2)
             throw new InvalidDataException(
-                $"audit file '{fs.Name}' schema {schemaVersion} != writer schema {AuditRecordCodec.SchemaVersion}; "
-                + "refusing to extend (would risk truncating non-fill records)");
+                $"audit file '{fs.Name}' unsupported schema v{schemaVersion} "
+                + $"(writer understands v{AuditRecordCodec.SchemaVersionV1} and v{AuditRecordCodec.SchemaVersionV2})");
 
         long goodEnd = AuditRecordCodec.FileHeaderSize;
-        Span<byte> rec = stackalloc byte[AuditRecordCodec.RecordSize];
+        Span<byte> buffer = stackalloc byte[AuditRecordCodec.MaxRecordSize];
+        Span<byte> lenPrefix = stackalloc byte[4];
         while (true)
         {
-            int read = fs.Read(rec);
-            if (read != rec.Length) break;
-            if (!AuditRecordCodec.TryDecode(rec, out _)) break;
-            goodEnd += rec.Length;
+            if (schemaVersion == AuditRecordCodec.SchemaVersionV1)
+            {
+                int read = fs.Read(buffer.Slice(0, AuditRecordCodec.RecordSize));
+                if (read != AuditRecordCodec.RecordSize) break;
+                if (!AuditRecordCodec.TryDecode(buffer.Slice(0, AuditRecordCodec.RecordSize), out _)) break;
+                goodEnd += AuditRecordCodec.RecordSize;
+                continue;
+            }
+            // v2: peek 4-byte recordLen, dispatch by kind, validate via
+            // type-specific TryDecode so a corrupt entry stops the scan.
+            int peeked = fs.Read(lenPrefix);
+            if (peeked == 0) break;
+            if (peeked < 4) break;
+            if (!AuditRecordCodec.TryPeekRecordLen(lenPrefix, out uint recordLen)) break;
+            if (!AuditRecordCodec.TryGetRecordSize(recordLen, out int onDiskSize, out var kind)) break;
+            lenPrefix.CopyTo(buffer);
+            int bodyRead = fs.Read(buffer.Slice(4, onDiskSize - 4));
+            if (bodyRead != onDiskSize - 4) break;
+            bool ok = kind switch
+            {
+                AuditRecordKind.Fill => AuditRecordCodec.TryDecode(buffer.Slice(0, onDiskSize), out _),
+                AuditRecordKind.Bust => AuditRecordCodec.TryDecodeBust(buffer.Slice(0, onDiskSize), out _),
+                AuditRecordKind.RejectAttempt => AuditRecordCodec.TryDecodeRejectAttempt(buffer.Slice(0, onDiskSize), out _),
+                _ => false,
+            };
+            if (!ok) break;
+            goodEnd += onDiskSize;
         }
         return goodEnd;
     }

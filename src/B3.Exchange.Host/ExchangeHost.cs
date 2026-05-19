@@ -279,6 +279,20 @@ public sealed class ExchangeHost : IAsyncDisposable
             // host-agnostic (it just gets a predicate + enum).
             var orphanPolicy = ParseOrphanPolicy(ch.Persistence?.OrphanSessionPolicy);
             Func<string, bool> sessionExists = sid => firmRegistry.FindSession(sid) is not null;
+            // ADR 0008 PR-2: rebuild the bust dedup index from on-disk
+            // audit files within the retention window so a restart picks
+            // up where the previous run left off. Only meaningful when
+            // the audit writer is wired (otherwise there are no files).
+            B3.Exchange.PostTrade.BustDedupIndex? bustDedup = null;
+            string? auditRootDir = null;
+            if (auditWriter != null && ch.PostTradeAudit?.DataDir is { } dataDir && !string.IsNullOrWhiteSpace(dataDir))
+            {
+                auditRootDir = dataDir;
+                int retention = ch.PostTradeAudit.RetentionDays;
+                bustDedup = B3.Exchange.PostTrade.BustDedupIndex.LoadFromAuditFiles(
+                    dataDir, ch.ChannelNumber, retention, DateOnly.FromDateTime(DateTime.UtcNow));
+            }
+
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s =>
@@ -301,7 +315,9 @@ public sealed class ExchangeHost : IAsyncDisposable
                 sessionExists: sessionExists,
                 orphanPolicy: orphanPolicy,
                 seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray(),
-                postTradeSink: auditWriter);
+                postTradeSink: auditWriter,
+                auditRootDir: auditRootDir,
+                bustDedup: bustDedup);
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)

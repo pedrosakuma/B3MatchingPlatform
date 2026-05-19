@@ -26,6 +26,8 @@ public partial class ChannelDispatcherTests
             CheckpointCount++;
             _durable = _pending;
         }
+        public void OnBust(in BustRecord record, DateOnly tradeDate) { }
+        public void OnRejectAttempt(in RejectAttemptRecord record) { }
         public long DurableThroughCommandSeq => _durable;
     }
 

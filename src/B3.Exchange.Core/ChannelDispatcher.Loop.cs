@@ -89,6 +89,15 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.OperatorBustV2)
+        {
+            ProcessOperatorBustV2(item.BustV2!, item.BustCompletion);
+            // Persist after every accept so the consumed RptSeq + dedup
+            // index state mirror durability of the audit-log write.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
         if (item.Kind == WorkKind.OperatorSetTradingPhase)
         {
             ProcessSetTradingPhase(item.TradingPhase!, item.PhaseCompletion);

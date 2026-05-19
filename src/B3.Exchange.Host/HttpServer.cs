@@ -41,6 +41,8 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly Action<string>? _log;
     private WebApplication? _app;
 
+    private static readonly DateOnly LocalMktDateEpoch = new(1970, 1, 1);
+
     public HttpServer(HttpConfig config, MetricsRegistry metrics,
         IReadOnlyList<IReadinessProbe> probes,
         IReadOnlyDictionary<byte, ChannelDispatcher> dispatchers,
@@ -204,6 +206,21 @@ public sealed class HttpServer : IAsyncDisposable
         // rest of /admin/*; PR-3 wires the daily-reset auto-trigger.
         app.MapPost("/admin/post-trade/eod-export", (HttpContext ctx) =>
             HandleEodExport(ctx));
+
+        // ADR 0008 PR-2: operator trade-bust endpoint with full
+        // validation surface. Distinct from the legacy
+        // /channel/{ch}/trade-bust/{tradeId} replay path (which does no
+        // validation and no audit write). Query parameters:
+        //   channel        - channel number (0-255)
+        //   tradeId        - the engine TradeId of the trade to bust
+        //   tradeDate      - YYYY-MM-DD of the busted trade's day
+        //   correlationId  - operator-supplied dedup key (ulong)
+        //   reason         - optional ushort reason code (default 0)
+        //   securityId     - optional long echo (server validates against the fill)
+        //   busterFirm     - optional uint operator firm id (default 0)
+        // Status codes mirror ADR §2.3.
+        app.MapPost("/admin/post-trade/bust", async (HttpContext ctx) =>
+            await HandlePostTradeBustAsync(ctx).ConfigureAwait(false));
 
         // Issue #271: admin endpoints for snapshot management.
         //
@@ -463,6 +480,155 @@ public sealed class HttpServer : IAsyncDisposable
         var s = values.ToString();
         if (string.IsNullOrEmpty(s)) return allowMissing;
         return long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
+    private static bool TryParseULong(Microsoft.Extensions.Primitives.StringValues values, out ulong value, bool allowMissing = false)
+    {
+        value = 0;
+        var s = values.ToString();
+        if (string.IsNullOrEmpty(s)) return allowMissing;
+        return ulong.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
+    private async Task<IResult> HandlePostTradeBustAsync(HttpContext ctx)
+    {
+        var q = ctx.Request.Query;
+        if (!TryParseLong(q["channel"], out long chRaw) || chRaw < 0 || chRaw > 255)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'channel' (0..255)\n", "text/plain");
+        }
+        byte channel = (byte)chRaw;
+        if (!_dispatchers.TryGetValue(channel, out var disp))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return Results.Text($"unknown channel {channel}\n", "text/plain");
+        }
+        if (!TryParseLong(q["tradeId"], out long tidRaw) || tidRaw <= 0 || tidRaw > uint.MaxValue)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"missing or invalid 'tradeId' (1..{uint.MaxValue})\n", "text/plain");
+        }
+        uint tradeId = (uint)tidRaw;
+        string tradeDateStr = q["tradeDate"].ToString();
+        if (string.IsNullOrEmpty(tradeDateStr)
+            || !DateOnly.TryParseExact(tradeDateStr, "yyyy-MM-dd", out var tradeDate))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'tradeDate' (YYYY-MM-DD)\n", "text/plain");
+        }
+        // UMDF TradeBust_57 encodes tradeDate as LocalMktDate (uint16,
+        // days since 1970-01-01). Range-check up front so accepted
+        // requests never crash mid-dispatch after writing audit state.
+        int tradeDateDaysSinceEpoch = tradeDate.DayNumber - LocalMktDateEpoch.DayNumber;
+        if (tradeDateDaysSinceEpoch < 0 || tradeDateDaysSinceEpoch > ushort.MaxValue)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text($"'tradeDate' out of LocalMktDate range (1970-01-01..{LocalMktDateEpoch.AddDays(ushort.MaxValue):yyyy-MM-dd})\n", "text/plain");
+        }
+        if (!TryParseULong(q["correlationId"], out ulong correlationId) || correlationId == 0)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return Results.Text("missing or invalid 'correlationId' (> 0)\n", "text/plain");
+        }
+        ushort reason = 0;
+        if (q.ContainsKey("reason"))
+        {
+            if (!TryParseLong(q["reason"], out long r) || r < 0 || r > ushort.MaxValue)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return Results.Text($"invalid 'reason' (0..{ushort.MaxValue})\n", "text/plain");
+            }
+            reason = (ushort)r;
+        }
+        long? securityIdEcho = null;
+        if (q.ContainsKey("securityId"))
+        {
+            if (!TryParseLong(q["securityId"], out long s) || s <= 0)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return Results.Text("invalid 'securityId' echo (must be > 0 when supplied)\n", "text/plain");
+            }
+            securityIdEcho = s;
+        }
+        uint busterFirm = 0;
+        if (q.ContainsKey("busterFirm"))
+        {
+            if (!TryParseLong(q["busterFirm"], out long bf) || bf < 0 || bf > uint.MaxValue)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return Results.Text($"invalid 'busterFirm' (0..{uint.MaxValue})\n", "text/plain");
+            }
+            busterFirm = (uint)bf;
+        }
+
+        var tcs = new TaskCompletionSource<B3.Exchange.Core.ChannelDispatcher.OperatorBustV2Outcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        ulong nowNanos = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
+        if (!disp.EnqueueOperatorBustV2(tradeId, tradeDate, correlationId, reason, busterFirm,
+                securityIdEcho, nowNanos, tcs))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text($"channel {channel} inbound queue full or not wired for bust-v2\n", "text/plain");
+        }
+
+        B3.Exchange.Core.ChannelDispatcher.OperatorBustV2Outcome outcome;
+        try
+        {
+            outcome = await tcs.Task.WaitAsync(PhaseChangeTimeout, ctx.RequestAborted).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+            return Results.Text("timed out waiting for bust validation\n", "text/plain");
+        }
+        catch (InvalidOperationException ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return Results.Text($"unavailable: {ex.Message}\n", "text/plain");
+        }
+        catch (Exception ex)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            return Results.Text($"bust failed: {ex.Message}\n", "text/plain");
+        }
+
+        switch (outcome.Kind)
+        {
+            case B3.Exchange.PostTrade.BustValidationKind.Accept:
+                ctx.Response.StatusCode = StatusCodes.Status200OK;
+                return Results.Text(
+                    $"{{\"status\":\"busted\",\"channel\":{channel},\"tradeId\":{tradeId},\"correlationId\":{correlationId}}}",
+                    "application/json");
+            case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:
+                ctx.Response.Headers["X-Idempotent"] = "true";
+                ctx.Response.StatusCode = StatusCodes.Status200OK;
+                return Results.Text(
+                    $"{{\"status\":\"idempotent-replay\",\"channel\":{channel},\"tradeId\":{tradeId},\"correlationId\":{correlationId}}}",
+                    "application/json");
+            case B3.Exchange.PostTrade.BustValidationKind.MissingDay:
+                ctx.Response.StatusCode = StatusCodes.Status410Gone;
+                return Results.Text(
+                    $"fills-{tradeDate:yyyy-MM-dd}.log missing for channel {channel}\n", "text/plain");
+            case B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId:
+                ctx.Response.StatusCode = StatusCodes.Status422UnprocessableEntity;
+                return Results.Text(
+                    $"{{\"status\":\"reject\",\"reason\":\"unknown-trade-id\",\"code\":1}}",
+                    "application/json");
+            case B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation:
+                ctx.Response.StatusCode = StatusCodes.Status409Conflict;
+                return Results.Text(
+                    $"{{\"status\":\"reject\",\"reason\":\"already-busted\",\"code\":2,\"existingCorrelationId\":{outcome.ExistingCorrelationId}}}",
+                    "application/json");
+            case B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch:
+                ctx.Response.StatusCode = StatusCodes.Status422UnprocessableEntity;
+                return Results.Text(
+                    $"{{\"status\":\"reject\",\"reason\":\"security-id-mismatch\",\"code\":3}}",
+                    "application/json");
+            default:
+                ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                return Results.Text($"unexpected outcome {outcome.Kind}\n", "text/plain");
+        }
     }
 
     private IResult HandleAdminGetSnapshot(HttpContext ctx, int channelNumber)
