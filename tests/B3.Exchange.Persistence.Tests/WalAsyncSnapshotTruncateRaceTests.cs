@@ -72,10 +72,12 @@ public class WalAsyncSnapshotTruncateRaceTests
     {
         private readonly SemaphoreSlim _gate = new(0, int.MaxValue);
         public int SaveCount { get; private set; }
+        public int SaveEnteredCount;
         public ChannelStateSnapshot? Last { get; private set; }
         public ChannelStateSnapshot? TryLoad(byte channelNumber) => null;
         public long Save(ChannelStateSnapshot snapshot)
         {
+            Interlocked.Increment(ref SaveEnteredCount);
             _gate.Wait();
             SaveCount++;
             Last = snapshot;
@@ -122,15 +124,24 @@ public class WalAsyncSnapshotTruncateRaceTests
         var probe = disp.CreateTestProbe();
         var session = new SessionId("80801");
 
-        // Cmd 1 → WAL seq=1 → submits snap@1 to the writer thread,
-        // which BLOCKS inside Save.
+        // Cmd 1 → WAL seq=1 → submits snap@1 to the writer thread.
+        // Wait until the writer thread observably entered Save (and is
+        // now parked on the gate) BEFORE enqueueing cmd 2. Without this
+        // sync the dispatch thread may finish cmd 2 first on slow CI
+        // runners, causing both snapshots to coalesce into snap@2 →
+        // TruncateThrough(2) → empty WAL → wrong race exercised.
         Assert.True(EnqueueOrder(disp, session, "CL-1", 0x1, 1UL));
         probe.DrainInbound();
         Assert.Single(wal.ReadAll());
+        Assert.True(await WaitForAsync(
+            () => Volatile.Read(ref blocking.SaveEnteredCount) >= 1,
+            TimeSpan.FromSeconds(5)),
+            "writer thread never entered Save(snap@1) — async writer may not be running");
 
-        // Cmd 2 → WAL seq=2 appended while the writer is parked.
-        // The dispatch thread's snapshot Submit is coalesced/dropped
-        // by the single-slot mailbox.
+        // Cmd 2 → WAL seq=2 appended while the writer is parked inside
+        // Save(snap@1). The dispatch thread's snapshot Submit lands in
+        // the single-slot mailbox; the writer will drain it after we
+        // release the first save.
         Assert.True(EnqueueOrder(disp, session, "CL-2", 0x2, 2UL));
         probe.DrainInbound();
         Assert.Equal(2, wal.ReadAll().Count);
