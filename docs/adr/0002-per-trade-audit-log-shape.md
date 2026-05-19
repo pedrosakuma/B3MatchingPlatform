@@ -62,7 +62,9 @@ the code so a future reader can verify the ADR against the source.
   `{rootDir}/{channelNumber}/fills-YYYY-MM-DD.log`.
 - File starts with a **24-byte header**: magic `B3PT` (4),
   `schemaVersion` u16 (currently 1), reserved u16, `channelNumber` u8,
-  3-byte pad, `tradeDate` ASCII `YYYY-MM-DD` (10). See
+  3-byte pad, `tradeDate` ASCII `YYYY-MM-DD` (10), and a 2-byte
+  reserved trailer (offsets 22–23, must be zero — strictly validated
+  on read so future schema bumps can repurpose them). See
   `AuditRecordCodec.FileHeaderSize`.
 - Each record is **85 bytes total**, framed as
   `recordLen` u32 + `crc32` u32 + 77-byte body (`tradeId`, transact
@@ -149,12 +151,19 @@ the code so a future reader can verify the ADR against the source.
     durability protocol, its own CRC, its own truncation policy —
     effectively a second audit log in front of the first one. Net
     complexity is worse for no clear win.
-- The dispatch thread is not idle during fsync: the slow
-  `fsync` syscall in `Checkpoint()` runs **outside** `_stateLock`
+- The dispatch thread is not idle during the periodic `Checkpoint()`
+  fsync: the slow `fsync` syscall runs **outside** `_stateLock`
   against pinned `SafeFileHandle` refs (see
   `FileAuditLogWriter.Checkpoint` — implementation of
   [#349](https://github.com/pedrosakuma/B3MatchingPlatform/issues/349)).
-  Only the `Write` itself blocks `OnTrade`.
+  In steady state, only the in-memory `Write` blocks `OnTrade`.
+  The one remaining synchronous-fsync path on the dispatch thread is
+  **day rollover**: when a record's UTC business date differs from the
+  currently-open file's, `OnTrade` calls `RotateTo` which fsyncs the
+  closing `.log` and `.idx` streams before opening the new pair. This
+  is once-per-day per channel and accepted as part of the rollover
+  cost; pushing it off-thread would require a second writer actor and
+  was not judged worthwhile.
 - The dispatcher catches and swallows any exception thrown by
   `OnTrade` (see `ChannelDispatcher.Sinks.OnTrade`). The writer
   responds by entering **write-fault state** (`_writeFault = true`,
@@ -184,8 +193,17 @@ This is the contract referenced as "ADR 0001 §2 first-cut" in
   5. writes the watermark sidecar (`audit-watermark.bin`, 20 bytes,
      CRC'd, atomic-rename via `File.Move(..., overwrite: true)` —
      see `AuditWatermarkCodec`),
-  6. on success, promotes pending → durable and increments the
-     `audit_checkpoint_total` metric.
+  6. on success, promotes pending → durable.
+
+  Observability of this path lives downstream of the watermark itself:
+  the WAL truncation gate increments
+  `audit_wal_truncation_deferred_total` whenever a truncation pass is
+  skipped because the audit watermark hasn't caught up, and the
+  replay path increments `audit_replay_records_skipped_total` for
+  every trade suppressed by the recovered watermark. See
+  `MetricsRegistry`. A dedicated `audit_checkpoint_total` counter
+  was considered and not added in v1 — the deferral counter already
+  surfaces the symptom an operator would alert on.
 - The WAL prefix-truncate gate (`ChannelDispatcher.Wal.cs`,
   implementation of [#348](https://github.com/pedrosakuma/B3MatchingPlatform/issues/348))
   reads `DurableThroughCommandSeq` before dropping WAL records: a
@@ -223,7 +241,7 @@ This is the contract referenced as "ADR 0001 §2 first-cut" in
 - The UTC choice itself was made by RFC 0001 §6 (project-wide
   default for post-trade artifacts). This ADR does not revisit it.
 
-### 7. Correction events: out of scope for v1
+### 7. Correction events: out of scope for v1 (reverses RFC §7 pre-EOD constraint)
 
 - Operator trade busts (`POST /channel/{ch}/trade-bust/{tradeId}`,
   see `ChannelDispatcher.Operator.cs` and the RUNBOOK entry under
@@ -231,32 +249,66 @@ This is the contract referenced as "ADR 0001 §2 first-cut" in
   publish a UMDF `TradeBust_57` frame only; the runbook explicitly
   documents that the simulator does not retain a per-trade audit
   record for the bust beyond the operator's own command log.
-- This is the right scope for ADR 0002 because:
+- **This is a deliberate reversal of one of the constraints RFC
+  §7 placed on ADR 0002.** The "Pre-EOD trade bust" row of the
+  RFC §7 failure-mode table assigned to ADR 0002 a requirement that
+  busts be "appended as a correction event on the audit stream
+  before the EOD projection runs". We are not honouring that
+  requirement in v1: as shipped, pre-EOD busts produce a UMDF
+  frame but do not enter the audit log, so they do not flow into
+  the EOD CSV projection either. The RFC §8 ADR roadmap row for
+  ADR 0002 is updated to reflect this.
+- Rationale for the reversal:
   - Including bust events on the same stream requires a tagged
     record variant (the body shape currently has no discriminator
     byte; adding one is a schema-version bump).
   - The semantics of late corrections — pre-EOD bust vs
     post-EOD bust, amendment file vs full rewrite, idempotency on
     duplicate busts — is a coherent decision in its own right
-    that RFC §8 already pinned to **ADR 0008**.
+    that RFC §8 already pinned to **ADR 0008**. Doing half of it
+    in ADR 0002 (just the stream shape) and the other half in
+    ADR 0008 (semantics) risked locking in a wire layout before
+    the semantic decisions were made.
+  - No committed consumer currently distinguishes "no bust ever
+    happened" from "a bust happened but is not in the CSV" for D+1
+    recon, so deferring is cheap.
 - Forward compatibility: when ADR 0008 lands, it can introduce a
   new record variant by bumping `schemaVersion` to 2. The reader
   already enforces a version match on header read so v1 readers
   will refuse v2 files outright (no silent misinterpretation).
 - Until ADR 0008 ships, the operational guidance is: pre-EOD busts
-  before the EOD export runs, accept that post-EOD busts are
-  documentation-only (UMDF tape + operator log) and not folded into
-  the EOD CSV. The RUNBOOK reflects this.
+  before the EOD export runs are **documentation-only** (UMDF tape
+  + operator log) and are NOT folded into the EOD CSV. Post-EOD
+  busts are identically documentation-only. The RUNBOOK reflects
+  this.
 
-### 8. Retention and backup: operator-owned, explicit non-promise
+### 8. Retention and backup: operator-configured prune, explicit non-promise on loss
 
-- The audit log writer **does not** rotate, compress, age out, or
-  delete files. Once written, a `fills-YYYY-MM-DD.log` /
-  `fills-YYYY-MM-DD.idx` pair stays in place until the operator
-  removes it. The watermark sidecar (`audit-watermark.bin`) is the
-  one file the writer rewrites in place.
-- Backup is the operator's responsibility. The simulator gives
-  three durability guarantees and no more:
+- The writer does not compress or archive files, and it rotates
+  the active `.log` / `.idx` pair only on UTC day-boundary (§6).
+  Beyond that, **deletion** of historical files is governed by a
+  single host-level configuration knob,
+  `postTradeAudit.retentionDays` (see `HostConfig`):
+  - **`retentionDays = 0` (default):** auto-prune disabled. The
+    host writes audit files but never deletes them; retention is
+    left entirely to an external operator job.
+  - **`retentionDays > 0`:** the host starts a 24-hour timer
+    that calls `FileAuditLogWriter.PruneOldDays(todayUtc,
+    retentionDays)`. Files whose embedded date is older than
+    `todayUtc - retentionDays` are deleted in pairs
+    (`fills-YYYY-MM-DD.log` + `.idx`). The currently-open day is
+    never pruned even when the calendar has rolled and the active
+    file lies before the cutoff. The watermark sidecar
+    (`audit-watermark.bin`) is per-channel, not per-day, and is
+    never pruned.
+- The choice to default to `0` keeps the ADR's stance intact: the
+  simulator does not impose a retention policy. Operators that
+  want host-managed pruning opt in by configuration; the
+  compliance-mandated horizon (e.g. 5 years for B3 fills) sits
+  outside this codebase.
+- Backup is the operator's responsibility regardless of the prune
+  setting. The simulator gives three durability guarantees and no
+  more:
   1. Within a successfully-fsync'd window
      (`commandSeq <= DurableThroughCommandSeq`), the on-disk file
      content is recoverable byte-for-byte after a crash.
@@ -269,14 +321,16 @@ This is the contract referenced as "ADR 0001 §2 first-cut" in
      a lost sidecar is conservatively rebuilt as "watermark = 0"
      on next start.
 - Loss of an audit log file (operator error, filesystem corruption
-  past CRC recovery, accidental `rm`) is **terminal for that day's
-  D+1 recon**. The day's EOD CSV cannot be regenerated because the
-  authoritative source is gone; the wire trade tape (UMDF) is
-  consumer-managed and is not a substitute. Operators are expected
-  to back up `audit/` to off-host storage at least once per
-  trading day; this ADR does not specify the backup mechanism
-  (rsync, snapshotting filesystem, object-storage upload — all are
-  acceptable; none are bundled with the simulator).
+  past CRC recovery, accidental `rm`, an over-aggressive
+  `retentionDays` setting deleting a still-needed day) is
+  **terminal for that day's D+1 recon**. The day's EOD CSV cannot
+  be regenerated because the authoritative source is gone; the
+  wire trade tape (UMDF) is consumer-managed and is not a
+  substitute. Operators are expected to back up `audit/` to
+  off-host storage at least once per trading day; this ADR does
+  not specify the backup mechanism (rsync, snapshotting
+  filesystem, object-storage upload — all are acceptable; none
+  are bundled with the simulator).
 - The RUNBOOK's "Post-trade audit log" section is the operational
   surface for this guidance. This ADR is the architectural
   justification for why retention sits on the operator's side of
