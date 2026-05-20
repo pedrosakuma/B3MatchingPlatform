@@ -52,3 +52,4 @@ changes, a new ADR supersedes the old one.
 | 0007 | Position aggregate per firm (deferred)                         | Deferred |
 | 0008 | Late corrections and bust propagation                          | Accepted |
 | 0009 | Single-writer threading model for per-channel state            | Accepted |
+| 0010 | Post-trade orchestration boundary                              | Accepted |

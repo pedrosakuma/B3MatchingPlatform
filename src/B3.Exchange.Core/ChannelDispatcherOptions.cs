@@ -41,4 +41,19 @@ public sealed record ChannelDispatcherOptions
     public BustDedupIndex? BustDedup { get; init; }
     public string? DropRootDir { get; init; }
     public IAmendmentsPublisher? AmendmentsPublisher { get; init; }
+    /// <summary>
+    /// Optional bust-orchestration port (issue #380 / ADR 0010). When
+    /// supplied, the dispatcher delegates bust validation, audit / dedup
+    /// writes and amendments republish to this orchestrator instead of
+    /// composing them inline from <see cref="PostTradeSink"/>,
+    /// <see cref="AuditRootDir"/>, <see cref="BustDedup"/>,
+    /// <see cref="DropRootDir"/> and <see cref="AmendmentsPublisher"/>.
+    /// When <c>null</c> and the inline deps are sufficient
+    /// (<see cref="PostTradeSink"/>, <see cref="AuditRootDir"/> and
+    /// <see cref="BustDedup"/> all non-null), the dispatcher constructs
+    /// a default <see cref="B3.Exchange.PostTrade.PostTradeOrchestrator"/>
+    /// internally — every pre-existing call site continues to work
+    /// unchanged.
+    /// </summary>
+    public IPostTradeOrchestrator? PostTradeOrchestrator { get; init; }
 }

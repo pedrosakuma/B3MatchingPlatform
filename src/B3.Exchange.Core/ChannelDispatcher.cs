@@ -228,19 +228,30 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     // NullPostTradeSink.Instance so existing callers see no behaviour
     // change; subsequent PRs install a real append-only writer.
     private readonly B3.Exchange.PostTrade.IPostTradeSink _postTradeSink;
-    private readonly string? _auditRootDir;
-    private readonly B3.Exchange.PostTrade.BustDedupIndex? _bustDedup;
-    private readonly string? _dropRootDir;
-    private readonly B3.Exchange.PostTrade.IAmendmentsPublisher? _amendmentsPublisher;
+    /// <summary>
+    /// Bust-orchestration port (issue #380 / ADR 0010). Owns the dedup
+    /// index, audit-log root, EOD drop dir, amendments publisher and
+    /// the routing lock. <c>null</c> iff the dispatcher was configured
+    /// without an audit sink (legacy behaviour — bust v2 endpoint
+    /// returns <c>InvalidOperationException</c>). Built either from
+    /// <see cref="ChannelDispatcherOptions.PostTradeOrchestrator"/> or
+    /// auto-composed from the inline post-trade options.
+    /// </summary>
+    private readonly B3.Exchange.PostTrade.IPostTradeOrchestrator? _postTradeOrch;
     /// <summary>
     /// ADR 0008 §3 routing race-window closure: shared lock between
     /// the dispatch thread (which checks fills.csv.done existence and
     /// writes the bust record) and the EOD exporter (which scans the
     /// audit log for cancelled fills then renames its .done sidecar).
     /// Exposed so <see cref="ExchangeHost.TriggerEodExport"/> can take
-    /// the same monitor across the scan→publish window.
+    /// the same monitor across the scan→publish window. Delegates to
+    /// the active <see cref="B3.Exchange.PostTrade.IPostTradeOrchestrator"/>
+    /// when one is wired; otherwise returns a private monitor for
+    /// backward compatibility with hosts that never installed an
+    /// orchestrator.
     /// </summary>
-    public object PostTradeRoutingLock { get; } = new();
+    public object PostTradeRoutingLock => _postTradeOrch?.RoutingLock ?? _legacyRoutingLock;
+    private readonly object _legacyRoutingLock = new();
     // Throttle bookkeeping (issue #267). Mutated only on the dispatch
     // loop thread → no Interlocked needed.
     private long _commandsSincePersist;
@@ -378,10 +389,30 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _sessionExists = options.SessionExists;
         _orphanPolicy = options.OrphanPolicy;
         _postTradeSink = options.PostTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;
-        _auditRootDir = options.AuditRootDir;
-        _bustDedup = options.BustDedup;
-        _dropRootDir = options.DropRootDir;
-        _amendmentsPublisher = options.AmendmentsPublisher;
+        // Issue #380 / ADR 0010: prefer the explicit orchestrator option
+        // when supplied. Otherwise auto-compose one from the legacy
+        // inline post-trade deps so every pre-existing call site
+        // (ExchangeHost + tests) keeps working without churn. The
+        // composition requires at minimum a sink, an audit root and a
+        // dedup index — anything less leaves _postTradeOrch null and
+        // EnqueueOperatorBustV2 returns a "not wired" exception, same
+        // as before the refactor.
+        if (options.PostTradeOrchestrator is not null)
+        {
+            _postTradeOrch = options.PostTradeOrchestrator;
+        }
+        else if (options.PostTradeSink is not null
+            && options.AuditRootDir is not null
+            && options.BustDedup is not null)
+        {
+            _postTradeOrch = new B3.Exchange.PostTrade.PostTradeOrchestrator(
+                options.PostTradeSink,
+                options.BustDedup,
+                options.AuditRootDir,
+                options.DropRootDir,
+                options.AmendmentsPublisher,
+                options.Logger);
+        }
         _snapshotThrottle = options.SnapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist
