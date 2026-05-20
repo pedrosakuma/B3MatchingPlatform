@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging;
 using Side = B3.Exchange.Matching.Side;
 
@@ -22,12 +23,8 @@ public sealed partial class ChannelDispatcher
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.OrderBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderAddedFrame(dst,
+        UmdfFrameBuilder.WriteOrderAdded(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.PriceMantissa, e.RemainingQuantity, e.RptSeq, e.InsertTimestampNanos);
-        Commit(n);
 
         if (_hasCurrentSession)
         {
@@ -62,17 +59,8 @@ public sealed partial class ChannelDispatcher
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.OrderBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderAddedFrame(dst,
+        UmdfFrameBuilder.WriteOrderUpdate(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.PriceMantissa, e.NewRemainingQuantity, e.RptSeq, e.InsertTimestampNanos);
-        // Patch MdUpdateAction byte from NEW(0x00) to UPDATE(0x01).
-        int actionOffset = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.OrderBodyMdUpdateActionOffset;
-        dst[actionOffset] = 0x01; // MDUpdateAction.CHANGE
-        Commit(n);
     }
 
     public void OnOrderModified(in OrderModifiedEvent e)
@@ -117,12 +105,7 @@ public sealed partial class ChannelDispatcher
     public void OnOrderBookSideEmpty(in OrderBookSideEmptyEvent e)
     {
         AssertOnLoopThread();
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.EmptyBookBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteEmptyBookFrame(
-            dst, e.SecurityId, e.TransactTimeNanos);
-        Commit(n);
+        UmdfFrameBuilder.WriteOrderBookSideEmpty(FrameSink, e.SecurityId, e.TransactTimeNanos);
     }
 
     public void OnOrderMassCanceled(in OrderMassCanceledEvent e)
@@ -131,12 +114,7 @@ public sealed partial class ChannelDispatcher
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.MassDeleteOrdersBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteMassDeleteOrdersFrame(
-            dst, e.SecurityId, entryType, e.RptSeq, e.TransactTimeNanos);
-        Commit(n);
+        UmdfFrameBuilder.WriteOrderMassCanceled(FrameSink, e.SecurityId, entryType, e.RptSeq, e.TransactTimeNanos);
     }
 
     public void OnTradingPhaseChanged(in TradingPhaseChangedEvent e)
@@ -146,22 +124,9 @@ public sealed partial class ChannelDispatcher
         // so the HTTP admin endpoint can decide between SetPhase and
         // UncrossAuction without piercing the engine off-thread.
         _phaseSnapshot[e.SecurityId] = e.Phase;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
         // tradingSessionID/securityTradingEvent unused for now (255 = NULL
         // for the optional event); tradeDate/tradSesOpenTime defaulted to 0.
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
-            dst,
-            securityId: e.SecurityId,
-            tradingSessionId: 0,
-            securityTradingStatus: (byte)e.Phase,
-            securityTradingEvent: 255,
-            tradeDate: 0,
-            tradSesOpenTimeNanos: 0,
-            transactTimeNanos: e.TransactTimeNanos,
-            rptSeq: e.RptSeq);
-        Commit(n);
+        UmdfFrameBuilder.WriteTradingPhaseChanged(FrameSink, e.SecurityId, (byte)e.Phase, e.RptSeq, e.TransactTimeNanos);
     }
 
     /// <summary>
@@ -172,8 +137,6 @@ public sealed partial class ChannelDispatcher
     /// carries the engine's preserved <see cref="TradingPhase"/> so the
     /// post-resume phase is unambiguous.
     /// </summary>
-    private const byte SecurityTradingEventHalt = 1;
-    private const byte SecurityTradingEventResume = 2;
 
     public void OnInstrumentHalted(in InstrumentHaltedEvent e)
     {
@@ -181,20 +144,7 @@ public sealed partial class ChannelDispatcher
         byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
             ? (byte)phase
             : (byte)TradingPhase.Open;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
-            dst,
-            securityId: e.SecurityId,
-            tradingSessionId: 0,
-            securityTradingStatus: phaseByte,
-            securityTradingEvent: SecurityTradingEventHalt,
-            tradeDate: 0,
-            tradSesOpenTimeNanos: 0,
-            transactTimeNanos: e.TransactTimeNanos,
-            rptSeq: e.RptSeq);
-        Commit(n);
+        UmdfFrameBuilder.WriteInstrumentHalted(FrameSink, e.SecurityId, phaseByte, e.RptSeq, e.TransactTimeNanos);
     }
 
     public void OnInstrumentResumed(in InstrumentResumedEvent e)
@@ -203,31 +153,14 @@ public sealed partial class ChannelDispatcher
         byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
             ? (byte)phase
             : (byte)TradingPhase.Open;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SecurityStatusBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteSecurityStatusFrame(
-            dst,
-            securityId: e.SecurityId,
-            tradingSessionId: 0,
-            securityTradingStatus: phaseByte,
-            securityTradingEvent: SecurityTradingEventResume,
-            tradeDate: 0,
-            tradSesOpenTimeNanos: 0,
-            transactTimeNanos: e.TransactTimeNanos,
-            rptSeq: e.RptSeq);
-        Commit(n);
+        UmdfFrameBuilder.WriteInstrumentResumed(FrameSink, e.SecurityId, phaseByte, e.RptSeq, e.TransactTimeNanos);
     }
 
     public void OnAuctionTopChanged(in AuctionTopChangedEvent e)
     {
         AssertOnLoopThread();
 
-        var topDst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.TheoreticalOpeningPriceBlockLength);
-        int nTop = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTheoreticalOpeningPriceFrame(
-            topDst,
+        UmdfFrameBuilder.WriteTheoreticalOpeningPrice(FrameSink,
             securityId: e.SecurityId,
             hasTop: e.HasTop,
             priceMantissa: e.TopPriceMantissa,
@@ -235,25 +168,19 @@ public sealed partial class ChannelDispatcher
             tradeDate: _tradeDate,
             mdEntryTimestampNanos: e.TransactTimeNanos,
             rptSeq: e.RptSeq);
-        Commit(nTop);
 
         ushort cond = e.HasImbalance
             ? (e.ImbalanceSide == Side.Buy
                 ? B3.Umdf.WireEncoder.UmdfWireEncoder.ImbalanceConditionMoreBuyers
                 : B3.Umdf.WireEncoder.UmdfWireEncoder.ImbalanceConditionMoreSellers)
             : (ushort)0;
-        var imbDst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.AuctionImbalanceBlockLength);
-        int nImb = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteAuctionImbalanceFrame(
-            imbDst,
+        UmdfFrameBuilder.WriteAuctionImbalance(FrameSink,
             securityId: e.SecurityId,
             hasImbalance: e.HasImbalance,
             imbalanceCondition: cond,
             imbalanceQty: e.ImbalanceQuantity,
             mdEntryTimestampNanos: e.TransactTimeNanos,
             rptSeq: e.RptSeq);
-        Commit(nImb);
     }
 
     /// <summary>
@@ -274,31 +201,21 @@ public sealed partial class ChannelDispatcher
 
         if (e.Kind == AuctionPrintKind.Opening)
         {
-            var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-                + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-                + B3.Umdf.WireEncoder.WireOffsets.OpeningPriceBlockLength);
-            int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOpeningPriceFrame(
-                dst,
+            UmdfFrameBuilder.WriteOpeningPrice(FrameSink,
                 securityId: e.SecurityId,
                 priceMantissa: e.PriceMantissa,
                 tradeDate: _tradeDate,
                 mdEntryTimestampNanos: e.TransactTimeNanos,
                 rptSeq: e.RptSeq);
-            Commit(n);
         }
         else
         {
-            var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-                + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-                + B3.Umdf.WireEncoder.WireOffsets.ClosingPriceBlockLength);
-            int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteClosingPriceFrame(
-                dst,
+            UmdfFrameBuilder.WriteClosingPrice(FrameSink,
                 securityId: e.SecurityId,
                 priceMantissa: e.PriceMantissa,
                 tradeDate: _tradeDate,
                 mdEntryTimestampNanos: e.TransactTimeNanos,
                 rptSeq: e.RptSeq);
-            Commit(n);
         }
     }
 
@@ -326,12 +243,8 @@ public sealed partial class ChannelDispatcher
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.DeleteOrderBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderDeletedFrame(dst,
+        UmdfFrameBuilder.WriteOrderDeleted(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.RemainingQuantityAtCancel, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
-        Commit(n);
 
         // Issue #167: resolve owner locally on the dispatch thread, then
         // evict the canonical entry. Pass the active session's ClOrdId (if
@@ -353,12 +266,8 @@ public sealed partial class ChannelDispatcher
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.DeleteOrderBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderDeletedFrame(dst,
+        UmdfFrameBuilder.WriteOrderDeleted(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.FinalFilledQuantity, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
-        Commit(n);
 
         // Tell the canonical registry the order has reached terminal state
         // — no wire ER here (the per-trade ER_Trade frames have already
@@ -374,16 +283,12 @@ public sealed partial class ChannelDispatcher
         // much of the prioritized leg remains for the internal print.
         if (_crossSweepFilledQty.HasValue)
             _crossSweepFilledQty = _crossSweepFilledQty.Value + e.Quantity;
-        var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.TradeBlockLength);
         bool aggressorIsBuy = e.AggressorSide == Side.Buy;
         uint buyer = aggressorIsBuy ? e.AggressorFirm : e.RestingFirm;
         uint seller = aggressorIsBuy ? e.RestingFirm : e.AggressorFirm;
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeFrame(dst,
+        UmdfFrameBuilder.WriteTrade(FrameSink,
             e.SecurityId, e.PriceMantissa, e.Quantity, e.TradeId, _tradeDate, e.TransactTimeNanos, e.RptSeq,
             buyerFirm: buyer, sellerFirm: seller);
-        Commit(n);
 
         // ER_Trade for the aggressor side: routed to the active session by
         // SessionId. Issue #319: cumQty/leavesQty are accumulated across
@@ -517,21 +422,13 @@ public sealed partial class ChannelDispatcher
         // 1. DeleteOrder for the consumed visible spot. Quantity is 0
         //    because the slice was fully traded away (it's a "removed by
         //    consumption" delete from the consumer's perspective).
-        var del = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.DeleteOrderBlockLength);
-        int dn = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderDeletedFrame(del,
+        UmdfFrameBuilder.WriteOrderDeleted(FrameSink,
             e.SecurityId, e.OrderId, entryType, 0L, e.DeleteRptSeq, e.TransactTimeNanos, e.PriceMantissa);
-        Commit(dn);
 
         // 2. OrderAdded for the replenished slice at the back of the level.
-        var add = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-            + B3.Umdf.WireEncoder.WireOffsets.OrderBlockLength);
-        int an = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteOrderAddedFrame(add,
+        UmdfFrameBuilder.WriteOrderAdded(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.PriceMantissa, e.NewVisibleQuantity,
             e.AddRptSeq, e.InsertTimestampNanos);
-        Commit(an);
     }
 
     /// <summary>
