@@ -400,9 +400,12 @@ Gateway. Issue #167 moved it to a per-channel `OrderRegistry` in Core
 for two reasons:
 
 1. The dispatcher already needs the owning session on the dispatch
-   thread (to compute the explicit `OrderId` list for `MassCancel` and
-   to track `CumQty` for passive trades). Keeping the index out of
-   reach in the Gateway forced a round-trip and split the writer.
+   thread (to stamp `SessionId` on every emitted `ExecutionEvent` and
+   to track `CumQty` for passive trades), and `HostRouter` needs it on
+   inbound recv threads to pre-resolve `OrigClOrdID → OrderId` and to
+   compute the explicit `OrderId` list for `MassCancel` before
+   enqueueing. Keeping the index out of reach in the Gateway forced a
+   round-trip and split the writer.
 2. Sharding by channel matches the single-writer invariant
    ([ADR 0009](adr/0009-single-writer-threading-model.md)): each
    registry has one writer (its dispatcher) and concurrent readers.
