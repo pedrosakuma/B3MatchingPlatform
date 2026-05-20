@@ -60,7 +60,7 @@ namespace B3.Exchange.Core;
 /// engine state, the packet buffer, the per-channel <c>OrderRegistry</c>,
 /// and the
 /// <see cref="SequenceNumber"/> / <see cref="SequenceVersion"/> counters.
-/// Every mutation path asserts <c>Thread.CurrentThread == _loopThread</c>
+/// Every mutation path asserts <c>Thread.CurrentThread == loop-owner</c>
 /// in DEBUG builds via <c>AssertOnLoopThread</c>.</description></item>
 /// <item><description><b>External readers</b> (e.g. <c>HttpServer.RenderProm</c>
 /// on an HTTP worker thread) read <see cref="SequenceNumber"/> /
@@ -324,9 +324,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
-    // Captured on entry to RunLoopAsync; used by AssertOnLoopThread() to
-    // enforce the dispatch-thread invariant in DEBUG builds.
-    private Thread? _loopThread;
+    // Single-thread invariant (ADR 0009 / issues #138, #169, #384).
+    // Captured on entry to RunLoop; used by AssertOnLoopThread() to enforce
+    // the dispatch-thread invariant in DEBUG builds. Backed by the shared
+    // B3.Exchange.Matching.Threading.SingleWriterGuard.
+    private readonly B3.Exchange.Matching.Threading.SingleWriterGuard _writerGuard;
 
     /// <summary>
     /// The snapshot rotator bound to this dispatcher, if any. Always invoked
@@ -357,6 +359,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         ArgumentNullException.ThrowIfNull(options.PacketSink);
 
         ChannelNumber = channelNumber;
+        _writerGuard = new B3.Exchange.Matching.Threading.SingleWriterGuard(
+            $"ChannelDispatcher[channel={channelNumber}]");
         _liveSink = options.PacketSink;
         _liveOutbound = options.Outbound;
         _packetSink = options.PacketSink;
