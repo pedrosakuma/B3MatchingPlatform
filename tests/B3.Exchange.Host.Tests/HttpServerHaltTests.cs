@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -14,18 +15,6 @@ public class HttpServerHaltTests
     private sealed class RecordingSink : IUmdfPacketSink
     {
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
-    }
-
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath}");
     }
 
     private static (HostConfig cfg, IUmdfPacketSink sink) BuildConfig()
@@ -43,7 +32,7 @@ public class HttpServerHaltTests
                     IncrementalGroup = "239.255.42.92",
                     IncrementalPort = 30192,
                     Ttl = 0,
-                    InstrumentsFile = ResolveRepoFile("config/instruments-eqt.json"),
+                    InstrumentsFile = TestPaths.ResolveRepoFile("config/instruments-eqt.json"),
                 },
             },
         };

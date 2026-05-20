@@ -1,5 +1,6 @@
 using B3.Exchange.Host;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.SyntheticTrader.Tests;
 
@@ -26,17 +27,6 @@ public class SyntheticTraderHostIntegrationTests
             => Interlocked.Increment(ref _packetCount);
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     [Fact]
     public async Task SynthTrader_AgainstInProcHost_GeneratesTrades()
@@ -54,7 +44,7 @@ public class SyntheticTraderHostIntegrationTests
                     IncrementalGroup = "239.255.42.84",
                     IncrementalPort = 30185,
                     Ttl = 0,
-                    InstrumentsFile = ResolveRepoFile("config/instruments-eqt.json"),
+                    InstrumentsFile = TestPaths.ResolveRepoFile("config/instruments-eqt.json"),
                 },
             },
         };

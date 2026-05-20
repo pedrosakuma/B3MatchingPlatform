@@ -1,6 +1,7 @@
 using B3.Exchange.Core;
 using B3.Exchange.Host;
 using B3.Exchange.SyntheticTrader;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.ScenarioReplay.Tests;
 
@@ -12,17 +13,6 @@ namespace B3.Exchange.ScenarioReplay.Tests;
 /// </summary>
 public class EndToEndReplayTests
 {
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     private sealed class CountingSink : IUmdfPacketSink
     {
@@ -33,7 +23,7 @@ public class EndToEndReplayTests
     [Fact]
     public async Task RunsScript_AgainstHost_AndCapturesExecReports()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var sink = new CountingSink();
         var cfg = new HostConfig
         {

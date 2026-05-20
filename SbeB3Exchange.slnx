@@ -22,6 +22,7 @@
     <Project Path="bench/B3.Exchange.Bench/B3.Exchange.Bench.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/B3.Exchange.TestSupport/B3.Exchange.TestSupport.csproj" />
     <Project Path="tests/B3.Umdf.WireEncoder.Tests/B3.Umdf.WireEncoder.Tests.csproj" />
     <Project Path="tests/B3.EntryPoint.Wire.Tests/B3.EntryPoint.Wire.Tests.csproj" />
     <Project Path="tests/B3.Exchange.Instruments.Tests/B3.Exchange.Instruments.Tests.csproj" />

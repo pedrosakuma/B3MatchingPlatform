@@ -1,5 +1,6 @@
 using System.Net.Http;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -14,7 +15,7 @@ public class HttpServerTests
 {
     private static (HostConfig cfg, IUmdfPacketSink sink) BuildConfig(int livenessStaleMs = 5000)
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var cfg = new HostConfig
         {
             Auth = new AuthConfig { RequireFixpHandshake = false },
@@ -40,17 +41,6 @@ public class HttpServerTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     [Fact]
     public async Task LiveAndReadyAndMetrics_AllReturn200_AfterStartup()

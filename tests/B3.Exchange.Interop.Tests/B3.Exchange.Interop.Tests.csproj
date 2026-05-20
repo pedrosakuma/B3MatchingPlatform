@@ -15,6 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\B3.Exchange.TestSupport\B3.Exchange.TestSupport.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Core\B3.Exchange.Core.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Host\B3.Exchange.Host.csproj" />
   </ItemGroup>

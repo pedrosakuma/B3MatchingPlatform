@@ -3,6 +3,7 @@ using System.Net.Http;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using B3.Exchange.PostTrade;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -20,23 +21,7 @@ public class DailyResetEodExportChainingTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
-    private static void TryDeleteDir(string dir)
-    {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
-        catch { /* best-effort */ }
-    }
 
     private static PostTradeRecord MakeFill(uint id, ulong nanos, long secId = 900000000001L)
         => new(
@@ -53,8 +38,8 @@ public class DailyResetEodExportChainingTests
     [Fact]
     public async Task TriggerDailyReset_ProjectsYesterdayAuditLogForAllConfiguredChannels()
     {
-        var eqtPath = ResolveRepoFile("config/instruments-eqt.json");
-        var drvPath = ResolveRepoFile("config/instruments-drv.json");
+        var eqtPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
+        var drvPath = TestPaths.ResolveRepoFile("config/instruments-drv.json");
         var auditDirA = Path.Combine(Path.GetTempPath(), "b3-dr-audit-a-" + Guid.NewGuid().ToString("N"));
         var dropDirA = Path.Combine(Path.GetTempPath(), "b3-dr-drop-a-" + Guid.NewGuid().ToString("N"));
         var auditDirB = Path.Combine(Path.GetTempPath(), "b3-dr-audit-b-" + Guid.NewGuid().ToString("N"));
@@ -134,17 +119,17 @@ public class DailyResetEodExportChainingTests
         }
         finally
         {
-            TryDeleteDir(auditDirA);
-            TryDeleteDir(dropDirA);
-            TryDeleteDir(auditDirB);
-            TryDeleteDir(dropDirB);
+            TempDirs.TryDelete(auditDirA);
+            TempDirs.TryDelete(dropDirA);
+            TempDirs.TryDelete(auditDirB);
+            TempDirs.TryDelete(dropDirB);
         }
     }
 
     [Fact]
     public async Task TriggerDailyReset_SkipsChannelsWithoutEodDropConfigured()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-dr-audit-" + Guid.NewGuid().ToString("N"));
         try
         {
@@ -186,15 +171,15 @@ public class DailyResetEodExportChainingTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
+            TempDirs.TryDelete(auditDir);
         }
     }
 
     [Fact]
     public async Task TriggerDailyReset_SwallowsMissingAuditLog_AndStillProcessesOtherChannels()
     {
-        var eqtPath = ResolveRepoFile("config/instruments-eqt.json");
-        var drvPath = ResolveRepoFile("config/instruments-drv.json");
+        var eqtPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
+        var drvPath = TestPaths.ResolveRepoFile("config/instruments-drv.json");
         // Channel A has NO audit log written → export should swallow.
         // Channel B has yesterday's audit log → export must still succeed.
         var auditDirA = Path.Combine(Path.GetTempPath(), "b3-dr-audit-a-" + Guid.NewGuid().ToString("N"));
@@ -261,17 +246,17 @@ public class DailyResetEodExportChainingTests
         }
         finally
         {
-            TryDeleteDir(auditDirA);
-            TryDeleteDir(dropDirA);
-            TryDeleteDir(auditDirB);
-            TryDeleteDir(dropDirB);
+            TempDirs.TryDelete(auditDirA);
+            TempDirs.TryDelete(dropDirA);
+            TempDirs.TryDelete(auditDirB);
+            TempDirs.TryDelete(dropDirB);
         }
     }
 
     [Fact]
     public async Task AdminDailyReset_HttpEndpoint_AlsoTriggersEodExport()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-dr-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-dr-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -319,8 +304,8 @@ public class DailyResetEodExportChainingTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 }
