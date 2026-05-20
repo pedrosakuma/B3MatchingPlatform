@@ -75,7 +75,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEventSink, IAsyncDisposable
 {
-    private const int DefaultInboundCapacity = 4096;
+    public const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
 
     /// <summary>
@@ -345,51 +345,39 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool IsWalHealthy => Volatile.Read(ref _walHalted) == 0;
 
-    public ChannelDispatcher(byte channelNumber, Func<IMatchingEventSink, MatchingEngine> engineFactory, IUmdfPacketSink packetSink,
-        ICoreOutbound outbound,
-        ILogger<ChannelDispatcher> logger,
-        Func<ulong>? nowNanos = null, ushort tradeDate = 0, int inboundCapacity = DefaultInboundCapacity,
-        ChannelMetrics? metrics = null,
-        BoundedSessionFirmCounters? sessionFirmCounters = null,
-        UmdfPacketRetransmitBuffer? retxBuffer = null,
-        IChannelStatePersister? persister = null,
-        SnapshotThrottlePolicy? snapshotThrottle = null,
-        bool useAsyncSnapshotWriter = false,
-        IChannelWriteAheadLog? wal = null,
-        WalAppendFailurePolicy walAppendFailurePolicy = WalAppendFailurePolicy.Continue,
-        Func<string, bool>? sessionExists = null,
-        OrphanSessionPolicy orphanPolicy = OrphanSessionPolicy.Drop,
-        IReadOnlyList<long>? seedSecurityIds = null,
-        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null,
-        string? auditRootDir = null,
-        B3.Exchange.PostTrade.BustDedupIndex? bustDedup = null,
-        string? dropRootDir = null,
-        B3.Exchange.PostTrade.IAmendmentsPublisher? amendmentsPublisher = null)
+    public ChannelDispatcher(
+        byte channelNumber,
+        Func<IMatchingEventSink, MatchingEngine> engineFactory,
+        ChannelDispatcherOptions options)
     {
-        ArgumentNullException.ThrowIfNull(logger);
-        ArgumentNullException.ThrowIfNull(outbound);
+        ArgumentNullException.ThrowIfNull(engineFactory);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(options.Logger);
+        ArgumentNullException.ThrowIfNull(options.Outbound);
+        ArgumentNullException.ThrowIfNull(options.PacketSink);
+
         ChannelNumber = channelNumber;
-        _liveSink = packetSink;
-        _liveOutbound = outbound;
-        _packetSink = packetSink;
-        _outbound = outbound;
-        _logger = logger;
-        _nowNanos = nowNanos ?? DefaultNowNanos;
-        _tradeDate = tradeDate;
-        _metrics = metrics;
-        _sessionFirmCounters = sessionFirmCounters;
-        _retxBuffer = retxBuffer;
-        _persister = persister;
-        _wal = wal;
-        _walAppendFailurePolicy = walAppendFailurePolicy;
-        _sessionExists = sessionExists;
-        _orphanPolicy = orphanPolicy;
-        _postTradeSink = postTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;
-        _auditRootDir = auditRootDir;
-        _bustDedup = bustDedup;
-        _dropRootDir = dropRootDir;
-        _amendmentsPublisher = amendmentsPublisher;
-        _snapshotThrottle = snapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
+        _liveSink = options.PacketSink;
+        _liveOutbound = options.Outbound;
+        _packetSink = options.PacketSink;
+        _outbound = options.Outbound;
+        _logger = options.Logger;
+        _nowNanos = options.NowNanos ?? DefaultNowNanos;
+        _tradeDate = options.TradeDate;
+        _metrics = options.Metrics;
+        _sessionFirmCounters = options.SessionFirmCounters;
+        _retxBuffer = options.RetxBuffer;
+        _persister = options.Persister;
+        _wal = options.Wal;
+        _walAppendFailurePolicy = options.WalAppendFailurePolicy;
+        _sessionExists = options.SessionExists;
+        _orphanPolicy = options.OrphanPolicy;
+        _postTradeSink = options.PostTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;
+        _auditRootDir = options.AuditRootDir;
+        _bustDedup = options.BustDedup;
+        _dropRootDir = options.DropRootDir;
+        _amendmentsPublisher = options.AmendmentsPublisher;
+        _snapshotThrottle = options.SnapshotThrottle ?? SnapshotThrottlePolicy.AlwaysPersist;
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist
         // (zero-RPO). Enabled per channel via host config.
@@ -397,8 +385,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // via the post-save callback so we can truncate the WAL on the
         // writer thread — guaranteeing the WAL is only ever truncated
         // after the matching snapshot has reached the disk.
-        _asyncSnapshotWriter = (useAsyncSnapshotWriter && persister is not null)
-            ? new BackgroundSnapshotWriter(channelNumber, persister, logger, metrics,
+        _asyncSnapshotWriter = (options.UseAsyncSnapshotWriter && options.Persister is not null)
+            ? new BackgroundSnapshotWriter(channelNumber, options.Persister, options.Logger, options.Metrics,
                 onSaved: _wal is null ? null : OnAsyncSnapshotSaved)
             : null;
         // Direct field writes are safe here: ctor runs on the constructing
@@ -407,7 +395,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _sequenceVersion = 1;
         _sequenceNumber = 0;
         _inbound = System.Threading.Channels.Channel.CreateBounded<WorkItem>(
-            new System.Threading.Channels.BoundedChannelOptions(inboundCapacity)
+            new System.Threading.Channels.BoundedChannelOptions(options.InboundCapacity)
             {
                 SingleReader = true,
                 SingleWriter = false,
@@ -418,9 +406,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
                 FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
             });
         _engine = engineFactory(this);
-        if (seedSecurityIds is not null)
+        if (options.SeedSecurityIds is not null)
         {
-            foreach (var secId in seedSecurityIds)
+            foreach (var secId in options.SeedSecurityIds)
             {
                 try { _phaseSnapshot[secId] = _engine.GetTradingPhase(secId); }
                 catch (KeyNotFoundException) { /* engine doesn't know this id; skip */ }

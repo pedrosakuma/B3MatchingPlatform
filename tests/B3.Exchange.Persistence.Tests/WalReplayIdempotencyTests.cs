@@ -120,14 +120,17 @@ public class WalReplayIdempotencyTests
             channelNumber: Channel,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: new NoOpOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: null,
-            persister: persister,
-            snapshotThrottle: NeverAuto,
-            useAsyncSnapshotWriter: false,
-            wal: wal);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = null,
+                Persister = persister,
+                SnapshotThrottle = NeverAuto,
+                UseAsyncSnapshotWriter = false,
+                Wal = wal,
+            });
     }
 
     private enum Op { New, Cancel, Replace }

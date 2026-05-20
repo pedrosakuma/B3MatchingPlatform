@@ -112,15 +112,18 @@ public class ChannelDispatcherAuditWatermarkTests
         => new(
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: new NoOpOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            persister: persister,
-            snapshotThrottle: null,
-            useAsyncSnapshotWriter: false,
-            wal: wal,
-            postTradeSink: postTradeSink);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Persister = persister,
+                SnapshotThrottle = null,
+                UseAsyncSnapshotWriter = false,
+                Wal = wal,
+                PostTradeSink = postTradeSink,
+            });
 
     private static bool EnqueueOrder(ChannelDispatcher disp, string clOrdId, ulong clOrdIdValue, ulong nanos)
         => disp.EnqueueNewOrder(
@@ -225,15 +228,18 @@ public class ChannelDispatcherAuditWatermarkTests
         var disp = new ChannelDispatcher(
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: new NoOpOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            persister: persister,
-            snapshotThrottle: null,
-            useAsyncSnapshotWriter: false,
-            wal: null,
-            postTradeSink: sink);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Persister = persister,
+                SnapshotThrottle = null,
+                UseAsyncSnapshotWriter = false,
+                Wal = null,
+                PostTradeSink = sink,
+            });
         var probe = disp.CreateTestProbe();
 
         Assert.True(EnqueueOrder(disp, "CL-1", 0x1, 1UL));

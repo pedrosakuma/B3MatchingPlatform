@@ -63,10 +63,13 @@ public class HostRouterTests
         var outbound = new RecordingOutbound();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => new MatchingEngine(new[] { inst }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000UL);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000UL,
+            });
         // Dispatcher loop not started; we read inbound queue directly.
         var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp }, outbound, NullLogger<HostRouter>.Instance);
 

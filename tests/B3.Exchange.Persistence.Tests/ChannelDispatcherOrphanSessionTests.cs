@@ -59,12 +59,15 @@ public class ChannelDispatcherOrphanSessionTests
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: new NoOpOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            sessionExists: sessionExists,
-            orphanPolicy: policy);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                SessionExists = sessionExists,
+                OrphanPolicy = policy,
+            });
     }
 
     private static ChannelStateSnapshot BuildSnapshotWithOwners(params string[] sessionIds)
