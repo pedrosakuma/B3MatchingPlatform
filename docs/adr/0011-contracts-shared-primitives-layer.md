@@ -32,8 +32,8 @@ After 18 months on `main`, the situation was:
   code in lockstep with used code is negative value.
 - The interface that **is** used at the Core→Gateway boundary —
   `ICoreOutbound` — takes Matching engine event types
-  (`OrderAcceptedEvent`, `TradeEvent`, `OrderCancelledEvent`,
-  `OrderRejectedEvent`) as parameters and would require non-trivial
+  (`OrderAcceptedEvent`, `TradeEvent`, `OrderCanceledEvent`,
+  `RejectEvent`) as parameters and would require non-trivial
   field expansion in the neutral records (Side, SecurityId, RptSeq,
   InsertTimestampNanos, …) to switch.
 - The "deferred to a follow-up PR" admission was 18 months stale; no
@@ -48,7 +48,7 @@ single largest source of "dead seam" weight in the codebase.
 1. **Matching's engine event records are the canonical Core→Gateway
    boundary model.** `ICoreOutbound` (in `B3.Exchange.Contracts`)
    continues to take `B3.Exchange.Matching.OrderAcceptedEvent`,
-   `TradeEvent`, `OrderCancelledEvent`, `OrderRejectedEvent` etc. as
+   `TradeEvent`, `OrderCanceledEvent`, `RejectEvent` etc. as
    parameters. There is no second event family.
 2. **`B3.Exchange.Contracts` is a "shared primitives + outbound port
    surface" layer**, not a neutral seam. It hosts:

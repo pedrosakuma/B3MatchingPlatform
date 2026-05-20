@@ -1,5 +1,16 @@
 # B3 EntryPoint — Target Architecture (Ephemeral)
 
+> **⚠️ Partially superseded — read alongside ADR 0011 (issue #379).**
+> The Gateway↔Core contract sketched below (especially §3.2 — `ICoreInbound` /
+> `IGatewayInbound` / the neutral `InboundOrderCommand` / `ExecutionEvent` /
+> `BusinessRejectEvent` family) was **never implemented** and has been
+> **deleted** from `B3.Exchange.Contracts`. The actual Core→Gateway boundary
+> is `ICoreOutbound` (in `B3.Exchange.Contracts/Ports.cs`), which carries
+> `B3.Exchange.Matching` engine event types directly as payload.
+> See [`adr/0011-contracts-shared-primitives-layer.md`](adr/0011-contracts-shared-primitives-layer.md)
+> for the current contract. Higher-level shape (Gateway = transport,
+> Core = matching, single-writer per channel) is still accurate.
+
 Sister document to [`B3-ENTRYPOINT-COMPLIANCE.md`](B3-ENTRYPOINT-COMPLIANCE.md).
 The compliance doc says **what's broken**; this doc says **how we will fix it
 coherently**, so the 19+ open spec-compliance issues converge on a single
