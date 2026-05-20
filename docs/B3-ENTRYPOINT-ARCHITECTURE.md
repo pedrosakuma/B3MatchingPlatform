@@ -104,9 +104,12 @@ Key differences:
 - **`FixpSession` outlives `TcpTransport`.** A reconnect (`Establish`
   within the same `sessionVerId`) reattaches a fresh transport to the same
   session, preserving outbound seq + retx buffer.
-- **Order ownership lives in the Gateway** (`OrderId → SessionId`). Core
-  stamps `SessionId` on each `ExecutionEvent`; Gateway resolves the live
-  `FixpSession` at delivery time.
+- **Order ownership lives in the Core** (`OrderId → SessionId`), in a
+  per-channel `OrderRegistry` (one per `ChannelDispatcher`). Core stamps
+  `SessionId` on each `ExecutionEvent`; Gateway resolves the live
+  `FixpSession` at delivery time via the `SessionRegistry`.
+  *(Issue #167 inverted the original Gateway-side `OrderOwnershipMap` —
+  see §4.7 for the rationale and current shape.)*
 
 ---
 
@@ -143,7 +146,6 @@ src/
     RetransmitBuffer.cs              ← in-RAM ring per session
     SessionRegistry.cs
     FirmRegistry.cs
-    OrderOwnershipMap.cs             ← OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId) (per process)
     Framing/
       SofhFrameReader.cs             ← #39 (GAP-01)
       SofhFrameWriter.cs
@@ -155,6 +157,7 @@ src/
 
   B3.Exchange.Core/                  ← RENAMED from B3.Exchange.Core
     HostRouter.cs
+    OrderRegistry.cs                 ← per-channel: OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId) (issue #167)
     ChannelDispatcher.cs             ← no longer holds IEntryPointResponseChannel
     InstrumentDefinitionPublisher.cs
     SnapshotRotator.cs
@@ -248,12 +251,15 @@ Properties of the contract:
 - **`SessionId` is the only routing key Core knows.** Core never holds a
   reference to a transport, socket, or `FixpSession` instance. It only
   produces events stamped with `SessionId`.
-- **Order ownership is Gateway-side.** When Core emits an
-  `ExecutionEvent`, the Gateway looks up the live `FixpSession` for that
-  `SessionId`, encodes the ER frame with that session's outbound seq, and
-  enqueues to its `TcpTransport`. If the session is `Suspended` (TCP gone
-  but session alive), the ER is still recorded in the retx buffer and
-  delivered on next `Establish`.
+- **Order ownership is Core-side, per channel** (issue #167). When Core
+  emits an `ExecutionEvent` it already knows the owning `SessionId`
+  (resolved on the dispatch thread from its per-channel `OrderRegistry`).
+  The event arrives at the Gateway with `(SessionId, ClOrdId)` already
+  stamped; the Gateway looks up the live `FixpSession` for that
+  `SessionId` via the `SessionRegistry`, encodes the ER frame with that
+  session's outbound seq, and enqueues to its `TcpTransport`. If the
+  session is `Suspended` (TCP gone but session alive), the ER is still
+  recorded in the retx buffer and delivered on next `Establish`.
 
 ### 3.3 What the boundary buys us
 
@@ -378,36 +384,55 @@ In-RAM map `FirmId → Firm` plus `(SessionId → SessionCredential)`. Loaded
 once from config at startup; immutable thereafter (for ephemeral). Future:
 hot-reload via admin endpoint.
 
-### 4.7 `OrderOwnershipMap` (per process)
-`OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId)`. Lives in the
-Gateway as a **single per-process** instance keyed by engine-assigned
-`OrderId`. Populated by `GatewayRouter` on every `ICoreOutbound.WriteExecutionReportNew`
-callback (i.e. as the engine accepts a new order); evicted on terminal
-events (`OnOrderCanceled`, full fill via `NotifyOrderTerminal`, and on
-session close via `EvictSession`).
+### 4.7 `OrderRegistry` (per channel — issue #167)
+`OrderId → (SessionId, ClOrdId, Firm, Side, SecurityId)`. Lives in
+**Core**, one instance per `ChannelDispatcher`. Populated by the
+dispatcher on `OnOrderAccepted` (single writer, dispatch thread);
+evicted on terminal events (`OnOrderCanceled`, full fill, mass cancel,
+session close via `EvictSession`). Also tracks per-order `CumQty`
+updated on every passive-side `OnTrade` so `ER_PassiveTrade` frames
+carry monotonically-cumulative values per the FIX/B3 wire contract
+(issue #319).
+
+**Inversion from the original design.** The first draft of this
+architecture placed a single per-process `OrderOwnershipMap` in the
+Gateway. Issue #167 moved it to a per-channel `OrderRegistry` in Core
+for two reasons:
+
+1. The dispatcher already needs the owning session on the dispatch
+   thread (to compute the explicit `OrderId` list for `MassCancel` and
+   to track `CumQty` for passive trades). Keeping the index out of
+   reach in the Gateway forced a round-trip and split the writer.
+2. Sharding by channel matches the single-writer invariant
+   ([ADR 0009](adr/0009-single-writer-threading-model.md)): each
+   registry has one writer (its dispatcher) and concurrent readers.
 
 Used by:
 
-- **`GatewayRouter`** to resolve the resting-side owner of passive trade
-  reports (`WriteExecutionReportPassiveTrade`) and resting cancels
-  (`WriteExecutionReportPassiveCancel`) — Core never sees `SessionId` for
-  those events.
-- **`HostRouter`** to pre-resolve `OrigClOrdID → OrderId` on inbound
-  `Cancel`/`Replace` and to compute the explicit `OrderId` list for
-  `MassCancel` (filtering by `(Session, Firm, Side?, SecurityId?)`) before
-  enqueueing into the Core dispatcher.
+- **`ChannelDispatcher`** (Core, dispatch thread) — single writer; reads
+  to stamp `SessionId` on every emitted `ExecutionEvent` before handing
+  it to `ICoreOutbound`.
+- **`HostRouter`** (Core, inbound recv threads) — reads to pre-resolve
+  `OrigClOrdID → OrderId` on inbound `Cancel`/`Replace` and to compute
+  the explicit `OrderId` list for `MassCancel` (filtering by
+  `(Session, Firm, Side?, SecurityId?)`) before enqueueing into the
+  Core dispatcher.
+- **`GatewayRouter`** (Gateway) — does **not** read this registry. It
+  receives pre-resolved `(SessionId, ClOrdId)` on every passive ER call
+  and looks the session up via `SessionRegistry` only.
 
 Threading: backed by `ConcurrentDictionary` for both forward
 (`OrderId → owner`) and reverse (`(Firm, ClOrdId) → OrderId`) indices.
-Writes happen on Core dispatch threads (one writer per `OrderId` because
-ID allocation is per-channel); reads happen on any FixpSession recv thread.
+Writes happen on the per-channel dispatch thread (one writer per
+`OrderId` because ID allocation is per-channel); reads happen on any
+inbound recv thread.
 
-Suspended-state ownership (open question 5): because the map is keyed by
-`SessionId` (the durable identity from the FIXP `Establish` claim) and not
-by the live `FixpSession` reference, entries survive a transport drop;
-when `SessionRegistry` re-binds a fresh `FixpSession` to that `SessionId`
-the existing resting orders' passive ER continue routing to the new
-transport.
+Suspended-state ownership (open question 5): because the entries are
+keyed by `SessionId` (the durable identity from the FIXP `Establish`
+claim) and not by the live `FixpSession` reference, entries survive a
+transport drop; when `SessionRegistry` re-binds a fresh `FixpSession`
+to that `SessionId` the existing resting orders' passive ER continue
+routing to the new transport.
 
 ---
 
@@ -599,8 +624,10 @@ testing of later phases.
   replace with `IGatewayInbound` from contracts.
 - Wire both via `B3.Exchange.Host` using in-process implementations of
   the interfaces.
-- Move `OrderOwnershipMap` from Core to Gateway; Core now stamps
-  `SessionId` on every event.
+- Keep order ownership in Core as a per-channel `OrderRegistry`
+  (issue #167 — inverts the original "ship to Gateway" step); Core
+  stamps `SessionId` on every event before handing it to
+  `ICoreOutbound`.
 
 No new spec compliance closed in this phase, but **all subsequent phases
 become cleanly localized** to the Gateway.
@@ -701,15 +728,16 @@ into a corner.
    Proposal: Core reset and Gateway reset are independent events
    triggered on the same wall-clock; drain happens at each loop's own
    pace. Confirm in Phase 4.
-5. **Should `OrderOwnershipMap` survive `Suspended` state?** **Resolved
-   (#66).** Yes — the Gateway map is keyed by the durable `SessionId`
-   (from the FIXP `Establish` claim), not by the live `FixpSession`
-   reference, so entries persist while a session is `Suspended` and
-   continue to route passive ER once a fresh transport re-binds the same
-   `SessionId` via `SessionRegistry`. Eviction on terminal events bounds
-   the map; explicit `EvictSession(SessionId)` runs only on transport
-   `OnSessionClosed`, releasing back-references without cancelling the
-   resting orders themselves.
+5. **Should the order-ownership index survive `Suspended` state?**
+   **Resolved (#66 + #167).** Yes — the per-channel `OrderRegistry`
+   (Core) is keyed by the durable `SessionId` (from the FIXP
+   `Establish` claim), not by the live `FixpSession` reference, so
+   entries persist while a session is `Suspended` and continue to
+   route passive ER once a fresh transport re-binds the same
+   `SessionId` via `SessionRegistry`. Eviction on terminal events
+   bounds the registry; explicit `EvictSession(SessionId)` runs only
+   on transport `OnSessionClosed`, releasing back-references without
+   cancelling the resting orders themselves.
 
 ---
 
