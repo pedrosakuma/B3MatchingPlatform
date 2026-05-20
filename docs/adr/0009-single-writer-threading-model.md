@@ -149,6 +149,60 @@ at PR time.
   pattern is opt-in per-field: do not generalize it to other state
   without an explicit ADR amendment.
 
+## Amendment 2026-05-20 — Scope beyond engine/dispatcher (issue #384)
+
+The original decision named two concrete owners — `MatchingEngine` and
+`ChannelDispatcher` — and the asserts originally lived as `private`
+methods on those two classes only. A 2026-05-20 architectural review
+flagged that **other** per-channel single-writer components silently
+drifted away from the rule: most notably
+`B3.Exchange.PostTrade.FileAuditLogWriter`, which took out an
+`_stateLock` because `Checkpoint()` is invoked from the
+`BackgroundSnapshotWriter` thread rather than the dispatch loop. The
+lock is correct given that call shape, but it leaks back-pressure into
+`OnTrade` and silently re-introduces locking onto the hot path the
+rest of the channel is engineered to avoid.
+
+Decision:
+
+1. **The single-writer invariant applies to every per-channel
+   component, not just engine + dispatcher.** Examples covered by the
+   amendment: `FileAuditLogWriter`, `BustDedupIndex`, the future
+   `IAmendmentsPublisher`, and any other type whose state is mutated
+   on behalf of one channel.
+
+2. **The hand-rolled asserts are extracted into a shared
+   `B3.Exchange.Matching.Threading.SingleWriterGuard` helper.**
+   `MatchingEngine` and `ChannelDispatcher` now hold a private guard
+   instance and delegate `BindToDispatchThread` /
+   `AssertOnOwnerThread` / `AssertOnLoopThread` to it; semantics are
+   unchanged (lazy-latch for direct-drive tests, eager-bind from the
+   production loop, `[Conditional("DEBUG")]` for hot-path cost).
+
+3. **Components whose current call shape requires a lock document the
+   exception and have a tracked migration.** `FileAuditLogWriter`'s
+   `_stateLock` stays for now (its removal requires marshaling
+   `Checkpoint()` through the dispatch inbox, a separate redesign);
+   it is tracked in follow-up issue #396. The contract for *new*
+   components is "guard, not lock" — adding a new per-channel
+   component that takes a lock requires an explicit ADR amendment
+   citing why the dispatch-thread handoff is impractical.
+
+4. **`SingleWriterGuard.RebindForReplay()` is the only sanctioned way
+   to clear the owner latch.** Snapshot-replay paths that rebuild
+   state on a thread different from the eventual dispatch loop must
+   call it; any other re-bind is a smell.
+
+Trade-off accepted: each owning component now holds one
+`SingleWriterGuard` reference (a single object allocation at
+construction; idle in Release). On the hot path the entire assert
+chain is `[Conditional("DEBUG")]` and elides to nothing in Release —
+the dispatcher/engine no longer perform the prior unconditional
+`_loopThread` / `_ownerThread` field writes either, since nothing
+outside Debug ever read them. Release IL is not byte-identical to the
+pre-refactor build (extra field + one object allocation per owner),
+but the per-call mutation cost is unchanged at zero.
+
 ## Alternatives considered
 
 - **Locks around engine/dispatcher state.** Rejected: the engine is on

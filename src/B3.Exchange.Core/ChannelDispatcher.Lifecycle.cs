@@ -28,8 +28,8 @@ public sealed partial class ChannelDispatcher
     // by the Debug assert and observable as 504 timeouts in E2E tests.
     private void RunLoop(CancellationToken ct)
     {
-        _loopThread = Thread.CurrentThread;
-        _engine.BindToDispatchThread(_loopThread);
+        _writerGuard.BindToCurrentThread();
+        _engine.BindToDispatchThread(Thread.CurrentThread);
         LoadPersistedStateOnLoopThread();
 
         var reader = _inbound.Reader;
@@ -94,19 +94,13 @@ public sealed partial class ChannelDispatcher
     /// in Release builds. Guards every mutation path — engine state, packet
     /// buffer, sequence counters, and the per-session order-id index — to
     /// catch any future producer-thread regression at test time (issue #138).
+    /// Issue #384: backed by the shared
+    /// <see cref="B3.Exchange.Matching.Threading.SingleWriterGuard"/>;
+    /// tests that drive <see cref="TestProbe.DrainInbound"/> directly
+    /// without calling <see cref="Start"/> lazy-latch on the first call.
     /// </summary>
     [System.Diagnostics.Conditional("DEBUG")]
-    private void AssertOnLoopThread()
-    {
-        var t = _loopThread;
-        // _loopThread is null only before Start() (e.g. unit tests calling
-        // ProcessOne directly on the test thread). Allow that case.
-        System.Diagnostics.Debug.Assert(
-            t == null || Thread.CurrentThread == t,
-            $"ChannelDispatcher mutation off the dispatch loop thread "
-            + $"(channel={ChannelNumber}, expected={t?.ManagedThreadId}, "
-            + $"actual={Thread.CurrentThread.ManagedThreadId})");
-    }
+    private void AssertOnLoopThread() => _writerGuard.AssertOwnedByCurrentThread();
 
     /// <summary>
     /// Test hook: simulate a wedged dispatcher by cancelling the loop
