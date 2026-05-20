@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -14,7 +15,7 @@ public class AdminSnapshotEndpointsTests
 {
     private static (HostConfig cfg, string dataDir) BuildConfig(string testName)
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var dataDir = Path.Combine(Path.GetTempPath(), "b3-admin-tests-" + testName + "-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataDir);
         var cfg = new HostConfig
@@ -47,17 +48,6 @@ public class AdminSnapshotEndpointsTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     [Fact]
     public async Task GetSnapshot_WhenNoneExists_Returns204()
@@ -72,7 +62,7 @@ public class AdminSnapshotEndpointsTests
             using var resp = await client.GetAsync("/admin/channels/91/snapshot");
             Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
     [Fact]
@@ -109,7 +99,7 @@ public class AdminSnapshotEndpointsTests
             var body = await validate.Content.ReadAsStringAsync();
             Assert.StartsWith("ok ", body);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
     [Fact]
@@ -125,7 +115,7 @@ public class AdminSnapshotEndpointsTests
             using var resp = await client.PostAsync("/admin/channels/91/snapshot/reset", content: null);
             Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
     [Fact]
@@ -158,7 +148,7 @@ public class AdminSnapshotEndpointsTests
                 Assert.Empty(Directory.GetFiles(dataDir, "channel-91.snapshot*"));
             }
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
     [Fact]
@@ -174,7 +164,7 @@ public class AdminSnapshotEndpointsTests
             using var resp = await client.PostAsync("/admin/channels/91/snapshot/validate", content: null);
             Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
     [Fact]
@@ -196,11 +186,7 @@ public class AdminSnapshotEndpointsTests
             using var reset = await client.PostAsync("/admin/channels/200/snapshot/reset?force=true", content: null);
             Assert.Equal(HttpStatusCode.NotFound, reset.StatusCode);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 
-    private static void TryDeleteDir(string dir)
-    {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch { }
-    }
 }

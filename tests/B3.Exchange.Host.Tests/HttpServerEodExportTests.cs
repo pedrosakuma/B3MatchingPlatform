@@ -4,6 +4,7 @@ using System.Text.Json;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using B3.Exchange.PostTrade;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -21,23 +22,7 @@ public class HttpServerEodExportTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
-    private static void TryDeleteDir(string dir)
-    {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
-        catch { /* best-effort */ }
-    }
 
     private const byte Channel = 82;
     private static readonly DateOnly TestDate = new(2026, 5, 18);
@@ -87,7 +72,7 @@ public class HttpServerEodExportTests
     [Fact]
     public async Task Post_EodExport_ProducesCsvAndDoneFilesAndReturnsJson()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -126,15 +111,15 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 
     [Fact]
     public async Task Post_EodExport_Returns404_WhenChannelHasNoEodDropConfigured()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         try
         {
@@ -153,14 +138,14 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
+            TempDirs.TryDelete(auditDir);
         }
     }
 
     [Fact]
     public async Task Post_EodExport_Returns404_WhenAuditLogForDateIsMissing()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -181,15 +166,15 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 
     [Fact]
     public async Task Post_EodExport_Returns400_OnMissingOrInvalidQueryParams()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -216,15 +201,15 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 
     [Fact]
     public async Task Post_EodExport_IsIdempotent_AcrossSequentialReruns()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -253,15 +238,15 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 
     [Fact]
     public async Task Post_EodExport_RejectsConcurrentSameChannelDateWith409()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(), "b3-eod-audit-" + Guid.NewGuid().ToString("N"));
         var dropDir = Path.Combine(Path.GetTempPath(), "b3-eod-drop-" + Guid.NewGuid().ToString("N"));
         try
@@ -304,8 +289,8 @@ public class HttpServerEodExportTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
-            TryDeleteDir(dropDir);
+            TempDirs.TryDelete(auditDir);
+            TempDirs.TryDelete(dropDir);
         }
     }
 }

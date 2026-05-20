@@ -1,4 +1,5 @@
 using B3.Exchange.Host;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -10,17 +11,6 @@ namespace B3.Exchange.Host.Tests;
 /// </summary>
 public class BundledConfigMultiGroupTests
 {
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     [Theory]
     [InlineData("config/exchange-simulator.json")]
@@ -28,7 +18,7 @@ public class BundledConfigMultiGroupTests
     [InlineData("config/exchange-simulator.soak.json")]
     public void BundledConfig_DeclaresBothEqtAndDrvChannels(string relPath)
     {
-        var cfg = HostConfigLoader.Load(ResolveRepoFile(relPath));
+        var cfg = HostConfigLoader.Load(TestPaths.ResolveRepoFile(relPath));
 
         var channelNumbers = cfg.Channels.Select(c => c.ChannelNumber).ToHashSet();
         Assert.Contains((byte)84, channelNumbers);

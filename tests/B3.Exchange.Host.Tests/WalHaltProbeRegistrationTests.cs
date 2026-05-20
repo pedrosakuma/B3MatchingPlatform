@@ -1,4 +1,5 @@
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -17,28 +18,10 @@ public class WalHaltProbeRegistrationTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
-
-    private static void TryDeleteDir(string dir)
-    {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
-        catch { /* best-effort cleanup */ }
-    }
-
     [Fact]
     public async Task StartAsync_WithWalHaltAndHttpEnabled_BootsCleanly()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var dataDir = Path.Combine(Path.GetTempPath(),
             "b3-walhalt-boot-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataDir);
@@ -83,6 +66,6 @@ public class WalHaltProbeRegistrationTests
             using var resp = await client.GetAsync("/health/ready");
             Assert.True(resp.IsSuccessStatusCode);
         }
-        finally { TryDeleteDir(dataDir); }
+        finally { TempDirs.TryDelete(dataDir); }
     }
 }

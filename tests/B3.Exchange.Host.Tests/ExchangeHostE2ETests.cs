@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -39,7 +40,7 @@ public class ExchangeHostE2ETests
 
     private static (HostConfig cfg, RecordingPacketSink sink) BuildConfig()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var cfg = new HostConfig
         {
             Auth = new AuthConfig { RequireFixpHandshake = false },
@@ -59,17 +60,6 @@ public class ExchangeHostE2ETests
         return (cfg, new RecordingPacketSink());
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
     [Fact]
     public async Task NewOrder_RoundTripsExecutionReportNew_ThenCrossingOrderProducesTrade()

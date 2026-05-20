@@ -1,5 +1,6 @@
 using B3.Exchange.Core;
 using B3.Exchange.PostTrade;
+using B3.Exchange.TestSupport;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -17,23 +18,7 @@ public class PostTradeAuditHostWiringTests
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
     }
 
-    private static string ResolveRepoFile(string relPath)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 8 && dir != null; i++)
-        {
-            var candidate = Path.Combine(dir, relPath);
-            if (File.Exists(candidate)) return candidate;
-            dir = Path.GetDirectoryName(dir);
-        }
-        throw new FileNotFoundException($"could not locate {relPath} from {AppContext.BaseDirectory}");
-    }
 
-    private static void TryDeleteDir(string dir)
-    {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
-        catch { /* best-effort */ }
-    }
 
     private static HostConfig BaseCfg(string instrumentsPath, PostTradeAuditConfig? audit, byte channel = 81)
         => new()
@@ -57,7 +42,7 @@ public class PostTradeAuditHostWiringTests
     [Fact]
     public async Task StartAsync_WithoutPostTradeAuditBlock_UsesNullSink()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var cfg = BaseCfg(instrumentsPath, audit: null);
 
         await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink());
@@ -69,7 +54,7 @@ public class PostTradeAuditHostWiringTests
     [Fact]
     public async Task StartAsync_WithDisabledAudit_DoesNotCreateAuditDir()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(),
             "b3-audit-disabled-" + Guid.NewGuid().ToString("N"));
         try
@@ -92,14 +77,14 @@ public class PostTradeAuditHostWiringTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
+            TempDirs.TryDelete(auditDir);
         }
     }
 
     [Fact]
     public async Task StartAsync_WithEnabledAudit_BootsCleanly()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(),
             "b3-audit-enabled-" + Guid.NewGuid().ToString("N"));
         try
@@ -123,14 +108,14 @@ public class PostTradeAuditHostWiringTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
+            TempDirs.TryDelete(auditDir);
         }
     }
 
     [Fact]
     public async Task StartAsync_WithEmptyDataDir_LogsWarningAndSkips()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var cfg = BaseCfg(instrumentsPath, new PostTradeAuditConfig
         {
             Enabled = true,
@@ -150,7 +135,7 @@ public class PostTradeAuditHostWiringTests
     [Fact]
     public async Task StartAsync_WithNegativeRetentionDays_Throws()
     {
-        var instrumentsPath = ResolveRepoFile("config/instruments-eqt.json");
+        var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
         var auditDir = Path.Combine(Path.GetTempPath(),
             "b3-audit-neg-" + Guid.NewGuid().ToString("N"));
         try
@@ -168,7 +153,7 @@ public class PostTradeAuditHostWiringTests
         }
         finally
         {
-            TryDeleteDir(auditDir);
+            TempDirs.TryDelete(auditDir);
         }
     }
 }
