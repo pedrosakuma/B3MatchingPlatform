@@ -75,7 +75,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEventSink, IAsyncDisposable
 {
-    public const int DefaultInboundCapacity = 4096;
+    internal const int DefaultInboundCapacity = 4096;
     private const int MaxPacketBytes = 1400;
 
     /// <summary>
