@@ -112,13 +112,13 @@ public sealed class MatchingEngine
     // HaltState lives at namespace scope — see HaltState.cs.
 
 
-    // Single-thread invariant (issue #169). Latched on first call to any
-    // mutation/read entry point (or eagerly via BindToDispatchThread) so
-    // future call-site regressions are caught at test time. Production
+    // Single-thread invariant (issue #169, #384). Latched on first call to
+    // any mutation/read entry point (or eagerly via BindToDispatchThread)
+    // so future call-site regressions are caught at test time. Production
     // callers (ChannelDispatcher) bind explicitly so even the very first
     // engine call is checked. Unit tests that exercise the engine on the
     // xUnit thread without binding are tolerated via lazy latching.
-    private Thread? _ownerThread;
+    private readonly Threading.SingleWriterGuard _writerGuard = new("MatchingEngine");
 
     public MatchingEngine(IEnumerable<Instrument> instruments, IMatchingEventSink sink,
         ILogger<MatchingEngine> logger,
@@ -1928,16 +1928,23 @@ public sealed class MatchingEngine
     /// off-thread engine call is caught on the very first invocation in
     /// DEBUG builds. Subsequent calls with the same thread are no-ops;
     /// calls from a different thread fail the assert.
-    /// Issue #169 (single-thread invariant audit).
+    /// Issue #169 / #384 (single-thread invariant audit).
     /// </summary>
     public void BindToDispatchThread(Thread thread)
     {
         ArgumentNullException.ThrowIfNull(thread);
-        var prior = Interlocked.CompareExchange(ref _ownerThread, thread, null);
+        // SingleWriterGuard.BindToCurrentThread always binds to the
+        // calling thread; the public API takes an explicit Thread for
+        // back-compat. Production callers always pass Thread.CurrentThread
+        // from within the dispatch loop, so the two are identical; the
+        // assert below catches any (unlikely) future caller that tries
+        // to bind a different thread.
         System.Diagnostics.Debug.Assert(
-            prior == null || prior == thread,
-            $"MatchingEngine already bound to a different thread "
-            + $"(existing={prior?.ManagedThreadId}, new={thread.ManagedThreadId})");
+            thread == Thread.CurrentThread,
+            $"BindToDispatchThread must be called from the thread being bound "
+            + $"(arg={thread.ManagedThreadId}, "
+            + $"actual={Thread.CurrentThread.ManagedThreadId})");
+        _writerGuard.BindToCurrentThread();
     }
 
     /// <summary>
@@ -1945,17 +1952,8 @@ public sealed class MatchingEngine
     /// thread on first call if no explicit binding was made (so unit
     /// tests that drive the engine directly remain consistent across
     /// their lifetime). Compiled out in Release.
-    /// Issue #169 (single-thread invariant).
+    /// Issue #169 / #384 (single-thread invariant).
     /// </summary>
     [System.Diagnostics.Conditional("DEBUG")]
-    private void AssertOnOwnerThread()
-    {
-        var current = Thread.CurrentThread;
-        var owner = Interlocked.CompareExchange(ref _ownerThread, current, null);
-        System.Diagnostics.Debug.Assert(
-            owner == null || owner == current,
-            $"MatchingEngine entered off the owner thread "
-            + $"(owner={owner?.ManagedThreadId}, "
-            + $"actual={current.ManagedThreadId})");
-    }
+    private void AssertOnOwnerThread() => _writerGuard.AssertOwnedByCurrentThread();
 }
