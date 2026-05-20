@@ -20,15 +20,11 @@ namespace B3.Exchange.Contracts;
 /// MUST NOT block on I/O — outbound encoding plus enqueueing onto the
 /// per-session send loop is expected to be O(1).
 ///
-/// <para>This interface intentionally still uses <c>B3.Exchange.Matching</c>
-/// engine event types as its payload: translating engine events into the
-/// neutral <see cref="ExecutionEvent"/> family in <c>B3.Exchange.Contracts</c>
-/// is deferred to a follow-up PR, because the Contracts records currently
-/// lack the fields (<c>Side</c>, <c>SecurityId</c>, <c>RptSeq</c>,
-/// <c>InsertTimestampNanos</c>, …) needed to reconstruct the
-/// <c>ExecutionReport</c> wire form. Removing the transport reference from
-/// Core (the acceptance criterion for #66) is the higher-priority half of
-/// the migration.</para>
+/// <para>This interface intentionally takes <c>B3.Exchange.Matching</c>
+/// engine event types as its payload. ADR 0011 (issue #379) adopts
+/// Matching's events as the canonical Core→Gateway boundary model and
+/// retires the never-implemented neutral <c>ExecutionEvent</c> family
+/// that previously lived in this assembly.</para>
 /// </summary>
 public interface ICoreOutbound
 {
