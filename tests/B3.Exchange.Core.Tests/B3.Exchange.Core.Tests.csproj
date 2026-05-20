@@ -17,6 +17,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.Gateway\B3.Exchange.Gateway.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Core\B3.Exchange.Core.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
+    <ProjectReference Include="..\B3.Exchange.TestSupport\B3.Exchange.TestSupport.csproj" />
   </ItemGroup>
 
   <ItemGroup>

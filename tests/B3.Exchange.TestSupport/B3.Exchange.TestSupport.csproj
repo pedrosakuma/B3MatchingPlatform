@@ -1,12 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <RootNamespace>B3.Exchange.TestSupport</RootNamespace>
+    <AssemblyName>B3.Exchange.TestSupport</AssemblyName>
     <IsPackable>false</IsPackable>
     <IsTestProject>false</IsTestProject>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\B3.Exchange.Contracts\B3.Exchange.Contracts.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,5 @@
 using B3.Exchange.Contracts;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -31,11 +32,11 @@ public sealed class HostRouter : IInboundCommandSink
     private readonly IReadOnlyList<ChannelDispatcher> _allDispatchers;
     private readonly ICoreOutbound _outbound;
     private readonly ILogger<HostRouter> _logger;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
 
     public HostRouter(IReadOnlyDictionary<long, ChannelDispatcher> routing, ICoreOutbound outbound,
         ILogger<HostRouter> logger,
-        Func<ulong>? nowNanos = null)
+        INanosTimeSource? timeSource = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(outbound);
@@ -44,7 +45,7 @@ public sealed class HostRouter : IInboundCommandSink
         _allDispatchers = routing.Values.Distinct().ToArray();
         _outbound = outbound;
         _logger = logger;
-        _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
     }
 
     public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue)
@@ -205,7 +206,7 @@ public sealed class HostRouter : IInboundCommandSink
         _outbound.WriteExecutionReportReject(session,
             new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _nowNanos()),
+                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _timeSource.NowNanos()),
             clOrdIdValue);
     }
 
@@ -216,7 +217,7 @@ public sealed class HostRouter : IInboundCommandSink
         _outbound.WriteExecutionReportReject(session,
             new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownOrderId, TransactTimeNanos: _nowNanos()),
+                Reason: RejectReason.UnknownOrderId, TransactTimeNanos: _timeSource.NowNanos()),
             clOrdIdValue);
     }
 }

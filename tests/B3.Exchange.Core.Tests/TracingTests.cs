@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using B3.Exchange.Contracts;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -60,7 +61,7 @@ public class TracingTests
             PacketSink = new RecordingPacketSink(),
             Outbound = new NoopOutbound(),
             Logger = NullLogger<ChannelDispatcher>.Instance,
-            NowNanos = () => 1_000_000_000UL,
+            TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
             TradeDate = 19_000,
         });
 

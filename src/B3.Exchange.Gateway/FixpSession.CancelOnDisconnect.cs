@@ -164,7 +164,7 @@ public sealed partial class FixpSession
         var cmd = new MassCancelCommand(
             SecurityId: 0,
             SideFilter: null,
-            EnteredAtNanos: _nowNanos());
+            EnteredAtNanos: _timeSource.NowNanos());
         _logger.LogInformation(
             "fixp session {ConnectionId} cancel-on-disconnect firing (mode={Mode} windowMs={WindowMs})",
             ConnectionId, CancelOnDisconnectType, CodTimeoutWindowMs);

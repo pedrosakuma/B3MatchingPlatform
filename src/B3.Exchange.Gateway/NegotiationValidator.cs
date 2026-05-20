@@ -1,4 +1,5 @@
 using B3.EntryPoint.Wire;
+using B3.Exchange.Contracts.Time;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.Gateway;
@@ -74,20 +75,20 @@ public sealed class NegotiationValidator
     private readonly FirmRegistry _firms;
     private readonly SessionClaimRegistry _claims;
     private readonly bool _devMode;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     /// <summary>Maximum tolerated absolute clock skew (nanoseconds)
     /// between server and Negotiate <c>timestamp</c>. Zero disables the
     /// check (used by tests). Default 5 minutes.</summary>
     public ulong TimestampSkewToleranceNs { get; }
 
     public NegotiationValidator(FirmRegistry firms, SessionClaimRegistry claims,
-        bool devMode, Func<ulong>? nowNanos = null,
+        bool devMode, INanosTimeSource? timeSource = null,
         ulong timestampSkewToleranceNs = 5UL * 60UL * 1_000_000_000UL)
     {
         _firms = firms ?? throw new ArgumentNullException(nameof(firms));
         _claims = claims ?? throw new ArgumentNullException(nameof(claims));
         _devMode = devMode;
-        _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
         TimestampSkewToleranceNs = timestampSkewToleranceNs;
     }
 
@@ -115,7 +116,7 @@ public sealed class NegotiationValidator
 
         if (TimestampSkewToleranceNs > 0 && req.TimestampNanos != 0)
         {
-            var now = _nowNanos();
+            var now = _timeSource.NowNanos();
             var diff = req.TimestampNanos > now ? req.TimestampNanos - now : now - req.TimestampNanos;
             if (diff > TimestampSkewToleranceNs)
                 return NegotiationOutcome.Reject(

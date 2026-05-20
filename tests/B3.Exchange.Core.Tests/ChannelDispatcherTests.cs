@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using B3.Exchange.Gateway;
 using B3.Exchange.Instruments;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 using B3.Exchange.Matching;
 using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -96,7 +97,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
             });
         return (disp, pkt, outbound);
@@ -494,7 +495,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
                 InboundCapacity = 1,
                 Metrics = metrics,
@@ -530,7 +531,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
                 Metrics = metrics,
             });
@@ -586,7 +587,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
                 Metrics = metrics,
             });

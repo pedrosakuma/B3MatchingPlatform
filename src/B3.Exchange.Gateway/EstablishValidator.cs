@@ -1,4 +1,5 @@
 using B3.EntryPoint.Wire;
+using B3.Exchange.Contracts.Time;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.Gateway;
@@ -52,7 +53,7 @@ public readonly struct EstablishOutcome
 /// </summary>
 public sealed class EstablishValidator
 {
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     /// <summary>Maximum tolerated absolute clock skew (nanoseconds)
     /// between server and Establish <c>timestamp</c>. Zero disables the
     /// check (used by tests). Default 5 minutes.</summary>
@@ -66,10 +67,10 @@ public sealed class EstablishValidator
     /// <summary>Inclusive upper bound for <c>keepAliveInterval</c> (ms).</summary>
     public const ulong MaxKeepAliveIntervalMs = 60_000;
 
-    public EstablishValidator(Func<ulong>? nowNanos = null,
+    public EstablishValidator(INanosTimeSource? timeSource = null,
         ulong timestampSkewToleranceNs = 5UL * 60UL * 1_000_000_000UL)
     {
-        _nowNanos = nowNanos ?? (() => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
         TimestampSkewToleranceNs = timestampSkewToleranceNs;
     }
 
@@ -110,7 +111,7 @@ public sealed class EstablishValidator
 
         if (TimestampSkewToleranceNs > 0 && req.TimestampNanos != 0)
         {
-            var now = _nowNanos();
+            var now = _timeSource.NowNanos();
             var diff = req.TimestampNanos > now ? req.TimestampNanos - now : now - req.TimestampNanos;
             if (diff > TimestampSkewToleranceNs)
                 return EstablishOutcome.Reject(

@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Matching;
 using B3.Umdf.WireEncoder;
 
@@ -40,7 +41,7 @@ public sealed class SnapshotRotator
     private readonly byte _channelNumber;
     private readonly ISnapshotBookSource _source;
     private readonly IUmdfPacketSink _sink;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     private readonly int _maxEntriesPerChunk;
     private readonly byte[] _packetBuf;
 
@@ -55,7 +56,7 @@ public sealed class SnapshotRotator
         byte channelNumber,
         ISnapshotBookSource source,
         IUmdfPacketSink sink,
-        Func<ulong>? nowNanos = null,
+        INanosTimeSource? timeSource = null,
         int maxEntriesPerChunk = SnapshotPacketBuilder.MaxEntriesPerChunk,
         int packetBufferSize = SnapshotPacketBuilder.DefaultPacketBufferSize)
     {
@@ -68,13 +69,10 @@ public sealed class SnapshotRotator
         _channelNumber = channelNumber;
         _source = source;
         _sink = sink;
-        _nowNanos = nowNanos ?? DefaultNowNanos;
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
         _maxEntriesPerChunk = maxEntriesPerChunk;
         _packetBuf = new byte[packetBufferSize];
     }
-
-    private static ulong DefaultNowNanos()
-        => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
 
     /// <summary>
     /// Bumps both the snapshot <see cref="SequenceVersion"/> and resets the
@@ -137,7 +135,7 @@ public sealed class SnapshotRotator
 
         ushort version = SequenceVersion;
         uint firstSeq = SequenceNumber + 1;
-        ulong nowNanos = _nowNanos();
+        ulong nowNanos = _timeSource.NowNanos();
         byte channel = _channelNumber;
         var sink = _sink;
 

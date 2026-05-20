@@ -21,6 +21,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.PostTrade\B3.Exchange.PostTrade.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.SyntheticTrader\B3.Exchange.SyntheticTrader.csproj" />
+    <ProjectReference Include="..\B3.Exchange.TestSupport\B3.Exchange.TestSupport.csproj" />
   </ItemGroup>
 
   <ItemGroup>
