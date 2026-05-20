@@ -60,6 +60,60 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  build-test-debug:
+    name: Build & Test (Debug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Debug builds enforce single-thread invariants (MatchingEngine /
+    # ChannelDispatcher) via Debug.Assert, which compiles out in
+    # Release. Two latent bugs (#374 dispatcher async-loop continuation
+    # hop; #375 test-thread hop) were silently green in Release CI
+    # for months. This lane catches that whole family on every PR.
+    # Kept as a SEPARATE job (not a matrix) so the existing required
+    # check "Build & Test" name remains stable for branch protection /
+    # auto-merge until this lane is promoted to required.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK (pinned by global.json)
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.slnx', 'Directory.Build.props', 'Directory.Packages.props', 'global.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore SbeB3Exchange.slnx
+
+      - name: Build (Debug, warnings-as-errors)
+        run: dotnet build SbeB3Exchange.slnx --no-restore -c Debug
+
+      - name: Test (Debug)
+        run: >
+          dotnet test SbeB3Exchange.slnx
+          --no-build -c Debug
+          --logger "trx;LogFileName=test-results-debug.trx"
+          --logger "console;verbosity=normal"
+          --blame-hang-timeout 60000
+          --results-directory ./TestResults
+
+      - name: Upload test results (Debug)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-debug
+          path: TestResults/**/*
+          if-no-files-found: ignore
+          retention-days: 14
+
   format:
     name: Format check
     runs-on: ubuntu-latest
