@@ -83,10 +83,13 @@ public class ChannelDispatcherDurabilityHandleTests
         var disp = new ChannelDispatcher(
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            wal: wal);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Wal = wal,
+            });
         var probe = disp.CreateTestProbe();
 
         Assert.True(disp.EnqueueNewOrder(
@@ -109,10 +112,13 @@ public class ChannelDispatcherDurabilityHandleTests
         var disp = new ChannelDispatcher(
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            wal: null);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Wal = null,
+            });
         var probe = disp.CreateTestProbe();
 
         Assert.True(disp.EnqueueNewOrder(

@@ -263,8 +263,14 @@ public class ChannelDispatcherSnapshotTests
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
-            packetSink: incSink, outbound: new ChannelDispatcherTests_RecordingOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = incSink,
+                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1UL,
+                TradeDate = 1,
+            });
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);
@@ -288,8 +294,14 @@ public class ChannelDispatcherSnapshotTests
         MatchingEngine? engine = null;
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
-            packetSink: incSink, outbound: new ChannelDispatcherTests_RecordingOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance, nowNanos: () => 1UL, tradeDate: 1);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = incSink,
+                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1UL,
+                TradeDate = 1,
+            });
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
             sink: snapSink, nowNanos: () => 1UL);

@@ -309,25 +309,28 @@ public sealed class ExchangeHost : IAsyncDisposable
                     capturedEngine = e;
                     return e;
                 },
-                packetSink: sink,
-                outbound: gatewayRouter,
-                logger: _loggerFactory.CreateLogger<ChannelDispatcher>(),
-                metrics: channelMetrics,
-                sessionFirmCounters: _metrics.SessionFirmMessages,
-                retxBuffer: retxBuffer,
-                persister: persister,
-                snapshotThrottle: ch.Persistence?.Throttle?.ToPolicy(),
-                useAsyncSnapshotWriter: ch.Persistence?.AsyncWriter ?? false,
-                wal: wal,
-                walAppendFailurePolicy: ch.Persistence?.Wal?.ResolveOnAppendFailure() ?? B3.Exchange.Core.WalAppendFailurePolicy.Continue,
-                sessionExists: sessionExists,
-                orphanPolicy: orphanPolicy,
-                seedSecurityIds: instruments.Select(i => i.SecurityId).ToArray(),
-                postTradeSink: auditWriter,
-                auditRootDir: auditRootDir,
-                bustDedup: bustDedup,
-                dropRootDir: dropRootDir,
-                amendmentsPublisher: amendmentsPublisher);
+                options: new ChannelDispatcherOptions
+                {
+                    PacketSink = sink,
+                    Outbound = gatewayRouter,
+                    Logger = _loggerFactory.CreateLogger<ChannelDispatcher>(),
+                    Metrics = channelMetrics,
+                    SessionFirmCounters = _metrics.SessionFirmMessages,
+                    RetxBuffer = retxBuffer,
+                    Persister = persister,
+                    SnapshotThrottle = ch.Persistence?.Throttle?.ToPolicy(),
+                    UseAsyncSnapshotWriter = ch.Persistence?.AsyncWriter ?? false,
+                    Wal = wal,
+                    WalAppendFailurePolicy = ch.Persistence?.Wal?.ResolveOnAppendFailure() ?? B3.Exchange.Core.WalAppendFailurePolicy.Continue,
+                    SessionExists = sessionExists,
+                    OrphanPolicy = orphanPolicy,
+                    SeedSecurityIds = instruments.Select(i => i.SecurityId).ToArray(),
+                    PostTradeSink = auditWriter,
+                    AuditRootDir = auditRootDir,
+                    BustDedup = bustDedup,
+                    DropRootDir = dropRootDir,
+                    AmendmentsPublisher = amendmentsPublisher,
+                });
             disp.Start();
             _dispatchers.Add(disp);
             foreach (var inst in instruments)

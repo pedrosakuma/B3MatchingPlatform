@@ -114,13 +114,16 @@ public class WalAsyncSnapshotTruncateRaceTests
         var disp = new ChannelDispatcher(
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: new NoOpOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            persister: blocking,
-            snapshotThrottle: null,
-            useAsyncSnapshotWriter: true,
-            wal: wal);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Persister = blocking,
+                SnapshotThrottle = null,
+                UseAsyncSnapshotWriter = true,
+                Wal = wal,
+            });
         var probe = disp.CreateTestProbe();
         var session = new SessionId("80801");
 

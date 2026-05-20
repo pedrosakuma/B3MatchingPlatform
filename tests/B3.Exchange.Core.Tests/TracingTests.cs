@@ -55,10 +55,14 @@ public class TracingTests
     private static ChannelDispatcher NewDispatcher() => new(
         channelNumber: 1,
         engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-        packetSink: new RecordingPacketSink(),
-        outbound: new NoopOutbound(),
-        logger: NullLogger<ChannelDispatcher>.Instance,
-        nowNanos: () => 1_000_000_000UL, tradeDate: 19_000);
+        options: new ChannelDispatcherOptions
+        {
+            PacketSink = new RecordingPacketSink(),
+            Outbound = new NoopOutbound(),
+            Logger = NullLogger<ChannelDispatcher>.Instance,
+            NowNanos = () => 1_000_000_000UL,
+            TradeDate = 19_000,
+        });
 
     private static ActivityListener Subscribe(List<Activity> sink) => new()
     {
