@@ -172,4 +172,58 @@ public sealed class AmendmentsPublisherTests : IDisposable
         var doneJson = File.ReadAllText(Path.Combine(dropDir, "amendments.csv.done"));
         Assert.Contains("\"sha256\":\"" + expected + "\"", doneJson);
     }
+
+    [Fact]
+    public void Publish_PreEodBust_WithFoldedFill_SkipsSilently()
+    {
+        // Pre-EOD bust: target tradeId 1 is folded out by EodFillsExporter
+        // (only fill 2 ends up in fills.csv). The bust audit record lands
+        // in the SAME-day file (filename == declaredTradeDate), which is
+        // the on-disk signal that distinguishes pre-EOD from post-EOD.
+        // Expectation: amendments.csv contains only the header (0 rows)
+        // and Publish succeeds — the pre-EOD bust is silent noise to the
+        // consumer (they never saw the original fill).
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            w.OnTrade(Fill(1, TradeDateNanos + 1_000UL));
+            w.OnTrade(Fill(2, TradeDateNanos + 2_000UL));
+            w.OnBust(Bust(1, TradeDateNanos + 3_000UL, correlationId: 42UL, declaredTradeDateDays: TradeDateDays), TradeDate);
+        }
+        new EodFillsExporter().Export(_auditRoot, _dropRoot, Channel, TradeDate, _ => "PETR4", GeneratedAt);
+
+        var publisher = new AmendmentsPublisher();
+        publisher.Publish(_auditRoot, _dropRoot, Channel, TradeDate, GeneratedAt);
+
+        var dropDir = Path.Combine(_dropRoot, Channel.ToString(CultureInfo.InvariantCulture),
+            TradeDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        var lines = File.ReadAllLines(Path.Combine(dropDir, "amendments.csv"));
+        Assert.Single(lines); // header only
+        Assert.True(File.Exists(Path.Combine(dropDir, "amendments.csv.done")));
+    }
+
+    [Fact]
+    public void Publish_PostEodBust_WithMissingFillsRow_FailsLoud()
+    {
+        // Pathological: post-EOD bust whose cancelled tradeId is NOT in
+        // the published fills.csv (corrupt audit log, fills.csv lost or
+        // regenerated from a stale source, etc.). The publisher MUST
+        // refuse to write the .done sentinel so the operator notices
+        // before consumers reconcile against a silently-incomplete
+        // amendments.csv. See AmendmentsPublisher §2.
+        PublishFillsCsv(new[] { Fill(1, TradeDateNanos + 1_000UL) });
+        using (var w = new FileAuditLogWriter(_auditRoot, channelNumber: Channel))
+        {
+            // tradeId 99 was never traded → not in fills.csv.
+            w.OnBust(Bust(99, BustTodayNanos + 1_000UL, correlationId: 7UL, declaredTradeDateDays: TradeDateDays), BustToday);
+        }
+        var publisher = new AmendmentsPublisher();
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => publisher.Publish(_auditRoot, _dropRoot, Channel, TradeDate, GeneratedAt));
+        Assert.Contains("cancelTradeId=99", ex.Message);
+
+        // No .done sentinel left behind on failure.
+        var dropDir = Path.Combine(_dropRoot, Channel.ToString(CultureInfo.InvariantCulture),
+            TradeDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        Assert.False(File.Exists(Path.Combine(dropDir, "amendments.csv.done")));
+    }
 }

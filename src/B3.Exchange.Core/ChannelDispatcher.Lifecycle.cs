@@ -6,71 +6,53 @@ namespace B3.Exchange.Core;
 
 /// <summary>
 /// Lifecycle facet of <see cref="ChannelDispatcher"/> (issue #168 split):
-/// thread bootstrap (<see cref="Start"/> / <see cref="RunLoopAsync"/>),
-/// heartbeat, single-thread invariant assert, shutdown / disposal,
-/// and the <see cref="TestProbe"/> seam.
+/// thread bootstrap (<see cref="Start"/> / <c>RunLoop</c>), heartbeat,
+/// single-thread invariant assert, shutdown / disposal, and the
+/// <see cref="TestProbe"/> seam.
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
     public void Start()
     {
         _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
-        _loopTask = Task.Factory.StartNew(() => RunLoopAsync(_cts.Token),
-            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _loopTask = Task.Factory.StartNew(() => RunLoop(_cts.Token),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
-    private async Task RunLoopAsync(CancellationToken ct)
+    // Issue #138 / PR-5: dispatch loop runs synchronously on the LongRunning
+    // thread so the single-writer invariant (engine state, packet buffer,
+    // sequence counters, audit writer, dedup index) holds. A previous async
+    // implementation used `await reader.WaitToReadAsync(ct).AsTask().WaitAsync(...)`
+    // which let the continuation hop to a thread-pool thread after each idle
+    // wait — silent in Release (AssertOnLoopThread compiles out) but caught
+    // by the Debug assert and observable as 504 timeouts in E2E tests.
+    private void RunLoop(CancellationToken ct)
     {
-        // Capture the dispatch-loop thread identity on entry so
-        // AssertOnLoopThread() in mutation paths can enforce the
-        // single-writer invariant in DEBUG builds (issue #138).
         _loopThread = Thread.CurrentThread;
-        // Issue #169: bind the matching engine eagerly so any off-thread
-        // engine call is caught on the very first invocation, not just
-        // after the first in-thread call has latched the owner.
         _engine.BindToDispatchThread(_loopThread);
-
-        // Issue #260: rehydrate from disk (if a persister is wired) on the
-        // loop thread so the engine's owner-thread invariant is satisfied
-        // and CaptureState/RestoreState see the same Thread identity as
-        // every subsequent ProcessOne.
         LoadPersistedStateOnLoopThread();
 
-        // Heartbeat is recorded on every loop wakeup (whether triggered by
-        // new work or by the periodic timeout) so a stuck/dead dispatch
-        // thread is detected by /health/live within HeartbeatInterval +
-        // probe threshold.
+        var reader = _inbound.Reader;
+        var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
         try
         {
-            var reader = _inbound.Reader;
             while (!ct.IsCancellationRequested)
             {
                 RecordHeartbeat();
-                Task<bool> waitTask = reader.WaitToReadAsync(ct).AsTask();
-                bool more;
-                try
-                {
-                    more = await waitTask.WaitAsync(HeartbeatInterval, ct)
-                        .ConfigureAwait(false);
-                }
-                catch (TimeoutException)
-                {
-                    // Timeout: loop and re-record the heartbeat on next iteration.
-                    continue;
-                }
+                var waitTask = reader.WaitToReadAsync(ct).AsTask();
+                bool signaled;
+                try { signaled = waitTask.Wait(heartbeatMs, ct); }
                 catch (OperationCanceledException) { return; }
+                catch (AggregateException ae) when (ae.InnerException is OperationCanceledException) { return; }
+                if (!signaled) continue; // heartbeat timeout — re-record and loop
 
+                bool more;
+                try { more = waitTask.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { return; }
                 if (!more) return; // channel completed
+
                 while (reader.TryRead(out var item))
                 {
-                    // Issue #170: contain unhandled exceptions per work-item
-                    // so a single bad command (engine bug, sink throw, etc.)
-                    // cannot kill the dispatch loop and silence the entire
-                    // channel. We log with full context and bump
-                    // exch_dispatcher_crash_total; the loop continues so
-                    // healthy commands still get serviced. Cancellation
-                    // bypasses containment because it is the cooperative
-                    // shutdown path — let it bubble to the outer handler.
                     try
                     {
                         ProcessOne(item);
@@ -94,10 +76,6 @@ public sealed partial class ChannelDispatcher
         }
         finally
         {
-            // Issue #267: ensure any throttle-deferred state is durable
-            // before the loop thread exits. Operator commands always
-            // force-persist, so this only matters when regular order
-            // commands have been deferred.
             try { FlushPendingSnapshotOnShutdown(); }
             catch (Exception ex)
             {
