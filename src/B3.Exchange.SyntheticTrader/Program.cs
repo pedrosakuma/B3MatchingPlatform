@@ -75,7 +75,7 @@ runner.Start();
 
 Info($"synthetic trader running; seed={seed}; instruments={cfg.Instruments.Count}; Ctrl+C to stop");
 try { await Task.Delay(Timeout.Infinite, shutdown.Token).ConfigureAwait(false); }
-catch (OperationCanceledException) { }
+catch (OperationCanceledException) { /* expected: Ctrl+C / SIGTERM cancelled the indefinite wait */ }
 
 Info($"shutting down (ticks={runner.TicksRun} sent={runner.OrdersSent} trades={runner.TradesObserved})");
 await client.DisposeAsync().ConfigureAwait(false);

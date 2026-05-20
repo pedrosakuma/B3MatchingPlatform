@@ -1091,7 +1091,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             if (drainDeadline.ElapsedMilliseconds >= graceMs) break;
             if (ct.IsCancellationRequested) break;
             try { await Task.Delay(pollMs, ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException) { break; /* expected: drain cancelled by hard shutdown */ }
         }
         sw.Stop();
         if (residual == 0)

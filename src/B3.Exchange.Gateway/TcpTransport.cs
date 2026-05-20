@@ -181,7 +181,7 @@ public sealed class TcpTransport : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* expected: send loop cancelled during transport close */ }
         finally
         {
             Close("send-loop-exit");

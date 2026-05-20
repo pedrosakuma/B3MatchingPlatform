@@ -42,13 +42,13 @@ public sealed partial class ChannelDispatcher
                 var waitTask = reader.WaitToReadAsync(ct).AsTask();
                 bool signaled;
                 try { signaled = waitTask.Wait(heartbeatMs, ct); }
-                catch (OperationCanceledException) { return; }
-                catch (AggregateException ae) when (ae.InnerException is OperationCanceledException) { return; }
+                catch (OperationCanceledException) { return; /* expected: dispatch loop cancelled during shutdown */ }
+                catch (AggregateException ae) when (ae.InnerException is OperationCanceledException) { return; /* same: wrapped in Task.Wait */ }
                 if (!signaled) continue; // heartbeat timeout — re-record and loop
 
                 bool more;
                 try { more = waitTask.GetAwaiter().GetResult(); }
-                catch (OperationCanceledException) { return; }
+                catch (OperationCanceledException) { return; /* expected: dispatch loop cancelled during shutdown */ }
                 if (!more) return; // channel completed
 
                 while (reader.TryRead(out var item))
@@ -69,7 +69,7 @@ public sealed partial class ChannelDispatcher
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* expected: dispatch loop cancelled during shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);

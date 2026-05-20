@@ -59,8 +59,8 @@ public sealed partial class FixpSession
                 }
             }
         }
-        catch (OperationCanceledException) { }
-        catch (EndOfStreamException) { }
+        catch (OperationCanceledException) { /* expected: inbound loop cancelled during session close */ }
+        catch (EndOfStreamException) { /* expected: peer closed transport; OnTransportClosed handles in finally */ }
         catch (IOException ex)
         {
             _logger.LogWarning(ex, "fixp session {ConnectionId} receive IO error", ConnectionId);
