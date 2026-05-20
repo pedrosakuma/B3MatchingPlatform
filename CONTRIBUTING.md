@@ -4,9 +4,15 @@ Short, opinionated guide for humans and agents touching this codebase.
 
 ## Pre-PR checklist
 
-These commands mirror the required CI checks (`Build & Test`,
-`Build & Test (Debug)`, `Format check`). Run them locally before
-opening a PR — they are fast and they are exactly what CI runs:
+Run these locally before opening a PR. The Release `dotnet build` /
+`dotnet test` and `dotnet format` invocations match the required CI
+checks (`Build & Test` and `Format check`). The Debug build/test
+mirror the new `Build & Test (Debug)` lane — that job exists in CI
+but is not yet a *required* check (see the comment in
+`.github/workflows/ci.yml`); run it locally anyway so a Debug-only
+regression doesn't surface as a red lane on your PR. CI itself adds
+loggers, coverage, and `--blame-hang-timeout` on top of these — those
+flags don't change pass/fail, only artifact shape.
 
 ```bash
 dotnet restore SbeB3Exchange.slnx

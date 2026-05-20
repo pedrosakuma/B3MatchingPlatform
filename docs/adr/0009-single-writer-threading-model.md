@@ -122,9 +122,9 @@ at PR time.
 
 ## Consequences
 
-- The hot path stays lock-free: no `Monitor`, no `Interlocked`, no
-  `Volatile` on per-channel state. Throughput stays at the Release-mode
-  numbers RFC 0001 §3 budgets for.
+- The hot path stays lock-free: no `Monitor` and no `Interlocked` on
+  per-channel state on the write side. Throughput stays at the
+  Release-mode numbers RFC 0001 §3 budgets for.
 - Adding a new mutation entry point on the engine or dispatcher is a
   three-line cost: place `AssertOnOwnerThread()` / `AssertOnLoopThread()`
   as the first statement of the method. No new locking, no rework of
@@ -138,13 +138,16 @@ at PR time.
   scope** for this ADR — those use their own locks or
   `Interlocked`/`Volatile` and are reviewed case by case. This ADR
   governs the per-channel hot path only.
-- Inbound metrics read on the HTTP server thread are a known
-  exception: `SequenceNumber` / `SequenceVersion` are read without
-  synchronization. That gap is tracked as a separate concern (the
-  values are monotonic and the worst case is a stale-but-not-torn
-  read on x64; ARM/AOT would need `Volatile.Read`). It does not
-  invalidate the single-writer model — it acknowledges a known
-  read-only window outside it.
+- One controlled exception lives inside the per-channel surface: the
+  HTTP-thread reads of `ChannelDispatcher.SequenceNumber` and
+  `SequenceVersion` (used by `HttpServer.RenderProm` and similar
+  scrapes). The loop thread is still the only writer, but external
+  readers are allowed; the writes use `Volatile.Write` and the public
+  getters use `Volatile.Read` against the backing fields so weak
+  memory models (ARM64, AOT) cannot hoist or tear. See
+  `ChannelDispatcher.cs:91-105` and the class-level XML doc. The
+  pattern is opt-in per-field: do not generalize it to other state
+  without an explicit ADR amendment.
 
 ## Alternatives considered
 
@@ -166,10 +169,6 @@ at PR time.
 
 ## Open questions
 
-- The HTTP-thread read of `SequenceNumber` / `SequenceVersion`: should
-  we add `Volatile.Read` there or fold both counters into a single
-  `long` snapshot read on the loop thread? Currently neither — track
-  separately if ARM/AOT becomes a target.
 - Persistence replay currently runs on the loop thread inside
   `LoadPersistedStateOnLoopThread`. If replay grows beyond what fits in
   the startup window, we may need a second "replay thread" with a
