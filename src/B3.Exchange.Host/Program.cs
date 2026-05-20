@@ -61,7 +61,7 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => shutdown.Cancel();
 
 bootLogger.LogInformation("exchange running; Ctrl+C to stop");
 try { await Task.Delay(Timeout.Infinite, shutdown.Token).ConfigureAwait(false); }
-catch (OperationCanceledException) { }
+catch (OperationCanceledException) { /* expected: Ctrl+C / SIGTERM cancelled the indefinite wait */ }
 
 bootLogger.LogInformation("shutting down");
 // Bound the graceful shutdown so a stuck phase can't pin the process

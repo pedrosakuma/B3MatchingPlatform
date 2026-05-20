@@ -95,7 +95,7 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
     {
         // Fire one cycle immediately so consumers connecting at startup can
         // resolve symbols within Cadence rather than after one full interval.
-        try { PublishOnce(); } catch (OperationCanceledException) { return; }
+        try { PublishOnce(); } catch (OperationCanceledException) { return; /* expected: publisher cancelled before first cycle */ }
 
         using var timer = new PeriodicTimer(Cadence);
         try
@@ -105,7 +105,7 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
                 PublishOnce();
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* expected: periodic publisher cancelled during shutdown */ }
     }
 
     /// <summary>

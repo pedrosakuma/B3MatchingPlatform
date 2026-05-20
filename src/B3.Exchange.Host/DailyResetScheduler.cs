@@ -91,7 +91,8 @@ public sealed class DailyResetScheduler : IAsyncDisposable
                 var next = ComputeNextFiringUtc(now, _localTime, _timezone);
                 var delay = next - now;
                 if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
-                try { _timer?.Change(delay, Timeout.InfiniteTimeSpan); } catch (ObjectDisposedException) { }
+                try { _timer?.Change(delay, Timeout.InfiniteTimeSpan); }
+                catch (ObjectDisposedException) { /* expected: scheduler disposed concurrently with the firing callback */ }
                 _logger.LogInformation(
                     "daily-reset re-armed: next-firing-utc={Next:o} (in {DelayMin:n1}min)",
                     next, delay.TotalMinutes);

@@ -104,9 +104,12 @@ public sealed partial class FixpSession
             CloseLocked(reason);
             return;
         }
-        try { _cts.Cancel(); } catch { }
-        try { _transport.Close(reason); } catch { }
-        try { _transport.Stream.Dispose(); } catch { }
+        // Best-effort teardown of cancellation + transport during Suspend; each
+        // step may legitimately fail if a concurrent Close has already raced
+        // ahead (e.g. transport callback while suspend was being decided).
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
+        try { _transport.Close(reason); } catch (ObjectDisposedException) { /* transport already disposed */ }
+        try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
         Volatile.Write(ref _suspendedSinceMs, NowMs());
         ScheduleCodTimerLocked();
     }
@@ -157,7 +160,7 @@ public sealed partial class FixpSession
         Volatile.Write(ref _suspendedSinceMs, 0);
         StopCodTimerLocked();
         _logger.LogInformation("fixp session {ConnectionId} closing", ConnectionId);
-        try { _cts.Cancel(); } catch { }
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose race; benign */ }
         // The transport may have already closed (it's the source of the
         // callback in IO-error paths). Either way, ensure it's down so the
         // send loop wakes up and exits.
@@ -166,14 +169,26 @@ public sealed partial class FixpSession
         // can be re-negotiated by a future transport.
         if (_claimedSessionId != 0 && _claims is not null)
         {
-            try { _claims.Release(_claimedSessionId, this); } catch { }
+            try { _claims.Release(_claimedSessionId, this); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp session {ConnectionId} sessionId={SessionId} failed to release claim during close",
+                    ConnectionId, _claimedSessionId);
+            }
             _claimedSessionId = 0;
         }
         // Notify the engine sink so it releases any cached references to this
         // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for
         // the lifetime of every resting order it placed → unbounded memory.
-        try { _sink.OnSessionClosed(Identity); } catch { }
+        try { _sink.OnSessionClosed(Identity); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} OnSessionClosed callback threw",
+                ConnectionId);
+        }
         // Issue #289: terminal close ⇒ drop the persisted retransmit
         // ring file. We deliberately do NOT do this on Suspend so a
         // host crash while Suspended leaves the file intact for the
@@ -188,7 +203,13 @@ public sealed partial class FixpSession
                     ConnectionId, SessionId);
             }
         }
-        try { _onClosed?.Invoke(this, reason); } catch { }
+        try { _onClosed?.Invoke(this, reason); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} onClosed callback threw",
+                ConnectionId);
+        }
     }
 
     /// <summary>
@@ -238,11 +259,23 @@ public sealed partial class FixpSession
         // suspended-session reaper will eventually clean up.
         if (oldRecv is not null)
         {
-            try { if (!oldRecv.Wait(TimeSpan.FromSeconds(2))) return false; } catch { }
+            try { if (!oldRecv.Wait(TimeSpan.FromSeconds(2))) return false; }
+            catch (AggregateException ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp session {ConnectionId} old recv task surfaced unexpected exception during re-attach drain",
+                    ConnectionId);
+            }
         }
         if (oldWatchdog is not null)
         {
-            try { if (!oldWatchdog.Wait(TimeSpan.FromSeconds(2))) return false; } catch { }
+            try { if (!oldWatchdog.Wait(TimeSpan.FromSeconds(2))) return false; }
+            catch (AggregateException ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp session {ConnectionId} old watchdog task surfaced unexpected exception during re-attach drain",
+                    ConnectionId);
+            }
         }
         lock (_attachLock)
         {
@@ -257,7 +290,7 @@ public sealed partial class FixpSession
                 "fixp session {ConnectionId} re-attaching transport (sessionId={SessionId} sessionVerId={SessionVerId})",
                 ConnectionId, SessionId, SessionVerId);
 
-            try { _cts.Dispose(); } catch { }
+            try { _cts.Dispose(); } catch (ObjectDisposedException) { /* concurrent dispose; benign */ }
             _cts = new CancellationTokenSource();
             _transport = CreateBoundTransport(rebindStream);
             // The new transport is back; cancel-on-disconnect grace is
@@ -306,8 +339,22 @@ public sealed partial class FixpSession
     public async ValueTask DisposeAsync()
     {
         Close("dispose");
-        try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); } catch { }
-        try { if (_watchdogTask != null) await _watchdogTask.ConfigureAwait(false); } catch { }
+        try { if (_recvTask != null) await _recvTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* expected: recv loop cancelled by Close */ }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} recv task threw during DisposeAsync drain",
+                ConnectionId);
+        }
+        try { if (_watchdogTask != null) await _watchdogTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* expected: watchdog cancelled by Close */ }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} watchdog task threw during DisposeAsync drain",
+                ConnectionId);
+        }
         await _transport.DisposeAsync().ConfigureAwait(false);
         _cts.Dispose();
     }
