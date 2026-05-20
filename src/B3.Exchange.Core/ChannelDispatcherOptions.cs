@@ -1,4 +1,5 @@
 using B3.Exchange.Contracts;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.PostTrade;
 using Microsoft.Extensions.Logging;
 
@@ -21,7 +22,7 @@ public sealed record ChannelDispatcherOptions
     public required ICoreOutbound Outbound { get; init; }
     public required ILogger<ChannelDispatcher> Logger { get; init; }
 
-    public Func<ulong>? NowNanos { get; init; }
+    public INanosTimeSource? TimeSource { get; init; }
     public ushort TradeDate { get; init; }
     public int InboundCapacity { get; init; } = ChannelDispatcher.DefaultInboundCapacity;
     public ChannelMetrics? Metrics { get; init; }

@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using B3.Exchange.Instruments;
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 
@@ -50,7 +51,7 @@ public class InstrumentDefinitionPublisherTests
         var sink = new RecordingPacketSink();
         var pub = new InstrumentDefinitionPublisher(
             channelNumber: 184, instruments, sink,
-            cadence: TimeSpan.FromSeconds(60), nowNanos: () => 12345UL);
+            cadence: TimeSpan.FromSeconds(60), timeSource: new FakeNanosTimeSource(12345UL));
 
         pub.PublishOnce();
 
@@ -94,7 +95,7 @@ public class InstrumentDefinitionPublisherTests
         var instruments = new List<Instrument> { Inst("PETR4", 900_000_000_001L, "BRPETRACNPR6") };
         var sink = new RecordingPacketSink();
         var pub = new InstrumentDefinitionPublisher(
-            channelNumber: 200, instruments, sink, TimeSpan.FromMinutes(1), () => 1UL);
+            channelNumber: 200, instruments, sink, TimeSpan.FromMinutes(1), new FakeNanosTimeSource(1UL));
 
         pub.PublishOnce();
 
@@ -115,7 +116,7 @@ public class InstrumentDefinitionPublisherTests
         };
         var sink = new RecordingPacketSink();
         var pub = new InstrumentDefinitionPublisher(
-            channelNumber: 99, instruments, sink, TimeSpan.FromMinutes(1), () => 0UL);
+            channelNumber: 99, instruments, sink, TimeSpan.FromMinutes(1), new FakeNanosTimeSource(0UL));
 
         pub.PublishOnce();
         pub.PublishOnce();
@@ -143,7 +144,7 @@ public class InstrumentDefinitionPublisherTests
         }
         var sink = new RecordingPacketSink();
         var pub = new InstrumentDefinitionPublisher(
-            channelNumber: 7, instruments, sink, TimeSpan.FromMinutes(1), () => 0UL);
+            channelNumber: 7, instruments, sink, TimeSpan.FromMinutes(1), new FakeNanosTimeSource(0UL));
 
         pub.PublishOnce();
 
@@ -163,7 +164,7 @@ public class InstrumentDefinitionPublisherTests
         var instruments = new List<Instrument> { Inst("PETR4", 1L, "BRPETRACNPR6") };
         var sink = new RecordingPacketSink();
         await using var pub = new InstrumentDefinitionPublisher(
-            channelNumber: 1, instruments, sink, TimeSpan.FromMilliseconds(50), () => 0UL);
+            channelNumber: 1, instruments, sink, TimeSpan.FromMilliseconds(50), new FakeNanosTimeSource(0UL));
 
         pub.Start();
 

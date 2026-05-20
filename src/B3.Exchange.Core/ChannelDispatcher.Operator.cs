@@ -40,7 +40,7 @@ public sealed partial class ChannelDispatcher
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.ChannelResetBlockLength);
-        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteChannelResetFrame(dst, _nowNanos());
+        int n = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteChannelResetFrame(dst, _timeSource.NowNanos());
         Commit(n);
         FlushPacket();
     }
@@ -63,7 +63,7 @@ public sealed partial class ChannelDispatcher
             + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength);
         int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
             bust.SecurityId, bust.PriceMantissa, bust.Size, bust.TradeId, bust.TradeDate,
-            _nowNanos(), rptSeq);
+            _timeSource.NowNanos(), rptSeq);
         Commit(written);
         FlushPacket();
     }
@@ -270,7 +270,7 @@ public sealed partial class ChannelDispatcher
                         int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
                             result.MatchedFill.SecurityId, result.MatchedFill.PriceMantissa,
                             result.MatchedFill.Quantity, op.TradeId, tradeDateDays,
-                            _nowNanos(), rptSeq);
+                            _timeSource.NowNanos(), rptSeq);
                         Commit(written);
                         FlushPacket();
                         // ADR 0008 §4: post-EOD busts publish/refresh
@@ -453,7 +453,7 @@ public sealed partial class ChannelDispatcher
             bool applied;
             try
             {
-                applied = _engine.SetTradingPhase(op.SecurityId, op.Phase, _nowNanos());
+                applied = _engine.SetTradingPhase(op.SecurityId, op.Phase, _timeSource.NowNanos());
             }
             catch (Exception ex)
             {
@@ -501,7 +501,7 @@ public sealed partial class ChannelDispatcher
             }
             try
             {
-                _engine.UncrossAuction(op.SecurityId, op.TargetPhase, _nowNanos());
+                _engine.UncrossAuction(op.SecurityId, op.TargetPhase, _timeSource.NowNanos());
             }
             catch (InvalidOperationException ex)
             {
@@ -588,7 +588,7 @@ public sealed partial class ChannelDispatcher
             bool stateChanged;
             try
             {
-                stateChanged = _engine.HaltInstrument(op.SecurityId, op.Reason, op.Note, _nowNanos());
+                stateChanged = _engine.HaltInstrument(op.SecurityId, op.Reason, op.Note, _timeSource.NowNanos());
             }
             catch (KeyNotFoundException ex)
             {
@@ -646,7 +646,7 @@ public sealed partial class ChannelDispatcher
             bool stateChanged;
             try
             {
-                stateChanged = _engine.ResumeInstrument(op.SecurityId, _nowNanos());
+                stateChanged = _engine.ResumeInstrument(op.SecurityId, _timeSource.NowNanos());
             }
             catch (KeyNotFoundException ex)
             {

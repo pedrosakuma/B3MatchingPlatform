@@ -34,7 +34,7 @@ public sealed partial class FixpSession
             decodeSpan.SetTag(ExchangeTelemetry.TagTemplate, (int)info.TemplateId);
         }
 
-        ulong now = _nowNanos();
+        ulong now = _timeSource.NowNanos();
         _logger.LogTrace("session {ConnectionId} inbound frame templateId={TemplateId} blockLength={BlockLength} varDataLength={VarDataLength}",
             ConnectionId, info.TemplateId, info.BlockLength, info.VarDataLength);
 

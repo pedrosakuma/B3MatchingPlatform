@@ -1,4 +1,5 @@
 using B3.Exchange.Core;
+using B3.Exchange.TestSupport;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
 using B3.Exchange.PostTrade;
@@ -44,7 +45,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
                 PostTradeSink = audit,
             });
@@ -109,7 +110,7 @@ public partial class ChannelDispatcherTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000_000_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
                 PostTradeSink = audit,
             });

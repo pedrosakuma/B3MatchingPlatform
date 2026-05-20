@@ -52,7 +52,7 @@ public sealed partial class ChannelDispatcher : IUmdfFrameSink
             _retxBuffer?.Reset();
         }
         Volatile.Write(ref _sequenceNumber, _sequenceNumber + 1);
-        ulong now = _nowNanos();
+        ulong now = _timeSource.NowNanos();
         B3.Umdf.WireEncoder.UmdfWireEncoder.PatchPacketHeader(
             _packetBuf.AsSpan(0, B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSize), _sequenceNumber, now);
         _packetSink.Publish(ChannelNumber, _packetBuf.AsSpan(0, _packetWritten));

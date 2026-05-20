@@ -1,4 +1,5 @@
 using System.Net;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Core;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -39,6 +40,7 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly IReadOnlyDictionary<byte, IChannelStatePersister> _persisters;
     private readonly IReadOnlyDictionary<byte, IChannelWriteAheadLog> _wals;
     private readonly Action<string>? _log;
+    private readonly INanosTimeSource _timeSource;
     private WebApplication? _app;
 
     private static readonly DateOnly LocalMktDateEpoch = new(1970, 1, 1);
@@ -53,7 +55,8 @@ public sealed class HttpServer : IAsyncDisposable
         IReadOnlyDictionary<byte, IChannelStatePersister>? persisters = null,
         IReadOnlyDictionary<byte, IChannelWriteAheadLog>? wals = null,
         IReadOnlyDictionary<long, ChannelDispatcher>? instrumentRouting = null,
-        Func<byte, DateOnly, B3.Exchange.PostTrade.EodFillsExportResult?>? eodExportTrigger = null)
+        Func<byte, DateOnly, B3.Exchange.PostTrade.EodFillsExportResult?>? eodExportTrigger = null,
+        INanosTimeSource? timeSource = null)
     {
         _config = config;
         _metrics = metrics;
@@ -67,6 +70,7 @@ public sealed class HttpServer : IAsyncDisposable
         _instrumentRouting = instrumentRouting ?? new Dictionary<long, ChannelDispatcher>();
         _eodExportTrigger = eodExportTrigger;
         _log = log;
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
     }
 
     public IPEndPoint? LocalEndpoint { get; private set; }
@@ -564,7 +568,7 @@ public sealed class HttpServer : IAsyncDisposable
 
         var tcs = new TaskCompletionSource<B3.Exchange.Core.ChannelDispatcher.OperatorBustV2Outcome>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        ulong nowNanos = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
+        ulong nowNanos = _timeSource.NowNanos();
         if (!disp.EnqueueOperatorBustV2(tradeId, tradeDate, correlationId, reason, busterFirm,
                 securityIdEcho, nowNanos, tcs))
         {

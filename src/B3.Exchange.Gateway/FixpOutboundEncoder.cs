@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using System.Buffers.Binary;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Matching;
 using DurabilityHandle = B3.Exchange.Contracts.DurabilityHandle;
 
@@ -28,7 +29,7 @@ internal sealed class FixpOutboundEncoder
     private readonly Func<TcpTransport> _transport;
     private readonly RetransmitBuffer _retxBuffer;
     private readonly object _outboundLock;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     private readonly Func<bool> _isOpen;
     private readonly Action _close;
 
@@ -45,7 +46,7 @@ internal sealed class FixpOutboundEncoder
         Func<TcpTransport> transport,
         RetransmitBuffer retxBuffer,
         object outboundLock,
-        Func<ulong> nowNanos,
+        INanosTimeSource timeSource,
         Func<bool> isOpen,
         Action close)
     {
@@ -54,7 +55,7 @@ internal sealed class FixpOutboundEncoder
         _transport = transport;
         _retxBuffer = retxBuffer;
         _outboundLock = outboundLock;
-        _nowNanos = nowNanos;
+        _timeSource = timeSource;
         _isOpen = isOpen;
         _close = close;
     }
@@ -201,7 +202,7 @@ internal sealed class FixpOutboundEncoder
         lock (_outboundLock)
         {
             BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
-                exact, _sessionId(), _nextMsgSeqNum(), _nowNanos(),
+                exact, _sessionId(), _nextMsgSeqNum(), _timeSource.NowNanos(),
                 refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
             return AppendAndEnqueueLocked(exact);
         }

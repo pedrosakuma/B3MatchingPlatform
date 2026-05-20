@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
+using B3.Exchange.TestSupport;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.Gateway.Tests;
@@ -56,7 +57,8 @@ public class EstablishValidatorTests
     public void Rejects_timestamp_skew_beyond_tolerance()
     {
         ulong now = 1_000_000_000UL;
-        var v = new EstablishValidator(nowNanos: () => now,
+        var clock = new FakeNanosTimeSource(now);
+        var v = new EstablishValidator(timeSource: clock,
             timestampSkewToleranceNs: 1_000UL);
         var req = Req(sid: 100, ver: 1, ts: now + 10_000UL);
         var o = v.Validate(req, FixpState.Negotiated, 100, 1, 0);

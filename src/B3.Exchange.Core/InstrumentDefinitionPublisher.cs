@@ -1,3 +1,4 @@
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Instruments;
 using B3.Umdf.WireEncoder;
 
@@ -40,7 +41,7 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
 
     private readonly IReadOnlyList<Instrument> _instruments;
     private readonly IUmdfPacketSink _sink;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     private readonly byte[] _packetBuf = new byte[MaxPacketBytes];
     private readonly object _publishLock = new();
 
@@ -52,7 +53,7 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
         IReadOnlyList<Instrument> instruments,
         IUmdfPacketSink sink,
         TimeSpan cadence,
-        Func<ulong>? nowNanos = null,
+        INanosTimeSource? timeSource = null,
         ushort sequenceVersion = 1)
     {
         ArgumentNullException.ThrowIfNull(instruments);
@@ -69,14 +70,12 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
         ChannelNumber = channelNumber;
         _instruments = instruments;
         _sink = sink;
-        _nowNanos = nowNanos ?? DefaultNowNanos;
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
         Cadence = cadence;
         SequenceVersion = sequenceVersion;
         SequenceNumber = 0;
     }
 
-    private static ulong DefaultNowNanos()
-        => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
 
     /// <summary>
     /// Starts the periodic loop. Idempotent: a second call is a no-op.
@@ -155,7 +154,7 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
         SequenceNumber++;
         UmdfWireEncoder.PatchPacketHeader(
             _packetBuf.AsSpan(0, WireOffsets.PacketHeaderSize),
-            SequenceNumber, _nowNanos());
+            SequenceNumber, _timeSource.NowNanos());
         _sink.Publish(ChannelNumber, _packetBuf.AsSpan(0, written));
     }
 

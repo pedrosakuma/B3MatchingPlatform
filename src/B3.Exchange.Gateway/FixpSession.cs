@@ -1,6 +1,7 @@
 using B3.EntryPoint.Wire;
 using System.Buffers;
 using B3.Exchange.Contracts;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 using ContractsSessionId = B3.Exchange.Contracts.SessionId;
@@ -34,7 +35,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     private readonly ILogger<TcpTransport> _transportLogger;
     private readonly int _sendQueueCapacity;
     private CancellationTokenSource _cts = new();
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     private readonly FixpSessionOptions _options;
     private readonly Action<FixpSession, string>? _onClosed;
     private readonly NegotiationValidator? _validator;
@@ -265,7 +266,7 @@ public sealed partial class FixpSession : IAsyncDisposable
 
     public FixpSession(long connectionId, uint enteringFirm, uint sessionId,
         Stream stream, IInboundCommandSink sink, ILogger<FixpSession> logger,
-        Func<ulong>? nowNanos = null,
+        INanosTimeSource? timeSource = null,
         int sendQueueCapacity = DefaultSendQueueCapacity,
         FixpSessionOptions? options = null,
         Action<FixpSession, string>? onClosed = null,
@@ -287,7 +288,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         _logger = logger;
         _transportLogger = transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance;
         _sendQueueCapacity = sendQueueCapacity;
-        _nowNanos = nowNanos ?? DefaultNowNanos;
+        _timeSource = timeSource ?? SystemNanosTimeSource.Instance;
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
@@ -321,7 +322,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             transport: () => _transport!,
             retxBuffer: _retxBuffer,
             outboundLock: _outboundLock,
-            nowNanos: () => _nowNanos(),
+            timeSource: _timeSource,
             // Use IsRegistered (not IsOpen) so that passive ERs delivered while
             // the session is Suspended (transport down, but session-state alive)
             // are still encoded, sequenced, and appended to the FIXP retransmit
@@ -391,9 +392,6 @@ public sealed partial class FixpSession : IAsyncDisposable
         _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
         _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
     }
-
-    private static ulong DefaultNowNanos()
-        => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
 
     private static long NowMs() => Environment.TickCount64;
 
