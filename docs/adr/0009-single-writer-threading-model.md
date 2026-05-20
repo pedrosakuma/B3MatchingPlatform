@@ -183,7 +183,7 @@ Decision:
    exception and have a tracked migration.** `FileAuditLogWriter`'s
    `_stateLock` stays for now (its removal requires marshaling
    `Checkpoint()` through the dispatch inbox, a separate redesign);
-   it is tracked in a follow-up issue. The contract for *new*
+   it is tracked in follow-up issue #396. The contract for *new*
    components is "guard, not lock" — adding a new per-channel
    component that takes a lock requires an explicit ADR amendment
    citing why the dispatch-thread handoff is impractical.
@@ -193,11 +193,15 @@ Decision:
    state on a thread different from the eventual dispatch loop must
    call it; any other re-bind is a smell.
 
-Trade-off accepted: a thin extra layer of indirection on every assert
-(`SingleWriterGuard.AssertOwnedByCurrentThread` → the same
-`Interlocked.CompareExchange` + `Debug.Assert` as before). The whole
-path is `[Conditional("DEBUG")]` so Release builds are byte-identical
-to the prior implementation.
+Trade-off accepted: each owning component now holds one
+`SingleWriterGuard` reference (a single object allocation at
+construction; idle in Release). On the hot path the entire assert
+chain is `[Conditional("DEBUG")]` and elides to nothing in Release —
+the dispatcher/engine no longer perform the prior unconditional
+`_loopThread` / `_ownerThread` field writes either, since nothing
+outside Debug ever read them. Release IL is not byte-identical to the
+pre-refactor build (extra field + one object allocation per owner),
+but the per-call mutation cost is unchanged at zero.
 
 ## Alternatives considered
 
