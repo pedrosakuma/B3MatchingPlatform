@@ -174,7 +174,7 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<OperatorBustV2Outcome> completion)
     {
         ArgumentNullException.ThrowIfNull(completion);
-        if (_auditRootDir is null || _bustDedup is null)
+        if (_postTradeOrch is null)
         {
             completion.TrySetException(new InvalidOperationException(
                 $"channel {ChannelNumber} bust-v2 endpoint requires audit-log configuration; not wired"));
@@ -208,9 +208,8 @@ public sealed partial class ChannelDispatcher
             // days since 1970-01-01); the reject-attempt record stores
             // the same value as int32. DateOnly.DayNumber is days since
             // 0001-01-01 so a normal date overflows ushort — convert
-            // relative to the Unix epoch and range-check BEFORE writing
-            // any audit/dedup state so we never persist a half-applied
-            // accept.
+            // relative to the Unix epoch and range-check BEFORE invoking
+            // the orchestrator so we never persist a half-applied accept.
             int tradeDateDaysSinceEpoch = op.TradeDate.DayNumber - LocalMktDateEpoch.DayNumber;
             if (tradeDateDaysSinceEpoch < 0 || tradeDateDaysSinceEpoch > ushort.MaxValue)
             {
@@ -223,128 +222,33 @@ public sealed partial class ChannelDispatcher
             var request = new B3.Exchange.PostTrade.BustRequest(
                 op.TradeId, op.TradeDate, op.CorrelationId, op.SecurityIdEcho,
                 op.ReasonCode, op.BusterFirm, op.AttemptTransactTimeNanos);
-            var result = B3.Exchange.PostTrade.BustValidator.Validate(
-                _auditRootDir!, ChannelNumber, request, _bustDedup!);
+            // ADR 0010: validation, dedup, audit write, file-routing and
+            // amendments republish are owned by the orchestrator. The
+            // dispatcher only owns the wire-emission half (TradeBust_57
+            // frame on Accept).
+            var outcome = _postTradeOrch!.ProcessBust(request, ChannelNumber, tradeDateDaysSinceEpoch);
 
-            switch (result.Kind)
+            if (outcome.Kind == B3.Exchange.PostTrade.BustValidationKind.Accept)
             {
-                case B3.Exchange.PostTrade.BustValidationKind.Accept:
-                    {
-                        var bust = new B3.Exchange.PostTrade.BustRecord(
-                            op.TradeId, op.AttemptTransactTimeNanos,
-                            result.MatchedFill.SecurityId, op.ReasonCode, op.BusterFirm, op.CorrelationId,
-                            DeclaredTradeDateDays: tradeDateDaysSinceEpoch);
-                        // ADR 0008 §3 routing: under the per-channel
-                        // post-trade lock, decide pre-EOD vs post-EOD
-                        // based on the existence of the target day's
-                        // fills.csv.done sidecar; this closes the race
-                        // with EodFillsExporter (which holds the same
-                        // lock between its cancelled-set scan and the
-                        // .done rename).
-                        DateOnly bustFileDate = op.TradeDate;
-                        bool isPostEod = false;
-                        lock (PostTradeRoutingLock)
-                        {
-                            if (_dropRootDir != null
-                                && File.Exists(Path.Combine(_dropRootDir,
-                                    ChannelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                                    op.TradeDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
-                                    "fills.csv.done")))
-                            {
-                                bustFileDate = DateOnly.FromDateTime(DateTime.UtcNow);
-                                isPostEod = true;
-                            }
-                            _postTradeSink.OnBust(bust, bustFileDate);
-                            _bustDedup!.Add(op.TradeId, op.CorrelationId, op.TradeDate);
-                        }
-                        // Emit TradeBust_57 frame; price/size echo come from the
-                        // matched fill so consumers see the same data the
-                        // original Trade_53 carried.
-                        uint rptSeq = _engine.AllocateNextRptSeq();
-                        _packetWritten = 0;
-                        int frameSize = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
-                            + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
-                            + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength;
-                        var dst = ReserveOrFlush(frameSize);
-                        ushort tradeDateDays = (ushort)tradeDateDaysSinceEpoch;
-                        int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
-                            result.MatchedFill.SecurityId, result.MatchedFill.PriceMantissa,
-                            result.MatchedFill.Quantity, op.TradeId, tradeDateDays,
-                            _timeSource.NowNanos(), rptSeq);
-                        Commit(written);
-                        FlushPacket();
-                        // ADR 0008 §4: post-EOD busts publish/refresh
-                        // amendments.csv for the original trade's day so
-                        // external consumers see the late correction.
-                        if (isPostEod && _amendmentsPublisher != null && _auditRootDir != null && _dropRootDir != null)
-                        {
-                            try
-                            {
-                                _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, ChannelNumber, op.TradeDate, DateTime.UtcNow);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex,
-                                    "amendments.csv publish failed for channel={Channel} date={Date}; bust persisted but downstream consumers will only see it on next operator retry or restart",
-                                    ChannelNumber, op.TradeDate);
-                            }
-                        }
-                        break;
-                    }
-                case B3.Exchange.PostTrade.BustValidationKind.IdempotentReplay:
-                    {
-                        // No new audit write, no UMDF emit. BUT: if the
-                        // original accept was a post-EOD bust whose
-                        // amendments.csv publish failed (logged-only
-                        // failure under §4), this is the operator's
-                        // retry — re-run the publish so the missing
-                        // row finally lands. AmendmentsPublisher
-                        // regenerates the file in full from the audit
-                        // log so this is naturally idempotent: if the
-                        // original publish succeeded the new file is
-                        // byte-identical except for `generatedAt`.
-                        if (_amendmentsPublisher != null && _auditRootDir != null && _dropRootDir != null
-                            && File.Exists(Path.Combine(_dropRootDir,
-                                ChannelNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                                op.TradeDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
-                                "fills.csv.done")))
-                        {
-                            try
-                            {
-                                _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, ChannelNumber, op.TradeDate, DateTime.UtcNow);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex,
-                                    "amendments.csv republish on idempotent replay failed for channel={Channel} date={Date}; further retries required",
-                                    ChannelNumber, op.TradeDate);
-                            }
-                        }
-                        break;
-                    }
-                case B3.Exchange.PostTrade.BustValidationKind.MissingDay:
-                    // No audit-log write (ADR §2.3).
-                    break;
-                case B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId:
-                case B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation:
-                case B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch:
-                    {
-                        ushort code = result.Kind switch
-                        {
-                            B3.Exchange.PostTrade.BustValidationKind.UnknownTradeId => (ushort)1,
-                            B3.Exchange.PostTrade.BustValidationKind.AlreadyBustedDifferentCorrelation => (ushort)2,
-                            B3.Exchange.PostTrade.BustValidationKind.SecurityIdMismatch => (ushort)3,
-                            _ => (ushort)0,
-                        };
-                        var reject = new B3.Exchange.PostTrade.RejectAttemptRecord(
-                            op.TradeId, op.AttemptTransactTimeNanos,
-                            tradeDateDaysSinceEpoch, code, op.BusterFirm, op.CorrelationId);
-                        _postTradeSink.OnRejectAttempt(reject);
-                        break;
-                    }
+                // Emit TradeBust_57 frame; price/size echo come from the
+                // matched fill so consumers see the same data the
+                // original Trade_53 carried.
+                uint rptSeq = _engine.AllocateNextRptSeq();
+                _packetWritten = 0;
+                int frameSize = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
+                    + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
+                    + B3.Umdf.WireEncoder.WireOffsets.TradeBustBlockLength;
+                var dst = ReserveOrFlush(frameSize);
+                ushort tradeDateDays = (ushort)tradeDateDaysSinceEpoch;
+                int written = B3.Umdf.WireEncoder.UmdfWireEncoder.WriteTradeBustFrame(dst,
+                    outcome.MatchedFill.SecurityId, outcome.MatchedFill.PriceMantissa,
+                    outcome.MatchedFill.Quantity, op.TradeId, tradeDateDays,
+                    _timeSource.NowNanos(), rptSeq);
+                Commit(written);
+                FlushPacket();
             }
 
-            completion?.TrySetResult(new OperatorBustV2Outcome(result.Kind, result.ExistingCorrelationId));
+            completion?.TrySetResult(new OperatorBustV2Outcome(outcome.Kind, outcome.ExistingCorrelationId));
         }
         catch (Exception ex)
         {
