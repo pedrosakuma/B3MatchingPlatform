@@ -370,8 +370,14 @@ public sealed class SyntheticTraderRunner : IAsyncDisposable
             _client.OnCancel -= OnExecCancel;
             _client.OnReject -= OnExecReject;
         }
-        try { _cts.Cancel(); } catch { }
-        try { if (_tickTask != null) await _tickTask.ConfigureAwait(false); } catch { }
+        // Best-effort teardown: _cts may already be disposed if Dispose races with a
+        // concurrent caller; the awaited tick task may surface its own
+        // OperationCanceledException. Both are expected during shutdown and
+        // are not worth logging — the caller is already on the way out.
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
+        try { if (_tickTask != null) await _tickTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* expected: tick loop cancelled above */ }
+        catch (Exception ex) { _logWarn?.Invoke($"runner tick task threw during dispose: {ex.GetType().Name}: {ex.Message}"); }
         _cts.Dispose();
     }
 

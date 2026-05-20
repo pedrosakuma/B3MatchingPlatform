@@ -146,7 +146,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             while (!ct.IsCancellationRequested)
             {
                 try { await Task.Delay(poll, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { return; }
+                catch (OperationCanceledException) { return; /* expected: reaper cancelled during shutdown */ }
                 ReapSuspendedOnce(Environment.TickCount64);
             }
         }
@@ -307,8 +307,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             {
                 Socket sock;
                 try { sock = await _listener!.AcceptSocketAsync(ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { return; }
-                catch (ObjectDisposedException) { return; }
+                catch (OperationCanceledException) { return; /* expected: listener cancelled during shutdown */ }
+                catch (ObjectDisposedException) { return; /* expected: listener disposed before accept completed */ }
 
                 sock.NoDelay = true;
                 // Per-connection task: parses the first frame to decide
@@ -319,7 +319,7 @@ public sealed class EntryPointListener : IAsyncDisposable
                 _ = Task.Run(() => HandleAcceptedConnectionAsync(sock, ct));
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* expected: accept loop cancelled during shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex, "entrypoint accept loop terminated unexpectedly");

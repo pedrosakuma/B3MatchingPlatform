@@ -99,7 +99,7 @@ public sealed partial class FixpSession
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { /* expected: heartbeat cancelled during shutdown */ }
         catch (Exception)
         {
             // Watchdog must never crash the session silently; tear down on

@@ -617,9 +617,11 @@ curl -sS http://127.0.0.1:8080/sessions | jq '.[] | {id: .sessionId, firm: .ente
 curl -sS http://127.0.0.1:8080/firms | jq
 ```
 
-Internally, the gateway-side `OrderOwnershipMap` (post-#66) is the
-authority; it routes passive ER + CoD mass-cancels back to the owning
-session's retx buffer.
+Internally, the per-channel `OrderRegistry` in Core (post-#66, #167)
+is the authority; `HostRouter` and `ChannelDispatcher` use it to
+resolve passive-ER routing + CoD/MassCancel sets back to the owning
+session's retx buffer (Gateway resolves `SessionId → FixpSession` via
+`SessionRegistry`).
 
 ### 6.7 Distributed tracing (OpenTelemetry, issue #175)
 
@@ -1433,7 +1435,7 @@ curl -sS -X POST 'http://127.0.0.1:8080/admin/post-trade/bust?channel=84&tradeId
 | Operator HTTP surface | `src/B3.Exchange.Host/HttpServer.cs` |
 | Host wiring + config schema | `src/B3.Exchange.Host/ExchangeHost.cs`, `src/B3.Exchange.Host/HostConfig.cs` |
 | FIXP session lifecycle | `src/B3.Exchange.Gateway/FixpSession.cs`, `FixpStateMachine.cs` |
-| Mass-cancel / CoD plumbing | `src/B3.Exchange.Gateway/OrderOwnershipMap.cs`, `FixpSession.cs` (CoD) |
+| Mass-cancel / CoD plumbing | `src/B3.Exchange.Core/OrderRegistry.cs`, `src/B3.Exchange.Core/HostRouter.cs`, `src/B3.Exchange.Gateway/FixpSession.cs` (CoD trigger) |
 | Per-channel matching | `src/B3.Exchange.Core/ChannelDispatcher.cs`, `src/B3.Exchange.Matching/MatchingEngine.cs` |
 | State persistence | `src/B3.Exchange.Persistence/FileChannelStatePersister.cs`, `BinaryChannelStateSnapshotCodec.cs`, `FileChannelWriteAheadLog.cs`; migration framework in `src/B3.Exchange.Core/SnapshotMigrations.cs` |
 | Post-trade audit log | `src/B3.Exchange.PostTrade/FileAuditLogWriter.cs`, `AuditRecordCodec.cs`, `AuditIndexCodec.cs`, `AuditWatermarkCodec.cs` |
