@@ -91,6 +91,7 @@ public class PostTradeOrchestratorTests : IDisposable
         var outcome = orch.ProcessBust(Req(100u, corr: 5UL, echo: SecId), Channel, tradeDateDaysSinceEpoch: 1234);
 
         Assert.Equal(BustValidationKind.Accept, outcome.Kind);
+        Assert.False(outcome.IsPostEodAccept);
         Assert.Equal(SecId, outcome.MatchedFill.SecurityId);
         Assert.Single(sink.Busts);
         Assert.Equal(Day0, sink.Busts[0].Date);
@@ -99,7 +100,7 @@ public class PostTradeOrchestratorTests : IDisposable
     }
 
     [Fact]
-    public void Accept_PostEod_RoutesToToday_AndPublishesAmendments()
+    public void Accept_PostEod_RoutesToToday_AndSignalsForDeferredPublish()
     {
         SeedFill(101u);
         TouchDoneSidecar(Day0);
@@ -108,17 +109,24 @@ public class PostTradeOrchestratorTests : IDisposable
         var amendments = new RecordingAmendments();
         var orch = new PostTradeOrchestrator(sink, dedup, _auditRoot, _dropRoot, amendments);
 
-        var outcome = orch.ProcessBust(Req(101u, corr: 7UL, echo: SecId), Channel, tradeDateDaysSinceEpoch: 1234);
+        var req = Req(101u, corr: 7UL, echo: SecId);
+        var outcome = orch.ProcessBust(req, Channel, tradeDateDaysSinceEpoch: 1234);
 
         Assert.Equal(BustValidationKind.Accept, outcome.Kind);
+        Assert.True(outcome.IsPostEodAccept);
         Assert.Single(sink.Busts);
         Assert.Equal(DateOnly.FromDateTime(DateTime.UtcNow), sink.Busts[0].Date);
+        // ADR 0010: ProcessBust must NOT publish amendments on accept; the
+        // caller invokes PublishPostEodAmendments after UMDF flush.
+        Assert.Empty(amendments.Calls);
+
+        orch.PublishPostEodAmendments(req, Channel);
         Assert.Single(amendments.Calls);
         Assert.Equal(Day0, amendments.Calls[0].Date);
     }
 
     [Fact]
-    public void Accept_PostEod_AmendmentsFailure_IsSwallowed_StatePersists()
+    public void PublishPostEodAmendments_SwallowsFailures()
     {
         SeedFill(102u);
         TouchDoneSidecar(Day0);
@@ -127,11 +135,17 @@ public class PostTradeOrchestratorTests : IDisposable
         var amendments = new RecordingAmendments { ThrowNext = true };
         var orch = new PostTradeOrchestrator(sink, dedup, _auditRoot, _dropRoot, amendments);
 
-        var outcome = orch.ProcessBust(Req(102u, corr: 9UL, echo: SecId), Channel, tradeDateDaysSinceEpoch: 1234);
+        var req = Req(102u, corr: 9UL, echo: SecId);
+        var outcome = orch.ProcessBust(req, Channel, tradeDateDaysSinceEpoch: 1234);
 
         Assert.Equal(BustValidationKind.Accept, outcome.Kind);
+        Assert.True(outcome.IsPostEodAccept);
         Assert.Single(sink.Busts);
         Assert.True(dedup.TryGet(102u, out _));
+
+        // The publish call itself does not throw — failure is logged + swallowed.
+        var ex = Record.Exception(() => orch.PublishPostEodAmendments(req, Channel));
+        Assert.Null(ex);
     }
 
     [Fact]

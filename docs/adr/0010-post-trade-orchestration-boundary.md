@@ -142,4 +142,17 @@ working unchanged and limits the blast radius of the refactor.
   internal mutations (dedup add, sink write) inherit the
   single-writer guarantee from ADR 0009. The `RoutingLock` exists
   for cross-thread synchronization with the EOD exporter, _not_ to
-  protect the orchestrator's own state.
+  protect the orchestrator's own state. Callers outside the
+  dispatcher loop MUST serialize their own invocations; the
+  interface documents this contract explicitly.
+- The post-EOD amendments republish is split across two orchestrator
+  calls so the dispatcher can preserve the legacy
+  audit → UMDF emit → amendments file ordering (ADR 0008 §4):
+  `ProcessBust` performs the audit / dedup write and signals
+  `IsPostEodAccept = true` on the outcome; the dispatcher then emits
+  and flushes the `TradeBust_57` frame; only after a successful flush
+  does the dispatcher invoke `PublishPostEodAmendments`. This means
+  a frame-emit failure cannot leave `amendments.csv` announcing a
+  bust that never reached consumers. Idempotent-replay republish
+  stays inline inside `ProcessBust` because no UMDF frame follows on
+  that branch.

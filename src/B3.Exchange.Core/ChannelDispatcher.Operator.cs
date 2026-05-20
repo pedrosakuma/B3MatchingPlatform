@@ -246,6 +246,15 @@ public sealed partial class ChannelDispatcher
                     _timeSource.NowNanos(), rptSeq);
                 Commit(written);
                 FlushPacket();
+                // ADR 0008 §4: post-EOD amendments republish runs AFTER
+                // the UMDF frame is flushed so a frame-emit failure can
+                // never leave amendments.csv announcing a bust the
+                // consumers never saw. The orchestrator owns the failure-
+                // swallow + retry-on-replay semantics.
+                if (outcome.IsPostEodAccept)
+                {
+                    _postTradeOrch!.PublishPostEodAmendments(request, ChannelNumber);
+                }
             }
 
             completion?.TrySetResult(new OperatorBustV2Outcome(outcome.Kind, outcome.ExistingCorrelationId));

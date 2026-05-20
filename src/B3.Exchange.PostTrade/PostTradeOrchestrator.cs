@@ -68,6 +68,14 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
                     // the race with EodFillsExporter, which holds the same
                     // monitor between its cancelled-set scan and the .done
                     // rename.
+                    //
+                    // The post-EOD amendments republish is intentionally
+                    // NOT performed here — the caller (dispatcher) invokes
+                    // PublishPostEodAmendments after the TradeBust_57 frame
+                    // is flushed, preserving the legacy ordering
+                    // (audit → UMDF → amendments) so a frame-flush failure
+                    // cannot leave amendments.csv announcing a bust that
+                    // never reached consumers.
                     DateOnly bustFileDate = request.TradeDate;
                     bool isPostEod = false;
                     lock (RoutingLock)
@@ -80,24 +88,7 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
                         _sink.OnBust(bust, bustFileDate);
                         _dedup.Add(request.TradeId, request.CorrelationId, request.TradeDate);
                     }
-
-                    // ADR 0008 §4: post-EOD busts publish/refresh
-                    // amendments.csv for the original trade's day so
-                    // external consumers see the late correction.
-                    if (isPostEod && _amendmentsPublisher != null && _dropRootDir != null)
-                    {
-                        try
-                        {
-                            _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, channel, request.TradeDate, DateTime.UtcNow);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex,
-                                "amendments.csv publish failed for channel={Channel} date={Date}; bust persisted but downstream consumers will only see it on next operator retry or restart",
-                                channel, request.TradeDate);
-                        }
-                    }
-                    break;
+                    return new BustProcessOutcome(result.Kind, result.MatchedFill, result.ExistingCorrelationId, isPostEod);
                 }
             case BustValidationKind.IdempotentReplay:
                 {
@@ -108,6 +99,8 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
                     // the publish so the missing row finally lands.
                     // AmendmentsPublisher regenerates the file in full
                     // from the audit log so this is naturally idempotent.
+                    // Safe to run inline: no UMDF frame follows so there
+                    // is no ordering concern with the dispatcher.
                     if (_amendmentsPublisher != null && _dropRootDir != null
                         && DoneSidecarExists(_dropRootDir, channel, request.TradeDate))
                     {
@@ -146,7 +139,28 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
                 }
         }
 
-        return new BustProcessOutcome(result.Kind, result.MatchedFill, result.ExistingCorrelationId);
+        return new BustProcessOutcome(result.Kind, result.MatchedFill, result.ExistingCorrelationId, IsPostEodAccept: false);
+    }
+
+    /// <inheritdoc />
+    public void PublishPostEodAmendments(in BustRequest request, byte channel)
+    {
+        // ADR 0008 §4: post-EOD busts publish/refresh amendments.csv
+        // for the original trade's day so external consumers see the
+        // late correction. Caller invokes this AFTER successful UMDF
+        // frame flush so a frame-emit failure cannot leave the
+        // amendments file announcing a bust the consumers never saw.
+        if (_amendmentsPublisher is null || _dropRootDir is null) return;
+        try
+        {
+            _amendmentsPublisher.Publish(_auditRootDir, _dropRootDir, channel, request.TradeDate, DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "amendments.csv publish failed for channel={Channel} date={Date}; bust persisted but downstream consumers will only see it on next operator retry or restart",
+                channel, request.TradeDate);
+        }
     }
 
     private static bool DoneSidecarExists(string dropRootDir, byte channel, DateOnly tradeDate)
