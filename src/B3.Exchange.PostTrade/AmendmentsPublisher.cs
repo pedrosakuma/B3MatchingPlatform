@@ -61,32 +61,53 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
         // never append, so a torn write cannot leave a partial row
         // visible. Sort by bustTransactTime so consumers can apply in
         // a deterministic order (rule §4 reconciliation).
-        var busts = new List<BustRecord>();
+        //
+        // We also capture the *file date* (parsed from the audit log
+        // filename `fills-{yyyy-MM-dd}.log`) for each bust because it
+        // is the only durable on-disk signal of when the bust was
+        // *issued* — pre-EOD busts land in the same-day file
+        // (filename == declaredTradeDate) and post-EOD busts land in
+        // today's file (filename != declaredTradeDate). This drives
+        // the missing-fills-row policy at row-emission time.
+        var busts = new List<(BustRecord Bust, DateOnly? FileDate)>();
         var channelDir = Path.Combine(auditRootDir, channel);
         if (Directory.Exists(channelDir))
         {
             int targetDays = businessDate.DayNumber - new DateOnly(1970, 1, 1).DayNumber;
             foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.log"))
             {
+                var fileDate = TryParseFillsLogDate(path);
                 foreach (var entry in AuditLogReader.ReadAllEntries(path))
                 {
                     if (entry.Kind != AuditRecordKind.Bust) continue;
                     var bust = entry.Bust;
                     if (bust.DeclaredTradeDateDays != targetDays) continue;
-                    busts.Add(bust);
+                    busts.Add((bust, fileDate));
                 }
             }
         }
-        busts.Sort((a, b) => a.BustTransactTimeNanos.CompareTo(b.BustTransactTimeNanos));
+        busts.Sort((a, b) => a.Bust.BustTransactTimeNanos.CompareTo(b.Bust.BustTransactTimeNanos));
 
         // 2) Build SHA-256 lookup for each cancelled tradeId by scanning
         // the published fills.csv once. The hash byte-range is defined
         // as "first byte of the row through and including the row-
         // terminating LF" (ADR 0008 §4 sha256OfOriginalFillRow).
+        //
+        // Missing-row policy:
+        //  - Pre-EOD bust (audit file date == declaredTradeDate): the
+        //    target fill was intentionally folded out by EodFillsExporter
+        //    (ADR 0008 §3) — the consumer never saw it, so emitting an
+        //    amendment row would be noise. Skip silently.
+        //  - Post-EOD bust (audit file date != declaredTradeDate): the
+        //    target fill MUST be in the published fills.csv. A missing
+        //    row signals a real inconsistency (lost fills.csv,
+        //    corrupted audit log, schema mismatch) and we fail loud so
+        //    the operator notices before consumers reconcile against a
+        //    silently-incomplete amendments.csv.
         var fillsCsvPath = Path.Combine(dropDir, "fills.csv");
         Dictionary<uint, string> tradeIdToHash = busts.Count == 0
             ? new Dictionary<uint, string>()
-            : ComputeRowHashes(fillsCsvPath, new HashSet<uint>(busts.Select(b => b.CancelledTradeId)));
+            : ComputeRowHashes(fillsCsvPath, new HashSet<uint>(busts.Select(b => b.Bust.CancelledTradeId)));
 
         string csvStaging = StagingPath(dropDir, "amendments.csv");
         string? doneStaging = null;
@@ -102,8 +123,30 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
                 {
                     sw.Write("cancelTradeId,bustTransactTime,reasonCode,correlationId,sha256OfOriginalFillRow\n");
                     long rows = 0;
-                    foreach (var b in busts)
+                    foreach (var (b, fileDate) in busts)
                     {
+                        if (!tradeIdToHash.TryGetValue(b.CancelledTradeId, out var h))
+                        {
+                            bool isPreEod = fileDate.HasValue
+                                && fileDate.Value.DayNumber - new DateOnly(1970, 1, 1).DayNumber == b.DeclaredTradeDateDays;
+                            if (isPreEod)
+                            {
+                                // Pre-EOD bust: target fill was folded out by
+                                // EodFillsExporter. Consumer has nothing to
+                                // amend — skip silently (see §2 above).
+                                continue;
+                            }
+                            // Post-EOD bust whose cancelled trade is not in
+                            // fills.csv. This is a real inconsistency, not
+                            // recoverable here — fail loud so the operator
+                            // sees it before the .done sentinel is published.
+                            throw new InvalidOperationException(
+                                $"amendments publish: channel={channel} date={dateStr} "
+                                + $"cancelTradeId={b.CancelledTradeId} (correlationId={b.CorrelationId}) "
+                                + $"has no matching row in {fillsCsvPath}; refusing to publish "
+                                + "an incomplete amendments.csv. Investigate the audit log / "
+                                + "fills.csv consistency before retrying.");
+                        }
                         sw.Write(b.CancelledTradeId.ToString(CultureInfo.InvariantCulture));
                         sw.Write(',');
                         sw.Write(FormatTimestampMicros(b.BustTransactTimeNanos));
@@ -112,7 +155,7 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
                         sw.Write(',');
                         sw.Write(b.CorrelationId.ToString(CultureInfo.InvariantCulture));
                         sw.Write(',');
-                        sw.Write(tradeIdToHash.TryGetValue(b.CancelledTradeId, out var h) ? h : string.Empty);
+                        sw.Write(h);
                         sw.Write('\n');
                         rows++;
                     }
@@ -158,6 +201,17 @@ public sealed class AmendmentsPublisher : IAmendmentsPublisher
             BestEffortDelete(csvStaging);
             BestEffortDelete(doneStaging);
         }
+    }
+
+    private static DateOnly? TryParseFillsLogDate(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path); // "fills-YYYY-MM-DD"
+        const string prefix = "fills-";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal)) return null;
+        var datePart = name.AsSpan(prefix.Length);
+        if (DateOnly.TryParseExact(datePart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+            return d;
+        return null;
     }
 
     private static Dictionary<uint, string> ComputeRowHashes(string fillsCsvPath, HashSet<uint> wantedTradeIds)
