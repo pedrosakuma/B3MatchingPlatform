@@ -1,3 +1,5 @@
+using B3.Umdf.WireEncoder;
+
 namespace B3.Exchange.Core;
 
 /// <summary>
@@ -10,8 +12,13 @@ namespace B3.Exchange.Core;
 /// <see cref="IUmdfPacketSink"/>, and accounts the throughput counters.
 /// All methods run on the dispatch thread.
 /// </summary>
-public sealed partial class ChannelDispatcher
+public sealed partial class ChannelDispatcher : IUmdfFrameSink
 {
+    Span<byte> IUmdfFrameSink.Reserve(int size) => ReserveOrFlush(size);
+    void IUmdfFrameSink.Commit(int written) => Commit(written);
+
+    private IUmdfFrameSink FrameSink => this;
+
     private void FlushPacket()
     {
         if (_packetWritten == 0) return;
