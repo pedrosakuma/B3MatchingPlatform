@@ -95,12 +95,15 @@ public class WalSizeCapDispatcherTests
             channelNumber: 91,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: sink,
-            outbound: localOutbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            wal: wal,
-            walAppendFailurePolicy: appendPolicy);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = sink,
+                Outbound = localOutbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Wal = wal,
+                WalAppendFailurePolicy = appendPolicy,
+            });
     }
 
     private static bool EnqueueOrder(ChannelDispatcher disp, ulong clOrdIdValue)

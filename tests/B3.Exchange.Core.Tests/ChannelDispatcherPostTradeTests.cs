@@ -39,11 +39,15 @@ public partial class ChannelDispatcherTests
         var audit = new RecordingPostTradeSink();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
-            postTradeSink: audit);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                PostTradeSink = audit,
+            });
         var maker = new FakeSession(outbound) { EnteringFirm = 7 };
         var taker = new FakeSession(outbound) { EnteringFirm = 8 };
 
@@ -100,11 +104,15 @@ public partial class ChannelDispatcherTests
         var audit = new RecordingPostTradeSink();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
-            postTradeSink: audit);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                PostTradeSink = audit,
+            });
         var maker = new FakeSession(outbound) { EnteringFirm = 7 };
         var taker = new FakeSession(outbound) { EnteringFirm = 8 };
 

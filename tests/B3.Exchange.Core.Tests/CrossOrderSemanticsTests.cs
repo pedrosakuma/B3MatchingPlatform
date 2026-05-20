@@ -92,10 +92,14 @@ public class CrossOrderSemanticsTests
         var outbound = new RecordingOutbound();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+            });
         return (disp, pkt, outbound);
     }
 

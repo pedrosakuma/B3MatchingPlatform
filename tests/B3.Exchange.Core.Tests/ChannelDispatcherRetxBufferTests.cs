@@ -64,12 +64,15 @@ public class ChannelDispatcherRetxBufferTests
         var ring = new UmdfPacketRetransmitBuffer(capacity);
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: new NoopOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL,
-            tradeDate: 19_000,
-            retxBuffer: ring);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = new NoopOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                RetxBuffer = ring,
+            });
         return (disp, pkt, ring);
     }
 
@@ -81,9 +84,12 @@ public class ChannelDispatcherRetxBufferTests
         var pkt = new RecordingPacketSink();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: new NoopOutbound(),
-            logger: NullLogger<ChannelDispatcher>.Instance);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = new NoopOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+            });
         Assert.Null(disp.RetransmitBuffer);
     }
 

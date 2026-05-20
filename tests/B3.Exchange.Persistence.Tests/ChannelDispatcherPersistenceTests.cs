@@ -85,13 +85,16 @@ public class ChannelDispatcherPersistenceTests
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: new NoOpPacketSink(),
-            outbound: localOutbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            persister: persister,
-            snapshotThrottle: throttle,
-            useAsyncSnapshotWriter: useAsyncSnapshotWriter);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = localOutbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Persister = persister,
+                SnapshotThrottle = throttle,
+                UseAsyncSnapshotWriter = useAsyncSnapshotWriter,
+            });
     }
 
     [Fact]

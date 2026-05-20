@@ -91,10 +91,14 @@ public partial class ChannelDispatcherTests
         var outbound = new RecordingOutbound();
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+            });
         return (disp, pkt, outbound);
     }
 
@@ -485,12 +489,16 @@ public partial class ChannelDispatcherTests
         var metrics = new ChannelMetrics(channelNumber: 1);
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
-            inboundCapacity: 1,
-            metrics: metrics);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                InboundCapacity = 1,
+                Metrics = metrics,
+            });
 
         var reply = new FakeSession(outbound);
 
@@ -517,11 +525,15 @@ public partial class ChannelDispatcherTests
         var metrics = new ChannelMetrics(channelNumber: 1);
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
-            metrics: metrics);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                Metrics = metrics,
+            });
 
         var reply = new FakeSession(outbound);
         disp.OnDecodeError(reply.Id, "bad sbe header");
@@ -569,11 +581,15 @@ public partial class ChannelDispatcherTests
         var metrics = new ChannelMetrics(channelNumber: 1);
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
-            packetSink: pkt,
-            outbound: outbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            nowNanos: () => 1_000_000_000UL, tradeDate: 19_000,
-            metrics: metrics);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                NowNanos = () => 1_000_000_000UL,
+                TradeDate = 19_000,
+                Metrics = metrics,
+            });
         try
         {
             disp.Start();

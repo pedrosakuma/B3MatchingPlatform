@@ -98,15 +98,18 @@ public class ChannelDispatcherWalTests
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: localSink,
-            outbound: localOutbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            persister: persister,
-            snapshotThrottle: throttle,
-            useAsyncSnapshotWriter: useAsyncSnapshotWriter,
-            wal: wal,
-            postTradeSink: postTradeSink);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = localSink,
+                Outbound = localOutbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Persister = persister,
+                SnapshotThrottle = throttle,
+                UseAsyncSnapshotWriter = useAsyncSnapshotWriter,
+                Wal = wal,
+                PostTradeSink = postTradeSink,
+            });
     }
 
     private static bool EnqueueOrder(ChannelDispatcher disp, SessionId session,

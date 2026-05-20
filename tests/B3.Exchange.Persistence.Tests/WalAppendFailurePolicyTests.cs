@@ -79,12 +79,15 @@ public class WalAppendFailurePolicyTests
             channelNumber: 84,
             engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
                 NullLogger<MatchingEngine>.Instance),
-            packetSink: sink,
-            outbound: localOutbound,
-            logger: NullLogger<ChannelDispatcher>.Instance,
-            metrics: metrics,
-            wal: wal,
-            walAppendFailurePolicy: policy);
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = sink,
+                Outbound = localOutbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
+                Wal = wal,
+                WalAppendFailurePolicy = policy,
+            });
     }
 
     private static bool EnqueueOrder(ChannelDispatcher disp, ulong clOrdIdValue)
