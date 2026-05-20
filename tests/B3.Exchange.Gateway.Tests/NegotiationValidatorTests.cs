@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
+using B3.Exchange.TestSupport;
 using FixpSbe = B3.Entrypoint.Fixp.Sbe.V6;
 
 namespace B3.Exchange.Gateway.Tests;
@@ -17,7 +18,7 @@ public class NegotiationValidatorTests
     {
         var claims = new SessionClaimRegistry();
         var v = new NegotiationValidator(BuildRegistry(), claims, devMode,
-            nowNanos: () => 1_000_000_000UL, timestampSkewToleranceNs: 0UL);
+            timeSource: new FakeNanosTimeSource(1_000_000_000UL), timestampSkewToleranceNs: 0UL);
         return (v, claims);
     }
 
@@ -136,7 +137,7 @@ public class NegotiationValidatorTests
     {
         var claims = new SessionClaimRegistry();
         var v = new NegotiationValidator(BuildRegistry(), claims, devMode: false,
-            nowNanos: () => 1_000_000_000UL,
+            timeSource: new FakeNanosTimeSource(1_000_000_000UL),
             timestampSkewToleranceNs: 100_000_000UL);
         // far-future timestamp
         var o = v.Validate(Req(ts: 5_000_000_000UL), Cred(), FixpState.Idle);

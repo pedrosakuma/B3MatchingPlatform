@@ -462,7 +462,7 @@ public sealed class FixpClient : IAsyncDisposable
         else Interlocked.Exchange(ref _lastOutboundTicks, ticks);
     }
 
-    private static ulong NowNanos() => (ulong)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L);
+    private static ulong NowNanos() => B3.Exchange.Contracts.Time.SystemNanosTimeSource.Instance.NowNanos();
 
     /// <summary>
     /// Builds the gateway-expected credentials JSON document

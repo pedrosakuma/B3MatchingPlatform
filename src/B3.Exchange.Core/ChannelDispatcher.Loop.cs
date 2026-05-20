@@ -323,7 +323,7 @@ public sealed partial class ChannelDispatcher
                         // prefers the ulong over ulong.TryParse(e.ClOrdId));
                         // skip the alloc.
                         _outbound.WriteExecutionReportReject(_currentSession,
-                            new RejectEvent(string.Empty, 0, 0, RejectReason.UnknownInstrument, _nowNanos()),
+                            new RejectEvent(string.Empty, 0, 0, RejectReason.UnknownInstrument, _timeSource.NowNanos()),
                             _currentClOrdId, CurrentDurability);
                         _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
                     }

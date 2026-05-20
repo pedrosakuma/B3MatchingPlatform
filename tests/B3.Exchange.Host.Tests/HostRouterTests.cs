@@ -7,6 +7,7 @@ using B3.Exchange.Host;
 using B3.Exchange.Core;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
+using B3.Exchange.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Host.Tests;
@@ -35,7 +36,7 @@ public class HostRouterTests
     {
         var routing = new Dictionary<long, ChannelDispatcher>(); // empty
         var outbound = new RecordingOutbound();
-        var router = new HostRouter(routing, outbound, NullLogger<HostRouter>.Instance, () => 1_000UL);
+        var router = new HostRouter(routing, outbound, NullLogger<HostRouter>.Instance, new FakeNanosTimeSource(1_000UL));
         router.EnqueueNewOrder(
             new NewOrderCommand("1", SecurityId: 12345, Side.Buy, OrderType.Limit, TimeInForce.Day, 100, 100, 1, 0),
             new B3.Exchange.Contracts.SessionId("s1"), enteringFirm: 1, clOrdIdValue: 1);
@@ -68,7 +69,7 @@ public class HostRouterTests
                 PacketSink = pkt,
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1_000UL,
+                TimeSource = new FakeNanosTimeSource(1_000UL),
             });
         // Dispatcher loop not started; we read inbound queue directly.
         var router = new HostRouter(new Dictionary<long, ChannelDispatcher> { [42] = disp }, outbound, NullLogger<HostRouter>.Instance);

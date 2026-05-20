@@ -6,6 +6,7 @@ using TimeInForce = B3.Exchange.Matching.TimeInForce;
 using System.Runtime.InteropServices;
 using B3.Exchange.Core;
 using B3.Exchange.Matching;
+using B3.Exchange.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
@@ -50,7 +51,7 @@ public class SnapshotRotatorTests
     {
         var src = new FakeSource { SecurityIds = new[] { 42L } };
         var sink = new CapturingSink();
-        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink, nowNanos: () => 1234UL);
+        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink, timeSource: new FakeNanosTimeSource(1234UL));
 
         int packets = rot.PublishNext();
 
@@ -268,12 +269,12 @@ public class ChannelDispatcherSnapshotTests
                 PacketSink = incSink,
                 Outbound = new ChannelDispatcherTests_RecordingOutbound(),
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1UL,
+                TimeSource = new FakeNanosTimeSource(1UL),
                 TradeDate = 1,
             });
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
-            sink: snapSink, nowNanos: () => 1UL);
+            sink: snapSink, timeSource: new FakeNanosTimeSource(1UL));
         disp.AttachSnapshotRotator(rotator);
 
         // Synchronously drive: enqueue tick → drain.
@@ -299,12 +300,12 @@ public class ChannelDispatcherSnapshotTests
                 PacketSink = incSink,
                 Outbound = new ChannelDispatcherTests_RecordingOutbound(),
                 Logger = NullLogger<ChannelDispatcher>.Instance,
-                NowNanos = () => 1UL,
+                TimeSource = new FakeNanosTimeSource(1UL),
                 TradeDate = 1,
             });
         var rotator = new SnapshotRotator(channelNumber: 1,
             source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
-            sink: snapSink, nowNanos: () => 1UL);
+            sink: snapSink, timeSource: new FakeNanosTimeSource(1UL));
         disp.AttachSnapshotRotator(rotator);
 
         // Submit a couple of resting orders so the snapshot has content.

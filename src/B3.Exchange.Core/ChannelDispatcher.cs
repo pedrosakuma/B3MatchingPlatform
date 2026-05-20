@@ -1,4 +1,5 @@
 using B3.Exchange.Contracts;
+using B3.Exchange.Contracts.Time;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
 
@@ -126,7 +127,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly IUmdfPacketSink _liveSink;
     private readonly ICoreOutbound _liveOutbound;
     private readonly ILogger<ChannelDispatcher> _logger;
-    private readonly Func<ulong> _nowNanos;
+    private readonly INanosTimeSource _timeSource;
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
     private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
@@ -366,7 +367,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _packetSink = options.PacketSink;
         _outbound = options.Outbound;
         _logger = options.Logger;
-        _nowNanos = options.NowNanos ?? DefaultNowNanos;
+        _timeSource = options.TimeSource ?? SystemNanosTimeSource.Instance;
         _tradeDate = options.TradeDate;
         _metrics = options.Metrics;
         _sessionFirmCounters = options.SessionFirmCounters;
@@ -440,7 +441,4 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     public bool TryGetHaltSnapshot(long securityId, out HaltSnapshot state)
         => _haltSnapshot.TryGetValue(securityId, out state);
-
-    private static ulong DefaultNowNanos()
-        => (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL;
 }
