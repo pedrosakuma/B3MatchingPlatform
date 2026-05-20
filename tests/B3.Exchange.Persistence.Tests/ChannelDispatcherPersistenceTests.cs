@@ -699,6 +699,21 @@ public class ChannelDispatcherPersistenceTests
         return condition();
     }
 
+    // Issue #375: synchronous variant for tests that interact with the
+    // engine before AND after the wait. Using `await Task.Delay` between
+    // two engine calls lets the second call resume on a thread-pool
+    // thread, violating MatchingEngine's single-owner invariant in Debug.
+    private static bool WaitFor(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition()) return true;
+            Thread.Sleep(10);
+        }
+        return condition();
+    }
+
     [Fact]
     public async Task AsyncWriter_Submits_PersistAfterFlush()
     {
@@ -778,6 +793,14 @@ public class ChannelDispatcherPersistenceTests
     [Fact]
     public async Task AsyncWriter_ThrowingPersister_DoesNotCrashWriter()
     {
+        // Issue #375: this test must NOT cross an `await` between the two
+        // DrainInbound calls. After `await Task.Delay(...)` resumes on a
+        // thread-pool thread, the second DrainInbound would run on a
+        // different thread than the first — violating the engine's
+        // single-owner invariant and tripping MatchingEngine.AssertOnOwnerThread
+        // in Debug. Use the synchronous WaitFor helper for inter-drain
+        // polling; await only at the end (DisposeAsync) where no further
+        // engine call follows.
         var throwing = new ThrowingPersister();
         var metrics = new ChannelMetrics(channelNumber: 84);
         var disp = BuildDispatcher(throwing, out _, metrics, useAsyncSnapshotWriter: true);
@@ -787,13 +810,13 @@ public class ChannelDispatcherPersistenceTests
         Assert.True(EnqueueOrder(disp, session, "CL-1", 0xD0, 8000UL));
         probe.DrainInbound();
 
-        Assert.True(await WaitForAsync(() => metrics.SnapshotSaveFailures >= 1,
+        Assert.True(WaitFor(() => metrics.SnapshotSaveFailures >= 1,
             TimeSpan.FromSeconds(2)));
 
         // Subsequent submissions still flow — writer survived the throw.
         Assert.True(EnqueueOrder(disp, session, "CL-2", 0xD1, 8001UL));
         probe.DrainInbound();
-        Assert.True(await WaitForAsync(() => metrics.SnapshotSaveFailures >= 2,
+        Assert.True(WaitFor(() => metrics.SnapshotSaveFailures >= 2,
             TimeSpan.FromSeconds(2)));
 
         await disp.DisposeAsync();
