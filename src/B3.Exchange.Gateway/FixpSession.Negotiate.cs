@@ -146,6 +146,33 @@ public sealed partial class FixpSession
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
+        // Issue #405 (review finding): commit the new SessionVerID to
+        // disk BEFORE acking the Negotiate. If persistence fails, abort
+        // the handshake — without this, a transient disk error would
+        // leak an accepted SessionVerID into the peer's view that no
+        // post-restart boot would honor, allowing a stale-version
+        // Negotiate to be replayed against a clean SessionClaimRegistry.
+        if (!TrySaveStateSnapshot())
+        {
+            // Roll back the in-memory claim taken above so the session
+            // can be retried by the peer (same SessionVerID, same TCP
+            // connection or a new one); without this the second attempt
+            // would hit DUPLICATE_SESSION_CONNECTION.
+            _claims.Release(req.SessionId, this);
+            _claimedSessionId = 0;
+            SessionId = 0;
+            SessionVerId = 0;
+            EnteringFirm = 0;
+            // No spec-defined "internal error" reject code; UNSPECIFIED
+            // (0) is the closest match. The peer will retry.
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                "negotiate-reject (UNSPECIFIED: state snapshot persist failed)");
+        }
 
         var responseFrame = new byte[NegotiateResponseEncoder.Total];
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,

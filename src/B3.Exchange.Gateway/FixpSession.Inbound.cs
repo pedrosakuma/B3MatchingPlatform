@@ -97,21 +97,30 @@ public sealed partial class FixpSession
     /// <summary>
     /// Sends a Terminate frame with <paramref name="terminationCode"/>
     /// directly to the underlying stream (bypassing the send queue), and
-    /// closes the session.
+    /// closes the session. <paramref name="kind"/> classifies the close
+    /// for the persistence layer (issue #405); defaults to
+    /// <see cref="CloseKind.PeerTerminate"/> for the decoding-error /
+    /// reject paths inside this class.
     /// </summary>
-    private async Task TerminateAndCloseAsync(byte terminationCode, string reason)
-        => await SendTerminateAndCloseAsync(terminationCode, reason).ConfigureAwait(false);
+    private async Task TerminateAndCloseAsync(byte terminationCode, string reason,
+        CloseKind kind = CloseKind.PeerTerminate)
+        => await SendTerminateAndCloseAsync(terminationCode, reason, kind).ConfigureAwait(false);
 
     /// <summary>
     /// Public wrapper around <see cref="TerminateAndCloseAsync"/> so the
     /// graceful-shutdown coordinator (issue #171) can broadcast
     /// <c>Terminate(Finished)</c> to every live session before the host
     /// tears the listener down. Idempotent: a session already closed
-    /// returns immediately without attempting any IO.
+    /// returns immediately without attempting any IO. <paramref name="kind"/>
+    /// classifies the close for the persistence layer (issue #405);
+    /// the graceful-shutdown caller should pass
+    /// <see cref="CloseKind.HostShutdown"/> so persisted state survives
+    /// the process exit and the peer can resync on reconnect.
     /// </summary>
-    public async Task SendTerminateAndCloseAsync(byte terminationCode, string reason)
+    public async Task SendTerminateAndCloseAsync(byte terminationCode, string reason,
+        CloseKind kind = CloseKind.PeerTerminate)
     {
-        if (!IsOpen) { Close(reason); return; }
+        if (!IsOpen) { Close(reason, kind); return; }
         var frame = new byte[SessionRejectEncoder.TerminateTotal];
         SessionRejectEncoder.EncodeTerminate(frame, SessionId, 0, terminationCode);
         try
@@ -122,7 +131,7 @@ public sealed partial class FixpSession
         {
             _logger.LogWarning(ex, "fixp session {ConnectionId} failed to write Terminate({Code})", ConnectionId, terminationCode);
         }
-        Close(reason);
+        Close(reason, kind);
     }
 
     private static async Task ReadExactlyAsync(Stream s, byte[] buf, CancellationToken ct)

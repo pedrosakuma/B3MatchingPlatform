@@ -95,4 +95,52 @@ public class SessionClaimRegistryTests
         r.Release(42, owner);
         Assert.False(r.TryGetActiveClaim(42, out _, out _));
     }
+
+    [Fact]
+    public void SeedLastVersion_records_initial_version_for_unknown_session()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(42, 9);
+        Assert.Equal(9UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void SeedLastVersion_keeps_max_across_calls()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(42, 5);
+        r.SeedLastVersion(42, 3);
+        r.SeedLastVersion(42, 7);
+        r.SeedLastVersion(42, 6);
+        Assert.Equal(7UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void SeedLastVersion_zero_is_noop()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(42, 0);
+        Assert.Equal(0UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void TryClaim_after_seed_rejects_stale_version()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(42, 10);
+        var owner = new object();
+        var result = r.TryClaim(42, sessionVerId: 10, owner);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.StaleVersion, result);
+    }
+
+    [Fact]
+    public void TryClaim_after_seed_accepts_strictly_greater_version()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(42, 10);
+        var owner = new object();
+        var result = r.TryClaim(42, sessionVerId: 11, owner);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted, result);
+        Assert.Equal(11UL, r.CurrentSessionVerId(42));
+    }
 }

@@ -29,8 +29,9 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly SessionClaimRegistry? _sessionClaims;
     private readonly EstablishValidator? _establishValidator;
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
-    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
-    private readonly IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? _persistedRetransmitSnapshots;
+    private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
+    private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
+    private readonly IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -67,8 +68,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         SessionClaimRegistry? sessionClaims = null,
         EstablishValidator? establishValidator = null,
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
-        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
-        IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? persistedRetransmitSnapshots = null)
+        B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
+        B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
+        IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? persistedSessionStates = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         ArgumentNullException.ThrowIfNull(registry);
@@ -85,8 +87,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         _sessionClaims = sessionClaims;
         _establishValidator = establishValidator;
         _retransmitMetrics = retransmitMetrics;
-        _retransmitPersister = retransmitPersister;
-        _persistedRetransmitSnapshots = persistedRetransmitSnapshots;
+        _outboundJournal = outboundJournal;
+        _statePersister = statePersister;
+        _persistedSessionStates = persistedSessionStates;
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
             throw new ArgumentException(
@@ -227,7 +230,10 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (!s.IsOpen) continue;
             try
             {
-                s.Close(reason);
+                // Daily-rollover / admin terminate-all is treated as a
+                // host-driven shutdown (issue #405): peer is expected
+                // to reconnect and we want persisted state preserved.
+                s.Close(reason, CloseKind.HostShutdown);
                 closed++;
             }
             catch (Exception ex)
@@ -283,7 +289,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (!s.IsOpen) continue;
             try
             {
-                await s.SendTerminateAndCloseAsync(terminationCode, reason).ConfigureAwait(false);
+                await s.SendTerminateAndCloseAsync(terminationCode, reason, CloseKind.HostShutdown).ConfigureAwait(false);
                 closed++;
             }
             catch (Exception ex)
@@ -353,7 +359,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         // wire-driven heartbeat tests rely on this).
         if (_sessionClaims is null)
         {
-            ConstructAndStartSession(stream, sock, firstFrame: null);
+            ConstructAndStartSession(stream, sock, firstFrame: null, persistedState: null);
             return;
         }
 
@@ -414,10 +420,84 @@ public sealed class EntryPointListener : IAsyncDisposable
             }
         }
 
-        ConstructAndStartSession(stream, sock, firstFrame);
+        // Issue #405 boot rehydration: if the first frame targets a
+        // SessionId we loaded from the state persister at boot, hand
+        // the snapshot to the new FixpSession so its identity
+        // (SessionVerId / LastIncomingSeqNo / outbound seq) resumes
+        // where the previous incarnation left off.
+        //
+        // Two distinct entry shapes need rehydration after a host crash:
+        //   (a) Negotiate with a STRICTLY-GREATER SessionVerId — peer
+        //       abandons the old session and starts fresh; SeedLastVersion
+        //       on the claim registry enforces monotonicity vs the
+        //       persisted version (spec §1.4).
+        //   (b) Establish with the SAME SessionVerId — peer resumes the
+        //       prior session per the EstablishmentAck.serverFlow=RECOVERABLE
+        //       contract (spec §1.5). The rehydrated session must come
+        //       up in FixpState.Negotiated (not Idle) so the Establish
+        //       lands as (Negotiated, Establish) → Established instead
+        //       of being rejected as UNNEGOTIATED.
+        // The active-claim re-attach branch above already handles the
+        // hot path (same-process Suspended session); this block handles
+        // the cold path where the prior incarnation died.
+        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? rehydrateState = null;
+        bool resumeAsNegotiated = false;
+        if (_persistedSessionStates is not null
+            && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize)
+        {
+            uint sessionIdFromFrame = 0;
+            ulong sessionVerIdFromFrame = 0;
+            bool isEstablish = false;
+            bool decoded = false;
+            if (templateId == EntryPointFrameReader.TidNegotiate
+                && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength)
+            {
+                var fixedBlock = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize, NegotiateDecoder.BlockLength);
+                var varData = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength);
+                if (NegotiateDecoder.TryDecode(fixedBlock, varData, out var negReq, out _, out _))
+                {
+                    sessionIdFromFrame = negReq.SessionId;
+                    sessionVerIdFromFrame = negReq.SessionVerId;
+                    decoded = true;
+                }
+            }
+            else if (templateId == EntryPointFrameReader.TidEstablish
+                && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + EstablishDecoder.BlockLength)
+            {
+                if (EstablishDecoder.TryDecode(
+                    firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize, EstablishDecoder.BlockLength),
+                    out var estReq, out _))
+                {
+                    sessionIdFromFrame = estReq.SessionId;
+                    sessionVerIdFromFrame = estReq.SessionVerId;
+                    isEstablish = true;
+                    decoded = true;
+                }
+            }
+            if (decoded && _persistedSessionStates.TryGetValue(sessionIdFromFrame, out var snap))
+            {
+                rehydrateState = snap;
+                // Only the Establish-with-matching-SessionVerId shape
+                // should resume in Negotiated state. A Negotiate frame
+                // (any SessionVerId) and an Establish with a different
+                // SessionVerId both go through the normal handshake
+                // gate — the latter will be rejected by EstablishValidator
+                // as INVALID_SESSIONVERID, which is the correct
+                // spec-defined response.
+                resumeAsNegotiated = isEstablish && sessionVerIdFromFrame == snap.SessionVerId;
+                _logger.LogInformation(
+                    "rehydrating persisted session {SessionId} (verId={VerId} → peer verId={PeerVerId} firstFrame={Frame} resumeAsNegotiated={Resume}) from {Remote}",
+                    snap.SessionId, snap.SessionVerId, sessionVerIdFromFrame,
+                    isEstablish ? "Establish" : "Negotiate", resumeAsNegotiated, SafeRemote(sock));
+            }
+        }
+
+        ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState, resumeAsNegotiated: resumeAsNegotiated);
     }
 
-    private void ConstructAndStartSession(NetworkStream stream, Socket sock, byte[]? firstFrame)
+    private void ConstructAndStartSession(NetworkStream stream, Socket sock, byte[]? firstFrame,
+        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState,
+        bool resumeAsNegotiated = false)
     {
         var identity = _identityFactory(SafeRemote(sock));
         _logger.LogInformation("accepted connection {ConnectionId} from {Remote} sessionId={SessionId}",
@@ -431,16 +511,6 @@ public sealed class EntryPointListener : IAsyncDisposable
         };
 
         Stream sessionStream = firstFrame is null ? stream : new PrependedStream(firstFrame, stream);
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedSnapshot = null;
-        // Issue #289: if a persister is wired in and we loaded a ring
-        // for this sessionId at boot, hand it to the new FixpSession so
-        // its RetransmitBuffer is rehydrated before the peer's
-        // Establish (and any subsequent RetransmitRequest) lands.
-        if (_persistedRetransmitSnapshots is not null
-            && _persistedRetransmitSnapshots.TryGetValue(identity.SessionId, out var preLoaded))
-        {
-            persistedSnapshot = preLoaded;
-        }
         var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
             sessionStream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
             options: _sessionOptions, onClosed: onClosed,
@@ -448,8 +518,10 @@ public sealed class EntryPointListener : IAsyncDisposable
             sessionClaims: _sessionClaims,
             establishValidator: _establishValidator,
             retransmitMetrics: _retransmitMetrics,
-            retransmitPersister: _retransmitPersister,
-            persistedRetransmitSnapshot: persistedSnapshot);
+            outboundJournal: _outboundJournal,
+            statePersister: _statePersister,
+            persistedState: persistedState,
+            resumeAsNegotiated: resumeAsNegotiated);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();

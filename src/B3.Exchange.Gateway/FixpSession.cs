@@ -77,7 +77,24 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// transport can recover via <c>RetransmitRequest</c>.
     /// </summary>
     private readonly RetransmitBuffer _retxBuffer;
-    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
+    /// <summary>
+    /// Issue #405: unbounded, segmented outbound business-frame
+    /// journal. Source-of-truth for both append-mirroring and
+    /// cold-read replay — the bounded ring becomes a hot cache in
+    /// front of this journal, so a reconnecting peer can replay any
+    /// frame produced since the last successful Negotiate, even
+    /// across host restarts.
+    /// </summary>
+    private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
+    /// <summary>
+    /// Issue #405: durable persister for the FIXP envelope
+    /// (<see cref="FixpSessionStateSnapshot"/>). Written at the end
+    /// of every successful Negotiate (commits SessionVerID), at the
+    /// start of every Suspend, and on every non-terminal Close so the
+    /// reconnecting peer's next Establish lands on a server with the
+    /// correct <c>LastIncomingSeqNo</c> / <c>OutboundMsgSeqNum</c>.
+    /// </summary>
+    private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
     private readonly FixpOutboundEncoder _outboundEncoder;
     private readonly FixpRetransmitController _retransmitController;
     /// <summary>The wire SessionID currently claimed in <see cref="_claims"/>,
@@ -90,6 +107,14 @@ public sealed partial class FixpSession : IAsyncDisposable
     private long _msgSeqNum;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    /// <summary>
+    /// Issue #405: classification of the most recent close (or null
+    /// when the session is still open / has never closed). Set
+    /// inside <c>CloseLocked</c>; read by tests asserting the close
+    /// path took the right branch, and by the future journal/state
+    /// persister wire-up to decide whether to erase persisted state.
+    /// </summary>
+    private CloseKind? _lastCloseKind;
     // Watchdog state (milliseconds since process start, monotonic).
     private long _lastInboundMs;
     // Set true while we are waiting on the grace window after sending a probe;
@@ -107,6 +132,16 @@ public sealed partial class FixpSession : IAsyncDisposable
     private readonly InboundThrottle? _throttle;
 
     public long ConnectionId { get; }
+
+    /// <summary>
+    /// Issue #405: classification of the most recent
+    /// <see cref="CloseLocked"/> call, or <c>null</c> while the
+    /// session is still open and never been closed. Exposed for
+    /// tests that need to assert the right close branch was taken
+    /// (transport-error vs peer-terminate vs host-shutdown vs
+    /// suspended-timeout) without poking at private state.
+    /// </summary>
+    public CloseKind? LastCloseKind => _lastCloseKind;
     /// <summary>
     /// Numeric firm code (B3 EnteringFirm). Initially set from
     /// <c>identityFactory</c> at accept time as a placeholder; rewritten
@@ -276,8 +311,10 @@ public sealed partial class FixpSession : IAsyncDisposable
         EstablishValidator? establishValidator = null,
         Func<long>? nowMs = null,
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
-        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedRetransmitSnapshot = null)
+        B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
+        B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
+        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
+        bool resumeAsNegotiated = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -292,30 +329,69 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
-        _retransmitPersister = retransmitPersister;
+        _outboundJournal = outboundJournal;
+        _statePersister = statePersister;
+        // Issue #405 rehydration: when a state snapshot survives a
+        // host restart, seed identity (SessionId / SessionVerId /
+        // EnteringFirm) and seq counters BEFORE wiring the buffer
+        // callbacks, so the very first journal.Append / state.Save
+        // sees the resumed identity rather than the
+        // identityFactory-supplied placeholder.
+        if (persistedState is { } state)
+        {
+            SessionId = state.SessionId;
+            SessionVerId = state.SessionVerId;
+            EnteringFirm = state.EnteringFirm;
+            LastIncomingSeqNo = state.LastIncomingSeqNo;
+            // Reconcile: prefer max(snapshot, journal.MaxSeq) so an
+            // older snapshot doesn't roll the outbound seq backwards
+            // and collide with frames already persisted in the journal.
+            uint resumedSeq = state.OutboundMsgSeqNum;
+            if (outboundJournal is not null)
+            {
+                uint journalMax = outboundJournal.MaxSeq(state.SessionId);
+                if (journalMax > resumedSeq) resumedSeq = journalMax;
+            }
+            Volatile.Write(ref _msgSeqNum, resumedSeq);
+            // Issue #405 (review finding): when the listener determined
+            // the peer is resuming with Establish (same SessionVerId),
+            // pre-position the state machine at Negotiated so the
+            // incoming Establish event lands as (Negotiated, Establish)
+            // → Established. Without this, a peer that legitimately
+            // skips Negotiate after a host crash (spec §1.5 RECOVERABLE
+            // serverFlow) would be rejected as UNNEGOTIATED. Negotiate-
+            // shaped resumes (peer abandons old session for a fresh
+            // SessionVerId) keep the default Idle so the normal
+            // handshake gate fires and SeedLastVersion can enforce
+            // monotonicity against the persisted version.
+            if (resumeAsNegotiated)
+            {
+                State = FixpState.Negotiated;
+                _claimedSessionId = state.SessionId;
+            }
+        }
         // Issue #288: feed the per-session ring with the process-wide
         // RetransmitMetrics + a "currently Suspended?" predicate so the
         // outbound encoder can attribute frames buffered while the
         // transport is down (the #217 path).
-        // Issue #289: when a persister is wired in, every append is
-        // mirrored to {dataDir}/sessions/session-{id:x8}.ring and the
-        // file is compacted in-place every 2× capacity appends. The
-        // file survives a host crash; on the next boot it is loaded
-        // by FileFixpRetransmitPersister.LoadAll and threaded back
-        // through persistedRetransmitSnapshot below.
+        // Issue #405: when an outbound journal is wired, it owns the
+        // append-mirror + cold-read paths so a peer reconnecting
+        // after a host restart can replay any business frame from
+        // disk. When no journal is wired (tests / standalone), the
+        // ring degrades to a pure in-memory cache.
+        Action<uint, byte[]>? onAppendPersist = null;
+        Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead = null;
+        if (outboundJournal is not null)
+        {
+            onAppendPersist = (seq, frame) => outboundJournal.Append(
+                SessionId, seq, (long)_timeSource.NowNanos(), frame);
+            coldRead = (fromSeq, count) => outboundJournal.ReadRange(SessionId, fromSeq, count);
+        }
         _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity,
             metrics: retransmitMetrics,
             isSuspended: () => State == FixpState.Suspended,
-            onAppendPersist: retransmitPersister is null
-                ? null
-                : (seq, frame) => retransmitPersister.Append(SessionId, seq, frame),
-            onCompactPersist: retransmitPersister is null
-                ? null
-                : entries => retransmitPersister.Compact(SessionId, entries));
-        if (persistedRetransmitSnapshot is { Count: > 0 })
-        {
-            _retxBuffer.RehydrateFromPersistedSnapshot(persistedRetransmitSnapshot);
-        }
+            onAppendPersist: onAppendPersist,
+            coldRead: coldRead);
         _outboundEncoder = new FixpOutboundEncoder(
             sessionId: () => SessionId,
             nextMsgSeqNum: NextMsgSeqNum,
@@ -358,6 +434,26 @@ public sealed partial class FixpSession : IAsyncDisposable
             throw new ArgumentException(
                 "sessionClaims is required when negotiationValidator is supplied",
                 nameof(sessionClaims));
+        // Issue #405 (review finding): when resuming as Negotiated
+        // (post-crash Establish path), take the in-memory claim now so
+        // a concurrent peer targeting the same SessionID gets rejected
+        // as DUPLICATE_SESSION_CONNECTION. The persisted SeedLastVersion
+        // already pinned the SessionVerId in the claim registry; this
+        // promotes the seed to a live claim bound to this transport.
+        if (resumeAsNegotiated && persistedState is { } resumed && _claims is not null)
+        {
+            var result = _claims.TryReclaim(resumed.SessionId, resumed.SessionVerId, this);
+            if (result != SessionClaimRegistry.ClaimResult.Accepted)
+            {
+                // A second peer raced us to the same session post-restart
+                // (rare). Roll back the Negotiated state so the normal
+                // Establish gate runs and rejects with the spec-defined
+                // code; otherwise the state machine would silently
+                // accept a duplicate session.
+                State = FixpState.Idle;
+                _claimedSessionId = 0;
+            }
+        }
         // The transport's onClose callback funnels back through our
         // OnTransportClosed handler so transport-driven teardown can be
         // demoted to a Suspend (preserving the FIXP session) when we are

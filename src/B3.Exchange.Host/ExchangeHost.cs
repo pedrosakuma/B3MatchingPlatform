@@ -50,7 +50,8 @@ public sealed class ExchangeHost : IAsyncDisposable
     private DailyResetScheduler? _dailyReset;
     private PhaseScheduler? _phaseScheduler;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
-    private B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister? _retransmitPersister;
+    private B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal? _outboundJournal;
+    private B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister? _statePersister;
 
     public ExchangeHost(HostConfig config, ILoggerFactory? loggerFactory = null,
         Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null,
@@ -483,23 +484,36 @@ public sealed class ExchangeHost : IAsyncDisposable
         // prior Negotiate/Establish — used by the synthetic trader and
         // pre-#42 integration tests until they learn the handshake.
         bool requireHandshake = _config.Auth.RequireFixpHandshake;
-        // Issue #289: optional FIXP retransmit-buffer persistence. When
-        // configured, every outbound business frame is mirrored to a
-        // per-session file under retransmitPersistenceDir; on boot we
-        // load whatever rings survived a crash and feed them to the
-        // listener so a re-Establishing peer's RetransmitRequest can
-        // be served from the recovered ring instead of falling through
-        // to FIXP §4.5.6 not-applied-range.
-        IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? persistedRings = null;
+        // Issue #405: optional FIXP session-resync persistence. When
+        // configured, every outbound business frame is appended to an
+        // unbounded per-session journal and the FIXP envelope state
+        // (SessionVerId, LastIncomingSeqNo, OutboundMsgSeqNum) is
+        // snapshotted on every Negotiate/Suspend/non-terminal Close.
+        // On boot we load whatever state survived a crash + seed the
+        // SessionClaimRegistry so a peer reconnecting with its
+        // original SessionId can resume the full FIXP §1.5
+        // RECOVERABLE serverFlow contract — every business frame
+        // produced pre-crash is recoverable post-restart via the
+        // journal cold-read path.
+        IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? persistedSessionStates = null;
         if (!string.IsNullOrWhiteSpace(_config.Tcp.RetransmitPersistenceDir))
         {
-            _retransmitPersister = new B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister(
+            _outboundJournal = new B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal(
                 _config.Tcp.RetransmitPersistenceDir!,
-                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpRetransmitPersister>());
-            persistedRings = _retransmitPersister.LoadAll();
+                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal>());
+            _statePersister = new B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister(
+                _config.Tcp.RetransmitPersistenceDir!,
+                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister>());
+            var loaded = _statePersister.LoadAll();
+            var loadedDict = loaded.ToDictionary(s => s.SessionId, s => s);
+            persistedSessionStates = loadedDict;
+            foreach (var snap in loadedDict.Values)
+            {
+                sessionClaims.SeedLastVersion(snap.SessionId, snap.SessionVerId);
+            }
             _logger.LogInformation(
-                "fixp retransmit persistence enabled: dir={Dir} recoveredSessions={Count}",
-                _config.Tcp.RetransmitPersistenceDir, persistedRings.Count);
+                "fixp session resync enabled: dir={Dir} recoveredStates={Count}",
+                _config.Tcp.RetransmitPersistenceDir, loadedDict.Count);
         }
         _listener = new EntryPointListener(listenEp, _router, sessionRegistry, _loggerFactory,
             identityFactory: remote =>
@@ -521,8 +535,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             sessionClaims: requireHandshake ? sessionClaims : null,
             establishValidator: requireHandshake ? establishValidator : null,
             retransmitMetrics: _metrics.Retransmit,
-            retransmitPersister: _retransmitPersister,
-            persistedRetransmitSnapshots: persistedRings);
+            outboundJournal: _outboundJournal,
+            statePersister: _statePersister,
+            persistedSessionStates: persistedSessionStates);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 
@@ -1022,7 +1037,8 @@ public sealed class ExchangeHost : IAsyncDisposable
         }
         _auditWriters.Clear();
         foreach (var s in _ownedSinks) s.Dispose();
-        _retransmitPersister?.Dispose();
+        _outboundJournal?.Dispose();
+        _statePersister?.Dispose();
         // Issue #290: release dataDir locks last so any persister/WAL
         // shutdown that needs the directory still has it.
         foreach (var l in _dataDirLocks)

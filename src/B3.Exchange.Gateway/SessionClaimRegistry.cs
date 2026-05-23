@@ -38,6 +38,66 @@ public sealed class SessionClaimRegistry
         lock (_lock) return _lastSessionVerId.TryGetValue(sessionId, out var v) ? v : 0UL;
     }
 
+    /// <summary>
+    /// Issue #405: boot-time seed for the highest-seen
+    /// <c>sessionVerID</c> per session, recovered from a persisted
+    /// <c>FixpSessionStateSnapshot</c>. Called once during host
+    /// startup, before the FIXP listener accepts connections.
+    /// Idempotent across calls — the registry monotonically keeps the
+    /// maximum value seen. Calling this with <paramref name="sessionVerId"/>
+    /// = 0 is a no-op (matches the "never negotiated" sentinel).
+    /// </summary>
+    /// <remarks>
+    /// This is the mechanism that preserves the SBE 5.2 §4.5.2
+    /// intraweek monotonicity rule across process restart: without
+    /// it, a fresh-process registry would accept the peer's old
+    /// <c>sessionVerID</c> and the spec-mandated "preventing affects
+    /// on subsequent retransmission" guarantee would silently break.
+    /// </remarks>
+    public void SeedLastVersion(uint sessionId, ulong sessionVerId)
+    {
+        if (sessionVerId == 0UL) return;
+        lock (_lock)
+        {
+            if (_lastSessionVerId.TryGetValue(sessionId, out var existing)
+                && existing >= sessionVerId)
+                return;
+            _lastSessionVerId[sessionId] = sessionVerId;
+        }
+    }
+
+    /// <summary>
+    /// Issue #405 (review finding): re-claim a session whose
+    /// <see cref="SeedLastVersion"/> entry survived a host crash, using
+    /// the SAME <paramref name="sessionVerId"/> as the persisted snapshot.
+    /// This is the spec §1.5 RECOVERABLE serverFlow resume path —
+    /// the peer reconnects with Establish reusing its original
+    /// SessionVerId, and the server is contractually obliged to
+    /// resume that session rather than treat the verId as stale.
+    /// Returns <see cref="ClaimResult.Accepted"/> only if no live
+    /// claim is currently held AND the seeded verId matches exactly;
+    /// any mismatch falls through to the normal monotonicity rules
+    /// (caller should use <see cref="TryClaim"/> for the Negotiate
+    /// path with strictly-greater verId).
+    /// </summary>
+    public ClaimResult TryReclaim(uint sessionId, ulong sessionVerId, object claimToken)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
+
+        lock (_lock)
+        {
+            if (_activeClaims.ContainsKey(sessionId))
+                return ClaimResult.DuplicateConnection;
+            if (!_lastSessionVerId.TryGetValue(sessionId, out var last) || sessionVerId != last)
+                return ClaimResult.StaleVersion;
+
+            _activeClaims[sessionId] = claimToken;
+            return ClaimResult.Accepted;
+        }
+    }
+
+
     /// <summary>Outcome of <see cref="TryClaim"/>.</summary>
     public enum ClaimResult
     {

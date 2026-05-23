@@ -95,12 +95,24 @@ public sealed class TcpConfig
     [JsonPropertyName("throttle")] public ThrottleConfig? Throttle { get; set; }
 
     /// <summary>
-    /// Issue #289: per-FIXP-session retransmit-buffer persistence
-    /// directory. When non-empty, every outbound business frame is
-    /// mirrored to <c>{retransmitPersistenceDir}/sessions/session-{sessionId:x8}.ring</c>
-    /// so a host crash while a session is <c>Suspended</c> does not
-    /// erase the buffered ExecutionReports. The directory is created
-    /// on demand. Empty (the default) disables retransmit persistence.
+    /// Issue #405: per-FIXP-session resync persistence directory.
+    /// When non-empty, two artifacts are written under this directory:
+    /// (a) an unbounded append-only journal of every outbound business
+    /// frame at <c>{dir}/journal/session-{sessionId:x8}/segment-*.log</c>,
+    /// and (b) a periodically-rewritten envelope-state snapshot
+    /// (SessionVerId, LastIncomingSeqNo, outbound MsgSeqNum, CoD
+    /// parameters) at <c>{dir}/state/session-{sessionId:x8}.state</c>.
+    /// On boot the host rehydrates <c>SessionClaimRegistry</c> from the
+    /// snapshots so peers reconnecting with their original SessionVerId
+    /// are accepted (no <c>UNNEGOTIATED</c> reject), and subsequent
+    /// <c>RetransmitRequest</c>s for seqs beyond the in-memory ring are
+    /// served from the journal — satisfying the
+    /// <c>EstablishmentAck.serverFlow=RECOVERABLE</c> contract across
+    /// host restarts. The directory is created on demand. Empty (the
+    /// default) disables resync persistence and the simulator falls
+    /// back to ephemeral FIXP state.
+    /// Property name retained from the #289 prototype for config
+    /// back-compat; semantics widened by #405.
     /// </summary>
     [JsonPropertyName("retransmitPersistenceDir")] public string? RetransmitPersistenceDir { get; set; }
 }

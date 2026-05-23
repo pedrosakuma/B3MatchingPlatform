@@ -247,6 +247,38 @@ Exposes:
   indicative state before restart. Omit the `persistence` block to keep
   the legacy stateless boot.
 
+### FIXP session resync persistence (`tcp.retransmitPersistenceDir`)
+
+The top-level `tcp.retransmitPersistenceDir` directory enables
+per-session **FIXP envelope + outbound journal** persistence
+(issue #405). When set, the host writes two artifacts:
+
+* **Outbound journal** at `{dir}/journal/session-{sessionId:x8}/segment-*.log` —
+  append-only, segmented (~16 MiB per segment), every outbound
+  business frame is durably recorded with seq + timestamp + CRC32C.
+  `RetransmitRequest` for any seq not in the in-memory ring is served
+  from this journal, eliminating the bounded-ring eviction window of
+  the prior `#289` prototype.
+* **Envelope-state snapshot** at `{dir}/state/session-{sessionId:x8}.state` —
+  rewritten on every handshake event (Negotiate / Establish /
+  CoD-params / non-terminal Close) with `SessionVerId`,
+  `LastIncomingSeqNo`, outbound `MsgSeqNum`, and CoD parameters.
+
+On boot, every snapshot is loaded and `SessionClaimRegistry` is
+seeded so a peer reconnecting after `docker compose restart
+matching-platform` with its original `SessionVerId` is accepted
+rather than `UNNEGOTIATED`-rejected — the
+`EstablishmentAck.serverFlow=RECOVERABLE` contract (SBE 5.2 §1.5)
+is honored across host restarts.
+
+Terminal lifecycle events — peer-initiated `Terminate(Finished)`
+and `SuspendedTimeout` expiration — remove both artifacts. Host
+graceful shutdown and transport errors **preserve** them so the
+peer can resync on reconnect.
+
+Property name kept from `#289` for config back-compat; the prior
+bounded `.ring` files are no longer read or written.
+
 **Consolidated example with every sub-block:**
 
 ```jsonc
