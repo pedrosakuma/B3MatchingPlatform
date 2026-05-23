@@ -227,7 +227,10 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (!s.IsOpen) continue;
             try
             {
-                s.Close(reason);
+                // Daily-rollover / admin terminate-all is treated as a
+                // host-driven shutdown (issue #405): peer is expected
+                // to reconnect and we want persisted state preserved.
+                s.Close(reason, CloseKind.HostShutdown);
                 closed++;
             }
             catch (Exception ex)
@@ -283,7 +286,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (!s.IsOpen) continue;
             try
             {
-                await s.SendTerminateAndCloseAsync(terminationCode, reason).ConfigureAwait(false);
+                await s.SendTerminateAndCloseAsync(terminationCode, reason, CloseKind.HostShutdown).ConfigureAwait(false);
                 closed++;
             }
             catch (Exception ex)

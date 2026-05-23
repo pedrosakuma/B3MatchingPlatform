@@ -236,7 +236,7 @@ public sealed partial class FixpSession
                         _claimedSessionId = 0;
                     }
                     await TerminateAndCloseAsync(
-                        SessionRejectEncoder.TerminationCode.Finished, reason).ConfigureAwait(false);
+                        SessionRejectEncoder.TerminationCode.Finished, reason, CloseKind.PeerTerminate).ConfigureAwait(false);
                     return false;
                 }
             case EntryPointFrameReader.TidSimpleNewOrder:

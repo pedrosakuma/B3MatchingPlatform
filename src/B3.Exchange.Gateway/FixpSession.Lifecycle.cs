@@ -62,7 +62,9 @@ public sealed partial class FixpSession
                 SuspendLocked(reason);
                 return;
             }
-            CloseLocked(reason);
+            // Transport went away before/after Establish — peer is expected
+            // to reconnect, so do not erase persisted state (issue #405).
+            CloseLocked(reason, CloseKind.TransportError);
         }
     }
 
@@ -101,7 +103,10 @@ public sealed partial class FixpSession
             _logger.LogInformation(
                 "fixp session {ConnectionId} suspend declined (state={State} action={Action}); closing instead",
                 ConnectionId, State, action);
-            CloseLocked(reason);
+            // State machine refused the demote → fall through to a
+            // hard close. Treat as transport loss (peer may reconnect)
+            // unless we know otherwise (issue #405).
+            CloseLocked(reason, CloseKind.TransportError);
             return;
         }
         // Best-effort teardown of cancellation + transport during Suspend; each
@@ -131,15 +136,32 @@ public sealed partial class FixpSession
         lock (_attachLock)
         {
             if (!ReferenceEquals(_transport, originatingTransport)) return;
-            CloseLocked(reason);
+            // Triggered exclusively from background loops (watchdog) on
+            // an idle-timeout / IO error → peer is expected to reconnect.
+            CloseLocked(reason, CloseKind.TransportError);
         }
     }
 
-    public void Close(string reason)
+    /// <summary>
+    /// Closes the session with a diagnostic reason. Legacy overload
+    /// kept for tests and existing call-sites that have not been
+    /// classified yet; defaults to <see cref="CloseKind.PeerTerminate"/>
+    /// to preserve pre-#405 behavior (the persistence delete-vs-keep
+    /// decision is wired in a later commit).
+    /// </summary>
+    public void Close(string reason) => Close(reason, CloseKind.PeerTerminate);
+
+    /// <summary>
+    /// Classified close (issue #405). The <paramref name="kind"/>
+    /// drives whether persisted FIXP session state and the outbound
+    /// journal are erased (terminal kinds) or preserved (kinds where
+    /// the peer is expected to reconnect).
+    /// </summary>
+    public void Close(string reason, CloseKind kind)
     {
         lock (_attachLock)
         {
-            CloseLocked(reason);
+            CloseLocked(reason, kind);
         }
     }
 
@@ -151,7 +173,7 @@ public sealed partial class FixpSession
     /// transition from "trying to suspend" to "actually closing" is
     /// atomic from the perspective of a concurrent re-attach).
     /// </summary>
-    private void CloseLocked(string reason)
+    private void CloseLocked(string reason, CloseKind kind)
     {
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
         Volatile.Write(ref _isAttached, 0);
@@ -159,7 +181,10 @@ public sealed partial class FixpSession
         // doesn't try to re-Close a session that's already terminal.
         Volatile.Write(ref _suspendedSinceMs, 0);
         StopCodTimerLocked();
-        _logger.LogInformation("fixp session {ConnectionId} closing", ConnectionId);
+        _lastCloseKind = kind;
+        _logger.LogInformation(
+            "fixp session {ConnectionId} closing (kind={Kind})",
+            ConnectionId, kind);
         try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose race; benign */ }
         // The transport may have already closed (it's the source of the
         // callback in IO-error paths). Either way, ensure it's down so the
@@ -189,10 +214,12 @@ public sealed partial class FixpSession
                 "fixp session {ConnectionId} OnSessionClosed callback threw",
                 ConnectionId);
         }
-        // Issue #289: terminal close ⇒ drop the persisted retransmit
-        // ring file. We deliberately do NOT do this on Suspend so a
-        // host crash while Suspended leaves the file intact for the
-        // next boot to rehydrate from.
+        // Issue #289 / #405: terminal close ⇒ drop the persisted
+        // retransmit ring file. Today this fires for every CloseKind
+        // (pre-#405 behavior); a subsequent commit will scope it to
+        // {PeerTerminate, SuspendedTimeout} so transport-error and
+        // host-shutdown closes preserve state for the reconnecting
+        // peer to resync against (SBE 5.2 §1.5 recoverable serverFlow).
         if (_retransmitPersister is not null)
         {
             try { _retransmitPersister.Remove(SessionId); }
@@ -331,7 +358,7 @@ public sealed partial class FixpSession
             var since = Volatile.Read(ref _suspendedSinceMs);
             if (since == 0) return false;
             if (since > thresholdMs) return false;
-            CloseLocked("suspended-timeout");
+            CloseLocked("suspended-timeout", CloseKind.SuspendedTimeout);
             return true;
         }
     }

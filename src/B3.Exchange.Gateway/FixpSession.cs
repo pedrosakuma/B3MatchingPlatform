@@ -90,6 +90,14 @@ public sealed partial class FixpSession : IAsyncDisposable
     private long _msgSeqNum;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    /// <summary>
+    /// Issue #405: classification of the most recent close (or null
+    /// when the session is still open / has never closed). Set
+    /// inside <c>CloseLocked</c>; read by tests asserting the close
+    /// path took the right branch, and by the future journal/state
+    /// persister wire-up to decide whether to erase persisted state.
+    /// </summary>
+    private CloseKind? _lastCloseKind;
     // Watchdog state (milliseconds since process start, monotonic).
     private long _lastInboundMs;
     // Set true while we are waiting on the grace window after sending a probe;
@@ -107,6 +115,16 @@ public sealed partial class FixpSession : IAsyncDisposable
     private readonly InboundThrottle? _throttle;
 
     public long ConnectionId { get; }
+
+    /// <summary>
+    /// Issue #405: classification of the most recent
+    /// <see cref="CloseLocked"/> call, or <c>null</c> while the
+    /// session is still open and never been closed. Exposed for
+    /// tests that need to assert the right close branch was taken
+    /// (transport-error vs peer-terminate vs host-shutdown vs
+    /// suspended-timeout) without poking at private state.
+    /// </summary>
+    public CloseKind? LastCloseKind => _lastCloseKind;
     /// <summary>
     /// Numeric firm code (B3 EnteringFirm). Initially set from
     /// <c>identityFactory</c> at accept time as a placeholder; rewritten
