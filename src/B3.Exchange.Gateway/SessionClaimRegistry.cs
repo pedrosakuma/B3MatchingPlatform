@@ -66,6 +66,37 @@ public sealed class SessionClaimRegistry
         }
     }
 
+    /// <summary>
+    /// Issue #405 (review finding): re-claim a session whose
+    /// <see cref="SeedLastVersion"/> entry survived a host crash, using
+    /// the SAME <paramref name="sessionVerId"/> as the persisted snapshot.
+    /// This is the spec §1.5 RECOVERABLE serverFlow resume path —
+    /// the peer reconnects with Establish reusing its original
+    /// SessionVerId, and the server is contractually obliged to
+    /// resume that session rather than treat the verId as stale.
+    /// Returns <see cref="ClaimResult.Accepted"/> only if no live
+    /// claim is currently held AND the seeded verId matches exactly;
+    /// any mismatch falls through to the normal monotonicity rules
+    /// (caller should use <see cref="TryClaim"/> for the Negotiate
+    /// path with strictly-greater verId).
+    /// </summary>
+    public ClaimResult TryReclaim(uint sessionId, ulong sessionVerId, object claimToken)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
+
+        lock (_lock)
+        {
+            if (_activeClaims.ContainsKey(sessionId))
+                return ClaimResult.DuplicateConnection;
+            if (!_lastSessionVerId.TryGetValue(sessionId, out var last) || sessionVerId != last)
+                return ClaimResult.StaleVersion;
+
+            _activeClaims[sessionId] = claimToken;
+            return ClaimResult.Accepted;
+        }
+    }
+
 
     /// <summary>Outcome of <see cref="TryClaim"/>.</summary>
     public enum ClaimResult

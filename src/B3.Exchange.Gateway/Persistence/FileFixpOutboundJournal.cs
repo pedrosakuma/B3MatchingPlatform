@@ -214,6 +214,14 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         var path = Path.Combine(dir, SegmentFileName(firstSeq));
         var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
             FileShare.Read, bufferSize: 4096, useAsync: false);
+        // Issue #405 (review finding): fsync the session directory so
+        // the new segment's directory entry is durable before the first
+        // frame written to it goes on-wire. Without this, a power-loss
+        // immediately after CreateNew + Append + send could lose the
+        // segment file entirely on next boot, even though its contents
+        // had been flushed — the peer would see acks for seqs that
+        // disappear from the journal.
+        DirectorySync.Fsync(dir);
         return new ActiveSegment(path, firstSeq, fs);
     }
 

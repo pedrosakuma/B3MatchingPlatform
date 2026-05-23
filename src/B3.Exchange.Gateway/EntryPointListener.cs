@@ -420,36 +420,84 @@ public sealed class EntryPointListener : IAsyncDisposable
             }
         }
 
-        // Issue #405 boot rehydration: if the first frame is a Negotiate
-        // targeting a SessionId we loaded from the state persister at
-        // boot, hand the snapshot to the new FixpSession so its identity
+        // Issue #405 boot rehydration: if the first frame targets a
+        // SessionId we loaded from the state persister at boot, hand
+        // the snapshot to the new FixpSession so its identity
         // (SessionVerId / LastIncomingSeqNo / outbound seq) resumes
-        // where the previous incarnation left off. The peer is expected
-        // to advance SessionVerId per spec §1.4 (microseconds-since-epoch)
-        // — SeedLastVersion on the claim registry ensures monotonicity
-        // is enforced against the persisted version.
+        // where the previous incarnation left off.
+        //
+        // Two distinct entry shapes need rehydration after a host crash:
+        //   (a) Negotiate with a STRICTLY-GREATER SessionVerId — peer
+        //       abandons the old session and starts fresh; SeedLastVersion
+        //       on the claim registry enforces monotonicity vs the
+        //       persisted version (spec §1.4).
+        //   (b) Establish with the SAME SessionVerId — peer resumes the
+        //       prior session per the EstablishmentAck.serverFlow=RECOVERABLE
+        //       contract (spec §1.5). The rehydrated session must come
+        //       up in FixpState.Negotiated (not Idle) so the Establish
+        //       lands as (Negotiated, Establish) → Established instead
+        //       of being rejected as UNNEGOTIATED.
+        // The active-claim re-attach branch above already handles the
+        // hot path (same-process Suspended session); this block handles
+        // the cold path where the prior incarnation died.
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? rehydrateState = null;
+        bool resumeAsNegotiated = false;
         if (_persistedSessionStates is not null
-            && templateId == EntryPointFrameReader.TidNegotiate
-            && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength)
+            && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize)
         {
-            var fixedBlock = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize, NegotiateDecoder.BlockLength);
-            var varData = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength);
-            if (NegotiateDecoder.TryDecode(fixedBlock, varData, out var negReq, out _, out _)
-                && _persistedSessionStates.TryGetValue(negReq.SessionId, out var snap))
+            uint sessionIdFromFrame = 0;
+            ulong sessionVerIdFromFrame = 0;
+            bool isEstablish = false;
+            bool decoded = false;
+            if (templateId == EntryPointFrameReader.TidNegotiate
+                && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength)
+            {
+                var fixedBlock = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize, NegotiateDecoder.BlockLength);
+                var varData = firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + NegotiateDecoder.BlockLength);
+                if (NegotiateDecoder.TryDecode(fixedBlock, varData, out var negReq, out _, out _))
+                {
+                    sessionIdFromFrame = negReq.SessionId;
+                    sessionVerIdFromFrame = negReq.SessionVerId;
+                    decoded = true;
+                }
+            }
+            else if (templateId == EntryPointFrameReader.TidEstablish
+                && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + EstablishDecoder.BlockLength)
+            {
+                if (EstablishDecoder.TryDecode(
+                    firstFrame.AsSpan(EntryPointFrameReader.WireHeaderSize, EstablishDecoder.BlockLength),
+                    out var estReq, out _))
+                {
+                    sessionIdFromFrame = estReq.SessionId;
+                    sessionVerIdFromFrame = estReq.SessionVerId;
+                    isEstablish = true;
+                    decoded = true;
+                }
+            }
+            if (decoded && _persistedSessionStates.TryGetValue(sessionIdFromFrame, out var snap))
             {
                 rehydrateState = snap;
+                // Only the Establish-with-matching-SessionVerId shape
+                // should resume in Negotiated state. A Negotiate frame
+                // (any SessionVerId) and an Establish with a different
+                // SessionVerId both go through the normal handshake
+                // gate — the latter will be rejected by EstablishValidator
+                // as INVALID_SESSIONVERID, which is the correct
+                // spec-defined response.
+                resumeAsNegotiated = isEstablish && sessionVerIdFromFrame == snap.SessionVerId;
                 _logger.LogInformation(
-                    "rehydrating persisted session {SessionId} (verId={VerId} → peer verId={PeerVerId}) from {Remote}",
-                    snap.SessionId, snap.SessionVerId, negReq.SessionVerId, SafeRemote(sock));
+                    "rehydrating persisted session {SessionId} (verId={VerId} → peer verId={PeerVerId} firstFrame={Frame} resumeAsNegotiated={Resume}) from {Remote}",
+                    snap.SessionId, snap.SessionVerId, sessionVerIdFromFrame,
+                    isEstablish ? "Establish" : "Negotiate", resumeAsNegotiated, SafeRemote(sock));
             }
         }
 
-        ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState);
+        ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState, resumeAsNegotiated: resumeAsNegotiated);
     }
 
     private void ConstructAndStartSession(NetworkStream stream, Socket sock, byte[]? firstFrame,
-        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState)
+        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState,
+        bool resumeAsNegotiated = false)
     {
         var identity = _identityFactory(SafeRemote(sock));
         _logger.LogInformation("accepted connection {ConnectionId} from {Remote} sessionId={SessionId}",
@@ -472,7 +520,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             retransmitMetrics: _retransmitMetrics,
             outboundJournal: _outboundJournal,
             statePersister: _statePersister,
-            persistedState: persistedState);
+            persistedState: persistedState,
+            resumeAsNegotiated: resumeAsNegotiated);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();

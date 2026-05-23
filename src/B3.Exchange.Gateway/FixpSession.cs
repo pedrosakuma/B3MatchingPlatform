@@ -313,7 +313,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
         B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
-        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null)
+        B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
+        bool resumeAsNegotiated = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -352,6 +353,22 @@ public sealed partial class FixpSession : IAsyncDisposable
                 if (journalMax > resumedSeq) resumedSeq = journalMax;
             }
             Volatile.Write(ref _msgSeqNum, resumedSeq);
+            // Issue #405 (review finding): when the listener determined
+            // the peer is resuming with Establish (same SessionVerId),
+            // pre-position the state machine at Negotiated so the
+            // incoming Establish event lands as (Negotiated, Establish)
+            // → Established. Without this, a peer that legitimately
+            // skips Negotiate after a host crash (spec §1.5 RECOVERABLE
+            // serverFlow) would be rejected as UNNEGOTIATED. Negotiate-
+            // shaped resumes (peer abandons old session for a fresh
+            // SessionVerId) keep the default Idle so the normal
+            // handshake gate fires and SeedLastVersion can enforce
+            // monotonicity against the persisted version.
+            if (resumeAsNegotiated)
+            {
+                State = FixpState.Negotiated;
+                _claimedSessionId = state.SessionId;
+            }
         }
         // Issue #288: feed the per-session ring with the process-wide
         // RetransmitMetrics + a "currently Suspended?" predicate so the
@@ -417,6 +434,26 @@ public sealed partial class FixpSession : IAsyncDisposable
             throw new ArgumentException(
                 "sessionClaims is required when negotiationValidator is supplied",
                 nameof(sessionClaims));
+        // Issue #405 (review finding): when resuming as Negotiated
+        // (post-crash Establish path), take the in-memory claim now so
+        // a concurrent peer targeting the same SessionID gets rejected
+        // as DUPLICATE_SESSION_CONNECTION. The persisted SeedLastVersion
+        // already pinned the SessionVerId in the claim registry; this
+        // promotes the seed to a live claim bound to this transport.
+        if (resumeAsNegotiated && persistedState is { } resumed && _claims is not null)
+        {
+            var result = _claims.TryReclaim(resumed.SessionId, resumed.SessionVerId, this);
+            if (result != SessionClaimRegistry.ClaimResult.Accepted)
+            {
+                // A second peer raced us to the same session post-restart
+                // (rare). Roll back the Negotiated state so the normal
+                // Establish gate runs and rejects with the spec-defined
+                // code; otherwise the state machine would silently
+                // accept a duplicate session.
+                State = FixpState.Idle;
+                _claimedSessionId = 0;
+            }
+        }
         // The transport's onClose callback funnels back through our
         // OnTransportClosed handler so transport-driven teardown can be
         // demoted to a Suspend (preserving the FIXP session) when we are

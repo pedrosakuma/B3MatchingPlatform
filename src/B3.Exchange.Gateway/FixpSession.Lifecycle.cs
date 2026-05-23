@@ -87,18 +87,41 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// <summary>
     /// Issue #405: writes the current FIXP envelope state to
     /// <see cref="_statePersister"/> if one is wired. Best-effort —
     /// persistence failures are logged but never propagate, so a
     /// transient disk hiccup does not kill the session. Caller must
     /// have set <see cref="SessionId"/>; otherwise the call is a
     /// no-op (no point persisting a zeroed identity).
+    ///
+    /// Suitable only for non-handshake-acking paths (post-Negotiate
+    /// outbound seq advance, lifecycle close, etc.) — the Negotiate
+    /// commit MUST use <see cref="TrySaveStateSnapshot"/> so a failed
+    /// save aborts the handshake instead of acknowledging a
+    /// SessionVerID that never reached disk.
     /// </summary>
     internal void SaveStateSnapshotSafe()
     {
+        _ = TrySaveStateSnapshot();
+    }
+
+    /// <summary>
+    /// Issue #405 (review finding): variant of
+    /// <see cref="SaveStateSnapshotSafe"/> that surfaces success / failure
+    /// to the caller so the Negotiate commit path can reject the
+    /// handshake if the SessionVerID could not be made crash-durable.
+    /// Returns <c>true</c> when there is no persister wired (the
+    /// simulator is running in ephemeral mode), when SessionId is 0
+    /// (nothing to persist yet), or when the underlying
+    /// <see cref="IFixpSessionStatePersister.Save(in FixpSessionStateSnapshot)"/>
+    /// call completes without throwing.
+    /// </summary>
+    internal bool TrySaveStateSnapshot()
+    {
         var persister = _statePersister;
-        if (persister is null) return;
-        if (SessionId == 0) return;
+        if (persister is null) return true;
+        if (SessionId == 0) return true;
         try
         {
             var snapshot = new B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot(
@@ -109,12 +132,14 @@ public sealed partial class FixpSession
                 EnteringFirm: EnteringFirm,
                 UpdatedAtNanos: (long)_timeSource.NowNanos());
             persister.Save(snapshot);
+            return true;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
                 "fixp session {ConnectionId} sessionId={SessionId} failed to persist state snapshot",
                 ConnectionId, SessionId);
+            return false;
         }
     }
 

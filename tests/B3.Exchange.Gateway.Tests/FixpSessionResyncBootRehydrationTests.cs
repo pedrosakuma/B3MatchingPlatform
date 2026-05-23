@@ -208,4 +208,205 @@ public class FixpSessionResyncBootRehydrationTests
             try { Directory.Delete(dir, recursive: true); } catch { }
         }
     }
+
+    [Fact]
+    public async Task ReconnectingEstablish_WithSamePersistedSessionVerId_ResumesNegotiatedAndAcceptsEstablish()
+    {
+        // Issue #405 / review finding: after a host crash the peer
+        // reconnects with Establish (NOT Negotiate) using its original
+        // SessionVerId, per spec §1.5 EstablishmentAck.serverFlow=
+        // RECOVERABLE. The rehydrated FixpSession must come up in
+        // FixpState.Negotiated so the Establish lands as
+        // (Negotiated, Establish) → Established. Without the
+        // resumeAsNegotiated path, the session would start Idle and
+        // EstablishValidator would reject with UNNEGOTIATED.
+        var dir = Path.Combine(Path.GetTempPath(), "fixp-resync-est-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var journal = new FileFixpOutboundJournal(dir,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<FileFixpOutboundJournal>.Instance);
+            using var statePersister = new FileFixpSessionStatePersister(dir,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<FileFixpSessionStatePersister>.Instance);
+            for (uint seq = 1; seq <= 3; seq++)
+            {
+                journal.Append(sessionId: 1, seq: seq, timestampNanos: 1_000L * seq,
+                    frame: new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, (byte)seq });
+            }
+            statePersister.Save(new FixpSessionStateSnapshot(
+                SessionId: 1,
+                SessionVerId: 100UL,
+                OutboundMsgSeqNum: 3u,
+                LastIncomingSeqNo: 2u,
+                EnteringFirm: 42u,
+                UpdatedAtNanos: 1_000_000L));
+
+            var persistedStates = statePersister.LoadAll().ToDictionary(s => s.SessionId, s => s);
+            var firms = new FirmRegistry(
+                new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+                new[] { new SessionCredential(SessionId: "1", FirmId: "F1", AccessKey: "", AllowedSourceCidrs: null, Policy: SessionPolicy.Default) });
+            var claims = new SessionClaimRegistry();
+            foreach (var s in persistedStates.Values)
+                claims.SeedLastVersion(s.SessionId, s.SessionVerId);
+            var negValidator = new NegotiationValidator(firms, claims, devMode: true, timestampSkewToleranceNs: 0);
+            var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
+
+            await using var listener = new EntryPointListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new NoOpEngineSink(),
+                new SessionRegistry(),
+                NullLoggerFactory.Instance,
+                sessionOptions: new FixpSessionOptions
+                {
+                    HeartbeatIntervalMs = 60_000,
+                    IdleTimeoutMs = 60_000,
+                    TestRequestGraceMs = 60_000,
+                    SuspendedTimeoutMs = 0,
+                    FirstFrameTimeoutMs = 5_000,
+                },
+                negotiationValidator: negValidator,
+                sessionClaims: claims,
+                establishValidator: estValidator,
+                outboundJournal: journal,
+                statePersister: statePersister,
+                persistedSessionStates: persistedStates);
+            listener.Start();
+
+            // Act: peer reconnects with Establish reusing the persisted
+            // SessionVerId (RECOVERABLE-flow resume).
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+            var buf = new byte[256];
+            int len = EntryPointFixpFrameCodec.EncodeEstablish(buf,
+                sessionId: 1, sessionVerId: 100UL,
+                timestampNanos: 0UL, keepAliveIntervalMillis: 60_000UL,
+                nextSeqNo: 3u,
+                cancelOnDisconnectType: 0, codTimeoutWindowMillis: 0UL,
+                credentials: ReadOnlySpan<byte>.Empty);
+            await client.GetStream().WriteAsync(buf.AsMemory(0, len));
+
+            // Assert: the listener constructs a rehydrated session that
+            // accepts the Establish (state transitions to Established).
+            var establishedSession = await TestUtil.WaitUntilAsync(() =>
+            {
+                var s = listener.ActiveSessions.FirstOrDefault(x => x.SessionId == 1);
+                return s is not null && s.State == FixpState.Established;
+            }, TimeSpan.FromSeconds(5));
+            Assert.True(establishedSession,
+                "rehydrated session should reach Established after Establish-resume; " +
+                $"current states: {string.Join(",", listener.ActiveSessions.Select(s => $"{s.SessionId}:{s.State}"))}");
+
+            var session = listener.ActiveSessions.Single(s => s.SessionId == 1);
+            // The persisted identity must survive: same SessionVerId,
+            // EnteringFirm, and counters from the snapshot.
+            Assert.Equal(100UL, session.SessionVerId);
+            Assert.Equal(42u, session.EnteringFirm);
+            Assert.Equal(3u, session.OutboundSeq);
+            Assert.Equal(2u, session.LastIncomingSeqNo);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    private sealed class FaultingStatePersister : IFixpSessionStatePersister
+    {
+        public int SaveCount;
+        public void Save(in FixpSessionStateSnapshot snapshot)
+        {
+            Interlocked.Increment(ref SaveCount);
+            throw new IOException("simulated disk failure");
+        }
+        public FixpSessionStateSnapshot? Load(uint sessionId) => null;
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
+            => Array.Empty<FixpSessionStateSnapshot>();
+        public void Remove(uint sessionId) { }
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public async Task Negotiate_StatePersisterFails_RejectsAndReleasesClaim()
+    {
+        // Issue #405 (review finding #2): the FIXP Negotiate accept
+        // path must persist the new SessionVerID BEFORE acking. If the
+        // persister throws (disk full / IO error), the peer must
+        // receive a NegotiateReject — never a NegotiateResponse for a
+        // SessionVerID that never reached durable storage. The
+        // in-memory claim must also be released so the peer can
+        // immediately retry on a fresh socket without colliding with
+        // DUPLICATE_SESSION_CONNECTION.
+        var faulting = new FaultingStatePersister();
+        using var journal = new FileFixpOutboundJournal(
+            Path.Combine(Path.GetTempPath(), "fixp-fault-" + Guid.NewGuid().ToString("n")),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<FileFixpOutboundJournal>.Instance);
+        try
+        {
+            var firms = new FirmRegistry(
+                new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+                new[] { new SessionCredential(SessionId: "1", FirmId: "F1", AccessKey: "", AllowedSourceCidrs: null, Policy: SessionPolicy.Default) });
+            var claims = new SessionClaimRegistry();
+            var negValidator = new NegotiationValidator(firms, claims, devMode: true, timestampSkewToleranceNs: 0);
+            var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
+
+            await using var listener = new EntryPointListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new NoOpEngineSink(),
+                new SessionRegistry(),
+                NullLoggerFactory.Instance,
+                sessionOptions: new FixpSessionOptions
+                {
+                    HeartbeatIntervalMs = 60_000,
+                    IdleTimeoutMs = 60_000,
+                    TestRequestGraceMs = 60_000,
+                    SuspendedTimeoutMs = 0,
+                    FirstFrameTimeoutMs = 5_000,
+                },
+                negotiationValidator: negValidator,
+                sessionClaims: claims,
+                establishValidator: estValidator,
+                outboundJournal: journal,
+                statePersister: faulting,
+                persistedSessionStates: null);
+            listener.Start();
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+            var creds = Encoding.UTF8.GetBytes("{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
+            var buf = new byte[256];
+            int len = EntryPointFixpFrameCodec.EncodeNegotiate(buf,
+                sessionId: 1, sessionVerId: 100UL,
+                timestampNanos: 0UL, enteringFirm: 42u, onBehalfFirm: null,
+                credentials: creds,
+                clientIp: ReadOnlySpan<byte>.Empty,
+                clientAppName: ReadOnlySpan<byte>.Empty,
+                clientAppVersion: ReadOnlySpan<byte>.Empty);
+            await client.GetStream().WriteAsync(buf.AsMemory(0, len));
+
+            // Wait for the listener to: (a) call the faulting persister,
+            // (b) reject the session, (c) deregister it from
+            // ActiveSessions (which the reject path drives via Close →
+            // onClosed callback).
+            var rejected = await TestUtil.WaitUntilAsync(
+                () => Volatile.Read(ref faulting.SaveCount) >= 1
+                    && listener.ActiveSessions.All(s => s.SessionId != 1),
+                TimeSpan.FromSeconds(5));
+            Assert.True(rejected,
+                $"expected reject + deregister; SaveCount={faulting.SaveCount}, " +
+                $"active=[{string.Join(",", listener.ActiveSessions.Select(s => $"{s.SessionId}:{s.State}"))}]");
+
+            // The claim registry must be empty so the peer can retry
+            // with the same SessionVerID without hitting
+            // DUPLICATE_SESSION_CONNECTION.
+            Assert.False(claims.TryGetActiveClaim(1u, out _, out _));
+        }
+        finally
+        {
+            try
+            {
+                if (journal is IDisposable d) d.Dispose();
+            }
+            catch { }
+        }
+    }
 }

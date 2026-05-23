@@ -84,6 +84,13 @@ public sealed class FileFixpSessionStatePersister : IFixpSessionStatePersister
                 fs.Flush(flushToDisk: true);
             }
             File.Move(tmpPath, finalPath, overwrite: true);
+            // Issue #405 (review finding): fsync the state directory so
+            // the rename's directory-entry update is itself crash-durable.
+            // Without this, a power-loss between Move() and the next OS
+            // metadata flush could lose the snapshot even though its
+            // bytes were already on disk — boot rehydration would then
+            // miss a SessionVerID the peer believes was acked.
+            DirectorySync.Fsync(_stateDir);
         }
     }
 
