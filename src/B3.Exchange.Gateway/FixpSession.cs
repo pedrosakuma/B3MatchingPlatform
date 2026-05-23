@@ -77,14 +77,13 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// transport can recover via <c>RetransmitRequest</c>.
     /// </summary>
     private readonly RetransmitBuffer _retxBuffer;
-    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
     /// <summary>
     /// Issue #405: unbounded, segmented outbound business-frame
-    /// journal. When non-null, supersedes <see cref="_retransmitPersister"/>
-    /// for both append-mirroring and cold-read replay — the bounded
-    /// ring becomes a hot cache in front of this journal, so a
-    /// reconnecting peer can replay any frame produced since the last
-    /// successful Negotiate, even across host restarts.
+    /// journal. Source-of-truth for both append-mirroring and
+    /// cold-read replay — the bounded ring becomes a hot cache in
+    /// front of this journal, so a reconnecting peer can replay any
+    /// frame produced since the last successful Negotiate, even
+    /// across host restarts.
     /// </summary>
     private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
     /// <summary>
@@ -312,8 +311,6 @@ public sealed partial class FixpSession : IAsyncDisposable
         EstablishValidator? establishValidator = null,
         Func<long>? nowMs = null,
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
-        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedRetransmitSnapshot = null,
         B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null)
@@ -331,7 +328,6 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
-        _retransmitPersister = retransmitPersister;
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
         // Issue #405 rehydration: when a state snapshot survives a
@@ -362,42 +358,23 @@ public sealed partial class FixpSession : IAsyncDisposable
         // outbound encoder can attribute frames buffered while the
         // transport is down (the #217 path).
         // Issue #405: when an outbound journal is wired, it owns the
-        // append-mirror + cold-read paths and the legacy bounded
-        // persister (#289) is bypassed — the two have incompatible
-        // semantics (bounded snapshot vs unbounded log) and only one
-        // can be the source-of-truth for cold replay. Legacy persister
-        // wiring is preserved verbatim for the no-journal path so
-        // existing #289 callers / tests are unaffected.
-        Action<uint, byte[]>? onAppendPersist;
-        Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? onCompactPersist;
-        Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead;
+        // append-mirror + cold-read paths so a peer reconnecting
+        // after a host restart can replay any business frame from
+        // disk. When no journal is wired (tests / standalone), the
+        // ring degrades to a pure in-memory cache.
+        Action<uint, byte[]>? onAppendPersist = null;
+        Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead = null;
         if (outboundJournal is not null)
         {
             onAppendPersist = (seq, frame) => outboundJournal.Append(
                 SessionId, seq, (long)_timeSource.NowNanos(), frame);
-            onCompactPersist = null; // journal is unbounded; nothing to compact
             coldRead = (fromSeq, count) => outboundJournal.ReadRange(SessionId, fromSeq, count);
-        }
-        else
-        {
-            onAppendPersist = retransmitPersister is null
-                ? null
-                : (seq, frame) => retransmitPersister.Append(SessionId, seq, frame);
-            onCompactPersist = retransmitPersister is null
-                ? null
-                : entries => retransmitPersister.Compact(SessionId, entries);
-            coldRead = null;
         }
         _retxBuffer = new RetransmitBuffer(_options.RetransmitBufferCapacity,
             metrics: retransmitMetrics,
             isSuspended: () => State == FixpState.Suspended,
             onAppendPersist: onAppendPersist,
-            onCompactPersist: onCompactPersist,
             coldRead: coldRead);
-        if (persistedRetransmitSnapshot is { Count: > 0 })
-        {
-            _retxBuffer.RehydrateFromPersistedSnapshot(persistedRetransmitSnapshot);
-        }
         _outboundEncoder = new FixpOutboundEncoder(
             sessionId: () => SessionId,
             nextMsgSeqNum: NextMsgSeqNum,

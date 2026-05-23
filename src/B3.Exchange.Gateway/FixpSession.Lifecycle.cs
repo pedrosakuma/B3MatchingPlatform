@@ -261,16 +261,6 @@ public sealed partial class FixpSession
             kind == CloseKind.PeerTerminate || kind == CloseKind.SuspendedTimeout;
         if (removePersistence)
         {
-            if (_retransmitPersister is not null)
-            {
-                try { _retransmitPersister.Remove(SessionId); }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex,
-                        "fixp session {ConnectionId} sessionId={SessionId} failed to remove persisted retransmit file",
-                        ConnectionId, SessionId);
-                }
-            }
             if (_outboundJournal is not null && SessionId != 0)
             {
                 try { _outboundJournal.Remove(SessionId); }

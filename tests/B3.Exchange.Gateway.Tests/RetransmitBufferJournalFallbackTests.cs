@@ -66,7 +66,7 @@ public class RetransmitBufferJournalFallbackTests
             metrics: null,
             isSuspended: null,
             onAppendPersist: null,
-            onCompactPersist: null,
+
             coldRead: (fromSeq, count) => j.ReadRange(fromSeq, count));
     }
 
@@ -208,7 +208,7 @@ public class RetransmitBufferJournalFallbackTests
         for (uint i = 1; i <= 5; i++) journal.Append(i, FrameWithSeq(i));
         var buf = new RetransmitBuffer(capacity: 8,
             metrics: null, isSuspended: null,
-            onAppendPersist: null, onCompactPersist: null,
+            onAppendPersist: null,
             coldRead: (fromSeq, count) => journal.ReadRange(fromSeq, count));
 
         var snap = buf.TryGet(fromSeq: 1, requestedCount: 5);
@@ -230,7 +230,7 @@ public class RetransmitBufferJournalFallbackTests
         var journal = new FakeJournal();
         var buf = new RetransmitBuffer(capacity: 8,
             metrics: null, isSuspended: null,
-            onAppendPersist: null, onCompactPersist: null,
+            onAppendPersist: null,
             coldRead: (fromSeq, count) => journal.ReadRange(fromSeq, count));
 
         var snap = buf.TryGet(fromSeq: 1, requestedCount: 5);
@@ -262,7 +262,7 @@ public class RetransmitBufferJournalFallbackTests
         // downgrade to OUT_OF_RANGE so the peer can resync via Negotiate.
         var buf = new RetransmitBuffer(capacity: 4,
             metrics: null, isSuspended: null,
-            onAppendPersist: null, onCompactPersist: null,
+            onAppendPersist: null,
             coldRead: (_, _) => throw new InvalidOperationException("disk failure"));
 
         for (uint i = 1; i <= 10; i++) buf.Append(i, FrameWithSeq(i));
@@ -279,7 +279,7 @@ public class RetransmitBufferJournalFallbackTests
         // rather than splicing a corrupt non-contiguous reply.
         var buf = new RetransmitBuffer(capacity: 4,
             metrics: null, isSuspended: null,
-            onAppendPersist: null, onCompactPersist: null,
+            onAppendPersist: null,
             coldRead: (fromSeq, count) =>
             {
                 // Return seq 5 then jump to 7.

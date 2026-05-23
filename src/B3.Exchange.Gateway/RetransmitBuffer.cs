@@ -49,7 +49,6 @@ internal sealed class RetransmitBuffer
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _metrics;
     private readonly Func<bool>? _isSuspended;
     private readonly Action<uint, byte[]>? _onAppendPersist;
-    private readonly Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? _onCompactPersist;
     /// <summary>
     /// Issue #405: cold-read callback into the persistent outbound
     /// journal, invoked when a <c>RetransmitRequest.fromSeqNo</c>
@@ -60,8 +59,6 @@ internal sealed class RetransmitBuffer
     /// "journal does not have this range" and stops the cold prefix.
     /// </summary>
     private readonly Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? _coldRead;
-    private readonly int _compactEveryNAppends;
-    private int _appendsSincePersistCompact;
     private int _head;        // next write index
     private int _count;
     private uint _lastSeq;
@@ -85,36 +82,21 @@ internal sealed class RetransmitBuffer
     public RetransmitBuffer(int capacity,
         B3.Exchange.Contracts.RetransmitMetrics? metrics,
         Func<bool>? isSuspended)
-        : this(capacity, metrics, isSuspended, onAppendPersist: null, onCompactPersist: null)
+        : this(capacity, metrics, isSuspended, onAppendPersist: null, coldRead: null)
     {
     }
 
     /// <summary>
-    /// Issue #289 overload: the optional persistence callbacks mirror
-    /// every append to a per-session durable file, and trigger an
-    /// atomic compaction of that file every
-    /// <c>2 × Capacity</c> appends so the on-disk size stays bounded.
-    /// Both callbacks are invoked under no lock the producer doesn't
-    /// already hold; <paramref name="onAppendPersist"/> runs on the
-    /// FixpSession outbound write lock and so MUST be cheap.
-    /// </summary>
-    public RetransmitBuffer(int capacity,
-        B3.Exchange.Contracts.RetransmitMetrics? metrics,
-        Func<bool>? isSuspended,
-        Action<uint, byte[]>? onAppendPersist,
-        Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? onCompactPersist)
-        : this(capacity, metrics, isSuspended, onAppendPersist, onCompactPersist, coldRead: null)
-    {
-    }
-
-    /// <summary>
-    /// Issue #405 overload: <paramref name="coldRead"/> is consulted
+    /// Issue #405 overload: <paramref name="onAppendPersist"/> mirrors
+    /// every append into the persistent outbound journal (cheap; runs
+    /// under this buffer's internal lock so the on-disk order matches
+    /// the in-memory order). <paramref name="coldRead"/> is consulted
     /// for any <see cref="TryGet"/> whose <c>fromSeq</c> falls below
-    /// the ring's lowest retained seq (or when the ring is empty),
-    /// so the bounded ring becomes a hot cache in front of the
-    /// unbounded persistent outbound journal. The callback is invoked
-    /// under this buffer's internal lock — a single journal disk
-    /// read per request is acceptable since the rare path is a
+    /// the ring's lowest retained seq (or when the ring is empty), so
+    /// the bounded ring becomes a hot cache in front of the unbounded
+    /// persistent outbound journal. The callback is invoked under
+    /// this buffer's internal lock — a single journal disk read per
+    /// request is acceptable since the rare path is a
     /// reconnect-resync, not the steady-state append path; the
     /// alternative (release-then-reacquire) would require a
     /// re-verification window that is materially more complex than
@@ -124,7 +106,6 @@ internal sealed class RetransmitBuffer
         B3.Exchange.Contracts.RetransmitMetrics? metrics,
         Func<bool>? isSuspended,
         Action<uint, byte[]>? onAppendPersist,
-        Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? onCompactPersist,
         Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
@@ -134,13 +115,7 @@ internal sealed class RetransmitBuffer
         _metrics = metrics;
         _isSuspended = isSuspended;
         _onAppendPersist = onAppendPersist;
-        _onCompactPersist = onCompactPersist;
         _coldRead = coldRead;
-        // Compact roughly every 2× capacity appends; matches the
-        // FileFixpRetransmitPersister contract where on-disk records
-        // up to ~2× capacity are tolerated before the file is
-        // rewritten with the live ring contents only.
-        _compactEveryNAppends = capacity * 2;
     }
 
     /// <summary>
@@ -155,8 +130,6 @@ internal sealed class RetransmitBuffer
     {
         ArgumentNullException.ThrowIfNull(frame);
         bool evicted;
-        bool compactNow = false;
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? compactSnapshot = null;
         lock (_lock)
         {
             evicted = _count == Capacity;
@@ -165,87 +138,17 @@ internal sealed class RetransmitBuffer
             _head = (_head + 1) % Capacity;
             if (_count < Capacity) _count++;
             _lastSeq = seq;
-            // Issue #289: every append goes to disk via the persister.
-            // We intentionally invoke the persist callback INSIDE the
-            // lock so the on-disk order matches the in-memory order
-            // (both producer threads serialize on _lock anyway).
+            // Issue #405: every append is mirrored to the persistent
+            // outbound journal. Callback runs INSIDE the lock so the
+            // on-disk order matches the in-memory order (both producer
+            // threads serialize on _lock anyway).
             _onAppendPersist?.Invoke(seq, frame);
-            // Trigger periodic compaction so the per-session file does
-            // not grow unbounded under steady-state churn. Snapshot the
-            // current ring contents while holding the lock; the actual
-            // file rewrite happens below, outside the lock, to avoid
-            // serialising the next Append behind a Flush.
-            if (_onCompactPersist is not null)
-            {
-                _appendsSincePersistCompact++;
-                if (_appendsSincePersistCompact >= _compactEveryNAppends)
-                {
-                    _appendsSincePersistCompact = 0;
-                    compactNow = true;
-                    compactSnapshot = SnapshotRingLocked();
-                }
-            }
         }
         // Issue #288: surface eviction + suspended-write counters outside
         // the lock so a slow metrics consumer cannot back-pressure the
         // outbound encoder. Both checks are best-effort.
         if (evicted) _metrics?.IncBufferEvictions();
         if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();
-        if (compactNow && compactSnapshot is not null)
-        {
-            _onCompactPersist!.Invoke(compactSnapshot);
-        }
-    }
-
-    /// <summary>
-    /// Issue #289: returns the current ring contents in seq-ascending
-    /// order, used by the persistence layer for atomic file
-    /// compaction. Public for the FixpSession to flush on close.
-    /// </summary>
-    public IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry> Snapshot()
-    {
-        lock (_lock) { return SnapshotRingLocked(); }
-    }
-
-    private IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry> SnapshotRingLocked()
-    {
-        if (_count == 0) return Array.Empty<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>();
-        var copy = new B3.Exchange.Gateway.Persistence.RetransmitRingEntry[_count];
-        int firstIndex = (_head - _count + Capacity) % Capacity;
-        for (int i = 0; i < _count; i++)
-        {
-            int idx = (firstIndex + i) % Capacity;
-            copy[i] = new B3.Exchange.Gateway.Persistence.RetransmitRingEntry(_seqs[idx], _frames[idx]!);
-        }
-        return copy;
-    }
-
-    /// <summary>
-    /// Issue #289: rehydrate this ring from a previously-persisted
-    /// snapshot. Only valid before any <see cref="Append"/> call.
-    /// Entries must be supplied in seq-ascending order.
-    /// </summary>
-    public void RehydrateFromPersistedSnapshot(
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry> entries)
-    {
-        ArgumentNullException.ThrowIfNull(entries);
-        lock (_lock)
-        {
-            if (_count != 0)
-                throw new InvalidOperationException("RetransmitBuffer.Rehydrate called on a non-empty ring");
-            // Apply the most recent Capacity entries (the persister may
-            // hand us up to ~2×Capacity records between compactions).
-            int start = entries.Count > Capacity ? entries.Count - Capacity : 0;
-            for (int i = start; i < entries.Count; i++)
-            {
-                var e = entries[i];
-                _frames[_head] = e.Frame;
-                _seqs[_head] = e.Seq;
-                _head = (_head + 1) % Capacity;
-                if (_count < Capacity) _count++;
-                _lastSeq = e.Seq;
-            }
-        }
     }
 
     /// <summary>Snapshot of the lowest seq currently retained, or 0 if

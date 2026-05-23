@@ -29,8 +29,6 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly SessionClaimRegistry? _sessionClaims;
     private readonly EstablishValidator? _establishValidator;
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
-    private readonly B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? _retransmitPersister;
-    private readonly IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? _persistedRetransmitSnapshots;
     private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
     private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
     private readonly IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
@@ -70,8 +68,6 @@ public sealed class EntryPointListener : IAsyncDisposable
         SessionClaimRegistry? sessionClaims = null,
         EstablishValidator? establishValidator = null,
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
-        B3.Exchange.Gateway.Persistence.IFixpRetransmitPersister? retransmitPersister = null,
-        IReadOnlyDictionary<uint, IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? persistedRetransmitSnapshots = null,
         B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? persistedSessionStates = null)
@@ -91,8 +87,6 @@ public sealed class EntryPointListener : IAsyncDisposable
         _sessionClaims = sessionClaims;
         _establishValidator = establishValidator;
         _retransmitMetrics = retransmitMetrics;
-        _retransmitPersister = retransmitPersister;
-        _persistedRetransmitSnapshots = persistedRetransmitSnapshots;
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
         _persistedSessionStates = persistedSessionStates;
@@ -469,16 +463,6 @@ public sealed class EntryPointListener : IAsyncDisposable
         };
 
         Stream sessionStream = firstFrame is null ? stream : new PrependedStream(firstFrame, stream);
-        IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>? persistedSnapshot = null;
-        // Issue #289: if a persister is wired in and we loaded a ring
-        // for this sessionId at boot, hand it to the new FixpSession so
-        // its RetransmitBuffer is rehydrated before the peer's
-        // Establish (and any subsequent RetransmitRequest) lands.
-        if (_persistedRetransmitSnapshots is not null
-            && _persistedRetransmitSnapshots.TryGetValue(identity.SessionId, out var preLoaded))
-        {
-            persistedSnapshot = preLoaded;
-        }
         var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
             sessionStream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
             options: _sessionOptions, onClosed: onClosed,
@@ -486,8 +470,6 @@ public sealed class EntryPointListener : IAsyncDisposable
             sessionClaims: _sessionClaims,
             establishValidator: _establishValidator,
             retransmitMetrics: _retransmitMetrics,
-            retransmitPersister: _retransmitPersister,
-            persistedRetransmitSnapshot: persistedSnapshot,
             outboundJournal: _outboundJournal,
             statePersister: _statePersister,
             persistedState: persistedState);
