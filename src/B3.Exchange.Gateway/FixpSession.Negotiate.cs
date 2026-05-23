@@ -146,6 +146,10 @@ public sealed partial class FixpSession
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
+        // Issue #405: commit the new SessionVerID to disk before any
+        // business traffic so the spec-mandated intraweek monotonicity
+        // holds across a host crash immediately after Negotiate.
+        SaveStateSnapshotSafe();
 
         var responseFrame = new byte[NegotiateResponseEncoder.Total];
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,

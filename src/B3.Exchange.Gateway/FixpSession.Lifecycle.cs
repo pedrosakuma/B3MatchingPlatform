@@ -87,6 +87,38 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// Issue #405: writes the current FIXP envelope state to
+    /// <see cref="_statePersister"/> if one is wired. Best-effort —
+    /// persistence failures are logged but never propagate, so a
+    /// transient disk hiccup does not kill the session. Caller must
+    /// have set <see cref="SessionId"/>; otherwise the call is a
+    /// no-op (no point persisting a zeroed identity).
+    /// </summary>
+    internal void SaveStateSnapshotSafe()
+    {
+        var persister = _statePersister;
+        if (persister is null) return;
+        if (SessionId == 0) return;
+        try
+        {
+            var snapshot = new B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot(
+                SessionId: SessionId,
+                SessionVerId: SessionVerId,
+                OutboundMsgSeqNum: (uint)Volatile.Read(ref _msgSeqNum),
+                LastIncomingSeqNo: LastIncomingSeqNo,
+                EnteringFirm: EnteringFirm,
+                UpdatedAtNanos: (long)_timeSource.NowNanos());
+            persister.Save(snapshot);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} sessionId={SessionId} failed to persist state snapshot",
+                ConnectionId, SessionId);
+        }
+    }
+
+    /// <summary>
     /// Body of <see cref="Suspend(string)"/>; assumes the caller already
     /// holds <see cref="_attachLock"/>. Idempotent — second caller is a
     /// no-op via the <see cref="_isAttached"/> CAS.
@@ -117,6 +149,10 @@ public sealed partial class FixpSession
         try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
         Volatile.Write(ref _suspendedSinceMs, NowMs());
         ScheduleCodTimerLocked();
+        // Issue #405: persist the envelope on suspend so a host crash
+        // while the session is parked still produces an
+        // EstablishmentAck.lastIncomingSeqNo matching reality.
+        SaveStateSnapshotSafe();
     }
 
     /// <summary>
@@ -215,20 +251,53 @@ public sealed partial class FixpSession
                 ConnectionId);
         }
         // Issue #289 / #405: terminal close ⇒ drop the persisted
-        // retransmit ring file. Today this fires for every CloseKind
-        // (pre-#405 behavior); a subsequent commit will scope it to
-        // {PeerTerminate, SuspendedTimeout} so transport-error and
-        // host-shutdown closes preserve state for the reconnecting
-        // peer to resync against (SBE 5.2 §1.5 recoverable serverFlow).
-        if (_retransmitPersister is not null)
+        // retransmit ring file AND the unbounded outbound journal AND
+        // the state snapshot. Scoped to {PeerTerminate, SuspendedTimeout}
+        // so transport-error and host-shutdown closes preserve state for
+        // the reconnecting peer to resync against (SBE 5.2 §1.5
+        // recoverable serverFlow). Non-removing kinds also save the
+        // final state so the resume point on reconnect is accurate.
+        bool removePersistence =
+            kind == CloseKind.PeerTerminate || kind == CloseKind.SuspendedTimeout;
+        if (removePersistence)
         {
-            try { _retransmitPersister.Remove(SessionId); }
-            catch (Exception ex)
+            if (_retransmitPersister is not null)
             {
-                _logger.LogWarning(ex,
-                    "fixp session {ConnectionId} sessionId={SessionId} failed to remove persisted retransmit file",
-                    ConnectionId, SessionId);
+                try { _retransmitPersister.Remove(SessionId); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} sessionId={SessionId} failed to remove persisted retransmit file",
+                        ConnectionId, SessionId);
+                }
             }
+            if (_outboundJournal is not null && SessionId != 0)
+            {
+                try { _outboundJournal.Remove(SessionId); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} sessionId={SessionId} failed to remove outbound journal",
+                        ConnectionId, SessionId);
+                }
+            }
+            if (_statePersister is not null && SessionId != 0)
+            {
+                try { _statePersister.Remove(SessionId); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} sessionId={SessionId} failed to remove state snapshot",
+                        ConnectionId, SessionId);
+                }
+            }
+        }
+        else
+        {
+            // Host shutdown / transport error: keep journal + ring;
+            // persist final snapshot so the reconnecting peer sees the
+            // correct LastIncomingSeqNo / OutboundMsgSeqNum.
+            SaveStateSnapshotSafe();
         }
         try { _onClosed?.Invoke(this, reason); }
         catch (Exception ex)
