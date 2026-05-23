@@ -36,8 +36,16 @@ out of the gap table and to make the rationale auditable.
 
 - **Continuous trading only.** No auction phases / TradingSessionStatus
   cycle. (See [#19](https://github.com/pedrosakuma/SbeB3Exchange/issues/19).)
-- **No persistence.** Books reset on restart; consumers re-bootstrap via the
-  snapshot channel + sequence-version bump.
+- **FIXP session resync persistence** ([#405](https://github.com/pedrosakuma/SbeB3Exchange/issues/405)).
+  Outbound business frames are appended to an unbounded per-session
+  journal and the FIXP envelope state (SessionVerId, LastIncomingSeqNo,
+  outbound MsgSeqNum, CoD parameters) is snapshotted on every
+  handshake / suspend / non-terminal close. On boot the host
+  rehydrates `SessionClaimRegistry` from the snapshots so a peer
+  reconnecting with its original SessionVerId is accepted (no
+  `UNNEGOTIATED` reject); subsequent `RetransmitRequest`s for seqs
+  beyond the in-memory ring are served from the journal. Channel
+  books are still rebuilt from snapshot + WAL (see `B3.Exchange.Persistence`).
 - **Routing by `SecurityID`** instead of by `marketSegmentID` from the inbound
   business header. Practical equivalent because every instrument in the
   simulator maps 1:1 to a UMDF channel; spec allows both as long as the
