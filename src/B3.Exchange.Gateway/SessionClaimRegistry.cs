@@ -38,6 +38,35 @@ public sealed class SessionClaimRegistry
         lock (_lock) return _lastSessionVerId.TryGetValue(sessionId, out var v) ? v : 0UL;
     }
 
+    /// <summary>
+    /// Issue #405: boot-time seed for the highest-seen
+    /// <c>sessionVerID</c> per session, recovered from a persisted
+    /// <c>FixpSessionStateSnapshot</c>. Called once during host
+    /// startup, before the FIXP listener accepts connections.
+    /// Idempotent across calls — the registry monotonically keeps the
+    /// maximum value seen. Calling this with <paramref name="sessionVerId"/>
+    /// = 0 is a no-op (matches the "never negotiated" sentinel).
+    /// </summary>
+    /// <remarks>
+    /// This is the mechanism that preserves the SBE 5.2 §4.5.2
+    /// intraweek monotonicity rule across process restart: without
+    /// it, a fresh-process registry would accept the peer's old
+    /// <c>sessionVerID</c> and the spec-mandated "preventing affects
+    /// on subsequent retransmission" guarantee would silently break.
+    /// </remarks>
+    public void SeedLastVersion(uint sessionId, ulong sessionVerId)
+    {
+        if (sessionVerId == 0UL) return;
+        lock (_lock)
+        {
+            if (_lastSessionVerId.TryGetValue(sessionId, out var existing)
+                && existing >= sessionVerId)
+                return;
+            _lastSessionVerId[sessionId] = sessionVerId;
+        }
+    }
+
+
     /// <summary>Outcome of <see cref="TryClaim"/>.</summary>
     public enum ClaimResult
     {
