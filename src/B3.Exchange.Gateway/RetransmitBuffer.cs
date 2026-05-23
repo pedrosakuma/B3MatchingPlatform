@@ -50,6 +50,16 @@ internal sealed class RetransmitBuffer
     private readonly Func<bool>? _isSuspended;
     private readonly Action<uint, byte[]>? _onAppendPersist;
     private readonly Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? _onCompactPersist;
+    /// <summary>
+    /// Issue #405: cold-read callback into the persistent outbound
+    /// journal, invoked when a <c>RetransmitRequest.fromSeqNo</c>
+    /// falls below this ring's lowest retained seq (or the ring is
+    /// empty). Signature is <c>(fromSeq, count) → entries in
+    /// strictly increasing seq order starting at fromSeq, with no
+    /// internal gaps</c>; an empty / short result is treated as
+    /// "journal does not have this range" and stops the cold prefix.
+    /// </summary>
+    private readonly Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? _coldRead;
     private readonly int _compactEveryNAppends;
     private int _appendsSincePersistCompact;
     private int _head;        // next write index
@@ -93,6 +103,29 @@ internal sealed class RetransmitBuffer
         Func<bool>? isSuspended,
         Action<uint, byte[]>? onAppendPersist,
         Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? onCompactPersist)
+        : this(capacity, metrics, isSuspended, onAppendPersist, onCompactPersist, coldRead: null)
+    {
+    }
+
+    /// <summary>
+    /// Issue #405 overload: <paramref name="coldRead"/> is consulted
+    /// for any <see cref="TryGet"/> whose <c>fromSeq</c> falls below
+    /// the ring's lowest retained seq (or when the ring is empty),
+    /// so the bounded ring becomes a hot cache in front of the
+    /// unbounded persistent outbound journal. The callback is invoked
+    /// under this buffer's internal lock — a single journal disk
+    /// read per request is acceptable since the rare path is a
+    /// reconnect-resync, not the steady-state append path; the
+    /// alternative (release-then-reacquire) would require a
+    /// re-verification window that is materially more complex than
+    /// the cost we save.
+    /// </summary>
+    public RetransmitBuffer(int capacity,
+        B3.Exchange.Contracts.RetransmitMetrics? metrics,
+        Func<bool>? isSuspended,
+        Action<uint, byte[]>? onAppendPersist,
+        Action<IReadOnlyList<B3.Exchange.Gateway.Persistence.RetransmitRingEntry>>? onCompactPersist,
+        Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         Capacity = capacity;
@@ -102,6 +135,7 @@ internal sealed class RetransmitBuffer
         _isSuspended = isSuspended;
         _onAppendPersist = onAppendPersist;
         _onCompactPersist = onCompactPersist;
+        _coldRead = coldRead;
         // Compact roughly every 2× capacity appends; matches the
         // FileFixpRetransmitPersister contract where on-disk records
         // up to ~2× capacity are tolerated before the file is
@@ -271,10 +305,13 @@ internal sealed class RetransmitBuffer
 
         lock (_lock)
         {
+            // Empty ring: defer to journal cold-read if available;
+            // otherwise treat as "above window" per pre-#405 behavior.
             if (_count == 0)
             {
-                // No history at all — treat as "above window".
-                return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_FROMSEQNO);
+                if (_coldRead is null)
+                    return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_FROMSEQNO);
+                return ServeFromColdOnlyLocked(fromSeq, requestedCount);
             }
 
             int firstIndex = (_head - _count + Capacity) % Capacity;
@@ -282,7 +319,14 @@ internal sealed class RetransmitBuffer
             uint lastSeq = _lastSeq;
 
             if (fromSeq < firstSeq)
-                return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.OUT_OF_RANGE);
+            {
+                // Below the hot ring; spill into the journal (issue #405).
+                // When no journal is wired we keep pre-#405 semantics
+                // (OUT_OF_RANGE) so existing tests / behavior stand.
+                if (_coldRead is null)
+                    return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.OUT_OF_RANGE);
+                return ServeColdThenWarmLocked(fromSeq, requestedCount, firstSeq, firstIndex, lastSeq);
+            }
             if (fromSeq > lastSeq)
                 return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.INVALID_FROMSEQNO);
 
@@ -290,20 +334,115 @@ internal sealed class RetransmitBuffer
             // — fromSeq+count near uint.MaxValue can overflow.
             ulong available = (ulong)lastSeq - fromSeq + 1UL;
             uint actual = (uint)Math.Min(requestedCount, available);
+            return new(CloneWarmLocked(fromSeq, firstSeq, firstIndex, actual), fromSeq, actual, null);
+        }
+    }
 
-            var clones = new byte[actual][];
-            int offsetFromFirst = (int)(fromSeq - firstSeq);
-            for (uint i = 0; i < actual; i++)
+    /// <summary>
+    /// Empty-ring path: every requested seq comes from the journal.
+    /// </summary>
+    private GetResult ServeFromColdOnlyLocked(uint fromSeq, uint requestedCount)
+    {
+        var cold = SafeColdRead(fromSeq, (int)requestedCount);
+        if (cold.Count == 0)
+            return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.OUT_OF_RANGE);
+        var clones = new byte[cold.Count][];
+        for (int i = 0; i < cold.Count; i++) clones[i] = CloneWithPossResend(cold[i].Frame);
+        return new(clones, fromSeq, (uint)cold.Count, null);
+    }
+
+    /// <summary>
+    /// Mixed path: cold range <c>[fromSeq, firstSeq-1]</c> from the
+    /// journal, then warm range <c>[firstSeq, fromSeq+count-1]</c>
+    /// from the ring. If the journal cannot serve the full cold
+    /// range (e.g. pruned watermark), only the contiguous prefix
+    /// starting at <paramref name="fromSeq"/> is returned and the
+    /// warm portion is silently dropped — the peer will request the
+    /// next missing slice itself.
+    /// </summary>
+    private GetResult ServeColdThenWarmLocked(uint fromSeq, uint requestedCount,
+        uint firstSeq, int firstIndex, uint lastSeq)
+    {
+        // Cold portion length capped by request and by the ring's
+        // floor; promotion to long keeps the subtraction sane near
+        // uint boundaries.
+        long coldDesired = Math.Min((long)requestedCount, (long)firstSeq - fromSeq);
+        var cold = SafeColdRead(fromSeq, (int)coldDesired);
+        if (cold.Count == 0)
+            return new(Array.Empty<byte[]>(), 0, 0, B3.Entrypoint.Fixp.Sbe.V6.RetransmitRejectCode.OUT_OF_RANGE);
+
+        // Cap warm portion at what the request still needs after the cold prefix.
+        long remaining = (long)requestedCount - cold.Count;
+        bool coldReachesRing = (long)cold[^1].Seq + 1 == firstSeq;
+        uint warmCount = 0;
+        if (coldReachesRing && remaining > 0)
+        {
+            ulong available = (ulong)lastSeq - firstSeq + 1UL;
+            warmCount = (uint)Math.Min((ulong)remaining, available);
+        }
+
+        var clones = new byte[cold.Count + (int)warmCount][];
+        for (int i = 0; i < cold.Count; i++) clones[i] = CloneWithPossResend(cold[i].Frame);
+        if (warmCount > 0)
+        {
+            var warm = CloneWarmLocked(firstSeq, firstSeq, firstIndex, warmCount);
+            warm.CopyTo(clones, cold.Count);
+        }
+        return new(clones, fromSeq, (uint)clones.Length, null);
+    }
+
+    private byte[][] CloneWarmLocked(uint fromSeq, uint firstSeq, int firstIndex, uint actual)
+    {
+        var clones = new byte[actual][];
+        int offsetFromFirst = (int)(fromSeq - firstSeq);
+        for (uint i = 0; i < actual; i++)
+        {
+            int idx = (firstIndex + offsetFromFirst + (int)i) % Capacity;
+            clones[i] = CloneWithPossResend(_frames[idx]!);
+        }
+        return clones;
+    }
+
+    private static byte[] CloneWithPossResend(byte[] src)
+    {
+        var clone = new byte[src.Length];
+        Buffer.BlockCopy(src, 0, clone, 0, src.Length);
+        if (clone.Length > EventIndicatorAbsoluteOffset)
+            clone[EventIndicatorAbsoluteOffset] |= PossResendBit;
+        return clone;
+    }
+
+    private IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry> SafeColdRead(uint fromSeq, int count)
+    {
+        if (_coldRead is null || count <= 0)
+            return Array.Empty<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>();
+        try
+        {
+            var raw = _coldRead(fromSeq, count);
+            if (raw is null || raw.Count == 0)
+                return Array.Empty<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>();
+            // Defensive: enforce the journal contract here (no gap,
+            // starts at fromSeq). A misbehaving journal that violates
+            // this would otherwise silently corrupt the replay.
+            if (raw[0].Seq != fromSeq)
+                return Array.Empty<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>();
+            for (int i = 1; i < raw.Count; i++)
             {
-                int idx = (firstIndex + offsetFromFirst + (int)i) % Capacity;
-                var src = _frames[idx]!;
-                var clone = new byte[src.Length];
-                Buffer.BlockCopy(src, 0, clone, 0, src.Length);
-                if (clone.Length > EventIndicatorAbsoluteOffset)
-                    clone[EventIndicatorAbsoluteOffset] |= PossResendBit;
-                clones[i] = clone;
+                if (raw[i].Seq != raw[i - 1].Seq + 1)
+                {
+                    // Trim at the gap.
+                    var prefix = new B3.Exchange.Gateway.Persistence.OutboundJournalEntry[i];
+                    for (int k = 0; k < i; k++) prefix[k] = raw[k];
+                    return prefix;
+                }
             }
-            return new(clones, fromSeq, actual, null);
+            return raw;
+        }
+        catch
+        {
+            // Cold-read errors must never crash the inbound dispatch
+            // thread; downgrade to "journal cannot serve this range".
+            return Array.Empty<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>();
         }
     }
 }
