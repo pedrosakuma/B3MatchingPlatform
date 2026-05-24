@@ -243,6 +243,8 @@ internal sealed class FixpOutboundEncoder
     ///   5  = Unknown order
     ///   11 = Unsupported order characteristic (used for invalid quantity and
     ///        Market/IOC-only constraints not satisfied by the inbound order)
+    ///   16 = Price exceeds current price band
+    ///   99 = Other
     /// Engine reasons that have no direct FIX peer (e.g. <see cref="RejectReason.MarketNoLiquidity"/>,
     /// <see cref="RejectReason.FokUnfillable"/>, <see cref="RejectReason.SelfTradePrevention"/>)
     /// fall through to 0 (Broker/exchange option) — context is conveyed via the
@@ -271,6 +273,8 @@ internal sealed class FixpOutboundEncoder
         RejectReason.InstrumentHalted => 13u,
         RejectReason.TimeInForceNotSupported => 11u,
         RejectReason.UnsupportedOrderCharacteristic => 11u,
+        RejectReason.QuantityExceedsLimit => 99u,
+        RejectReason.PriceExceedsCurrentPriceBand => 16u,
         RejectReason.MinQtyNotMet => 0u,
         RejectReason.InvalidField => 11u,
         _ => 0u,

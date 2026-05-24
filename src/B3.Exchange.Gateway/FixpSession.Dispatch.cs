@@ -272,7 +272,8 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidNewOrderSingle:
                 {
                     var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-                        fixedBlock, EnteringFirm, now, out var nos, out var nosClOrd, out var nosMsg);
+                        fixedBlock, EnteringFirm, now, out var nos, out var nosClOrd, out var nosMsg,
+                        _options.FatFinger);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
                         nos = nos with { Memo = inboundMemo };
@@ -301,7 +302,8 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidOrderCancelReplaceRequest:
                 {
                     var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
-                        fixedBlock, now, out var ocr, out var ocrClOrd, out var ocrOrigClOrd, out var ocrMsg);
+                        fixedBlock, now, out var ocr, out var ocrClOrd, out var ocrOrigClOrd, out var ocrMsg,
+                        _options.FatFinger);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
                         ocr = ocr with { Memo = inboundMemo };

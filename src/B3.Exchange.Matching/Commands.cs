@@ -97,6 +97,16 @@ public enum RejectReason : byte
     /// client receives an <c>ExecutionReport_Reject</c> with FIX
     /// OrdRejReason=11 instead of a <c>BusinessMessageReject</c>.</summary>
     UnsupportedOrderCharacteristic,
+    /// <summary>The order quantity breached the gateway's pre-trade
+    /// fat-finger ceiling. B3's public SBE schema delegates concrete
+    /// reject domains to the external error-code document; this maps to
+    /// OrdRejReason=99 (Other) rather than a session-level reject.</summary>
+    QuantityExceedsLimit,
+    /// <summary>The order price breached the gateway's absolute fat-finger
+    /// ceiling or optional dynamic price band. Maps to OrdRejReason=16
+    /// (Price exceeds current price band) per the B3/FIX reject-domain
+    /// convention used by EntryPoint clients.</summary>
+    PriceExceedsCurrentPriceBand,
 }
 
 /// <summary>
@@ -237,6 +247,8 @@ public sealed record NewOrderCommand(
 
     public bool UnsupportedOrderCharacteristic { get; init; }
 
+    public RejectReason? PreTradeRejectReason { get; init; }
+
     public byte[] Memo { get; init; } = [];
 }
 
@@ -285,6 +297,8 @@ public sealed record ReplaceOrderCommand(
     public TimeInForce? NewTif { get; init; }
 
     public bool UnsupportedOrderCharacteristic { get; init; }
+
+    public RejectReason? PreTradeRejectReason { get; init; }
 
     public byte[] Memo { get; init; } = [];
 }

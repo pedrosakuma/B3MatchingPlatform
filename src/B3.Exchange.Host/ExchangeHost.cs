@@ -472,6 +472,13 @@ public sealed class ExchangeHost : IAsyncDisposable
             MaxOrderRatePerSecond = 200,
             ThrottleMetrics = _metrics.Throttle,
             OnTransportSendQueueFull = _metrics.Transport.IncSendQueueFull,
+            FatFinger = new InboundFatFingerOptions
+            {
+                MaxOrderQty = _config.Tcp.MaxOrderQty,
+                MaxPriceMantissa = _config.Tcp.MaxPrice,
+                PriceBandPercent = _config.Tcp.PriceBandPercent,
+                LastTradePriceProvider = _router.LastTradePriceMantissa,
+            },
         };
         // Phase 2 (#42): real Negotiate handshake. The validator is pure
         // (no IO); the claim ledger lives for the host process lifetime
