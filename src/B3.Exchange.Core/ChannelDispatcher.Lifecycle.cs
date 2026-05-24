@@ -36,20 +36,25 @@ public sealed partial class ChannelDispatcher
         var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (true)
             {
                 RecordHeartbeat();
-                var waitTask = reader.WaitToReadAsync(ct).AsTask();
+                var drainingShutdown = ct.IsCancellationRequested
+                    && Volatile.Read(ref _drainOnCancellation) != 0;
+                if (ct.IsCancellationRequested && !drainingShutdown) return;
+                var waitTask = drainingShutdown
+                    ? reader.WaitToReadAsync().AsTask()
+                    : reader.WaitToReadAsync(ct).AsTask();
                 bool signaled;
-                try { signaled = waitTask.Wait(heartbeatMs, ct); }
-                catch (OperationCanceledException) { return; /* expected: dispatch loop cancelled during shutdown */ }
-                catch (AggregateException ae) when (ae.InnerException is OperationCanceledException) { return; /* same: wrapped in Task.Wait */ }
+                try { signaled = waitTask.Wait(heartbeatMs); }
+                catch (OperationCanceledException) { if (Volatile.Read(ref _drainOnCancellation) == 0) return; else continue; }
+                catch (AggregateException ae) when (ae.InnerException is OperationCanceledException) { if (Volatile.Read(ref _drainOnCancellation) == 0) return; else continue; }
                 if (!signaled) continue; // heartbeat timeout — re-record and loop
 
                 bool more;
                 try { more = waitTask.GetAwaiter().GetResult(); }
-                catch (OperationCanceledException) { return; /* expected: dispatch loop cancelled during shutdown */ }
-                if (!more) return; // channel completed
+                catch (OperationCanceledException) { if (Volatile.Read(ref _drainOnCancellation) == 0) return; else continue; }
+                if (!more) return; // channel completed after all queued work drained
 
                 while (reader.TryRead(out var item))
                 {
@@ -69,20 +74,34 @@ public sealed partial class ChannelDispatcher
                 }
             }
         }
-        catch (OperationCanceledException) { /* expected: dispatch loop cancelled during shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
         finally
         {
-            try { FlushPendingSnapshotOnShutdown(); }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "channel {ChannelNumber}: final shutdown snapshot flush failed",
-                    ChannelNumber);
-            }
+            FlushPendingSnapshotOnShutdownSafely();
+        }
+    }
+
+    private async Task DrainInboundBeforeStoppingSnapshotWriterAsync()
+    {
+        if (_loopTask is null) return;
+        var drained = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var item = new WorkItem(WorkKind.ShutdownBarrier, default, 0, false,
+            0, 0, null, null, null, null, ShutdownBarrier: drained);
+        await _inbound.Writer.WriteAsync(item).AsTask().WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+    }
+
+    private void FlushPendingSnapshotOnShutdownSafely()
+    {
+        try { FlushPendingSnapshotOnShutdown(); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: final shutdown snapshot flush failed",
+                ChannelNumber);
         }
     }
 
@@ -177,12 +196,22 @@ public sealed partial class ChannelDispatcher
     {
         _logger.LogInformation("channel {ChannelNumber} dispatcher stopping (sequenceNumber={SequenceNumber})",
             ChannelNumber, SequenceNumber);
-        _inbound.Writer.TryComplete();
+        Volatile.Write(ref _drainOnCancellation, 1);
         try { _cts.Cancel(); } catch { }
-        if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
-        // Issue #268: ensure any in-flight async snapshot is durable
-        // before tearing down. The writer drains its pending mailbox
-        // inside StopAsync.
+        try { await DrainInboundBeforeStoppingSnapshotWriterAsync().ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: shutdown inbox drain failed before snapshot writer stop",
+                ChannelNumber);
+        }
+        // Issue #445 review: keep the inbox open while the async snapshot
+        // writer drains. Its final onSaved callback enqueues an AuditCheckpoint
+        // work item; the dispatch loop remains alive after cancellation until
+        // the channel is completed below, so the prepare half runs on the
+        // dispatch thread and the writer-thread fsync completes before this
+        // method returns. BackgroundSnapshotWriter only enqueues that
+        // AuditCheckpoint callback during drain.
         if (_asyncSnapshotWriter is { } writer)
         {
             try { await writer.DisposeAsync().ConfigureAwait(false); }
@@ -193,6 +222,8 @@ public sealed partial class ChannelDispatcher
                     ChannelNumber);
             }
         }
+        _inbound.Writer.TryComplete();
+        if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
         // Issue #269: release the WAL file handle so the underlying
         // file can be deleted by tests / operator tooling. The
         // dispatcher loop has already flushed its final snapshot

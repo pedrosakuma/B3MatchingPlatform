@@ -344,6 +344,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private AuctionPrintInfo? _pendingAuctionPrint;
 
     private readonly CancellationTokenSource _cts = new();
+    private int _drainOnCancellation;
     private Task? _loopTask;
     // Single-thread invariant (ADR 0009 / issues #138, #169, #384).
     // Captured on entry to RunLoop; used by AssertOnLoopThread() to enforce
@@ -430,13 +431,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         // Issue #268: opt-in async snapshot writer. Off by default so
         // pre-existing deployments keep the synchronous in-loop persist
         // (zero-RPO). Enabled per channel via host config.
-        // Issue #269: when WAL is also enabled, the writer notifies us
-        // via the post-save callback so we can truncate the WAL on the
-        // writer thread — guaranteeing the WAL is only ever truncated
-        // after the matching snapshot has reached the disk.
+        // Issue #269/#396: the writer notifies us via the post-save
+        // callback so we can checkpoint audit durability and, when WAL is
+        // configured, truncate on the writer thread — guaranteeing the WAL
+        // is only ever truncated after the matching snapshot and audit
+        // checkpoint are durable.
         _asyncSnapshotWriter = (options.UseAsyncSnapshotWriter && options.Persister is not null)
             ? new BackgroundSnapshotWriter(channelNumber, options.Persister, options.Logger, options.Metrics,
-                onSaved: _wal is null ? null : OnAsyncSnapshotSaved)
+                onSaved: OnAsyncSnapshotSaved)
             : null;
         // Direct field writes are safe here: ctor runs on the constructing
         // thread before Start() and before any other thread can observe the

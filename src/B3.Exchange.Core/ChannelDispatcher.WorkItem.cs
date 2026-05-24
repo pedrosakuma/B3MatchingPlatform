@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using B3.Exchange.PostTrade;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Core;
@@ -10,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2 }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -37,6 +38,8 @@ public sealed partial class ChannelDispatcher
         "OperatorHaltInstrument",
         "OperatorResumeInstrument",
         "OperatorBustV2",
+        "AuditCheckpoint",
+        "ShutdownBarrier",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -66,6 +69,8 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<HaltOutcome>? HaltCompletion = null,
         OperatorBustV2? BustV2 = null,
         TaskCompletionSource<OperatorBustV2Outcome>? BustCompletion = null,
+        AuditCheckpointRequest? AuditCheckpoint = null,
+        TaskCompletionSource<bool>? ShutdownBarrier = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -139,6 +144,15 @@ public sealed partial class ChannelDispatcher
     public readonly record struct OperatorBustV2Outcome(
         B3.Exchange.PostTrade.BustValidationKind Kind,
         ulong ExistingCorrelationId);
+
+    /// <summary>
+    /// Cross-thread handshake payload for issue #396: snapshot writer requests
+    /// a dispatch-thread audit checkpoint prepare, then performs the returned
+    /// durable flush off the dispatch loop.
+    /// </summary>
+    internal sealed record AuditCheckpointRequest(
+        long SnapshotLastAppliedSeq,
+        TaskCompletionSource<IAuditCheckpointOperation> Prepared);
 
     // ====== high-frequency log messages (LoggerMessage source-gen) ======
 
