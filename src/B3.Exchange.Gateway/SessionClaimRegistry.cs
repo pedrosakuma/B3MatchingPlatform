@@ -177,11 +177,13 @@ public sealed class SessionClaimRegistry
     /// Releases the claim for <paramref name="sessionId"/> if (and only
     /// if) it is currently held by <paramref name="claimToken"/>. Safe to
     /// call from any thread; safe to call multiple times. Does not
-    /// reset the recorded last-seen sessionVerID — that persists for
-    /// the life of the process so reconnects can be checked for
-    /// monotonicity.
+    /// reset the recorded last-seen sessionVerID unless
+    /// <paramref name="forgetLastVersion"/> is true. Normal reconnects
+    /// need monotonicity to survive for the process lifetime; daily
+    /// trading-day resets explicitly clear it so SessionVerID starts
+    /// fresh.
     /// </summary>
-    public void Release(uint sessionId, object claimToken)
+    public void Release(uint sessionId, object claimToken, bool forgetLastVersion = false)
     {
         ArgumentNullException.ThrowIfNull(claimToken);
         lock (_lock)
@@ -190,6 +192,10 @@ public sealed class SessionClaimRegistry
                 ReferenceEquals(owner, claimToken))
             {
                 _activeClaims.Remove(sessionId);
+            }
+            if (forgetLastVersion)
+            {
+                _lastSessionVerId.Remove(sessionId);
             }
         }
     }

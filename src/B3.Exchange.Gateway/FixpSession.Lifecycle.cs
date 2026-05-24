@@ -295,10 +295,12 @@ public sealed partial class FixpSession
         // send loop wakes up and exits.
         _transport.Close(reason);
         // Release the FIXP session claim (if any) so the same sessionID
-        // can be re-negotiated by a future transport.
+        // can be re-negotiated by a future transport. Daily reset also
+        // clears the last-seen SessionVerID because B3 daily state starts
+        // fresh rather than obeying prior-day monotonicity.
         if (_claimedSessionId != 0 && _claims is not null)
         {
-            try { _claims.Release(_claimedSessionId, this); }
+            try { _claims.Release(_claimedSessionId, this, forgetLastVersion: kind == CloseKind.DailyReset); }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex,
@@ -318,7 +320,7 @@ public sealed partial class FixpSession
                 "fixp session {ConnectionId} OnSessionClosed callback threw",
                 ConnectionId);
         }
-        // Issue #289 / #405: terminal close ⇒ drop the persisted
+        // Issue #289 / #405 / #416: terminal close ⇒ drop the persisted
         // retransmit ring file AND the unbounded outbound journal AND
         // the state snapshot. Scoped to terminal close kinds
         // so transport-error and host-shutdown closes preserve state for
@@ -329,7 +331,8 @@ public sealed partial class FixpSession
             kind == CloseKind.PeerTerminate
             || kind == CloseKind.LocalTerminate
             || kind == CloseKind.KeepaliveLapsed
-            || kind == CloseKind.SuspendedTimeout;
+            || kind == CloseKind.SuspendedTimeout
+            || kind == CloseKind.DailyReset;
         if (removePersistence)
         {
             if (_outboundJournal is not null && SessionId != 0)

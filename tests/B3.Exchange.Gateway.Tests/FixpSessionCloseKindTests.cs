@@ -111,6 +111,7 @@ public sealed class FixpSessionCloseKindTests
     [InlineData(CloseKind.PeerTerminate)]
     [InlineData(CloseKind.LocalTerminate)]
     [InlineData(CloseKind.HostShutdown)]
+    [InlineData(CloseKind.DailyReset)]
     [InlineData(CloseKind.TransportError)]
     [InlineData(CloseKind.KeepaliveLapsed)]
     [InlineData(CloseKind.SuspendedTimeout)]

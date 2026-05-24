@@ -38,13 +38,19 @@ public enum CloseKind
     LocalTerminate,
 
     /// <summary>
-    /// Host process is shutting down gracefully (SIGTERM,
-    /// daily-rollover, etc.). The peer is expected to reconnect when
-    /// the host comes back; persisted state must be preserved so the
-    /// resumed session can replay every event produced before the
-    /// shutdown.
+    /// Host process is shutting down gracefully (SIGTERM, operator stop,
+    /// etc.). The peer is expected to reconnect when the host comes back;
+    /// persisted state must be preserved so the resumed session can
+    /// replay every event produced before the shutdown.
     /// </summary>
     HostShutdown,
+
+    /// <summary>
+    /// Trading-day rollover. The peer must reconnect with fresh daily
+    /// FIXP sequence state; persisted state and last-seen SessionVerID
+    /// should be removed rather than preserved for resync.
+    /// </summary>
+    DailyReset,
 
     /// <summary>
     /// Underlying TCP transport dropped (read/write error, peer RST,

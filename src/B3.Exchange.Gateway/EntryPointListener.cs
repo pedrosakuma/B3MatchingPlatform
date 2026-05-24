@@ -31,7 +31,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
     private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
     private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
-    private readonly IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
+    private readonly IDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -89,7 +89,9 @@ public sealed class EntryPointListener : IAsyncDisposable
         _retransmitMetrics = retransmitMetrics;
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
-        _persistedSessionStates = persistedSessionStates;
+        _persistedSessionStates = persistedSessionStates is null
+            ? null
+            : new Dictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>(persistedSessionStates);
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
             throw new ArgumentException(
@@ -219,7 +221,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     /// not nest the listener's mutex. Safe to call from the HTTP thread
     /// or from the daily-rollover scheduler timer.</para>
     /// </summary>
-    public int TerminateAllSessions(string reason)
+    public int TerminateAllSessions(string reason, CloseKind closeKind = CloseKind.HostShutdown)
     {
         ArgumentException.ThrowIfNullOrEmpty(reason);
         FixpSession[] snapshot;
@@ -230,10 +232,9 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (!s.IsOpen) continue;
             try
             {
-                // Daily-rollover / admin terminate-all is treated as a
-                // host-driven shutdown (issue #405): peer is expected
-                // to reconnect and we want persisted state preserved.
-                s.Close(reason, CloseKind.HostShutdown);
+                s.Close(reason, closeKind);
+                if (closeKind == CloseKind.DailyReset)
+                    _persistedSessionStates?.Remove(s.SessionId);
                 closed++;
             }
             catch (Exception ex)
