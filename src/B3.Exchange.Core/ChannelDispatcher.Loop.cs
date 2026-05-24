@@ -145,6 +145,7 @@ public sealed partial class ChannelDispatcher
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
+        bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
         // observes it. Only New/Cancel/Replace are durable today;
         // operator commands force-snapshot post-flush so the
@@ -157,13 +158,18 @@ public sealed partial class ChannelDispatcher
         // WAL on next replay). We bail out of ProcessOne entirely.
         if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
         {
+            if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
+            {
+                _metrics?.IncOrdersIn();
+                EmitOpenOrderLimitReject(item.NewOrder!);
+                return;
+            }
             if (!WalAppendIfEnabled(in item))
             {
                 _metrics?.IncWalHaltReject();
                 return;
             }
         }
-        bool succeeded = false;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -471,5 +477,19 @@ public sealed partial class ChannelDispatcher
                 _currentClOrdId, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
+    }
+
+    private bool WouldExceedOpenOrderLimit(uint enteringFirm)
+        => _openOrdersByFirm.TryGetValue(enteringFirm, out int current)
+           && current >= _maxOpenOrdersPerFirm;
+
+    private void EmitOpenOrderLimitReject(NewOrderCommand order)
+    {
+        if (!_hasCurrentSession) return;
+        _outbound.WriteExecutionReportReject(_currentSession,
+            new RejectEvent(order.ClOrdId, order.SecurityId, 0,
+                RejectReason.OrderExceedsLimit, order.EnteredAtNanos, order.Memo),
+            _currentClOrdId, CurrentDurability);
+        _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
     }
 }

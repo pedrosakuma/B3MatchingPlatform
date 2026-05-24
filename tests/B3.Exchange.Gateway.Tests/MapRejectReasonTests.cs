@@ -22,6 +22,7 @@ public class MapRejectReasonTests
     [InlineData(RejectReason.PriceOutOfBand, 3u)]
     [InlineData(RejectReason.PriceNotOnTick, 3u)]
     [InlineData(RejectReason.PriceNonPositive, 3u)]
+    [InlineData(RejectReason.OrderExceedsLimit, 3u)]
     [InlineData(RejectReason.QuantityNonPositive, 11u)]
     [InlineData(RejectReason.QuantityNotMultipleOfLot, 11u)]
     [InlineData(RejectReason.MarketNotImmediateOrCancel, 11u)]

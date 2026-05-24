@@ -19,6 +19,7 @@ public sealed class HostConfig
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
     [JsonPropertyName("phaseScheduler")] public PhaseSchedulerConfig? PhaseScheduler { get; set; }
     [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
+    [JsonPropertyName("maxOpenOrdersPerFirm")] public int MaxOpenOrdersPerFirm { get; set; } = 100_000;
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 
     /// <summary>

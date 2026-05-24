@@ -30,6 +30,7 @@ public sealed partial class ChannelDispatcher
         _engine.ResetForChannelReset();
         _orders.Clear();
         RecordAllBookCounts();
+        ClearOpenOrderCounts();
         Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
         Volatile.Write(ref _sequenceNumber, 0u);
         _snapshotRotator?.BumpSequenceVersion();

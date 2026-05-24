@@ -87,10 +87,13 @@ public partial class ChannelDispatcherTests
         { if (Find(session) is { } s) { s.Rejects.Add(e); s.RejectClOrdIds.Add(clOrdIdValue); s.Calls.Add("Reject"); } return true; }
     }
 
-    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()
+    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher(
+        int maxOpenOrdersPerFirm = 100_000,
+        MetricsRegistry? metrics = null)
     {
         var pkt = new RecordingPacketSink();
         var outbound = new RecordingOutbound();
+        var channelMetrics = metrics?.RegisterChannel(1);
         var disp = new ChannelDispatcher(channelNumber: 1,
             engineFactory: sink => new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance),
             options: new ChannelDispatcherOptions
@@ -100,6 +103,9 @@ public partial class ChannelDispatcherTests
                 Logger = NullLogger<ChannelDispatcher>.Instance,
                 TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
+                Metrics = channelMetrics,
+                OpenOrders = metrics?.OpenOrders,
+                MaxOpenOrdersPerFirm = maxOpenOrdersPerFirm,
             });
         return (disp, pkt, outbound);
     }
@@ -151,6 +157,136 @@ public partial class ChannelDispatcherTests
         Assert.Equal(RejectReason.UnsupportedOrderCharacteristic, reject.Reason);
         Assert.Equal("415", reject.ClOrdId);
         Assert.Equal(415UL, Assert.Single(reply.RejectClOrdIds));
+    }
+
+    [Fact]
+    public void NewOrder_MaxOpenOrdersPerFirm_RejectsNPlusOneWithOrderExceedsLimit()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 2);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3UL);
+
+        DrainInbound(disp);
+
+        Assert.Equal(2, reply.News.Count);
+        var reject = Assert.Single(reply.Rejects);
+        Assert.Equal(RejectReason.OrderExceedsLimit, reject.Reason);
+        Assert.Equal(3UL, Assert.Single(reply.RejectClOrdIds));
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_CancelDecrementsSoNextNewIsAccepted()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long orderId = Assert.Single(reply.News).OrderId;
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+        Assert.Single(reply.Rejects);
+
+        disp.EnqueueCancel(new CancelOrderCommand("3", Petr, orderId, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("4", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 4_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 4UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, reply.News.Count);
+        Assert.Single(reply.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_FillDecrementsSoNextNewIsAccepted()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var maker = new FakeSession(outbound) { EnteringFirm = 7 };
+        var taker = new FakeSession(outbound) { EnteringFirm = 8 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.IOC, Px(10m), 100, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(11m), 100, 7, 3_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, maker.News.Count);
+        Assert.Empty(maker.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_ReplaceIsNeutral()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long orderId = Assert.Single(reply.News).OrderId;
+        disp.EnqueueReplace(new ReplaceOrderCommand("2", Petr, orderId, Px(10m), 100, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(reply.Rejects).Reason);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_IsIsolatedByFirm()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var firmA = new FakeSession(outbound) { EnteringFirm = 7 };
+        var firmB = new FakeSession(outbound) { EnteringFirm = 8 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            firmA.Id, firmA.EnteringFirm, clOrdIdValue: 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 2_000UL),
+            firmA.Id, firmA.EnteringFirm, clOrdIdValue: 2UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 8, 3_000UL),
+            firmB.Id, firmB.EnteringFirm, clOrdIdValue: 3UL);
+
+        DrainInbound(disp);
+
+        Assert.Single(firmA.News);
+        Assert.Single(firmA.Rejects);
+        Assert.Single(firmB.News);
+        Assert.Empty(firmB.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_GaugeReflectsCurrentCount()
+    {
+        var metrics = new MetricsRegistry();
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 2, metrics: metrics);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        Assert.Contains("open_orders_per_firm{firm=\"7\"} 1\n", metrics.RenderProm());
+        long orderId = Assert.Single(reply.News).OrderId;
+
+        disp.EnqueueCancel(new CancelOrderCommand("2", Petr, orderId, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Contains("open_orders_per_firm{firm=\"7\"} 0\n", metrics.RenderProm());
     }
 
 

@@ -107,6 +107,10 @@ public enum RejectReason : byte
     /// (Price exceeds current price band) per the B3/FIX reject-domain
     /// convention used by EntryPoint clients.</summary>
     PriceExceedsCurrentPriceBand,
+    /// <summary>The order would exceed a configured pre-trade risk limit
+    /// (for example max open orders per entering firm). Maps to FIX/B3
+    /// OrdRejReason=3 (OrderExceedsLimit).</summary>
+    OrderExceedsLimit,
 }
 
 /// <summary>

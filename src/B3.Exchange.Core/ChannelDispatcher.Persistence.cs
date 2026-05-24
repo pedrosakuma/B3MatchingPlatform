@@ -208,6 +208,7 @@ public sealed partial class ChannelDispatcher
             }
             _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId,
                 originalQty: origQty, cumQty: o.CumQty);
+            IncrementOpenOrders(o.Firm);
         }
         if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
         RecordAllBookCounts();

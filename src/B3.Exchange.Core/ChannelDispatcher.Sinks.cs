@@ -46,6 +46,7 @@ public sealed partial class ChannelDispatcher
                 _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
                     originalQty: _aggressorOrigQty > 0 ? _aggressorOrigQty : e.RemainingQuantity,
                     cumQty: _aggressorCumQty);
+                IncrementOpenOrders(_currentFirm);
             }
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
@@ -252,6 +253,7 @@ public sealed partial class ChannelDispatcher
         // OrigClOrdID points to the owner's original ClOrdID.
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
+            DecrementOpenOrders(owner.Firm);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
@@ -272,7 +274,8 @@ public sealed partial class ChannelDispatcher
         // Tell the canonical registry the order has reached terminal state
         // — no wire ER here (the per-trade ER_Trade frames have already
         // covered the fills).
-        _orders.Evict(e.OrderId);
+        if (_orders.TryEvict(e.OrderId, out var owner))
+            DecrementOpenOrders(owner.Firm);
     }
 
     public void OnTrade(in TradeEvent e)
@@ -404,6 +407,33 @@ public sealed partial class ChannelDispatcher
             _outbound.WriteExecutionReportReject(_currentSession, e, _currentClOrdId, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
+    }
+
+    private void IncrementOpenOrders(uint firm)
+    {
+        int next = _openOrdersByFirm.TryGetValue(firm, out int current) ? current + 1 : 1;
+        _openOrdersByFirm[firm] = next;
+        _openOrderMetrics?.Set(ChannelNumber, firm, next);
+    }
+
+    private void DecrementOpenOrders(uint firm)
+    {
+        if (!_openOrdersByFirm.TryGetValue(firm, out int current) || current <= 0)
+            return;
+        int next = current - 1;
+        if (next == 0)
+            _openOrdersByFirm.Remove(firm);
+        else
+            _openOrdersByFirm[firm] = next;
+        _openOrderMetrics?.Set(ChannelNumber, firm, next);
+    }
+
+    private void ClearOpenOrderCounts()
+    {
+        if (_openOrdersByFirm.Count == 0) return;
+        foreach (uint firm in _openOrdersByFirm.Keys.ToArray())
+            _openOrderMetrics?.Set(ChannelNumber, firm, 0);
+        _openOrdersByFirm.Clear();
     }
 
     public void OnIcebergReplenished(in IcebergReplenishedEvent e)
