@@ -516,14 +516,29 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
             }
         }
         var dir = SessionDir(sessionId);
-        if (!Directory.Exists(dir)) return;
-        try { Directory.Delete(dir, recursive: true); }
-        catch (Exception ex)
+        bool removed = !Directory.Exists(dir);
+        if (!removed)
         {
-            _logger.LogWarning(ex,
-                "fixp outbound journal: failed to delete session directory {Dir}",
-                dir);
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+                removed = true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp outbound journal: failed to delete session directory {Dir}",
+                    dir);
+            }
         }
+
+        if (!removed) return;
+
+        lock (_lock)
+        {
+            _confirmedPeerAck.Remove(sessionId);
+        }
+        _metrics?.Reset(sessionId);
     }
 
     public IReadOnlyCollection<uint> ListSessions()

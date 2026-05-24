@@ -242,6 +242,40 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
     }
 
     [Fact]
+    public void Remove_clears_peer_ack_watermark_before_session_id_reuse()
+    {
+        using var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 350);
+        const uint sid = 0x437u;
+        for (uint s = 1; s <= 4; s++) j.Append(sid, s, s, Frame(s, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 4);
+
+        j.Remove(sid);
+
+        j.Append(sid, 1, 1, Frame(1, extraBytes: 96));
+        j.Append(sid, 2, 2, Frame(2, extraBytes: 96));
+        j.Append(sid, 3, 3, Frame(3, extraBytes: 96));
+
+        Assert.Equal(new uint[] { 1, 2, 3 }, j.ReadRange(sid, 1, 10).Select(e => e.Seq));
+    }
+
+    [Fact]
+    public void Remove_resets_journal_metrics_for_session()
+    {
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(metrics: metrics);
+        const uint sid = 0x438u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 96));
+
+        var before = Assert.Single(metrics.Snapshot());
+        Assert.Equal("0x00000438", before.Session);
+        Assert.True(before.Bytes > 0);
+
+        j.Remove(sid);
+
+        Assert.Empty(metrics.Snapshot());
+    }
+
+    [Fact]
     public void ListSessions_enumerates_persisted_sessions()
     {
         using (var j = NewJournal())

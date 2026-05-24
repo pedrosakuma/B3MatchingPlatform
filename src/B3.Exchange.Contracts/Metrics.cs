@@ -132,6 +132,9 @@ public sealed class FixpJournalMetrics
             Interlocked.Increment(ref s.RotationsAge);
     }
 
+    public void Reset(uint sessionId)
+        => _sessions.TryRemove(SessionKey(sessionId), out _);
+
     public IReadOnlyList<FixpJournalMetricsSnapshot> Snapshot()
         => _sessions
             .Select(kv => new FixpJournalMetricsSnapshot(
@@ -144,8 +147,11 @@ public sealed class FixpJournalMetrics
             .ToArray();
 
     private SessionJournalMetrics Get(uint sessionId)
-        => _sessions.GetOrAdd("0x" + sessionId.ToString("x8", System.Globalization.CultureInfo.InvariantCulture),
+        => _sessions.GetOrAdd(SessionKey(sessionId),
             static _ => new SessionJournalMetrics());
+
+    private static string SessionKey(uint sessionId)
+        => "0x" + sessionId.ToString("x8", System.Globalization.CultureInfo.InvariantCulture);
 
     private sealed class SessionJournalMetrics
     {
