@@ -92,6 +92,11 @@ public enum RejectReason : byte
     /// rejected with this reason; cancels are allowed so participants can
     /// pull resting orders during the halt.</summary>
     InstrumentHalted,
+    /// <summary>The order requested a wire-valid characteristic the simulator
+    /// does not implement. The gateway forwards these to the engine so the
+    /// client receives an <c>ExecutionReport_Reject</c> with FIX
+    /// OrdRejReason=11 instead of a <c>BusinessMessageReject</c>.</summary>
+    UnsupportedOrderCharacteristic,
 }
 
 /// <summary>
@@ -229,6 +234,8 @@ public sealed record NewOrderCommand(
     /// as a Limit order at <see cref="PriceMantissa"/>. Issue #214.
     /// </summary>
     public long StopPxMantissa { get; init; }
+
+    public bool UnsupportedOrderCharacteristic { get; init; }
 }
 
 public sealed record CancelOrderCommand(
@@ -271,6 +278,8 @@ public sealed record ReplaceOrderCommand(
     /// coded to <see cref="TimeInForce.Day"/>).
     /// </summary>
     public TimeInForce? NewTif { get; init; }
+
+    public bool UnsupportedOrderCharacteristic { get; init; }
 }
 
 /// <summary>

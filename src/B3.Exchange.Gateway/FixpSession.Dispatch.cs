@@ -277,7 +277,15 @@ public sealed partial class FixpSession
                     }
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
                     {
-                        WriteApplicationBusinessReject(info.TemplateId, fixedBlock, nosClOrd, nosMsg ?? "unsupported");
+                        if (nos is not null)
+                        {
+                            if (!_sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd))
+                                WriteSystemBusyReject(info.TemplateId, fixedBlock, nosClOrd, "New");
+                        }
+                        else
+                        {
+                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, nosClOrd, nosMsg ?? "unsupported");
+                        }
                         return true;
                     }
                     _sink.OnDecodeError(Identity, nosMsg ?? "decode error: NewOrderSingle");
@@ -296,7 +304,15 @@ public sealed partial class FixpSession
                     }
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature)
                     {
-                        WriteApplicationBusinessReject(info.TemplateId, fixedBlock, ocrClOrd, ocrMsg ?? "unsupported");
+                        if (ocr is not null)
+                        {
+                            if (!_sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd))
+                                WriteSystemBusyReject(info.TemplateId, fixedBlock, ocrClOrd, "Replace");
+                        }
+                        else
+                        {
+                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, ocrClOrd, ocrMsg ?? "unsupported");
+                        }
                         return true;
                     }
                     _sink.OnDecodeError(Identity, ocrMsg ?? "decode error: OrderCancelReplaceRequest");

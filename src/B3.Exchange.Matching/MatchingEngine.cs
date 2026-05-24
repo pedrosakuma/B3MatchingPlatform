@@ -766,6 +766,12 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            if (cmd.UnsupportedOrderCharacteristic)
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.UnsupportedOrderCharacteristic, cmd.EnteredAtNanos);
+                return;
+            }
+
             if (!_rulesById.TryGetValue(cmd.SecurityId, out var rules))
             {
                 Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.UnknownInstrument, cmd.EnteredAtNanos);
@@ -1070,6 +1076,9 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            if (cmd.UnsupportedOrderCharacteristic)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnsupportedOrderCharacteristic, cmd.EnteredAtNanos); return; }
+
             if (!_rulesById.TryGetValue(cmd.SecurityId, out var rules))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownInstrument, cmd.EnteredAtNanos); return; }
             // Issue #322: replace under an administrative halt is rejected

@@ -48,6 +48,7 @@ public partial class ChannelDispatcherTests
         public List<OrderAcceptedEvent> News { get; } = new();
         public List<OrderCanceledEvent> Cancels { get; } = new();
         public List<RejectEvent> Rejects { get; } = new();
+        public List<ulong> RejectClOrdIds { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
         public List<(long LeavesQty, long CumQty)> TradeQty { get; } = new();
         public bool CaptureCancelIds { get; set; }
@@ -83,7 +84,7 @@ public partial class ChannelDispatcherTests
         public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default)
-        { if (Find(session) is { } s) { s.Rejects.Add(e); s.Calls.Add("Reject"); } return true; }
+        { if (Find(session) is { } s) { s.Rejects.Add(e); s.RejectClOrdIds.Add(clOrdIdValue); s.Calls.Add("Reject"); } return true; }
     }
 
     private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()
@@ -129,6 +130,27 @@ public partial class ChannelDispatcherTests
         // SecurityId in body (after PacketHeader+Framing+SbeHeader)
         int bodyStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.Equal(Petr, MemoryMarshal.Read<long>(packet.AsSpan(bodyStart + WireOffsets.OrderBodySecurityIdOffset, 8)));
+    }
+
+    [Fact]
+    public void NewOrder_UnsupportedCharacteristic_EmitsExecutionReportReject_NoUmdfPacket()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("415", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL)
+        {
+            UnsupportedOrderCharacteristic = true,
+        }, reply.Id, reply.EnteringFirm, clOrdIdValue: 415UL);
+
+        DrainInbound(disp);
+
+        Assert.Empty(pkt.Packets);
+        Assert.Empty(reply.News);
+        var reject = Assert.Single(reply.Rejects);
+        Assert.Equal(RejectReason.UnsupportedOrderCharacteristic, reject.Reason);
+        Assert.Equal("415", reject.ClOrdId);
+        Assert.Equal(415UL, Assert.Single(reply.RejectClOrdIds));
     }
 
     [Fact]
