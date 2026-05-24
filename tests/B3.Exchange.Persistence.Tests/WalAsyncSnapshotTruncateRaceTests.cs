@@ -62,6 +62,67 @@ public class WalAsyncSnapshotTruncateRaceTests
         public void Dispose() { try { Directory.Delete(Path, recursive: true); } catch { } }
     }
 
+    private sealed class DispatcherDriver : IDisposable
+    {
+        private readonly ChannelDispatcher.TestProbe _probe;
+        private readonly System.Collections.Concurrent.BlockingCollection<DrainRequest> _requests = new();
+        private readonly Thread _thread;
+
+        public DispatcherDriver(ChannelDispatcher.TestProbe probe)
+        {
+            _probe = probe;
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "wal-race-dispatcher-test-driver",
+            };
+            _thread.Start();
+        }
+
+        public void DrainInbound()
+        {
+            var request = new DrainRequest();
+            _requests.Add(request);
+            request.Done.Wait();
+            if (request.Error is { } error)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
+            }
+        }
+
+        public void Dispose()
+        {
+            _requests.CompleteAdding();
+            _thread.Join();
+            _requests.Dispose();
+        }
+
+        private void Run()
+        {
+            foreach (var request in _requests.GetConsumingEnumerable())
+            {
+                try
+                {
+                    _probe.DrainInbound();
+                }
+                catch (Exception ex)
+                {
+                    request.Error = ex;
+                }
+                finally
+                {
+                    request.Done.Set();
+                }
+            }
+        }
+
+        private sealed class DrainRequest
+        {
+            public ManualResetEventSlim Done { get; } = new();
+            public Exception? Error { get; set; }
+        }
+    }
+
     /// <summary>
     /// Persister whose <c>Save</c> blocks on a counting gate. The test
     /// releases one save at a time so it can observe the post-fix WAL
@@ -136,6 +197,7 @@ public class WalAsyncSnapshotTruncateRaceTests
                 Wal = wal,
             });
         var probe = disp.CreateTestProbe();
+        using var driver = new DispatcherDriver(probe);
         var session = new SessionId("80801");
 
         // Cmd 1 → WAL seq=1 → submits snap@1 to the writer thread.
@@ -145,7 +207,7 @@ public class WalAsyncSnapshotTruncateRaceTests
         // runners, causing both snapshots to coalesce into snap@2 →
         // TruncateThrough(2) → empty WAL → wrong race exercised.
         Assert.True(EnqueueOrder(disp, session, "CL-1", 0x1, 1UL));
-        probe.DrainInbound();
+        driver.DrainInbound();
         Assert.Single(wal.ReadAll());
         Assert.True(await WaitForTaskAsync(blocking.FirstSaveEntered, TimeSpan.FromSeconds(5)),
             "writer thread never entered Save(snap@1) — async writer may not be running");
@@ -155,7 +217,7 @@ public class WalAsyncSnapshotTruncateRaceTests
         // the single-slot mailbox; the writer will drain it after we
         // release the first save.
         Assert.True(EnqueueOrder(disp, session, "CL-2", 0x2, 2UL));
-        probe.DrainInbound();
+        driver.DrainInbound();
         Assert.Equal(2, wal.ReadAll().Count);
 
         // Release ONLY the first blocked Save. The writer completes
