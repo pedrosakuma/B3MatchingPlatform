@@ -273,7 +273,12 @@ public sealed class ExchangeHost : IAsyncDisposable
             var wal = BuildWal(ch);
             var auditWriter = BuildPostTradeAuditWriter(ch);
             if (persister != null) _persistersByChannel[ch.ChannelNumber] = persister;
-            if (wal != null) _walsByChannel[ch.ChannelNumber] = wal;
+            if (wal != null)
+            {
+                _walsByChannel[ch.ChannelNumber] = wal;
+                channelMetrics.SetWalSizeBytes(wal.CurrentSizeBytes);
+                channelMetrics.SetWalDropsOnFull(wal.DropsOnFullCount);
+            }
             if (auditWriter != null) _auditWriters.Add(auditWriter);
             // Issue #270: cross-channel consistency check on restore.
             // Resolve the policy here so the dispatcher can stay

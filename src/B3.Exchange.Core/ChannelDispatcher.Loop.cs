@@ -347,6 +347,7 @@ public sealed partial class ChannelDispatcher
             // partial state would corrupt downstream consumers.
             if (succeeded)
             {
+                RecordBookCountsAfterWorkItem(in item);
                 long flushStart = engineEnd;
                 // Fast path: skip the virtual StartActivity call when no
                 // listeners are attached (round-2 perf #11).
@@ -404,6 +405,46 @@ public sealed partial class ChannelDispatcher
     {
         _aggressorOrigQty = originalQty;
         _aggressorCumQty = 0;
+    }
+
+    private void RecordBookCountsAfterWorkItem(in WorkItem item)
+    {
+        if (_metrics is null) return;
+        switch (item.Kind)
+        {
+            case WorkKind.New when item.NewOrder is not null:
+                RecordBookCount(item.NewOrder.SecurityId);
+                break;
+            case WorkKind.Cancel when item.Cancel is not null:
+                RecordBookCount(item.Cancel.SecurityId);
+                break;
+            case WorkKind.Replace when item.Replace is not null:
+                RecordBookCount(item.Replace.SecurityId);
+                break;
+            case WorkKind.Cross when item.Cross is not null:
+                RecordBookCount(item.Cross.Buy.SecurityId);
+                break;
+            case WorkKind.MassCancel when item.MassCancel is not null && item.MassCancel.Command.SecurityId != 0:
+                RecordBookCount(item.MassCancel.Command.SecurityId);
+                break;
+            case WorkKind.MassCancel:
+                RecordAllBookCounts();
+                break;
+        }
+    }
+
+    private void RecordBookCount(long securityId)
+    {
+        if (_metrics is null) return;
+        try { _metrics.SetBookLiveOrders(securityId, _engine.OrderCount(securityId)); }
+        catch (KeyNotFoundException) { }
+    }
+
+    private void RecordAllBookCounts()
+    {
+        if (_metrics is null) return;
+        foreach (var sample in _engine.OrderCountsSnapshot())
+            _metrics.SetBookLiveOrders(sample.SecurityId, sample.Count);
     }
 
     private void EmitUnknownOrderIdReject(string clOrdId, long securityId, ulong nowNanos)

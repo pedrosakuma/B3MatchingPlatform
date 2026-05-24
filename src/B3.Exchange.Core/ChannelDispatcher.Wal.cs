@@ -78,6 +78,8 @@ public sealed partial class ChannelDispatcher
             // we return the on-disk bytes from this single call.
             long approxBytes = _wal.Append(rec);
             _metrics?.IncWalAppend(approxBytes);
+            if (approxBytes > 0)
+                _metrics?.SetWalLastWriteUnixMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             _metrics?.SetWalSizeBytes(_wal.CurrentSizeBytes);
             _metrics?.SetWalDropsOnFull(_wal.DropsOnFullCount);
             return true;
@@ -379,6 +381,7 @@ public sealed partial class ChannelDispatcher
         // and migration progress immediately after boot.
         _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
         _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
+        RecordAllBookCounts();
         _logger.LogInformation(
             "channel {ChannelNumber}: WAL replay complete — replayed={Replayed} skipped={Skipped} corrupt={Corrupt} legacy={Legacy} (snapshotLastAppliedSeq={SnapshotSeq})",
             ChannelNumber, replayed, skipped, _wal.LastReadCorruptCount, _wal.LastReadLegacyCount, snapshotLastAppliedSeq);

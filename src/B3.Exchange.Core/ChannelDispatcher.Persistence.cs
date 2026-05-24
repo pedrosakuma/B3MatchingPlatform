@@ -210,6 +210,7 @@ public sealed partial class ChannelDispatcher
                 originalQty: origQty, cumQty: o.CumQty);
         }
         if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
+        RecordAllBookCounts();
 
         _logger.LogInformation(
             "channel {ChannelNumber}: restored snapshot — seq={SequenceNumber}/{SequenceVersion} owners={OwnerCount} orphansDropped={OrphansDropped}",

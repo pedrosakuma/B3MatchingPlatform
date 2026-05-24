@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Collections.Concurrent;
 using B3.Exchange.Contracts;
 
 namespace B3.Exchange.Core;
@@ -266,6 +267,28 @@ public sealed class ChannelMetrics
     /// (or the audit Checkpoint threw). See <see cref="_auditWalTruncateDeferred"/>.</summary>
     public void IncAuditWalTruncateDeferred() => Interlocked.Increment(ref _auditWalTruncateDeferred);
 
+    private sealed class LiveOrderGauge
+    {
+        public long Value;
+    }
+
+    private readonly ConcurrentDictionary<long, LiveOrderGauge> _liveOrdersBySecurityId = new();
+
+    public void SetBookLiveOrders(long securityId, long count)
+    {
+        var gauge = _liveOrdersBySecurityId.GetOrAdd(securityId, static _ => new LiveOrderGauge());
+        Interlocked.Exchange(ref gauge.Value, count);
+    }
+
+    internal IReadOnlyList<(long SecurityId, long Count)> BookLiveOrdersSnapshot()
+    {
+        var result = new List<(long SecurityId, long Count)>(_liveOrdersBySecurityId.Count);
+        foreach (var kv in _liveOrdersBySecurityId)
+            result.Add((kv.Key, Interlocked.Read(ref kv.Value.Value)));
+        result.Sort(static (a, b) => a.SecurityId.CompareTo(b.SecurityId));
+        return result;
+    }
+
     /// <summary>Issue #291: current on-disk WAL size in bytes
     /// (gauge). Updated by the dispatcher after every successful
     /// Append/Truncate so the alert can fire well before
@@ -273,6 +296,10 @@ public sealed class ChannelMetrics
     private long _walSizeBytes;
     public long WalSizeBytes => Interlocked.Read(ref _walSizeBytes);
     public void SetWalSizeBytes(long bytes) => Interlocked.Exchange(ref _walSizeBytes, bytes);
+
+    private long _walLastWriteUnixMs;
+    public long WalLastWriteUnixMs => Interlocked.Read(ref _walLastWriteUnixMs);
+    public void SetWalLastWriteUnixMs(long unixMs) => Interlocked.Exchange(ref _walLastWriteUnixMs, unixMs);
 
     /// <summary>Issue #291: cumulative count of WAL appends silently
     /// skipped because <c>maxBytes</c> was reached and the resolved
@@ -534,6 +561,7 @@ public sealed class MetricsRegistry
         EmitGauge(sb, "exch_dispatch_loop_last_tick_unixms",
             "Unix time (milliseconds) of the dispatcher loop's last heartbeat.",
             channels, c => c.LastTickUnixMs);
+        EmitBookLiveOrders(sb, channels);
         EmitCounter(sb, "umdf_chaos_dropped_total",
             "Total UMDF packets dropped by the chaos decorator (issue #119). 0 unless chaos is enabled in HostConfig.",
             channels, c => c.ChaosDropped);
@@ -598,6 +626,7 @@ public sealed class MetricsRegistry
         EmitSessionGauge(sb, sessionSnap, "fixp_session_retx_buffer_depth",
             "Number of business frames buffered for replay on this session.",
             withFirmLabel: false, s => s.RetxBufferDepth);
+        EmitSessionRetransmitUtilizationPercent(sb, sessionSnap);
         EmitSessionGauge(sb, sessionSnap, "fixp_session_attached_transports",
             "1 if a TCP transport is currently attached, 0 if Suspended.",
             withFirmLabel: false, s => s.AttachedTransportId is null ? 0 : 1);
@@ -745,6 +774,12 @@ public sealed class MetricsRegistry
         EmitGauge(sb, "exch_wal_size_bytes",
             "Issue #291: current on-disk size of the channel's WAL file in bytes. Compare against persistence.wal.maxBytes to alert before the cap is reached. A flat-line at the cap under onFull=halt indicates a halted channel; a flat-line under onFull=drop indicates silent data loss.",
             channels, c => c.WalSizeBytes);
+        EmitProcessGauge(sb, "exch_wal_total_size_bytes",
+            "Total on-disk size in bytes of all channel WAL files. Alert before this approaches the persistence volume capacity.",
+            channels.Sum(static c => c.WalSizeBytes));
+        EmitGauge(sb, "exch_wal_last_write_unixms",
+            "Unix time (milliseconds) of the most recent successful WAL append per channel; 0 if no record has been written.",
+            channels, c => c.WalLastWriteUnixMs);
         EmitCounter(sb, "exch_wal_drops_on_full_total",
             "Issue #291: WAL Append() calls silently skipped because persistence.wal.maxBytes was reached and persistence.wal.onFull=drop. Distinct from exch_wal_append_failures_total so on-call can route a capacity-exhaustion alert separately from a generic IO-fault alert. Non-zero means the durability contract has been silently relaxed on this channel.",
             channels, c => c.WalDropsOnFull);
@@ -1009,6 +1044,13 @@ public sealed class MetricsRegistry
         sb.Append(name).Append(' ').Append(value.ToString("0.######", CultureInfo.InvariantCulture)).Append('\n');
     }
 
+    private static void EmitProcessGauge(StringBuilder sb, string name, string help, long value)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(" gauge\n");
+        sb.Append(name).Append(' ').Append(value.ToString(CultureInfo.InvariantCulture)).Append('\n');
+    }
+
     private static void EmitProcessCounter(StringBuilder sb, string name, string help, long value)
     {
         sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
@@ -1078,6 +1120,43 @@ public sealed class MetricsRegistry
               .Append(c.ChannelNumber.ToString(CultureInfo.InvariantCulture))
               .Append("\"} ")
               .Append(selector(c).ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+    }
+
+    private static void EmitBookLiveOrders(StringBuilder sb, ChannelMetrics[] channels)
+    {
+        sb.Append("# HELP exch_book_live_orders Current resting order count per SecurityId. Updated on the channel dispatch thread after each command.\n");
+        sb.Append("# TYPE exch_book_live_orders gauge\n");
+        foreach (var c in channels)
+        {
+            foreach (var sample in c.BookLiveOrdersSnapshot())
+            {
+                sb.Append("exch_book_live_orders{channel=\"")
+                  .Append(c.ChannelNumber.ToString(CultureInfo.InvariantCulture))
+                  .Append("\",security_id=\"")
+                  .Append(sample.SecurityId.ToString(CultureInfo.InvariantCulture))
+                  .Append("\"} ")
+                  .Append(sample.Count.ToString(CultureInfo.InvariantCulture))
+                  .Append('\n');
+            }
+        }
+    }
+
+    private static void EmitSessionRetransmitUtilizationPercent(StringBuilder sb, SessionDiagnostics[] sessions)
+    {
+        sb.Append("# HELP exch_fixp_retransmit_buffer_full_percent Per-session FIXP retransmit ring fill level as a percentage of RetransmitBufferCapacity (0..100).\n");
+        sb.Append("# TYPE exch_fixp_retransmit_buffer_full_percent gauge\n");
+        foreach (var s in sessions)
+        {
+            if (s.RetxBufferCapacity <= 0) continue;
+            double percent = 100.0 * s.RetxBufferDepth / s.RetxBufferCapacity;
+            sb.Append("exch_fixp_retransmit_buffer_full_percent{session=\"")
+              .Append(EscapeLabel(s.SessionId))
+              .Append("\",firm=\"")
+              .Append(EscapeLabel(s.FirmId))
+              .Append("\"} ")
+              .Append(percent.ToString("0.######", CultureInfo.InvariantCulture))
               .Append('\n');
         }
     }
