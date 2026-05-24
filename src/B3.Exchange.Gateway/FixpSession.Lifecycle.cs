@@ -150,8 +150,18 @@ public sealed partial class FixpSession
     /// </summary>
     private void SuspendLocked(string reason)
     {
-        // Atomically flip the attachment flag; second caller is a no-op.
-        if (Interlocked.Exchange(ref _isAttached, 0) == 0) return;
+        // Atomically claim the right to suspend; second caller is a no-op.
+        // We use a separate CAS guard (not _isAttached) so the public
+        // IsAttached flag stays true until after teardown + state transition,
+        // preserving the invariant that observers seeing !IsAttached can rely
+        // on State == Suspended AND the transport already being down.
+        if (Interlocked.Exchange(ref _suspendInProgress, 1) == 1) return;
+        if (Volatile.Read(ref _isAttached) == 0)
+        {
+            // A concurrent Close already cleared attachment; nothing to do.
+            Volatile.Write(ref _suspendInProgress, 0);
+            return;
+        }
         _logger.LogInformation("fixp session {ConnectionId} suspending (reason={Reason})",
             ConnectionId, reason);
         // Best-effort teardown of cancellation + transport before publishing
@@ -180,6 +190,9 @@ public sealed partial class FixpSession
         // while the session is parked still produces an
         // EstablishmentAck.lastIncomingSeqNo matching reality.
         SaveStateSnapshotSafe();
+        // Publish !IsAttached only after state transition + teardown so
+        // consumers observing IsAttached==false see a fully-suspended session.
+        Volatile.Write(ref _isAttached, 0);
     }
 
     /// <summary>
