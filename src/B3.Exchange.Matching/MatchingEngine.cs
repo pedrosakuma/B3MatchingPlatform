@@ -99,6 +99,7 @@ public sealed class MatchingEngine
         long ImbalanceQuantity);
 
     private bool _dispatching;
+    private byte[] _currentMemo = [];
 
     // Issue #322: per-instrument administrative-halt overlay. While an
     // entry is present here, Submit and Replace are short-circuited
@@ -196,7 +197,8 @@ public sealed class MatchingEngine
                     LimitPriceMantissa: s.LimitPriceMantissa,
                     Quantity: s.Quantity,
                     EnteringFirm: s.EnteringFirm,
-                    EnteredAtNanos: s.EnteredAtNanos));
+                    EnteredAtNanos: s.EnteredAtNanos)
+                { Memo = s.Memo });
             }
         }
         // Issue #322: capture per-instrument administrative halts so the
@@ -292,6 +294,7 @@ public sealed class MatchingEngine
                     EnteringFirm = s.EnteringFirm,
                     EnteredAtNanos = s.EnteredAtNanos,
                     SecurityId = s.SecurityId,
+                    Memo = s.Memo,
                 };
                 bucket.Add(stop);
                 _stopById.Add(s.OrderId, stop);
@@ -763,6 +766,7 @@ public sealed class MatchingEngine
 
     private void SubmitImpl(NewOrderCommand cmd, bool emitUnmatchedIocClose)
     {
+        _currentMemo = cmd.Memo;
         EnterDispatch();
         try
         {
@@ -948,6 +952,7 @@ public sealed class MatchingEngine
 
     public void Cancel(CancelOrderCommand cmd)
     {
+        _currentMemo = cmd.Memo;
         EnterDispatch();
         try
         {
@@ -968,14 +973,15 @@ public sealed class MatchingEngine
                     StopPxMantissa: stop.StopPxMantissa,
                     RemainingQuantityAtCancel: stop.Quantity,
                     TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: NextRptSeq()));
+                    RptSeq: NextRptSeq(),
+                    Memo: cmd.Memo));
                 return;
             }
 
             if (!book.TryGet(cmd.OrderId, out var resting))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownOrderId, cmd.EnteredAtNanos); return; }
 
-            EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.Client);
+            EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.Client, cmd.Memo);
             RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
         }
         finally { ExitDispatch(); }
@@ -1073,6 +1079,7 @@ public sealed class MatchingEngine
 
     public void Replace(ReplaceOrderCommand cmd)
     {
+        _currentMemo = cmd.Memo;
         EnterDispatch();
         try
         {
@@ -1156,7 +1163,8 @@ public sealed class MatchingEngine
                     NewRemainingQuantity: cmd.NewQuantity,
                     InsertTimestampNanos: resting.InsertTimestampNanos,
                     TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: rptSeq));
+                    RptSeq: rptSeq,
+                    Memo: cmd.Memo));
                 // Issue #251: priority-kept Replace must also surface as
                 // an ExecutionReport_Modify on the requesting session.
                 // The book mutation is announced via the UMDF UPDATE
@@ -1171,7 +1179,8 @@ public sealed class MatchingEngine
                     NewPriceMantissa: resting.PriceMantissa,
                     NewRemainingQuantity: cmd.NewQuantity,
                     TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: rptSeq));
+                    RptSeq: rptSeq,
+                    Memo: cmd.Memo));
                 RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }
@@ -1179,7 +1188,7 @@ public sealed class MatchingEngine
             // Priority lost: emit DEL of the resting order, then submit the
             // replacement as a fresh aggressor (which may cross or rest).
             var side = resting.Side;
-            EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.ReplaceLostPriority);
+            EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.ReplaceLostPriority, cmd.Memo);
 
             // Build a synthetic NewOrderCommand for the replacement and process
             // it through the normal aggressor path. Type/TIF come from the
@@ -1200,6 +1209,7 @@ public sealed class MatchingEngine
                 OrdTagId = resting.OrdTagId,
                 Asset = resting.Asset,
                 InvestorId = resting.InvestorId,
+                Memo = cmd.Memo,
             };
 
             // Issue #228 / #229 (Onda M): in auction phases the replacement
@@ -1523,7 +1533,9 @@ public sealed class MatchingEngine
                         RestingOrderId: maker.OrderId,
                         RestingFirm: maker.EnteringFirm,
                         TransactTimeNanos: cmd.EnteredAtNanos,
-                        RptSeq: NextRptSeq()));
+                        RptSeq: NextRptSeq(),
+                        AggressorMemo: cmd.Memo,
+                        RestingMemo: maker.Memo));
 
                     aggressorRemaining -= tradeQty;
                     maker.RemainingQuantity -= tradeQty;
@@ -1677,7 +1689,8 @@ public sealed class MatchingEngine
                         RemainingQuantityAtCancel: aggressorRemaining,
                         TransactTimeNanos: cmd.EnteredAtNanos,
                         Reason: CancelReason.IocUnmatched,
-                        RptSeq: NextRptSeq()));
+                        RptSeq: NextRptSeq(),
+                        Memo: cmd.Memo));
                 }
                 return;
             }
@@ -1708,6 +1721,7 @@ public sealed class MatchingEngine
                 Tif = cmd.Tif,
                 MaxFloor = (long)cmd.MaxFloor,
                 HiddenQuantity = hidden,
+                Memo = cmd.Memo,
             };
             book.Insert(resting);
             _sink.OnOrderAccepted(new OrderAcceptedEvent(
@@ -1719,7 +1733,8 @@ public sealed class MatchingEngine
                 RemainingQuantity: resting.RemainingQuantity,
                 EnteringFirm: resting.EnteringFirm,
                 InsertTimestampNanos: resting.InsertTimestampNanos,
-                RptSeq: NextRptSeq()));
+                RptSeq: NextRptSeq(),
+                Memo: resting.Memo));
         }
         finally
         {
@@ -1734,12 +1749,13 @@ public sealed class MatchingEngine
         }
     }
 
-    private void EmitCanceled(LimitOrderBook book, RestingOrder o, ulong txn, CancelReason reason)
+    private void EmitCanceled(LimitOrderBook book, RestingOrder o, ulong txn, CancelReason reason, byte[]? requestMemo = null)
     {
         var side = o.Side;
         long px = o.PriceMantissa;
         long qty = o.RemainingQuantity;
         long oid = o.OrderId;
+        var memo = requestMemo ?? o.Memo;
         book.Remove(o);
         _sink.OnOrderCanceled(new OrderCanceledEvent(
             SecurityId: book.SecurityId,
@@ -1749,7 +1765,8 @@ public sealed class MatchingEngine
             RemainingQuantityAtCancel: qty,
             TransactTimeNanos: txn,
             Reason: reason,
-            RptSeq: NextRptSeq()));
+            RptSeq: NextRptSeq(),
+            Memo: memo));
         // #200: when this cancel emptied the side, publish EmptyBook_9 so
         // recovery consumers can drop their per-side state without waiting
         // for the next snapshot rotation.
@@ -1788,6 +1805,7 @@ public sealed class MatchingEngine
         public uint EnteringFirm { get; init; }
         public ulong EnteredAtNanos { get; init; }
         public long SecurityId { get; init; }
+        public byte[] Memo { get; init; } = [];
     }
 
     private void SubmitStop(NewOrderCommand cmd, InstrumentTradingRules rules)
@@ -1841,6 +1859,7 @@ public sealed class MatchingEngine
             EnteringFirm = cmd.EnteringFirm,
             EnteredAtNanos = cmd.EnteredAtNanos,
             SecurityId = cmd.SecurityId,
+            Memo = cmd.Memo,
         };
         _stopsBySymbol[cmd.SecurityId].Add(stop);
         _stopById.Add(oid, stop);
@@ -1856,7 +1875,8 @@ public sealed class MatchingEngine
             Quantity: cmd.Quantity,
             EnteringFirm: cmd.EnteringFirm,
             InsertTimestampNanos: cmd.EnteredAtNanos,
-            RptSeq: NextRptSeq()));
+            RptSeq: NextRptSeq(),
+            Memo: cmd.Memo));
     }
 
     /// <summary>
@@ -1933,7 +1953,8 @@ public sealed class MatchingEngine
             PriceMantissa: s.StopType == OrderType.StopLoss ? 0L : s.LimitPriceMantissa,
             Quantity: s.Quantity,
             EnteringFirm: s.EnteringFirm,
-            EnteredAtNanos: txnNanos);
+            EnteredAtNanos: txnNanos)
+        { Memo = s.Memo };
 
         // Triggered StopLoss sees an empty opposite side → no fills,
         // silently dropped. We do NOT emit MarketNoLiquidity reject
@@ -1947,7 +1968,7 @@ public sealed class MatchingEngine
     }
 
     private void Reject(string clOrdId, long securityId, long orderId, RejectReason r, ulong txn)
-        => _sink.OnReject(new RejectEvent(clOrdId, securityId, orderId, r, txn));
+        => _sink.OnReject(new RejectEvent(clOrdId, securityId, orderId, r, txn, _currentMemo));
 
     private uint NextRptSeq() => ++_rptSeq;
 

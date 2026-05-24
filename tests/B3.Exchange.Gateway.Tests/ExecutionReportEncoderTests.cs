@@ -47,6 +47,26 @@ public class ExecutionReportEncoderTests
         Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(112, 8))); // StopPx null
     }
 
+
+    [Fact]
+    public void EncodeNew_WritesMemoVarData()
+    {
+        byte[] memo = System.Text.Encoding.ASCII.GetBytes("ABC123");
+        var buf = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportNewBlock, memo.Length)];
+
+        int n = ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777, execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 12_3450L, memo: memo);
+
+        Assert.Equal(buf.Length, n);
+        var trailer = buf.AsSpan(EntryPointFrameReader.WireHeaderSize + ExecutionReportEncoder.ExecReportNewBlock);
+        Assert.Equal((byte)memo.Length, trailer[0]);
+        Assert.True(trailer.Slice(1, memo.Length).SequenceEqual(memo));
+    }
+
     [Fact]
     public void EncodeTrade_WritesCoreFields()
     {

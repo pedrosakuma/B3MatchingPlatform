@@ -236,13 +236,18 @@ public sealed record NewOrderCommand(
     public long StopPxMantissa { get; init; }
 
     public bool UnsupportedOrderCharacteristic { get; init; }
+
+    public byte[] Memo { get; init; } = [];
 }
 
 public sealed record CancelOrderCommand(
     string ClOrdId,
     long SecurityId,
     long OrderId,
-    ulong EnteredAtNanos);
+    ulong EnteredAtNanos)
+{
+    public byte[] Memo { get; init; } = [];
+}
 
 /// <summary>
 /// Replace command. <see cref="NewQuantity"/> is interpreted as the new
@@ -280,6 +285,8 @@ public sealed record ReplaceOrderCommand(
     public TimeInForce? NewTif { get; init; }
 
     public bool UnsupportedOrderCharacteristic { get; init; }
+
+    public byte[] Memo { get; init; } = [];
 }
 
 /// <summary>

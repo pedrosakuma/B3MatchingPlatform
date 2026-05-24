@@ -15,6 +15,7 @@ internal sealed class RestingOrder
     public byte OrdTagId { get; init; }
     public string? Asset { get; init; }
     public InvestorId? InvestorId { get; init; }
+    public byte[] Memo { get; init; } = [];
 
     /// <summary>
     /// Wall-clock timestamp at which the order entered (or last re-entered)
@@ -308,7 +309,8 @@ internal sealed class LimitOrderBook
                         HiddenQuantity: o.HiddenQuantity,
                         OrdTagId: o.OrdTagId,
                         Asset: o.Asset,
-                        InvestorId: o.InvestorId);
+                        InvestorId: o.InvestorId)
+                    { Memo = o.Memo };
                 }
             }
         }
@@ -340,6 +342,7 @@ internal sealed class LimitOrderBook
             MaxFloor = record.MaxFloor,
             HiddenQuantity = record.HiddenQuantity,
             RemainingQuantity = record.RemainingQuantity,
+            Memo = record.Memo,
         };
         Insert(order);
     }

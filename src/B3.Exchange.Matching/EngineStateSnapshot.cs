@@ -61,7 +61,10 @@ public sealed record RestingOrderRecord(
     long HiddenQuantity,
     byte OrdTagId = 0,
     string? Asset = null,
-    InvestorId? InvestorId = null);
+    InvestorId? InvestorId = null)
+{
+    public byte[] Memo { get; init; } = [];
+}
 
 /// <summary>
 /// Persistable view of a single untriggered stop order (issue #262). Mirrors
@@ -82,4 +85,7 @@ public sealed record RestingStopRecord(
     long LimitPriceMantissa,
     long Quantity,
     uint EnteringFirm,
-    ulong EnteredAtNanos);
+    ulong EnteredAtNanos)
+{
+    public byte[] Memo { get; init; } = [];
+}

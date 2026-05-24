@@ -29,18 +29,13 @@ internal static class BusinessMessageRejectEncoder
     public const int BusinessRejectBlock = 36;
     private const ulong UTCTimestampNullValue = ulong.MaxValue;
 
-    /// <summary>
-    /// Maximum text varData length (schema cap). The memo segment is always
-    /// emitted empty (we never echo a client-provided memo today).
-    /// </summary>
+    /// <summary>Maximum varData lengths (schema caps).</summary>
+    public const int MaxMemoLength = 40;
     public const int MaxTextLength = 250;
 
-    /// <summary>
-    /// Maximum total wire size when <paramref name="textLen"/> bytes of
-    /// text varData are present (memo is always 0 bytes).
-    /// </summary>
-    public static int TotalSize(int textLen)
-        => HeaderSize + BusinessRejectBlock + 1 /*memo len*/ + 1 /*text len*/ + textLen;
+    public static int TotalSize(int textLen) => TotalSize(0, textLen);
+    public static int TotalSize(int memoLen, int textLen)
+        => HeaderSize + BusinessRejectBlock + 1 + memoLen + 1 + textLen;
 
     /// <summary>
     /// <c>RefMsgType</c> wire value derived from the inbound
@@ -85,12 +80,13 @@ internal static class BusinessMessageRejectEncoder
     public static int EncodeBusinessMessageReject(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason,
-        ReadOnlySpan<byte> textAscii)
+        ReadOnlySpan<byte> textAscii, ReadOnlySpan<byte> memo = default)
     {
+        if (memo.Length > MaxMemoLength) throw new ArgumentException($"memo exceeds {MaxMemoLength} bytes", nameof(memo));
         if (textAscii.Length > MaxTextLength)
             throw new ArgumentException($"text exceeds {MaxTextLength} bytes", nameof(textAscii));
 
-        int total = TotalSize(textAscii.Length);
+        int total = TotalSize(memo.Length, textAscii.Length);
         if (dst.Length < total)
             throw new ArgumentException("buffer too small for BusinessMessageReject", nameof(dst));
 
@@ -112,11 +108,13 @@ internal static class BusinessMessageRejectEncoder
         MemoryMarshal.Write(body.Slice(24, 8), in businessRejectRefId);     // 0 == null
         MemoryMarshal.Write(body.Slice(32, 4), in businessRejectReason);
 
-        // varData: memo (always empty) + text
+        // varData: memo + text
         var trailer = dst.Slice(HeaderSize + BusinessRejectBlock, total - HeaderSize - BusinessRejectBlock);
-        trailer[0] = 0;                                                     // memo length
-        trailer[1] = (byte)textAscii.Length;                                // text length
-        if (textAscii.Length > 0) textAscii.CopyTo(trailer.Slice(2));
+        trailer[0] = (byte)memo.Length;
+        if (memo.Length > 0) memo.CopyTo(trailer.Slice(1));
+        int textLenOffset = 1 + memo.Length;
+        trailer[textLenOffset] = (byte)textAscii.Length;
+        if (textAscii.Length > 0) textAscii.CopyTo(trailer.Slice(textLenOffset + 1));
         return total;
     }
 
@@ -128,17 +126,17 @@ internal static class BusinessMessageRejectEncoder
     public static int EncodeBusinessMessageRejectWithText(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         byte refMsgType, uint refSeqNum, ulong businessRejectRefId, uint businessRejectReason,
-        string? text)
+        string? text, ReadOnlySpan<byte> memo = default)
     {
         if (string.IsNullOrEmpty(text))
         {
             return EncodeBusinessMessageReject(dst, sessionId, msgSeqNum, sendingTimeNanos,
-                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, ReadOnlySpan<byte>.Empty);
+                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, ReadOnlySpan<byte>.Empty, memo);
         }
         var truncated = text.Length > MaxTextLength ? text.Substring(0, MaxTextLength) : text;
         Span<byte> tmp = stackalloc byte[MaxTextLength];
         int n = Encoding.ASCII.GetBytes(truncated, tmp);
         return EncodeBusinessMessageReject(dst, sessionId, msgSeqNum, sendingTimeNanos,
-            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, tmp.Slice(0, n));
+            refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, tmp.Slice(0, n), memo);
     }
 }

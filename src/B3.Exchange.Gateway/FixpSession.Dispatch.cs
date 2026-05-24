@@ -160,6 +160,8 @@ public sealed partial class FixpSession
             }
         }
 
+        byte[] inboundMemo = ExtractInboundMemo(info.TemplateId, varData);
+
         // §4.10 (#GAP-21): CR/LF in fixed-block identifier slots
         // (senderLocation / enteringTrader / executingTrader) on the four
         // application templates that carry them must answer with
@@ -248,6 +250,7 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidSimpleNewOrder:
                 if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
                 {
+                    no = no with { Memo = inboundMemo };
                     if (!_sink.EnqueueNewOrder(no, Identity, EnteringFirm, noClOrd))
                         WriteSystemBusyReject(info.TemplateId, fixedBlock, noClOrd, "New");
                     return true;
@@ -258,6 +261,7 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidSimpleModifyOrder:
                 if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
                 {
+                    rp = rp with { Memo = inboundMemo };
                     if (!_sink.EnqueueReplace(rp, Identity, EnteringFirm, rpClOrd, rpOrigClOrd))
                         WriteSystemBusyReject(info.TemplateId, fixedBlock, rpClOrd, "Replace");
                     return true;
@@ -271,6 +275,7 @@ public sealed partial class FixpSession
                         fixedBlock, EnteringFirm, now, out var nos, out var nosClOrd, out var nosMsg);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
+                        nos = nos with { Memo = inboundMemo };
                         if (!_sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd))
                             WriteSystemBusyReject(info.TemplateId, fixedBlock, nosClOrd, "New");
                         return true;
@@ -279,12 +284,13 @@ public sealed partial class FixpSession
                     {
                         if (nos is not null)
                         {
+                            nos = nos with { Memo = inboundMemo };
                             if (!_sink.EnqueueNewOrder(nos, Identity, EnteringFirm, nosClOrd))
                                 WriteSystemBusyReject(info.TemplateId, fixedBlock, nosClOrd, "New");
                         }
                         else
                         {
-                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, nosClOrd, nosMsg ?? "unsupported");
+                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, nosClOrd, nosMsg ?? "unsupported", inboundMemo);
                         }
                         return true;
                     }
@@ -298,6 +304,7 @@ public sealed partial class FixpSession
                         fixedBlock, now, out var ocr, out var ocrClOrd, out var ocrOrigClOrd, out var ocrMsg);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
+                        ocr = ocr with { Memo = inboundMemo };
                         if (!_sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd))
                             WriteSystemBusyReject(info.TemplateId, fixedBlock, ocrClOrd, "Replace");
                         return true;
@@ -306,12 +313,13 @@ public sealed partial class FixpSession
                     {
                         if (ocr is not null)
                         {
+                            ocr = ocr with { Memo = inboundMemo };
                             if (!_sink.EnqueueReplace(ocr, Identity, EnteringFirm, ocrClOrd, ocrOrigClOrd))
                                 WriteSystemBusyReject(info.TemplateId, fixedBlock, ocrClOrd, "Replace");
                         }
                         else
                         {
-                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, ocrClOrd, ocrMsg ?? "unsupported");
+                            WriteApplicationBusinessReject(info.TemplateId, fixedBlock, ocrClOrd, ocrMsg ?? "unsupported", inboundMemo);
                         }
                         return true;
                     }
@@ -347,6 +355,7 @@ public sealed partial class FixpSession
             case EntryPointFrameReader.TidOrderCancelRequest:
                 if (InboundMessageDecoder.TryDecodeCancel(fixedBlock, now, out var cn, out var cnClOrd, out var cnOrigClOrd, out var cnErr))
                 {
+                    cn = cn with { Memo = inboundMemo };
                     if (!_sink.EnqueueCancel(cn, Identity, EnteringFirm, cnClOrd, cnOrigClOrd))
                         WriteSystemBusyReject(info.TemplateId, fixedBlock, cnClOrd, "Cancel");
                     return true;
@@ -428,4 +437,35 @@ public sealed partial class FixpSession
         || templateId == EntryPointFrameReader.TidOrderCancelRequest
         || templateId == EntryPointFrameReader.TidNewOrderCross
         || templateId == EntryPointFrameReader.TidOrderMassActionRequest;
+    private static byte[] ExtractInboundMemo(ushort templateId, ReadOnlySpan<byte> varData)
+    {
+        if (varData.IsEmpty) return [];
+        static bool TryReadAt(ReadOnlySpan<byte> data, int offset, out ReadOnlySpan<byte> segment, out int next)
+        {
+            segment = default;
+            next = offset;
+            if ((uint)offset >= (uint)data.Length) return false;
+            int len = data[offset];
+            int start = offset + 1;
+            next = start + len;
+            if (next > data.Length) return false;
+            segment = data.Slice(start, len);
+            return true;
+        }
+
+        ReadOnlySpan<byte> memo;
+        switch (templateId)
+        {
+            case EntryPointFrameReader.TidSimpleNewOrder:
+            case EntryPointFrameReader.TidSimpleModifyOrder:
+                return TryReadAt(varData, 0, out memo, out _) && !memo.IsEmpty ? memo.ToArray() : [];
+            case EntryPointFrameReader.TidNewOrderSingle:
+            case EntryPointFrameReader.TidOrderCancelReplaceRequest:
+            case EntryPointFrameReader.TidOrderCancelRequest:
+                if (!TryReadAt(varData, 0, out _, out int next)) return [];
+                return TryReadAt(varData, next, out memo, out _) && !memo.IsEmpty ? memo.ToArray() : [];
+            default:
+                return [];
+        }
+    }
 }
