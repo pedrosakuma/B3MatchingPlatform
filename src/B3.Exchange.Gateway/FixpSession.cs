@@ -394,6 +394,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             coldRead: coldRead);
         _outboundEncoder = new FixpOutboundEncoder(
             sessionId: () => SessionId,
+            sessionVerId: () => SessionVerId,
             nextMsgSeqNum: NextMsgSeqNum,
             transport: () => _transport!,
             retxBuffer: _retxBuffer,

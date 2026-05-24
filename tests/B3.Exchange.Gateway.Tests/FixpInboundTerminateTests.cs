@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
@@ -33,6 +34,29 @@ public class FixpInboundTerminateTests
         var buf = new byte[EntryPointFixpFrameCodec.TerminateBlock + EntryPointFrameReader.WireHeaderSize];
         EntryPointFixpFrameCodec.EncodeTerminate(buf, sessionId, sessionVerId, code);
         return buf;
+    }
+
+    private static async Task<byte[]> ReadFrameAsync(NetworkStream stream)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var head = new byte[EntryPointFrameReader.WireHeaderSize];
+        await ReadExactlyAsync(stream, head, cts.Token);
+        ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(head.AsSpan(0, 2));
+        var frame = new byte[messageLength];
+        head.CopyTo(frame.AsSpan());
+        await ReadExactlyAsync(stream, frame.AsMemory(head.Length), cts.Token);
+        return frame;
+    }
+
+    private static async Task ReadExactlyAsync(NetworkStream stream, Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int n = await stream.ReadAsync(buffer[read..], cancellationToken);
+            if (n <= 0) throw new EndOfStreamException("connection closed before expected frame was received");
+            read += n;
+        }
     }
 
     [Fact]
@@ -80,6 +104,58 @@ public class FixpInboundTerminateTests
             byte echoedCode = buf[EntryPointFrameReader.WireHeaderSize + 12];
             Assert.Equal(SessionRejectEncoder.TerminationCode.Finished, echoedCode);
 
+        }
+    }
+
+    [Fact]
+    public async Task EstablishedSession_TerminateEchoCarriesLiveSessionVerId()
+    {
+        const uint sessionId = 100;
+        const ulong sessionVerId = 42;
+
+        var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            NullLoggerFactory.Instance);
+        listener.Start();
+        await using (listener)
+        using (var client = new TcpClient())
+        {
+            await client.ConnectAsync(listener.LocalEndpoint!.Address, listener.LocalEndpoint!.Port);
+            var ns = client.GetStream();
+            var frame = new byte[256];
+
+            int negotiateLen = EntryPointFixpFrameCodec.EncodeNegotiate(frame,
+                sessionId, sessionVerId, timestampNanos: 1UL, enteringFirm: 42u, onBehalfFirm: null,
+                credentials: Encoding.UTF8.GetBytes("{}"),
+                clientIp: ReadOnlySpan<byte>.Empty,
+                clientAppName: ReadOnlySpan<byte>.Empty,
+                clientAppVersion: ReadOnlySpan<byte>.Empty);
+            await ns.WriteAsync(frame.AsMemory(0, negotiateLen));
+            byte[] negotiateResponse = await ReadFrameAsync(ns);
+            Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+                BinaryPrimitives.ReadUInt16LittleEndian(negotiateResponse.AsSpan(EntryPointFrameReader.SofhSize + 2, 2)));
+
+            int establishLen = EntryPointFixpFrameCodec.EncodeEstablish(frame,
+                sessionId, sessionVerId, timestampNanos: 2UL, keepAliveIntervalMillis: 60_000UL,
+                nextSeqNo: 1u, cancelOnDisconnectType: 0, codTimeoutWindowMillis: 0UL,
+                credentials: ReadOnlySpan<byte>.Empty);
+            await ns.WriteAsync(frame.AsMemory(0, establishLen));
+            byte[] establishAck = await ReadFrameAsync(ns);
+            Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+                BinaryPrimitives.ReadUInt16LittleEndian(establishAck.AsSpan(EntryPointFrameReader.SofhSize + 2, 2)));
+
+            byte[] terminate = EncodeInboundTerminate(sessionId, sessionVerId,
+                SessionRejectEncoder.TerminationCode.Finished);
+            await ns.WriteAsync(terminate);
+
+            byte[] echo = await ReadFrameAsync(ns);
+            Assert.Equal(EntryPointFrameReader.TidTerminate,
+                BinaryPrimitives.ReadUInt16LittleEndian(echo.AsSpan(EntryPointFrameReader.SofhSize + 2, 2)));
+            Assert.Equal(sessionVerId,
+                BinaryPrimitives.ReadUInt64LittleEndian(echo.AsSpan(EntryPointFrameReader.WireHeaderSize + 4, 8)));
+            Assert.Equal(SessionRejectEncoder.TerminationCode.Finished,
+                echo[EntryPointFrameReader.WireHeaderSize + 12]);
         }
     }
 }
