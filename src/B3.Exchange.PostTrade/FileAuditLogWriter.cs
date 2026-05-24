@@ -1,3 +1,4 @@
+using B3.Exchange.Matching.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace B3.Exchange.PostTrade;
@@ -11,14 +12,11 @@ namespace B3.Exchange.PostTrade;
 /// rather than wall-clock so the rollover is deterministic across replay
 /// and across time-warped scenario tests.
 ///
-/// Threading model: OnTrade and OnCommandBoundary are called exclusively on
-/// the <c>ChannelDispatcher</c>'s dispatch thread. Checkpoint MAY be called
-/// from another thread (the async snapshot writer's onSaved callback runs on
-/// the writer thread). A single private state lock serializes mutations of
-/// the FileStream / counters; the slow <c>fsync</c> portion of Checkpoint is
-/// executed OUTSIDE the lock against the underlying <see cref="SafeFileHandle"/>
-/// via <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/> so the
-/// dispatch thread's next OnTrade does not have to wait for storage
+/// Threading model: mutable file/index/counter state is owned by the
+/// <c>ChannelDispatcher</c>'s dispatch thread and guarded by
+/// <see cref="SingleWriterGuard"/> (ADR 0009). Async snapshot callbacks
+/// marshal checkpoint preparation back to the dispatcher; the returned
+/// operation performs slow <c>fsync</c> on the snapshot writer thread
 /// (issue #349).
 ///
 /// Durability watermark (issue #329 PR-4): each <see cref="OnCommandBoundary"/>
@@ -27,14 +25,14 @@ namespace B3.Exchange.PostTrade;
 /// promotes that pending value into <see cref="DurableThroughCommandSeq"/>,
 /// which the WAL truncation gate reads before dropping WAL records.
 /// </summary>
-public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
+public sealed class FileAuditLogWriter : IDispatchThreadCheckpointSink, IDisposable
 {
     private readonly string _rootDir;
     private readonly byte _channelNumber;
     private readonly int _indexBlockRecords;
     private readonly byte[] _scratch;
     private readonly byte[] _indexScratch;
-    private readonly object _stateLock = new();
+    private readonly SingleWriterGuard _writerGuard;
 
     private FileStream? _stream;
     private FileStream? _indexStream;
@@ -58,7 +56,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     // on-disk WAL. Mirrors the WalAppendFailurePolicy.Halt model in
     // ChannelDispatcher (issue #286). Sticky for the lifetime of this
     // writer instance — only a restart/rebuild clears it.
-    private bool _writeFault;
+    private int _writeFault;
 
     // Current in-progress index block. _blockFirmIds is kept sorted+distinct
     // (linear insertion — typical session has well below 64 firms per block,
@@ -74,6 +72,7 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
             throw new ArgumentOutOfRangeException(nameof(indexBlockRecords), "block size must be in [1, 65535]");
         _rootDir = rootDir;
         _channelNumber = channelNumber;
+        _writerGuard = new SingleWriterGuard($"FileAuditLogWriter[channel={channelNumber}]");
         _indexBlockRecords = indexBlockRecords;
         _scratch = new byte[Math.Max(AuditRecordCodec.RecordSize, AuditRecordCodec.FileHeaderSize)];
         // Worst-case index entry: prefix + indexBlockRecords distinct firm IDs
@@ -142,63 +141,61 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// no record has been written yet.</summary>
     public DateOnly? CurrentTradeDate => _stream is null ? null : _currentDate;
 
+    public SingleWriterGuard Guard => _writerGuard;
+
     public void OnTrade(in PostTradeRecord record)
     {
-        lock (_stateLock)
+        _writerGuard.AssertOwnedByCurrentThread();
+        // If a prior write already failed, refuse silently — the audit
+        // log is in a known-broken state and further writes would only
+        // deepen the hole. ChannelDispatcher's OnTrade catches and
+        // swallows post-trade sink exceptions, so throwing here would
+        // not even reach the operator; the deferred-truncate metric
+        // (bumped on every Checkpoint attempt below) is the alert path.
+        if (Volatile.Read(ref _writeFault) != 0) return;
+        try
         {
-            // If a prior write already failed, refuse silently — the audit
-            // log is in a known-broken state and further writes would only
-            // deepen the hole. ChannelDispatcher's OnTrade catches and
-            // swallows post-trade sink exceptions, so throwing here would
-            // not even reach the operator; the deferred-truncate metric
-            // (bumped on every Checkpoint attempt below) is the alert path.
-            if (_writeFault) return;
-            try
+            var recordDate = ToUtcDate(record.TransactTimeNanos);
+            if (_stream is null || recordDate != _currentDate)
             {
-                var recordDate = ToUtcDate(record.TransactTimeNanos);
-                if (_stream is null || recordDate != _currentDate)
-                {
-                    RotateTo(recordDate);
-                }
-                if (_blockRecordCount == 0)
-                    _blockStartOffset = _stream!.Position;
-
-                int n = AuditRecordCodec.Encode(_scratch, in record);
-                _stream!.Write(_scratch, 0, n);
-                _stream.Flush(flushToDisk: false);
-                _recordsWritten++;
-
-                TrackFirm(record.BuyFirm);
-                TrackFirm(record.SellFirm);
-                _blockRecordCount++;
-                if (_blockRecordCount >= _indexBlockRecords)
-                    FlushCurrentBlock();
+                RotateTo(recordDate);
             }
-            catch
-            {
-                // Poison the watermark for the rest of this writer's life.
-                // Any subsequent OnCommandBoundary/Checkpoint will refuse to
-                // advance _durableCommandSeq, keeping the WAL truncation
-                // gate permanently closed until the operator restarts.
-                _writeFault = true;
-                throw;
-            }
+            if (_blockRecordCount == 0)
+                _blockStartOffset = _stream!.Position;
+
+            int n = AuditRecordCodec.Encode(_scratch, in record);
+            _stream!.Write(_scratch, 0, n);
+            _stream.Flush(flushToDisk: false);
+            _recordsWritten++;
+
+            TrackFirm(record.BuyFirm);
+            TrackFirm(record.SellFirm);
+            _blockRecordCount++;
+            if (_blockRecordCount >= _indexBlockRecords)
+                FlushCurrentBlock();
+        }
+        catch
+        {
+            // Poison the watermark for the rest of this writer's life.
+            // Any subsequent OnCommandBoundary/Checkpoint will refuse to
+            // advance _durableCommandSeq, keeping the WAL truncation
+            // gate permanently closed until the operator restarts.
+            Volatile.Write(ref _writeFault, 1);
+            throw;
         }
     }
 
     /// <summary>Tags every record OnTrade'd since the previous boundary as
     /// "produced by <paramref name="commandSeq"/>". The watermark advances
     /// from pending to durable on the next <see cref="Checkpoint"/> call.
-    /// Dispatch-thread-only; cheap (single store under the shared lock).
+    /// Dispatch-thread-only; cheap (single monotonic store).
     /// No-op when the writer is in write-fault state.</summary>
     public void OnCommandBoundary(long commandSeq)
     {
-        lock (_stateLock)
-        {
-            if (_writeFault) return;
-            // Monotonic: tolerate replay paths that resubmit lower seqs.
-            if (commandSeq > _pendingCommandSeq) _pendingCommandSeq = commandSeq;
-        }
+        _writerGuard.AssertOwnedByCurrentThread();
+        if (Volatile.Read(ref _writeFault) != 0) return;
+        // Monotonic: tolerate replay paths that resubmit lower seqs.
+        if (commandSeq > _pendingCommandSeq) _pendingCommandSeq = commandSeq;
     }
 
     /// <summary>ADR 0008 PR-2: appends a bust audit record. When
@@ -210,31 +207,29 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// busts are queried via the v2 ReadAllEntries path).</summary>
     public void OnBust(in BustRecord record, DateOnly tradeDate)
     {
-        lock (_stateLock)
+        _writerGuard.AssertOwnedByCurrentThread();
+        if (Volatile.Read(ref _writeFault) != 0) return;
+        try
         {
-            if (_writeFault) return;
-            try
+            Span<byte> buf = stackalloc byte[AuditRecordCodec.BustRecordSize];
+            int n = AuditRecordCodec.EncodeBust(buf, in record);
+            if (_stream is not null && tradeDate == _currentDate)
             {
-                Span<byte> buf = stackalloc byte[AuditRecordCodec.BustRecordSize];
-                int n = AuditRecordCodec.EncodeBust(buf, in record);
-                if (_stream is not null && tradeDate == _currentDate)
-                {
-                    // Same-day inline: end any open fill block first so the
-                    // .idx invariant ("entries cover contiguous fill runs")
-                    // is preserved across the non-fill insertion.
-                    FlushCurrentBlock();
-                    _stream.Write(buf.Slice(0, n));
-                    _stream.Flush(flushToDisk: false);
-                    return;
-                }
-                // Cross-day write: open/create, fsync, close.
-                AppendNonFillToOtherDay(tradeDate, buf.Slice(0, n));
+                // Same-day inline: end any open fill block first so the
+                // .idx invariant ("entries cover contiguous fill runs")
+                // is preserved across the non-fill insertion.
+                FlushCurrentBlock();
+                _stream.Write(buf.Slice(0, n));
+                _stream.Flush(flushToDisk: false);
+                return;
             }
-            catch
-            {
-                _writeFault = true;
-                throw;
-            }
+            // Cross-day write: open/create, fsync, close.
+            AppendNonFillToOtherDay(tradeDate, buf.Slice(0, n));
+        }
+        catch
+        {
+            Volatile.Write(ref _writeFault, 1);
+            throw;
         }
     }
 
@@ -244,31 +239,29 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// </summary>
     public void OnRejectAttempt(in RejectAttemptRecord record)
     {
-        lock (_stateLock)
+        _writerGuard.AssertOwnedByCurrentThread();
+        if (Volatile.Read(ref _writeFault) != 0) return;
+        try
         {
-            if (_writeFault) return;
-            try
+            var recordDate = ToUtcDate(record.AttemptTransactTimeNanos);
+            Span<byte> buf = stackalloc byte[AuditRecordCodec.RejectAttemptRecordSize];
+            int n = AuditRecordCodec.EncodeRejectAttempt(buf, in record);
+            if (_stream is null || recordDate != _currentDate)
             {
-                var recordDate = ToUtcDate(record.AttemptTransactTimeNanos);
-                Span<byte> buf = stackalloc byte[AuditRecordCodec.RejectAttemptRecordSize];
-                int n = AuditRecordCodec.EncodeRejectAttempt(buf, in record);
-                if (_stream is null || recordDate != _currentDate)
-                {
-                    // OnRejectAttempt is dispatched on the dispatch thread,
-                    // so a rotation to today's log is the natural action:
-                    // future fills land on the same day. Mirrors OnTrade's
-                    // RotateTo path.
-                    RotateTo(recordDate);
-                }
-                FlushCurrentBlock();
-                _stream!.Write(buf.Slice(0, n));
-                _stream.Flush(flushToDisk: false);
+                // OnRejectAttempt is dispatched on the dispatch thread,
+                // so a rotation to today's log is the natural action:
+                // future fills land on the same day. Mirrors OnTrade's
+                // RotateTo path.
+                RotateTo(recordDate);
             }
-            catch
-            {
-                _writeFault = true;
-                throw;
-            }
+            FlushCurrentBlock();
+            _stream!.Write(buf.Slice(0, n));
+            _stream.Flush(flushToDisk: false);
+        }
+        catch
+        {
+            Volatile.Write(ref _writeFault, 1);
+            throw;
         }
     }
 
@@ -294,92 +287,52 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         fs.Flush(flushToDisk: true);
     }
 
-    /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
-    /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
-    /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
-    /// (the lock serializes against OnTrade/OnCommandBoundary on the
-    /// dispatch thread). If the fsync throws the watermark is NOT advanced
-    /// — callers must treat that as "audit not durable; defer truncation".
-    /// Throws when the writer is in write-fault state so the WAL truncation
-    /// gate stays closed.</summary>
-    /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
-    /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
-    /// <see cref="OnCommandBoundary"/> value. Safe to call from any thread
-    /// (the lock serializes against OnTrade/OnCommandBoundary on the
-    /// dispatch thread). If the fsync throws the watermark is NOT advanced
-    /// — callers must treat that as "audit not durable; defer truncation".
-    /// Throws when the writer is in write-fault state so the WAL truncation
-    /// gate stays closed.
-    ///
-    /// <para>Issue #349: the slow <c>fsync</c> syscalls run OUTSIDE the
-    /// state lock against pinned <see cref="SafeFileHandle"/> refs (via
-    /// <see cref="RandomAccess.FlushToDisk(SafeFileHandle)"/>). The state
-    /// lock is held only for: bail-on-fault check, FlushCurrentBlock,
-    /// user-space buffer flush, snapshot pending, AddRef the handles —
-    /// all O(1) memcpy/syscall work. The dispatch thread can keep
-    /// OnTrade-ing during the storage fsync without being stalled.
-    /// Handle lifetime is anchored by <see cref="SafeHandle.DangerousAddRef"/>
-    /// so a concurrent rotation/dispose can't pull the fd from under us.</para></summary>
-    public void Checkpoint()
+    /// <summary>Dispatch-thread prepare half of an audit checkpoint. It
+    /// snapshots the pending boundary, flushes user-space buffers, and pins
+    /// any open file handles. The returned operation owns the slow durable
+    /// flush and watermark promotion.</summary>
+    public IAuditCheckpointOperation BeginCheckpointOnDispatchThread()
     {
-        long pending;
-        SafeFileHandle? streamHandle = null;
-        SafeFileHandle? indexHandle = null;
+        _writerGuard.AssertOwnedByCurrentThread();
+        if (Volatile.Read(ref _writeFault) != 0)
+        {
+            throw new IOException(
+                "audit log writer in write-fault state — refusing to advance durability watermark; restart the host after investigating the prior OnTrade failure");
+        }
+
+        long pending = _pendingCommandSeq;
+        FlushCurrentBlock();
+        _stream?.Flush(flushToDisk: false);
+        _indexStream?.Flush(flushToDisk: false);
+
+        SafeFileHandle? streamHandle = _streamHandle;
+        SafeFileHandle? indexHandle = _indexStreamHandle;
         bool streamRef = false;
         bool indexRef = false;
-        lock (_stateLock)
-        {
-            if (_writeFault)
-            {
-                throw new IOException(
-                    "audit log writer in write-fault state — refusing to advance durability watermark; restart the host after investigating the prior OnTrade failure");
-            }
-            // Snapshot the pending boundary BEFORE the fsync — any
-            // concurrent OnCommandBoundary call would have to acquire
-            // this lock so the value is stable while we fsync.
-            pending = _pendingCommandSeq;
-            FlushCurrentBlock();
-            // Push FileStream user-space buffer down to the OS while we
-            // hold the lock; the slow disk fsync happens below outside
-            // the lock against the SafeFileHandle directly.
-            _stream?.Flush(flushToDisk: false);
-            _indexStream?.Flush(flushToDisk: false);
-            streamHandle = _streamHandle;
-            indexHandle = _indexStreamHandle;
-            // Anchor the handles for the duration of the fsync so a
-            // concurrent OnTrade-triggered RotateTo (or Dispose) can't
-            // close the underlying fd while we're flushing it.
-            if (streamHandle is not null) streamHandle.DangerousAddRef(ref streamRef);
-            if (indexHandle is not null) indexHandle.DangerousAddRef(ref indexRef);
-        }
         try
         {
-            if (streamRef) RandomAccess.FlushToDisk(streamHandle!);
-            if (indexRef) RandomAccess.FlushToDisk(indexHandle!);
-            // Issue #329 PR-5: persist the watermark sidecar so a post-crash
-            // boot can recover it and gate replay-mode OnTrade emissions.
-            // Order matters: sidecar update happens AFTER the .log/.idx
-            // fsyncs so the sidecar can never claim durability the underlying
-            // files don't already have. If the sidecar write itself throws
-            // we propagate without advancing _durableCommandSeq so the gate
-            // stays closed and the next Checkpoint retries.
-            WriteWatermarkSidecar(pending);
+            if (streamHandle is not null) streamHandle.DangerousAddRef(ref streamRef);
+            if (indexHandle is not null) indexHandle.DangerousAddRef(ref indexRef);
+            return new CheckpointOperation(this, pending, streamHandle, indexHandle, streamRef, indexRef);
         }
-        finally
+        catch
         {
             if (streamRef) streamHandle!.DangerousRelease();
             if (indexRef) indexHandle!.DangerousRelease();
+            throw;
         }
-        // Advance only on success; if any Flush/sidecar threw we
-        // propagated above without touching _durableCommandSeq so the
-        // WAL truncation gate stays closed. Re-check _writeFault — a
-        // concurrent OnTrade may have failed during the unlocked fsync
-        // window; if so do not promote the watermark.
-        lock (_stateLock)
-        {
-            if (_writeFault) return;
-            Volatile.Write(ref _durableCommandSeq, pending);
-        }
+    }
+
+    /// <summary>Flushes OS buffers, forces <c>fsync</c> on both files, and
+    /// advances <see cref="DurableThroughCommandSeq"/> to the most recent
+    /// <see cref="OnCommandBoundary"/> value. Must be entered from the
+    /// dispatch thread; async snapshot mode calls
+    /// <see cref="BeginCheckpointOnDispatchThread"/> on the dispatcher and
+    /// runs the returned operation on the snapshot writer thread.</summary>
+    public void Checkpoint()
+    {
+        using var checkpoint = BeginCheckpointOnDispatchThread();
+        checkpoint.FlushToDiskAndCommit();
     }
 
     /// <summary>Highest commandSeq whose OnTrade records are guaranteed
@@ -390,12 +343,68 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// <summary>True once an OnTrade write has thrown; the writer is
     /// permanently broken and the watermark will not advance. Exposed
     /// for regression tests of the issue #329 PR-4 write-fault contract.</summary>
-    internal bool WriteFault => _writeFault;
+    internal bool WriteFault => Volatile.Read(ref _writeFault) != 0;
 
     /// <summary>Test-only hook to force the writer into write-fault state
     /// without engineering a real I/O failure. Exercises the watermark
     /// poisoning contract.</summary>
-    internal void ForceWriteFaultForTests() { lock (_stateLock) { _writeFault = true; } }
+    internal void ForceWriteFaultForTests()
+    {
+        _writerGuard.AssertOwnedByCurrentThread();
+        Volatile.Write(ref _writeFault, 1);
+    }
+
+    private sealed class CheckpointOperation : IAuditCheckpointOperation
+    {
+        private readonly FileAuditLogWriter _owner;
+        private readonly long _pending;
+        private readonly SafeFileHandle? _streamHandle;
+        private readonly SafeFileHandle? _indexHandle;
+        private readonly bool _streamRef;
+        private readonly bool _indexRef;
+        private int _disposed;
+
+        public CheckpointOperation(
+            FileAuditLogWriter owner,
+            long pending,
+            SafeFileHandle? streamHandle,
+            SafeFileHandle? indexHandle,
+            bool streamRef,
+            bool indexRef)
+        {
+            _owner = owner;
+            _pending = pending;
+            _streamHandle = streamHandle;
+            _indexHandle = indexHandle;
+            _streamRef = streamRef;
+            _indexRef = indexRef;
+        }
+
+        public void FlushToDiskAndCommit()
+        {
+            try
+            {
+                if (_streamRef) RandomAccess.FlushToDisk(_streamHandle!);
+                if (_indexRef) RandomAccess.FlushToDisk(_indexHandle!);
+                // Issue #329 PR-5: persist the watermark sidecar after the
+                // .log/.idx fsyncs, never before.
+                _owner.WriteWatermarkSidecar(_pending);
+                if (Volatile.Read(ref _owner._writeFault) == 0)
+                    Volatile.Write(ref _owner._durableCommandSeq, _pending);
+            }
+            finally
+            {
+                Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            if (_streamRef) _streamHandle!.DangerousRelease();
+            if (_indexRef) _indexHandle!.DangerousRelease();
+        }
+    }
 
     private void TrackFirm(uint firmId)
     {
@@ -455,8 +464,8 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         }
         fs.Seek(0, SeekOrigin.End);
         _stream = fs;
-        // Cache the underlying SafeFileHandle so Checkpoint can call
-        // RandomAccess.FlushToDisk outside the state lock (issue #349).
+        // Cache the underlying SafeFileHandle so checkpoint operations can
+        // call RandomAccess.FlushToDisk off the dispatch thread (issue #349).
         // The handle is owned by the FileStream; Dispose releases it.
         _streamHandle = fs.SafeFileHandle;
         _currentDate = newDate;
@@ -657,10 +666,9 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
     /// (.log, .idx) pairs deleted; partial pairs (an orphan .log or
     /// .idx) are still counted toward the deletion total per file.</para>
     ///
-    /// <para>Safe to call from any thread: the method acquires the same
-    /// <c>_stateLock</c> as <see cref="Checkpoint"/> / <see cref="Dispose"/>
-    /// so it never races the active stream. The active day is identified
-    /// by <c>_currentDate</c> under the lock to avoid a TOCTOU window.</para>
+    /// <para>Best-effort operator maintenance hook. It does not mutate the
+    /// active stream; it snapshots the currently-open day and never prunes
+    /// that day.</para>
     /// </summary>
     public int PruneOldDays(DateOnly todayUtc, int retentionDays)
     {
@@ -670,32 +678,30 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
         if (!Directory.Exists(channelDir)) return 0;
         var cutoff = todayUtc.AddDays(-retentionDays);
         int deleted = 0;
-        lock (_stateLock)
+        DateOnly? activeDate = _stream is null ? null : _currentDate;
+        foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.*"))
         {
-            foreach (var path in Directory.EnumerateFiles(channelDir, "fills-*.*"))
+            var name = Path.GetFileName(path);
+            if (!TryParseFillsDate(name, out var date, out var ext)) continue;
+            if (ext != ".log" && ext != ".idx") continue;
+            // Never delete the currently-open day even if it falls
+            // before the cutoff (e.g. a clock skew or aggressive
+            // retentionDays=1 during development).
+            if (activeDate is { } current && date == current) continue;
+            if (date >= cutoff) continue;
+            try
             {
-                var name = Path.GetFileName(path);
-                if (!TryParseFillsDate(name, out var date, out var ext)) continue;
-                if (ext != ".log" && ext != ".idx") continue;
-                // Never delete the currently-open day even if it falls
-                // before the cutoff (e.g. a clock skew or aggressive
-                // retentionDays=1 during development).
-                if (_stream is not null && date == _currentDate) continue;
-                if (date >= cutoff) continue;
-                try
-                {
-                    File.Delete(path);
-                    deleted++;
-                }
-                catch (IOException)
-                {
-                    // Best-effort: file in use or transient FS error;
-                    // the next prune pass will retry.
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    // Permissions issue — leave for the operator.
-                }
+                File.Delete(path);
+                deleted++;
+            }
+            catch (IOException)
+            {
+                // Best-effort: file in use or transient FS error;
+                // the next prune pass will retry.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Permissions issue — leave for the operator.
             }
         }
         return deleted;
@@ -720,23 +726,20 @@ public sealed class FileAuditLogWriter : IPostTradeSink, IDisposable
 
     public void Dispose()
     {
-        lock (_stateLock)
+        if (_stream is not null)
         {
-            if (_stream is not null)
-            {
-                FlushCurrentBlock();
-                _stream.Flush(flushToDisk: true);
-                _stream.Dispose();
-                _stream = null;
-                _streamHandle = null;
-            }
-            if (_indexStream is not null)
-            {
-                _indexStream.Flush(flushToDisk: true);
-                _indexStream.Dispose();
-                _indexStream = null;
-                _indexStreamHandle = null;
-            }
+            FlushCurrentBlock();
+            _stream.Flush(flushToDisk: true);
+            _stream.Dispose();
+            _stream = null;
+            _streamHandle = null;
+        }
+        if (_indexStream is not null)
+        {
+            _indexStream.Flush(flushToDisk: true);
+            _indexStream.Dispose();
+            _indexStream = null;
+            _indexStreamHandle = null;
         }
     }
 }

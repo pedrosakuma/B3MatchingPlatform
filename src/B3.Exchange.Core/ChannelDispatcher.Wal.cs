@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using B3.Exchange.PostTrade;
 using Microsoft.Extensions.Logging;
 using MatchingRejectEvent = B3.Exchange.Matching.RejectEvent;
 using MatchingSide = B3.Exchange.Matching.Side;
@@ -175,21 +176,26 @@ public sealed partial class ChannelDispatcher
 
     /// <summary>
     /// Post-save callback invoked by <see cref="BackgroundSnapshotWriter"/>
-    /// on the writer thread when async-writer mode is enabled. Truncates
-    /// the WAL on that thread so the on-disk WAL only loses records that
-    /// the matching snapshot has already absorbed.
+    /// on the writer thread when async-writer mode is enabled. It requests
+    /// the audit checkpoint prepare from the dispatch thread, performs the
+    /// slow audit fsync on this writer thread, then truncates the WAL on this
+    /// writer thread so the on-disk WAL only loses records that the matching
+    /// snapshot has already absorbed.
     ///
-    /// <para>Issue #329 PR-4: gated on the audit watermark (see
-    /// <see cref="TruncateWalAfterSyncSave(long)"/>). The audit sink's
-    /// Checkpoint is safe to call cross-thread.</para>
+    /// <para>Issue #396: FileAuditLogWriter state is dispatch-thread owned;
+    /// this callback never calls Checkpoint directly.</para>
     /// </summary>
     private void OnAsyncSnapshotSaved(ChannelStateSnapshot snap)
     {
+        if (_wal is null && ReferenceEquals(_postTradeSink, NullPostTradeSink.Instance))
+            return;
+
         // Issue #329 PR-4 / #352 follow-up: Checkpoint the audit sink
         // even when no WAL is configured (see TruncateWalAfterSyncSave
-        // above for the same rationale). The audit sink's Checkpoint
-        // is safe to call cross-thread.
-        bool watermarkOk = CheckpointAndGateAuditWatermark(snap.LastAppliedSeq, async: true);
+        // above for the same rationale). Issue #396 marshals the prepare
+        // half through the dispatch inbox; this writer thread performs the
+        // returned operation's fsync and sidecar write.
+        bool watermarkOk = EnqueueAndRunAsyncAuditCheckpoint(snap.LastAppliedSeq);
         if (_wal is null) return;
         if (!watermarkOk) return;
         try
@@ -243,6 +249,80 @@ public sealed partial class ChannelDispatcher
             return false;
         }
         return true;
+    }
+
+    private void ProcessAuditCheckpoint(AuditCheckpointRequest request)
+    {
+        AssertOnLoopThread();
+        try
+        {
+            if (_postTradeSink is IDispatchThreadCheckpointSink splitSink)
+            {
+                request.Prepared.TrySetResult(splitSink.BeginCheckpointOnDispatchThread());
+                return;
+            }
+
+            _postTradeSink.Checkpoint();
+            request.Prepared.TrySetResult(CompletedAuditCheckpointOperation.Instance);
+        }
+        catch (Exception ex)
+        {
+            request.Prepared.TrySetException(ex);
+        }
+    }
+
+    private bool EnqueueAndRunAsyncAuditCheckpoint(long snapshotLastAppliedSeq)
+    {
+        var prepared = new TaskCompletionSource<IAuditCheckpointOperation>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var request = new AuditCheckpointRequest(snapshotLastAppliedSeq, prepared);
+        var item = new WorkItem(WorkKind.AuditCheckpoint, default, 0, false,
+            0, 0, null, null, null, null, AuditCheckpoint: request);
+
+        if (!_inbound.Writer.TryWrite(item))
+        {
+            _metrics?.IncAuditWalTruncateDeferred();
+            _logger.LogWarning(
+                "channel {ChannelNumber}: audit checkpoint enqueue failed; WAL truncation deferred (snapshotSeq={SnapshotSeq})",
+                ChannelNumber, snapshotLastAppliedSeq);
+            return false;
+        }
+
+        try
+        {
+            if (!prepared.Task.Wait(TimeSpan.FromSeconds(30)))
+                throw new TimeoutException("timed out waiting for dispatch-thread audit checkpoint prepare");
+            using var checkpoint = prepared.Task.GetAwaiter().GetResult();
+            checkpoint.FlushToDiskAndCommit();
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncAuditWalTruncateDeferred();
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: audit log async Checkpoint failed; WAL truncation deferred (snapshotSeq={SnapshotSeq})",
+                ChannelNumber, snapshotLastAppliedSeq);
+            return false;
+        }
+
+        long durable = _postTradeSink.DurableThroughCommandSeq;
+        if (durable < snapshotLastAppliedSeq)
+        {
+            _metrics?.IncAuditWalTruncateDeferred();
+            _logger.LogWarning(
+                "channel {ChannelNumber}: WAL truncation deferred — audit watermark behind snapshot (durable={Durable}, snapshotSeq={SnapshotSeq}, path=async)",
+                ChannelNumber, durable, snapshotLastAppliedSeq);
+            return false;
+        }
+
+        return true;
+    }
+
+    private sealed class CompletedAuditCheckpointOperation : IAuditCheckpointOperation
+    {
+        public static readonly CompletedAuditCheckpointOperation Instance = new();
+        private CompletedAuditCheckpointOperation() { }
+        public void FlushToDiskAndCommit() { }
+        public void Dispose() { }
     }
 
     /// <summary>

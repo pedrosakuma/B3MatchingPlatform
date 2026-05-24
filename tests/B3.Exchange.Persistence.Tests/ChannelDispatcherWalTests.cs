@@ -306,8 +306,14 @@ public class ChannelDispatcherWalTests
 
         // Async writer is on a background thread; wait until it has
         // drained and truncated instead of sleeping a fixed interval.
+        // Issue #396: onSaved enqueues an AuditCheckpoint work item before
+        // truncation, so TestProbe-driven tests must pump the inbox.
         Assert.True(await WaitForAsync(
-            () => persister.SaveCount >= 1 && metrics.WalTruncations >= 1,
+            () =>
+            {
+                probe.DrainInbound();
+                return persister.SaveCount >= 1 && metrics.WalTruncations >= 1;
+            },
             TimeSpan.FromSeconds(5)), "async snapshot writer did not save and truncate before timeout");
 
         Assert.True(persister.SaveCount >= 1);

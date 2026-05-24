@@ -3,6 +3,28 @@ using B3.Exchange.Matching;
 namespace B3.Exchange.PostTrade;
 
 /// <summary>
+/// Prepared audit checkpoint whose dispatch-thread portion has already
+/// snapshotted writer state. The slow durable flush may be executed by a
+/// background writer thread; <see cref="FlushToDiskAndCommit"/> advances the
+/// durability watermark only after every durable write succeeds.
+/// </summary>
+public interface IAuditCheckpointOperation : IDisposable
+{
+    void FlushToDiskAndCommit();
+}
+
+/// <summary>
+/// Optional split-checkpoint contract for ADR 0009 single-writer audit sinks.
+/// The dispatcher calls <see cref="BeginCheckpointOnDispatchThread"/> on the
+/// dispatch thread; the returned operation is then flushed off-thread by the
+/// snapshot writer in async snapshot mode.
+/// </summary>
+public interface IDispatchThreadCheckpointSink : IPostTradeSink
+{
+    IAuditCheckpointOperation BeginCheckpointOnDispatchThread();
+}
+
+/// <summary>
 /// Self-contained, per-trade audit record. One <see cref="PostTradeRecord"/>
 /// is emitted on the dispatch thread for every <see cref="TradeEvent"/> the
 /// engine produces, immediately after the matching ER_Trade / UMDF
@@ -74,12 +96,9 @@ public interface IPostTradeSink
     /// On exception the watermark is NOT advanced — callers (the WAL
     /// truncation gate) must treat that as "audit not durable; defer".
     ///
-    /// <para>Implementations MUST be safe to call from a thread other than
-    /// the dispatch thread (the async snapshot writer invokes it from its
-    /// dedicated writer thread). The expected concurrency cost is a brief
-    /// lock acquisition; the fsync itself runs under the lock so the
-    /// dispatch hot path stalls only for the fsync duration when both
-    /// happen to overlap.</para>
+    /// <para>Implementations that also implement
+    /// <see cref="IDispatchThreadCheckpointSink"/> may split this into a
+    /// dispatch-thread prepare step and an off-thread durable flush.</para>
     /// </summary>
     void Checkpoint();
 

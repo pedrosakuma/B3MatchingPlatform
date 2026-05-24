@@ -120,35 +120,24 @@ public class FileAuditLogWriterWatermarkTests : IDisposable
     }
 
     [Fact]
-    public void Checkpoint_FromAnotherThread_IsSafeAgainstOnTrade()
+    public void CheckpointOperation_CanFlushOffOwnerThread()
     {
-        // The async-snapshot-writer path calls Checkpoint from its writer
-        // thread while OnTrade keeps running on the dispatch thread.
-        // The internal lock must keep both honest. We don't assert
-        // performance here — just that no exception or corruption arises
-        // and the watermark advances at least to the last observed boundary.
+        // Issue #396: the dispatch thread prepares the checkpoint under the
+        // SingleWriterGuard, then the background snapshot writer performs the
+        // slow fsync/watermark sidecar write off the owner thread.
         using var w = new FileAuditLogWriter(_root, channelNumber: 1);
-        var stop = false;
-        var producer = new System.Threading.Thread(() =>
+        for (uint i = 1; i <= 20; i++)
         {
-            for (uint i = 1; i <= 200 && !stop; i++)
-            {
-                w.OnTrade(Make(i, Day0Nanos));
-                w.OnCommandBoundary(i);
-                System.Threading.Thread.Yield();
-            }
-        });
-        producer.Start();
-        for (int i = 0; i < 20; i++)
-        {
-            w.Checkpoint();
-            System.Threading.Thread.Sleep(1);
+            w.OnTrade(Make(i, Day0Nanos));
+            w.OnCommandBoundary(i);
         }
-        stop = true;
-        producer.Join(TimeSpan.FromSeconds(5));
-        w.Checkpoint();
-        Assert.True(w.DurableThroughCommandSeq > 0);
-        Assert.True(w.DurableThroughCommandSeq <= 200);
+
+        using var checkpoint = w.BeginCheckpointOnDispatchThread();
+        var flushThread = new System.Threading.Thread(checkpoint.FlushToDiskAndCommit);
+        flushThread.Start();
+        Assert.True(flushThread.Join(TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(20, w.DurableThroughCommandSeq);
     }
 
     [Fact]

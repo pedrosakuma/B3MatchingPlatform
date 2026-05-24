@@ -92,6 +92,55 @@ public class ChannelDispatcherAuditWatermarkTests
             => DurableOverride >= 0 ? DurableOverride : _pending;
     }
 
+    private sealed class ThreadRecordingPostTradeSink : IDispatchThreadCheckpointSink
+    {
+        private long _pending;
+        private long _durable;
+        public int PrepareThreadId;
+        public int FlushThreadId;
+        public int PrepareCount;
+        public int FlushCount;
+
+        public void OnTrade(in PostTradeRecord record) { }
+        public void OnCommandBoundary(long commandSeq)
+        {
+            if (commandSeq > _pending) _pending = commandSeq;
+        }
+        public void Checkpoint()
+        {
+            using var op = BeginCheckpointOnDispatchThread();
+            op.FlushToDiskAndCommit();
+        }
+        public void OnBust(in BustRecord record, DateOnly tradeDate) { }
+        public void OnRejectAttempt(in RejectAttemptRecord record) { }
+        public long DurableThroughCommandSeq => Volatile.Read(ref _durable);
+
+        public IAuditCheckpointOperation BeginCheckpointOnDispatchThread()
+        {
+            PrepareThreadId = Environment.CurrentManagedThreadId;
+            PrepareCount++;
+            return new Operation(this, _pending);
+        }
+
+        private sealed class Operation : IAuditCheckpointOperation
+        {
+            private readonly ThreadRecordingPostTradeSink _owner;
+            private readonly long _pending;
+            public Operation(ThreadRecordingPostTradeSink owner, long pending)
+            {
+                _owner = owner;
+                _pending = pending;
+            }
+            public void FlushToDiskAndCommit()
+            {
+                _owner.FlushThreadId = Environment.CurrentManagedThreadId;
+                _owner.FlushCount++;
+                Volatile.Write(ref _owner._durable, _pending);
+            }
+            public void Dispose() { }
+        }
+    }
+
     private sealed class TempDir : IDisposable
     {
         public string Path { get; }
@@ -253,6 +302,44 @@ public class ChannelDispatcherAuditWatermarkTests
             $"expected audit Checkpoint to run, got CheckpointCount={sink.CheckpointCount}");
         Assert.Equal(0, metrics.WalTruncations);
         Assert.Equal(0, metrics.AuditWalTruncateDeferred);
+    }
+
+    [Fact]
+    public async Task AsyncSnapshot_AuditCheckpoint_PreparesOnDispatcher_AndFlushesOnWriterThread()
+    {
+        var persister = new InMemoryPersister();
+        var sink = new ThreadRecordingPostTradeSink();
+        var disp = new ChannelDispatcher(
+            channelNumber: 84,
+            engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoOpPacketSink(),
+                Outbound = new NoOpOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = new ChannelMetrics(84),
+                Persister = persister,
+                SnapshotThrottle = null,
+                UseAsyncSnapshotWriter = true,
+                Wal = null,
+                PostTradeSink = sink,
+            });
+
+        disp.Start();
+        Assert.True(EnqueueOrder(disp, "CL-ASYNC", 0xA1, 1UL));
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while ((Volatile.Read(ref sink.FlushCount) == 0 || persister.SaveCount == 0) && DateTime.UtcNow < deadline)
+            Thread.Sleep(10);
+
+        Assert.True(sink.PrepareCount >= 1);
+        Assert.True(sink.FlushCount >= 1);
+        Assert.NotEqual(0, sink.PrepareThreadId);
+        Assert.NotEqual(0, sink.FlushThreadId);
+        Assert.NotEqual(sink.PrepareThreadId, sink.FlushThreadId);
+        Assert.True(sink.DurableThroughCommandSeq >= 1);
+
+        await disp.DisposeAsync();
     }
 
 

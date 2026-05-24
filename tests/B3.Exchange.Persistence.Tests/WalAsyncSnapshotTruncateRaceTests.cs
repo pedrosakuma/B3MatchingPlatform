@@ -227,9 +227,16 @@ public class WalAsyncSnapshotTruncateRaceTests
         // release a second time), giving us a stable window to assert
         // the WAL state after the first prefix truncate.
         blocking.ReleaseOne();
+        // Issue #396: async onSaved now marshals audit-checkpoint prepare
+        // through the dispatch inbox before truncating. This test drives the
+        // dispatcher via TestProbe, so pump that work item while waiting.
         // Pre-fix (full Truncate): WAL ends up empty → seq=2 is lost.
         // Post-fix (TruncateThrough): seq=2 survives.
-        Assert.True(await WaitForAsync(() => metrics.WalTruncations >= 1,
+        Assert.True(await WaitForAsync(() =>
+        {
+            driver.DrainInbound();
+            return metrics.WalTruncations >= 1;
+        },
             TimeSpan.FromSeconds(2)), "async snapshot writer did not truncate WAL before timeout");
         var kept = wal.ReadAll();
         Assert.True(kept.Count == 1 && kept[0].Seq == 2,
@@ -237,6 +244,7 @@ public class WalAsyncSnapshotTruncateRaceTests
 
         // Drain the writer cleanly before disposing.
         blocking.ReleaseOne();
+        driver.DrainInbound();
         await disp.DisposeAsync();
         wal.Dispose();
     }
