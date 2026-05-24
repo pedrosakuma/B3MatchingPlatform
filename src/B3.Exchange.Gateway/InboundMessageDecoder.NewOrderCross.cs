@@ -54,7 +54,8 @@ internal static partial class InboundMessageDecoder
     /// </summary>
     public static InboundDecodeOutcome TryDecodeNewOrderCross(
         ReadOnlySpan<byte> body, uint sessionFirm, ulong enteredAtNanos,
-        out CrossOrderCommand cross, out ulong crossId, out string? message)
+        out CrossOrderCommand cross, out ulong crossId, out string? message,
+        InboundFatFingerOptions? fatFingerOptions = null)
     {
         cross = null!;
         crossId = 0;
@@ -96,6 +97,11 @@ internal static partial class InboundMessageDecoder
             message = "NewOrderCross requires positive OrderQty";
             return InboundDecodeOutcome.UnsupportedFeature;
         }
+
+        var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
+        RejectReason? preTradeRejectReason = ValidateFatFinger(secId, qty, priceMantissa, guardrails);
+        if (preTradeRejectReason is not null)
+            message = FatFingerRejectMessage(preTradeRejectReason.Value, "OrderQty", guardrails);
 
         // CrossType: null/255 → AllOrNone (default). Wire values 1
         // (AllOrNone) and 4 (AgainstBook) accepted; 7/8 (VWAP /
@@ -246,7 +252,10 @@ internal static partial class InboundMessageDecoder
             PriceMantissa: priceMantissa,
             Quantity: qty,
             EnteringFirm: sessionFirm,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            PreTradeRejectReason = preTradeRejectReason,
+        };
         var sell = new NewOrderCommand(
             ClOrdId: sellClOrd.ToString(),
             SecurityId: secId,
@@ -256,7 +265,10 @@ internal static partial class InboundMessageDecoder
             PriceMantissa: priceMantissa,
             Quantity: qty,
             EnteringFirm: sessionFirm,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            PreTradeRejectReason = preTradeRejectReason,
+        };
         cross = new CrossOrderCommand(buy, sell, buyClOrd, sellClOrd, crossId)
         {
             CrossType = crossTypeEnum,

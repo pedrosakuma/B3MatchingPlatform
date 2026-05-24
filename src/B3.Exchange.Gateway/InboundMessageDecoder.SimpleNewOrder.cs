@@ -20,7 +20,8 @@ internal static partial class InboundMessageDecoder
     }
 
     public static bool TryDecodeNewOrder(ReadOnlySpan<byte> body, uint enteringFirm, ulong enteredAtNanos,
-        out NewOrderCommand cmd, out ulong clOrdIdValue, out string? error)
+        out NewOrderCommand cmd, out ulong clOrdIdValue, out string? error,
+        InboundFatFingerOptions? fatFingerOptions = null)
     {
         cmd = null!;
         clOrdIdValue = 0;
@@ -38,8 +39,13 @@ internal static partial class InboundMessageDecoder
         if (!TryMapOrdType(ordTypeByte, out var ordType)) { error = $"invalid OrdType={ordTypeByte}"; return false; }
         if (!TryMapTif(tifByte, out var tif)) { error = $"invalid TimeInForce={tifByte}"; return false; }
 
+        var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
+
         // Market orders never carry a meaningful price; engine ignores it.
         long enginePrice = ordType == OrderType.Market ? 0L : (priceMantissa == PriceNull ? 0L : priceMantissa);
+        RejectReason? preTradeRejectReason = ValidateFatFinger(secId, qty, enginePrice, guardrails);
+        if (preTradeRejectReason is not null)
+            error = FatFingerRejectMessage(preTradeRejectReason.Value, "OrderQty", guardrails);
 
         clOrdIdValue = clOrdId;
         cmd = new NewOrderCommand(
@@ -51,7 +57,10 @@ internal static partial class InboundMessageDecoder
             PriceMantissa: enginePrice,
             Quantity: qty,
             EnteringFirm: enteringFirm,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            PreTradeRejectReason = preTradeRejectReason,
+        };
         return true;
     }
 }

@@ -6,24 +6,57 @@ namespace B3.Exchange.Gateway.Tests;
 
 public class InboundMessageDecoderTests
 {
+    private static readonly InboundFatFingerOptions TightGuardrails = new()
+    {
+        MaxOrderQty = 1_000,
+        MaxPriceMantissa = 1_000_000,
+    };
+
+    private static byte[] BuildSimpleNewOrder(
+        ulong clOrdId = 12345UL,
+        long secId = 99887766L,
+        long qty = 100L,
+        long price = 12_3450L)
+    {
+        var body = new byte[82];
+        Span<byte> s = body;
+        MemoryMarshal.Write(s.Slice(20, 8), in clOrdId);
+        MemoryMarshal.Write(s.Slice(48, 8), in secId);
+        s[56] = (byte)'1';
+        s[57] = (byte)'2';
+        s[58] = (byte)'0';
+        MemoryMarshal.Write(s.Slice(60, 8), in qty);
+        MemoryMarshal.Write(s.Slice(68, 8), in price);
+        return body;
+    }
+
+    private static byte[] BuildSimpleModifyOrder(
+        ulong clOrdId = 99UL,
+        long secId = 555L,
+        long qty = 200L,
+        long price = 100_000L,
+        ulong orderId = 42UL,
+        ulong origClOrdId = 7UL)
+    {
+        var body = new byte[98];
+        Span<byte> s = body;
+        MemoryMarshal.Write(s.Slice(20, 8), in clOrdId);
+        MemoryMarshal.Write(s.Slice(48, 8), in secId);
+        MemoryMarshal.Write(s.Slice(60, 8), in qty);
+        MemoryMarshal.Write(s.Slice(68, 8), in price);
+        MemoryMarshal.Write(s.Slice(76, 8), in orderId);
+        MemoryMarshal.Write(s.Slice(84, 8), in origClOrdId);
+        return body;
+    }
+
     [Fact]
     public void DecodesSimpleNewOrderLimitDay()
     {
-        Span<byte> body = stackalloc byte[82];
-        body.Clear();
-
         ulong clOrdId = 12345UL;
         long secId = 99887766L;
         long qty = 100L;
         long price = 12_3450L;
-
-        MemoryMarshal.Write(body.Slice(20, 8), in clOrdId);
-        MemoryMarshal.Write(body.Slice(48, 8), in secId);
-        body[56] = (byte)'1';     // Side = Buy
-        body[57] = (byte)'2';     // OrdType = Limit
-        body[58] = (byte)'0';     // TimeInForce = Day
-        MemoryMarshal.Write(body.Slice(60, 8), in qty);
-        MemoryMarshal.Write(body.Slice(68, 8), in price);
+        var body = BuildSimpleNewOrder(clOrdId, secId, qty, price);
 
         var ok = InboundMessageDecoder.TryDecodeNewOrder(body, enteringFirm: 7, enteredAtNanos: 1_000_000UL,
             out var cmd, out var clOrdValue, out var err);
@@ -38,6 +71,34 @@ public class InboundMessageDecoderTests
         Assert.Equal(qty, cmd.Quantity);
         Assert.Equal(price, cmd.PriceMantissa);
         Assert.Equal(7u, cmd.EnteringFirm);
+    }
+
+    [Fact]
+    public void SimpleNewOrder_QtyOverLimitReturnsErRejectCommand()
+    {
+        var body = BuildSimpleNewOrder(qty: 1_001);
+
+        var ok = InboundMessageDecoder.TryDecodeNewOrder(body, 7, 1_000_000UL,
+            out var cmd, out _, out var msg, TightGuardrails);
+
+        Assert.True(ok);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cmd.PreTradeRejectReason);
+        Assert.Equal(99u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("OrderQty", msg);
+    }
+
+    [Fact]
+    public void SimpleNewOrder_PriceOverAbsoluteMaxReturnsErRejectCommand()
+    {
+        var body = BuildSimpleNewOrder(price: 1_000_001);
+
+        var ok = InboundMessageDecoder.TryDecodeNewOrder(body, 7, 1_000_000UL,
+            out var cmd, out _, out var msg, TightGuardrails);
+
+        Assert.True(ok);
+        Assert.Equal(RejectReason.PriceExceedsCurrentPriceBand, cmd.PreTradeRejectReason);
+        Assert.Equal(16u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("Price", msg);
     }
 
     [Fact]
@@ -90,20 +151,12 @@ public class InboundMessageDecoderTests
     [Fact]
     public void DecodesReplaceByOrigClOrdIdOnly()
     {
-        Span<byte> body = stackalloc byte[98];
-        body.Clear();
         ulong clOrdId = 99UL;
         long secId = 555L;
         long qty = 200L;
         long price = 100_000L;
-        ulong orderId = 0UL;
         ulong origClOrdId = 42UL;
-        MemoryMarshal.Write(body.Slice(20, 8), in clOrdId);
-        MemoryMarshal.Write(body.Slice(48, 8), in secId);
-        MemoryMarshal.Write(body.Slice(60, 8), in qty);
-        MemoryMarshal.Write(body.Slice(68, 8), in price);
-        MemoryMarshal.Write(body.Slice(76, 8), in orderId);
-        MemoryMarshal.Write(body.Slice(84, 8), in origClOrdId);
+        var body = BuildSimpleModifyOrder(clOrdId, secId, qty, price, orderId: 0UL, origClOrdId: origClOrdId);
 
         var ok = InboundMessageDecoder.TryDecodeReplace(body, 9_000UL,
             out var cmd, out var clOrd, out var origClOrd, out var err);
@@ -114,5 +167,19 @@ public class InboundMessageDecoderTests
         Assert.Equal(0L, cmd.OrderId);
         Assert.Equal(qty, cmd.NewQuantity);
         Assert.Equal(price, cmd.NewPriceMantissa);
+    }
+
+    [Fact]
+    public void SimpleModifyOrder_QtyOverLimitReturnsErRejectCommand()
+    {
+        var body = BuildSimpleModifyOrder(qty: 1_001);
+
+        var ok = InboundMessageDecoder.TryDecodeReplace(body, 9_000UL,
+            out var cmd, out _, out _, out var msg, TightGuardrails);
+
+        Assert.True(ok);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cmd.PreTradeRejectReason);
+        Assert.Equal(99u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("NewQuantity", msg);
     }
 }

@@ -248,7 +248,7 @@ public sealed partial class FixpSession
                     return false;
                 }
             case EntryPointFrameReader.TidSimpleNewOrder:
-                if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr))
+                if (InboundMessageDecoder.TryDecodeNewOrder(fixedBlock, EnteringFirm, now, out var no, out var noClOrd, out var noErr, _options.FatFinger))
                 {
                     no = no with { Memo = inboundMemo };
                     if (!_sink.EnqueueNewOrder(no, Identity, EnteringFirm, noClOrd))
@@ -259,7 +259,7 @@ public sealed partial class FixpSession
                 await TerminateAndCloseAsync(SessionRejectEncoder.TerminationCode.DecodingError, "decode-error:SimpleNewOrder").ConfigureAwait(false);
                 return false;
             case EntryPointFrameReader.TidSimpleModifyOrder:
-                if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr))
+                if (InboundMessageDecoder.TryDecodeReplace(fixedBlock, now, out var rp, out var rpClOrd, out var rpOrigClOrd, out var rpErr, _options.FatFinger))
                 {
                     rp = rp with { Memo = inboundMemo };
                     if (!_sink.EnqueueReplace(rp, Identity, EnteringFirm, rpClOrd, rpOrigClOrd))
@@ -336,7 +336,7 @@ public sealed partial class FixpSession
                     // decoder can walk past the SBE group header.
                     var fullBodySpan = fullBody.Span;
                     var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
-                        fullBodySpan, EnteringFirm, now, out var cross, out var crossId, out var crossMsg);
+                        fullBodySpan, EnteringFirm, now, out var cross, out var crossId, out var crossMsg, _options.FatFinger);
                     if (outcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
                         if (!_sink.EnqueueCross(cross, Identity, EnteringFirm))

@@ -242,6 +242,19 @@ public sealed partial class ChannelDispatcher
                         var otherLeg = buyFirst ? cross.Sell : cross.Buy;
                         ulong otherClOrd = buyFirst ? cross.SellClOrdIdValue : cross.BuyClOrdIdValue;
 
+                        if (prioLeg.PreTradeRejectReason is not null || otherLeg.PreTradeRejectReason is not null)
+                        {
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = prioClOrd;
+                            BeginAggressor(prioLeg.Quantity);
+                            _engine.Submit(prioLeg);
+                            _metrics?.IncOrdersIn();
+                            _currentClOrdId = otherClOrd;
+                            BeginAggressor(otherLeg.Quantity);
+                            _engine.Submit(otherLeg);
+                            break;
+                        }
+
                         if (cross.CrossType == CrossType.AgainstBook && cross.MaxSweepQty > 0)
                         {
                             // Phase 1: prioritized leg sweeps the opposing

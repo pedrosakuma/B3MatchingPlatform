@@ -65,6 +65,14 @@ internal static partial class InboundMessageDecoder
             : null;
     }
 
+    private static string FatFingerRejectMessage(
+        RejectReason reason,
+        string quantityFieldName,
+        InboundFatFingerOptions options)
+        => reason == RejectReason.QuantityExceedsLimit
+            ? $"{quantityFieldName} exceeds maxOrderQty={options.MaxOrderQty}"
+            : "Price exceeds configured fat-finger limit or current price band";
+
     /// <summary>
     /// Three-valued outcome for the full NewOrderSingle (102) and
     /// OrderCancelReplaceRequest (104) decoders. Distinguishes

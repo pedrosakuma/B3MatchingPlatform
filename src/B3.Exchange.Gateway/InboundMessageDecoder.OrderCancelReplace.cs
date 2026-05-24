@@ -198,9 +198,7 @@ internal static partial class InboundMessageDecoder
 
         if (ValidateFatFinger(secId, qty, enginePrice, guardrails) is { } preTradeRejectReason)
         {
-            message = preTradeRejectReason == RejectReason.QuantityExceedsLimit
-                ? $"NewQuantity exceeds maxOrderQty={guardrails.MaxOrderQty}"
-                : "Price exceeds configured fat-finger limit or current price band";
+            message = FatFingerRejectMessage(preTradeRejectReason, "NewQuantity", guardrails);
             cmd = new ReplaceOrderCommand(
                 ClOrdId: clOrdId.ToString(),
                 SecurityId: secId,
