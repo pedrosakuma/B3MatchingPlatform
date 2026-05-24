@@ -25,6 +25,7 @@ namespace B3.Exchange.Gateway;
 internal sealed class FixpOutboundEncoder
 {
     private readonly Func<uint> _sessionId;
+    private readonly Func<ulong> _sessionVerId;
     private readonly Func<uint> _nextMsgSeqNum;
     private readonly Func<TcpTransport> _transport;
     private readonly RetransmitBuffer _retxBuffer;
@@ -42,6 +43,7 @@ internal sealed class FixpOutboundEncoder
 
     public FixpOutboundEncoder(
         Func<uint> sessionId,
+        Func<ulong> sessionVerId,
         Func<uint> nextMsgSeqNum,
         Func<TcpTransport> transport,
         RetransmitBuffer retxBuffer,
@@ -51,6 +53,7 @@ internal sealed class FixpOutboundEncoder
         Action close)
     {
         _sessionId = sessionId;
+        _sessionVerId = sessionVerId;
         _nextMsgSeqNum = nextMsgSeqNum;
         _transport = transport;
         _retxBuffer = retxBuffer;
@@ -186,7 +189,7 @@ internal sealed class FixpOutboundEncoder
     {
         if (!_isOpen()) return false;
         var exact = new byte[SessionRejectEncoder.TerminateTotal];
-        SessionRejectEncoder.EncodeTerminate(exact, _sessionId(), 0, terminationCode);
+        SessionRejectEncoder.EncodeTerminate(exact, _sessionId(), _sessionVerId(), terminationCode);
         bool result = _transport().TryEnqueueFrame(exact);
         _close();
         return result;
