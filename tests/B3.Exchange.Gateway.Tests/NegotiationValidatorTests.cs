@@ -74,11 +74,12 @@ public class NegotiationValidatorTests
     }
 
     [Fact]
-    public void Unknown_session_rejected_credentials()
+    public void Unknown_session_rejected_invalid_sessionid()
     {
         var (v, _) = Build();
         var o = v.Validate(Req(sid: 99999), Cred(user: "99999"), FixpState.Idle);
-        Assert.Equal(FixpSbe.NegotiationRejectCode.CREDENTIALS, o.RejectCode);
+        Assert.False(o.IsAccepted);
+        Assert.Equal(FixpSbe.NegotiationRejectCode.INVALID_SESSIONID, o.RejectCode);
     }
 
     [Fact]
@@ -90,10 +91,11 @@ public class NegotiationValidatorTests
     }
 
     [Fact]
-    public void Wrong_access_key_rejected_credentials()
+    public void Known_session_wrong_access_key_rejected_credentials()
     {
         var (v, _) = Build();
         var o = v.Validate(Req(), Cred(key: "wrong"), FixpState.Idle);
+        Assert.False(o.IsAccepted);
         Assert.Equal(FixpSbe.NegotiationRejectCode.CREDENTIALS, o.RejectCode);
     }
 
