@@ -154,6 +154,14 @@ public sealed partial class FixpSession
         if (Interlocked.Exchange(ref _isAttached, 0) == 0) return;
         _logger.LogInformation("fixp session {ConnectionId} suspending (reason={Reason})",
             ConnectionId, reason);
+        // Best-effort teardown of cancellation + transport before publishing
+        // Suspended. Tests and diagnostics use State==Suspended as the contract
+        // that the transport is already detached/down; publishing the state
+        // first races observers against the close side effect on fast machines.
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
+        try { _transport.Close(reason); } catch (ObjectDisposedException) { /* transport already disposed */ }
+        try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
+
         var action = ApplyTransition(FixpEvent.Detach);
         if (action != FixpAction.Accept || State != FixpState.Suspended)
         {
@@ -166,12 +174,6 @@ public sealed partial class FixpSession
             CloseLocked(reason, CloseKind.TransportError);
             return;
         }
-        // Best-effort teardown of cancellation + transport during Suspend; each
-        // step may legitimately fail if a concurrent Close has already raced
-        // ahead (e.g. transport callback while suspend was being decided).
-        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
-        try { _transport.Close(reason); } catch (ObjectDisposedException) { /* transport already disposed */ }
-        try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
         Volatile.Write(ref _suspendedSinceMs, NowMs());
         ScheduleCodTimerLocked();
         // Issue #405: persist the envelope on suspend so a host crash
