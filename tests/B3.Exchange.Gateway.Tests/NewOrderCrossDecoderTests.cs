@@ -17,6 +17,11 @@ public class NewOrderCrossDecoderTests
     private const long PriceNull = long.MinValue;
     private const uint FirmNull = 0xFFFFFFFFu;
     private const uint SessionFirm = 4242u;
+    private static readonly InboundFatFingerOptions TightGuardrails = new()
+    {
+        MaxOrderQty = 1_000,
+        MaxPriceMantissa = 1_000_000,
+    };
 
     /// <summary>
     /// Builds a NewOrderCross body (root 84B + NoSides group + DeskID + Memo)
@@ -135,6 +140,23 @@ public class NewOrderCrossDecoderTests
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
         Assert.Equal(9002UL, cross.BuyClOrdIdValue);
         Assert.Equal(9001UL, cross.SellClOrdIdValue);
+    }
+
+    [Fact]
+    public void QtyOverLimitReturnsErRejectCommandsForBothLegs()
+    {
+        // NewOrderCross carries shared OrderQty/Price in the root block, so
+        // a fat-finger violation applies to both emitted NewOrderCommand legs.
+        var body = BuildCross(qty: 1_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderCross(
+            body, SessionFirm, 1UL, out var cross, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cross.Buy.PreTradeRejectReason);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cross.Sell.PreTradeRejectReason);
+        Assert.Equal(99u, FixpSession.MapRejectReason(cross.Buy.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("OrderQty", msg);
     }
 
     [Theory]

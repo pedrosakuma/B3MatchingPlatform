@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using B3.Exchange.Gateway;
 
 namespace B3.Exchange.Host;
 
@@ -92,6 +93,22 @@ public sealed class TcpConfig
     /// InboundBusinessHeader.sendingTime. Default: 5 s. Set to 0 to disable.
     /// </summary>
     [JsonPropertyName("sendingTimeSkewToleranceMs")] public int SendingTimeSkewToleranceMs { get; set; } = 5_000;
+
+    /// <summary>Decode-time maximum accepted OrderQty/NewQuantity. Larger
+    /// values are rejected with ER_Reject OrdRejReason=99 (Other).</summary>
+    [JsonPropertyName("maxOrderQty")] public long MaxOrderQty { get; set; } = InboundFatFingerOptions.DefaultMaxOrderQty;
+
+    /// <summary>Decode-time maximum accepted limit price mantissa (/10000).
+    /// Default 1e15 = 100,000,000,000.0000, intentionally far above normal B3
+    /// cash-equity and listed-derivative price ranges while still catching
+    /// corrupted 64-bit payloads.</summary>
+    [JsonPropertyName("maxPrice")] public long MaxPrice { get; set; } = InboundFatFingerOptions.DefaultMaxPriceMantissa;
+
+    /// <summary>Optional dynamic price band in percent, relative to the last
+    /// trade price for the instrument. Null disables the band; with no last
+    /// trade reference the decoder accepts and leaves downstream validation
+    /// unchanged.</summary>
+    [JsonPropertyName("priceBandPercent")] public decimal? PriceBandPercent { get; set; }
 
     /// <summary>
     /// Per-session inbound sliding-window throttle (issue #56 / GAP-20,

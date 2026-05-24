@@ -278,6 +278,7 @@ public sealed partial class ChannelDispatcher
     public void OnTrade(in TradeEvent e)
     {
         AssertOnLoopThread();
+        _lastTradePriceBySecurity[e.SecurityId] = e.PriceMantissa;
         // Issue #218 (Onda L · L5): when a cross sweep phase is active,
         // accumulate the aggressor's filled qty so the loop can decide how
         // much of the prioritized leg remains for the internal print.

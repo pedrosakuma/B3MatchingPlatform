@@ -61,8 +61,10 @@ internal static partial class InboundMessageDecoder
     /// </summary>
     public static InboundDecodeOutcome TryDecodeNewOrderSingle(
         ReadOnlySpan<byte> body, uint enteringFirm, ulong enteredAtNanos,
-        out NewOrderCommand cmd, out ulong clOrdIdValue, out string? message)
+        out NewOrderCommand cmd, out ulong clOrdIdValue, out string? message,
+        InboundFatFingerOptions? fatFingerOptions = null)
     {
+        var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
         cmd = null!;
         clOrdIdValue = 0;
         message = null;
@@ -73,7 +75,8 @@ internal static partial class InboundMessageDecoder
         byte ordTypeByte = body[NewOrderSingleOffsets.OrdType];
         byte tifByte = body[NewOrderSingleOffsets.TimeInForce];
         byte routing = body[NewOrderSingleOffsets.RoutingInstruction];
-        long qty = (long)MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.OrderQty, 8));
+        ulong qtyRaw = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.OrderQty, 8));
+        long qty = qtyRaw > long.MaxValue ? long.MaxValue : (long)qtyRaw;
         long priceMantissa = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.PriceMantissa, 8));
         long stopPx = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.StopPxMantissa, 8));
         ulong minQty = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.MinQty, 8));
@@ -204,6 +207,30 @@ internal static partial class InboundMessageDecoder
             ? 0L
             : (priceMantissa == PriceNull ? 0L : priceMantissa);
         long engineStopPx = isStop ? stopPx : 0L;
+
+        if (ValidateFatFinger(secId, qty, enginePrice, guardrails) is { } preTradeRejectReason)
+        {
+            message = FatFingerRejectMessage(preTradeRejectReason, "OrderQty", guardrails);
+            cmd = new NewOrderCommand(
+                ClOrdId: clOrdId.ToString(),
+                SecurityId: secId,
+                Side: side,
+                Type: ordType,
+                Tif: tif,
+                PriceMantissa: enginePrice,
+                Quantity: qty,
+                EnteringFirm: enteringFirm,
+                EnteredAtNanos: enteredAtNanos)
+            {
+                MinQty = minQty,
+                MaxFloor = maxFloor,
+                StopPxMantissa = engineStopPx,
+                OrdTagId = ordTagId,
+                InvestorId = investorId,
+                PreTradeRejectReason = preTradeRejectReason,
+            };
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
 
         cmd = new NewOrderCommand(
             ClOrdId: clOrdId.ToString(),

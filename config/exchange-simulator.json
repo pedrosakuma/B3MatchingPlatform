@@ -12,7 +12,12 @@
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000,
-    "sendingTimeSkewToleranceMs": 5000
+    "sendingTimeSkewToleranceMs": 5000,
+    // Decode-time fat-finger guardrails. Price is the EntryPoint /10000
+    // mantissa; priceBandPercent null disables the last-trade-relative band.
+    "maxOrderQty": 1000000000,
+    "maxPrice": 1000000000000000,
+    "priceBandPercent": null
   },
   // Authentication. devMode=true bypasses access-key validation during
   // FIXP Negotiate (#42) — useful for local dev / tests. Production

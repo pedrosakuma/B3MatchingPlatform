@@ -109,6 +109,13 @@ public sealed record FixpSessionOptions
 
     public B3.Exchange.Contracts.ThrottleMetrics? ThrottleMetrics { get; init; }
 
+    /// <summary>
+    /// Decode-time pre-trade fat-finger guardrails for OrderQty/NewQuantity
+    /// and Price. Defaults are intentionally loose and preserve legacy
+    /// behaviour except for absurd values.
+    /// </summary>
+    public InboundFatFingerOptions FatFinger { get; init; } = InboundFatFingerOptions.Default;
+
     public static FixpSessionOptions Default { get; } = new();
 
     internal void Validate()
@@ -122,5 +129,6 @@ public sealed record FixpSessionOptions
         if (ThrottleTimeWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleTimeWindowMs));
         if (ThrottleMaxMessages < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleMaxMessages));
         if (MaxOrderRatePerSecond < 0) throw new ArgumentOutOfRangeException(nameof(MaxOrderRatePerSecond));
+        FatFinger.Validate();
     }
 }

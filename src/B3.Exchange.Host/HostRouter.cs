@@ -157,6 +157,11 @@ public sealed class HostRouter : IInboundCommandSink
             _logger.LogDebug("session {Session} closed; evicted {Count} ownership entries", session, total);
     }
 
+    public long? LastTradePriceMantissa(long securityId)
+        => _bySecId.TryGetValue(securityId, out var disp)
+            ? disp.LastTradePriceMantissa(securityId)
+            : null;
+
     private CancelOrderCommand ResolveOrderIdIfNeeded(in CancelOrderCommand cmd, uint firm, ulong origClOrdId, out bool ok)
     {
         if (cmd.OrderId != 0) { ok = true; return cmd; }

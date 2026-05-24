@@ -42,8 +42,10 @@ internal static partial class InboundMessageDecoder
     /// </summary>
     public static InboundDecodeOutcome TryDecodeOrderCancelReplace(
         ReadOnlySpan<byte> body, ulong enteredAtNanos,
-        out ReplaceOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? message)
+        out ReplaceOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? message,
+        InboundFatFingerOptions? fatFingerOptions = null)
     {
+        var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
         cmd = null!;
         clOrdIdValue = 0;
         origClOrdIdValue = 0;
@@ -55,7 +57,8 @@ internal static partial class InboundMessageDecoder
         byte ordTypeByte = body[OrderCancelReplaceOffsets.OrdType];
         byte tifByte = body[OrderCancelReplaceOffsets.TimeInForce];
         byte routing = body[OrderCancelReplaceOffsets.RoutingInstruction];
-        long qty = (long)MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrderQty, 8));
+        ulong qtyRaw = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrderQty, 8));
+        long qty = qtyRaw > long.MaxValue ? long.MaxValue : (long)qtyRaw;
         long priceMantissa = MemoryMarshal.Read<long>(body.Slice(OrderCancelReplaceOffsets.PriceMantissa, 8));
         ulong orderId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrderID, 8));
         ulong origClOrdId = MemoryMarshal.Read<ulong>(body.Slice(OrderCancelReplaceOffsets.OrigClOrdID, 8));
@@ -192,6 +195,24 @@ internal static partial class InboundMessageDecoder
         long enginePrice = ordType == OrderType.Market
             ? 0L
             : priceMantissa;
+
+        if (ValidateFatFinger(secId, qty, enginePrice, guardrails) is { } preTradeRejectReason)
+        {
+            message = FatFingerRejectMessage(preTradeRejectReason, "NewQuantity", guardrails);
+            cmd = new ReplaceOrderCommand(
+                ClOrdId: clOrdId.ToString(),
+                SecurityId: secId,
+                OrderId: (long)orderId,
+                NewPriceMantissa: enginePrice,
+                NewQuantity: qty,
+                EnteredAtNanos: enteredAtNanos)
+            {
+                NewOrdType = ordType,
+                NewTif = newTif,
+                PreTradeRejectReason = preTradeRejectReason,
+            };
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
 
         cmd = new ReplaceOrderCommand(
             ClOrdId: clOrdId.ToString(),

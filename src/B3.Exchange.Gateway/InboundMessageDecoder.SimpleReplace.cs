@@ -20,7 +20,8 @@ internal static partial class InboundMessageDecoder
     }
 
     public static bool TryDecodeReplace(ReadOnlySpan<byte> body, ulong enteredAtNanos,
-        out ReplaceOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? error)
+        out ReplaceOrderCommand cmd, out ulong clOrdIdValue, out ulong origClOrdIdValue, out string? error,
+        InboundFatFingerOptions? fatFingerOptions = null)
     {
         cmd = null!;
         clOrdIdValue = 0;
@@ -45,6 +46,11 @@ internal static partial class InboundMessageDecoder
             return false;
         }
 
+        var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
+        RejectReason? preTradeRejectReason = ValidateFatFinger(secId, qty, priceMantissa, guardrails);
+        if (preTradeRejectReason is not null)
+            error = FatFingerRejectMessage(preTradeRejectReason.Value, "NewQuantity", guardrails);
+
         clOrdIdValue = clOrdId;
         origClOrdIdValue = origClOrdId;
         cmd = new ReplaceOrderCommand(
@@ -53,7 +59,10 @@ internal static partial class InboundMessageDecoder
             OrderId: (long)orderId,
             NewPriceMantissa: priceMantissa,
             NewQuantity: qty,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            PreTradeRejectReason = preTradeRejectReason,
+        };
         return true;
     }
 }

@@ -779,6 +779,12 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            if (cmd.PreTradeRejectReason is { } preTradeRejectReason)
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, preTradeRejectReason, cmd.EnteredAtNanos);
+                return;
+            }
+
             if (cmd.UnsupportedOrderCharacteristic)
             {
                 Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.UnsupportedOrderCharacteristic, cmd.EnteredAtNanos);
@@ -1092,6 +1098,9 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            if (cmd.PreTradeRejectReason is { } preTradeRejectReason)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, preTradeRejectReason, cmd.EnteredAtNanos); return; }
+
             if (cmd.UnsupportedOrderCharacteristic)
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnsupportedOrderCharacteristic, cmd.EnteredAtNanos); return; }
 
@@ -2015,6 +2024,14 @@ public sealed class MatchingEngine
             + $"actual={Thread.CurrentThread.ManagedThreadId})");
         _writerGuard.BindToCurrentThread();
     }
+
+    /// <summary>
+    /// Test-only seam for direct-drive dispatcher probes that intentionally
+    /// process queued work on xUnit continuation threads rather than a live
+    /// dispatcher loop. Production dispatchers must bind once via
+    /// <see cref="BindToDispatchThread"/>.
+    /// </summary>
+    public void RebindOwnerForTesting() => _writerGuard.RebindForReplay();
 
     /// <summary>
     /// Asserts the calling thread owns the engine. Latches the owner

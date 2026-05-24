@@ -11,6 +11,8 @@ namespace B3.Exchange.Gateway.Tests;
 ///   3  = Order exceeds limit
 ///   5  = Unknown order
 ///   11 = Unsupported order characteristic
+///   16 = Price exceeds current price band
+///   99 = Other
 /// </summary>
 public class MapRejectReasonTests
 {
@@ -30,6 +32,8 @@ public class MapRejectReasonTests
     [InlineData(RejectReason.MinQtyNotMet, 0u)]
     [InlineData(RejectReason.InvalidField, 11u)]
     [InlineData(RejectReason.UnsupportedOrderCharacteristic, 11u)]
+    [InlineData(RejectReason.QuantityExceedsLimit, 99u)]
+    [InlineData(RejectReason.PriceExceedsCurrentPriceBand, 16u)]
     public void MapRejectReason_ProducesExpectedWireCode(RejectReason reason, uint expected)
     {
         Assert.Equal(expected, FixpSession.MapRejectReason(reason));
@@ -45,7 +49,7 @@ public class MapRejectReasonTests
         {
             // Should not throw and must return one of the documented wire codes.
             uint code = FixpSession.MapRejectReason(r);
-            Assert.Contains(code, new uint[] { 0u, 1u, 3u, 5u, 11u, 13u });
+            Assert.Contains(code, new uint[] { 0u, 1u, 3u, 5u, 11u, 13u, 16u, 99u });
         }
     }
 }

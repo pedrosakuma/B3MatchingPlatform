@@ -77,7 +77,10 @@ Exposes:
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000,
-    "sendingTimeSkewToleranceMs": 5000
+    "sendingTimeSkewToleranceMs": 5000,
+    "maxOrderQty": 1000000000,
+    "maxPrice": 1000000000000000,
+    "priceBandPercent": null
   },
   "auth": { "devMode": true },
   "firms": [
@@ -147,6 +150,18 @@ Exposes:
 * `tcp.sendingTimeSkewToleranceMs` — maximum absolute skew tolerated between
   the server clock and an inbound application message's
   `InboundBusinessHeader.sendingTime`. Default `5000`; set `0` to disable.
+* `tcp.maxOrderQty` — decode-time upper bound for `OrderQty` /
+  `NewQuantity`. Default `1000000000`; larger values are rejected with
+  `ER_Reject(OrdRejReason=99 Other)`.
+* `tcp.maxPrice` — decode-time upper bound for EntryPoint `Price` mantissa
+  (`/10000`). Default `1000000000000000` (decimal
+  `100,000,000,000.0000`), deliberately far above normal B3 cash-equity and
+  listed-derivative prices while still catching corrupted 64-bit payloads.
+* `tcp.priceBandPercent` — optional dynamic price-band check relative to the
+  instrument's last trade price. `null` disables it; when enabled but no last
+  trade reference exists yet, the decoder accepts and leaves downstream
+  validation unchanged. Breaches produce
+  `ER_Reject(OrdRejReason=16 Price exceeds current price band)`.
 * `http` — **optional** Kestrel-hosted operability endpoint exposing
   `/health/live`, `/health/ready`, and `/metrics`. Omit the entire block to
   disable HTTP.

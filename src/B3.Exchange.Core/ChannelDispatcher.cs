@@ -173,6 +173,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// wire and no ExecutionReport is sent to a (potentially long-gone)
     /// session.</summary>
     private bool _replayMode;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> _lastTradePriceBySecurity = new();
 
     /// <summary>
     /// Issue #329 PR-5: snapshot of the audit sink's persisted durability
@@ -276,6 +277,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// <c>receivedTime</c> field nulled.
     /// </summary>
     private ulong _currentReceivedTimeNanos = ulong.MaxValue;
+
+    public long? LastTradePriceMantissa(long securityId)
+        => _lastTradePriceBySecurity.TryGetValue(securityId, out var price) && price > 0
+            ? price
+            : null;
 
     /// <summary>
     /// When non-null, the dispatcher is processing the sweep phase of a

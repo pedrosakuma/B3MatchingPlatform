@@ -145,6 +145,11 @@ public sealed partial class ChannelDispatcher
         /// </summary>
         public void DrainInbound()
         {
+            if (_disp._loopTask is null)
+            {
+                _disp._writerGuard.RebindForReplay();
+                _disp._engine.RebindOwnerForTesting();
+            }
             var reader = _disp._inbound.Reader;
             while (reader.TryRead(out var item))
             {

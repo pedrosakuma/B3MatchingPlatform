@@ -29,6 +29,50 @@ internal static partial class InboundMessageDecoder
 
     private const long PriceNull = long.MinValue;
 
+    private static InboundFatFingerOptions NormalizeFatFingerOptions(InboundFatFingerOptions? options)
+        => options ?? InboundFatFingerOptions.Default;
+
+    private static RejectReason? ValidateFatFinger(
+        long securityId,
+        long qty,
+        long enginePrice,
+        InboundFatFingerOptions options)
+    {
+        if (qty <= 0)
+            return null;
+
+        if (qty > options.MaxOrderQty)
+            return RejectReason.QuantityExceedsLimit;
+
+        if (enginePrice <= 0)
+            return null;
+
+        if (enginePrice > options.MaxPriceMantissa)
+            return RejectReason.PriceExceedsCurrentPriceBand;
+
+        if (options.PriceBandPercent is not { } bandPercent)
+            return null;
+
+        long? reference = options.LastTradePriceProvider?.Invoke(securityId);
+        if (reference is not > 0)
+            return null;
+
+        decimal price = enginePrice;
+        decimal refPrice = reference.Value;
+        decimal deviationPercent = Math.Abs(price - refPrice) * 100m / refPrice;
+        return deviationPercent > bandPercent
+            ? RejectReason.PriceExceedsCurrentPriceBand
+            : null;
+    }
+
+    private static string FatFingerRejectMessage(
+        RejectReason reason,
+        string quantityFieldName,
+        InboundFatFingerOptions options)
+        => reason == RejectReason.QuantityExceedsLimit
+            ? $"{quantityFieldName} exceeds maxOrderQty={options.MaxOrderQty}"
+            : "Price exceeds configured fat-finger limit or current price band";
+
     /// <summary>
     /// Three-valued outcome for the full NewOrderSingle (102) and
     /// OrderCancelReplaceRequest (104) decoders. Distinguishes

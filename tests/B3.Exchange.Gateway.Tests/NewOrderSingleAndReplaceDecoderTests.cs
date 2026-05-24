@@ -14,6 +14,11 @@ public class NewOrderSingleAndReplaceDecoderTests
 {
     private const long PriceNull = long.MinValue;
     private const byte RoutingNull = 255;
+    private static readonly InboundFatFingerOptions TightGuardrails = new()
+    {
+        MaxOrderQty = 1_000,
+        MaxPriceMantissa = 1_000_000,
+    };
 
     private static byte[] BuildNewOrderSingleV2(
         ulong clOrdId = 99UL,
@@ -226,6 +231,98 @@ public class NewOrderSingleAndReplaceDecoderTests
     }
 
     [Fact]
+    public void NewOrderSingle_QtyOverLimitReturnsErRejectCommand()
+    {
+        var body = BuildNewOrderSingleV2(qty: 1_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cmd.PreTradeRejectReason);
+        Assert.Equal(99u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("OrderQty", msg);
+    }
+
+    [Fact]
+    public void NewOrderSingle_PriceOverAbsoluteMaxReturnsErRejectCommand()
+    {
+        var body = BuildNewOrderSingleV2(price: 1_000_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Equal(RejectReason.PriceExceedsCurrentPriceBand, cmd.PreTradeRejectReason);
+        Assert.Equal(16u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("Price", msg);
+    }
+
+    [Fact]
+    public void NewOrderSingle_BoundaryValuesAtLimitsAreAccepted()
+    {
+        var body = BuildNewOrderSingleV2(qty: 1_000, price: 1_000_000);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(1_000, cmd.Quantity);
+        Assert.Equal(1_000_000, cmd.PriceMantissa);
+    }
+
+    [Fact]
+    public void NewOrderSingle_PriceBandEnabledInBandPassesOutOfBandRejects()
+    {
+        var options = TightGuardrails with
+        {
+            MaxPriceMantissa = 2_000_000,
+            PriceBandPercent = 10m,
+            LastTradePriceProvider = _ => 1_000_000,
+        };
+
+        var inBand = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            BuildNewOrderSingleV2(price: 1_100_000), 1, 0, out var accepted, out _, out var inBandMsg, options);
+        var outOfBand = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            BuildNewOrderSingleV2(price: 1_100_001), 1, 0, out var rejected, out _, out var outOfBandMsg, options);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, inBand);
+        Assert.Null(inBandMsg);
+        Assert.Equal(1_100_000, accepted.PriceMantissa);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outOfBand);
+        Assert.Equal(RejectReason.PriceExceedsCurrentPriceBand, rejected.PreTradeRejectReason);
+        Assert.Contains("Price", outOfBandMsg);
+    }
+
+    [Fact]
+    public void NewOrderSingle_PriceBandDisabledOrNoReferencePasses()
+    {
+        var disabled = TightGuardrails with
+        {
+            MaxPriceMantissa = 2_000_000,
+            PriceBandPercent = null,
+            LastTradePriceProvider = _ => 1_000_000,
+        };
+        var noReference = TightGuardrails with
+        {
+            MaxPriceMantissa = 2_000_000,
+            PriceBandPercent = 10m,
+            LastTradePriceProvider = _ => null,
+        };
+
+        var disabledOutcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            BuildNewOrderSingleV2(price: 1_500_000), 1, 0, out _, out _, out var disabledMsg, disabled);
+        var noReferenceOutcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            BuildNewOrderSingleV2(price: 1_500_000), 1, 0, out _, out _, out var noReferenceMsg, noReference);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, disabledOutcome);
+        Assert.Null(disabledMsg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, noReferenceOutcome);
+        Assert.Null(noReferenceMsg);
+    }
+
+    [Fact]
     public void NewOrderSingle_RoutingInstructionRejectsAsUnsupported()
     {
         var body = BuildNewOrderSingleV2(routing: 1);
@@ -275,6 +372,34 @@ public class NewOrderSingleAndReplaceDecoderTests
 
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
         Assert.Null(msg);
+    }
+
+    [Fact]
+    public void OrderCancelReplace_QtyOverLimitReturnsErRejectCommand()
+    {
+        var body = BuildOrderCancelReplaceV2(qty: 1_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 1, out var cmd, out _, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Equal(RejectReason.QuantityExceedsLimit, cmd.PreTradeRejectReason);
+        Assert.Equal(99u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("NewQuantity", msg);
+    }
+
+    [Fact]
+    public void OrderCancelReplace_PriceOverAbsoluteMaxReturnsErRejectCommand()
+    {
+        var body = BuildOrderCancelReplaceV2(price: 1_000_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 1, out var cmd, out _, out _, out var msg, TightGuardrails);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Equal(RejectReason.PriceExceedsCurrentPriceBand, cmd.PreTradeRejectReason);
+        Assert.Equal(16u, FixpSession.MapRejectReason(cmd.PreTradeRejectReason.GetValueOrDefault()));
+        Assert.Contains("Price", msg);
     }
 
     [Theory]
