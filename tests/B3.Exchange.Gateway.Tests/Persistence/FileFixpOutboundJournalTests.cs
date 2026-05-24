@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using B3.Exchange.Contracts;
 using B3.Exchange.Gateway.Persistence;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -24,10 +25,14 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
 
     private FileFixpOutboundJournal NewJournal(
         int segmentMaxBytes = FileFixpOutboundJournal.DefaultSegmentMaxBytes,
-        long maxBytesPerSession = 0)
+        long maxBytesPerSession = 0,
+        TimeSpan? maxRetention = null,
+        FixpJournalMetrics? metrics = null)
         => new(_root, NullLogger<FileFixpOutboundJournal>.Instance,
             segmentMaxBytes: segmentMaxBytes,
-            maxBytesPerSession: maxBytesPerSession);
+            maxBytesPerSession: maxBytesPerSession,
+            maxRetention: maxRetention,
+            metrics: metrics);
 
     private static byte[] Frame(uint seq, int extraBytes = 0)
     {
@@ -237,6 +242,40 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
     }
 
     [Fact]
+    public void Remove_clears_peer_ack_watermark_before_session_id_reuse()
+    {
+        using var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 350);
+        const uint sid = 0x437u;
+        for (uint s = 1; s <= 4; s++) j.Append(sid, s, s, Frame(s, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 4);
+
+        j.Remove(sid);
+
+        j.Append(sid, 1, 1, Frame(1, extraBytes: 96));
+        j.Append(sid, 2, 2, Frame(2, extraBytes: 96));
+        j.Append(sid, 3, 3, Frame(3, extraBytes: 96));
+
+        Assert.Equal(new uint[] { 1, 2, 3 }, j.ReadRange(sid, 1, 10).Select(e => e.Seq));
+    }
+
+    [Fact]
+    public void Remove_resets_journal_metrics_for_session()
+    {
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(metrics: metrics);
+        const uint sid = 0x438u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 96));
+
+        var before = Assert.Single(metrics.Snapshot());
+        Assert.Equal("0x00000438", before.Session);
+        Assert.True(before.Bytes > 0);
+
+        j.Remove(sid);
+
+        Assert.Empty(metrics.Snapshot());
+    }
+
+    [Fact]
     public void ListSessions_enumerates_persisted_sessions()
     {
         using (var j = NewJournal())
@@ -251,18 +290,86 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
     }
 
     [Fact]
-    public void Cap_overflow_fails_stop_when_configured()
+    public void Bytes_quota_without_peer_ack_warns_and_allows_growth()
     {
         // record overhead 20 + frame 100 = 120 bytes per record.
-        // cap = 250 => after 2 records the 3rd is rejected.
-        using var j = NewJournal(maxBytesPerSession: 250);
+        // cap = 250 => after 2 records the 3rd is over budget, but no
+        // peer ACK watermark means nothing is safe to delete.
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(maxBytesPerSession: 250, metrics: metrics);
         const uint sid = 1u;
         j.Append(sid, 1, 0, Frame(1, extraBytes: 96));
         j.Append(sid, 2, 0, Frame(2, extraBytes: 96));
-        var ex = Assert.Throws<JournalCapacityExceededException>(
-            () => j.Append(sid, 3, 0, Frame(3, extraBytes: 96)));
-        Assert.Equal(sid, ex.SessionId);
-        Assert.True(ex.CapBytes == 250);
+        j.Append(sid, 3, 0, Frame(3, extraBytes: 96));
+
+        Assert.Equal(new uint[] { 1, 2, 3 }, j.ReadRange(sid, 1, 10).Select(e => e.Seq));
+        Assert.True(Assert.Single(metrics.Snapshot()).Bytes > 250);
+    }
+
+    [Fact]
+    public void Bytes_quota_triggers_rotation_below_peer_ack_watermark()
+    {
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 500, metrics: metrics);
+        const uint sid = 0x431u;
+        for (uint s = 1; s <= 4; s++) j.Append(sid, s, s, Frame(s, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 4);
+        j.Append(sid, 5, 5, Frame(5, extraBytes: 96));
+        j.Append(sid, 6, 6, Frame(6, extraBytes: 96));
+
+        Assert.Empty(j.ReadRange(sid, 1, 2));
+        Assert.Equal(new uint[] { 5, 6 }, j.ReadRange(sid, 5, 10).Select(e => e.Seq));
+        var snap = Assert.Single(metrics.Snapshot());
+        Assert.True(snap.RotationsBytes >= 1);
+    }
+
+    [Fact]
+    public void Age_quota_triggers_rotation_below_peer_ack_watermark()
+    {
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(segmentMaxBytes: 250,
+            maxRetention: TimeSpan.FromHours(1),
+            metrics: metrics);
+        const uint sid = 0x432u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 96));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 2);
+        j.Append(sid, 3, 8_000_000_000_000L, Frame(3, extraBytes: 96));
+
+        Assert.Empty(j.ReadRange(sid, 1, 2));
+        Assert.Equal(new uint[] { 3 }, j.ReadRange(sid, 3, 10).Select(e => e.Seq));
+        var snap = Assert.Single(metrics.Snapshot());
+        Assert.True(snap.RotationsAge >= 1);
+    }
+
+    [Fact]
+    public void Rotation_never_drops_entries_above_peer_confirmed_sequence()
+    {
+        using var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 500);
+        const uint sid = 0x433u;
+        for (uint s = 1; s <= 4; s++) j.Append(sid, s, s, Frame(s, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 2);
+        j.Append(sid, 5, 5, Frame(5, extraBytes: 96));
+        j.Append(sid, 6, 6, Frame(6, extraBytes: 96));
+
+        Assert.Equal(new uint[] { 3, 4, 5, 6 }, j.ReadRange(sid, 3, 10).Select(e => e.Seq));
+    }
+
+    [Fact]
+    public void Reconnect_after_rotation_serves_retained_sequence_range()
+    {
+        const uint sid = 0x434u;
+        using (var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 500))
+        {
+            for (uint s = 1; s <= 4; s++) j.Append(sid, s, s, Frame(s, extraBytes: 96));
+            j.ConfirmPeerAck(sid, 4);
+            j.Append(sid, 5, 5, Frame(5, extraBytes: 96));
+            j.Append(sid, 6, 6, Frame(6, extraBytes: 96));
+        }
+
+        using var reopened = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 500);
+        Assert.Equal(6u, reopened.MaxSeq(sid));
+        Assert.Equal(new uint[] { 5, 6 }, reopened.ReadRange(sid, 5, 10).Select(e => e.Seq));
     }
 
     [Fact]

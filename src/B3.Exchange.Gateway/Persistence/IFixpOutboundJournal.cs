@@ -79,6 +79,14 @@ public interface IFixpOutboundJournal : IDisposable
     void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame);
 
     /// <summary>
+    /// Records the highest outbound <c>MsgSeqNum</c> the peer has proven it
+    /// no longer needs for retransmit. Implementations may use this as the
+    /// safe lower bound for quota/retention pruning; they must never delete
+    /// entries above this watermark.
+    /// </summary>
+    void ConfirmPeerAck(uint sessionId, uint uptoSeq);
+
+    /// <summary>
     /// Returns up to <paramref name="count"/> consecutive entries
     /// from <paramref name="sessionId"/>'s journal starting at
     /// <paramref name="fromSeq"/> (inclusive). Returns an empty list

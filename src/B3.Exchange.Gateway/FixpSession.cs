@@ -418,6 +418,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             peekNextMsgSeqNum: PeekNextMsgSeqNum,
             applyTransition: ApplyTransition,
             getState: () => State,
+            confirmPeerAck: ack => _outboundJournal?.ConfirmPeerAck(SessionId, ack),
             logger: _logger,
             connectionId: ConnectionId);
         if (_options.ThrottleMaxMessages > 0 && _options.ThrottleTimeWindowMs > 0)

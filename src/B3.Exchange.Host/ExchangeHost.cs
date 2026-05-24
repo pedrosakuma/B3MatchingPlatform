@@ -485,9 +485,9 @@ public sealed class ExchangeHost : IAsyncDisposable
         // prior Negotiate/Establish — used by the synthetic trader and
         // pre-#42 integration tests until they learn the handshake.
         bool requireHandshake = _config.Auth.RequireFixpHandshake;
-        // Issue #405: optional FIXP session-resync persistence. When
-        // configured, every outbound business frame is appended to an
-        // unbounded per-session journal and the FIXP envelope state
+        // Issue #405/#431: optional FIXP session-resync persistence. When
+        // configured, every outbound business frame is appended to a
+        // quota/retention-managed per-session journal and the FIXP envelope state
         // (SessionVerId, LastIncomingSeqNo, OutboundMsgSeqNum) is
         // snapshotted on every Negotiate/Suspend/non-terminal Close.
         // On boot we load whatever state survived a crash + seed the
@@ -501,7 +501,10 @@ public sealed class ExchangeHost : IAsyncDisposable
         {
             _outboundJournal = new B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal(
                 _config.Tcp.RetransmitPersistenceDir!,
-                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal>());
+                _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal>(),
+                maxBytesPerSession: _config.Tcp.MaxJournalBytes,
+                maxRetention: TimeSpan.FromHours(_config.Tcp.MaxJournalRetentionHours),
+                metrics: _metrics.Journal);
             _statePersister = new B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister(
                 _config.Tcp.RetransmitPersistenceDir!,
                 _loggerFactory.CreateLogger<B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister>());

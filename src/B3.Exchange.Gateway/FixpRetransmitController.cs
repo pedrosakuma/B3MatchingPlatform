@@ -28,6 +28,7 @@ internal sealed class FixpRetransmitController
     private readonly Func<uint> _peekNextMsgSeqNum;
     private readonly Func<FixpEvent, FixpAction> _applyTransition;
     private readonly Func<FixpState> _getState;
+    private readonly Action<uint>? _confirmPeerAck;
     private readonly ILogger _logger;
     private readonly long _connectionId;
 
@@ -46,6 +47,7 @@ internal sealed class FixpRetransmitController
         Func<uint> peekNextMsgSeqNum,
         Func<FixpEvent, FixpAction> applyTransition,
         Func<FixpState> getState,
+        Action<uint>? confirmPeerAck,
         ILogger logger,
         long connectionId)
     {
@@ -58,6 +60,7 @@ internal sealed class FixpRetransmitController
         _peekNextMsgSeqNum = peekNextMsgSeqNum;
         _applyTransition = applyTransition;
         _getState = getState;
+        _confirmPeerAck = confirmPeerAck;
         _logger = logger;
         _connectionId = connectionId;
     }
@@ -163,6 +166,8 @@ internal sealed class FixpRetransmitController
                 EnqueueRetransmitReject(reqTimestamp, code);
                 return;
             }
+            if (fromSeq > 1)
+                _confirmPeerAck?.Invoke(fromSeq - 1);
 
             // Hold the outbound lock for the entire block so (a) no live
             // business frame interleaves on the wire and (b) the
