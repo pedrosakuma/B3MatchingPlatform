@@ -64,3 +64,8 @@ BenchmarkDotNet.Artifacts/
 
 # dotnet-trace / speedscope captures
 .profile/
+
+## Copilot CLI scratch / fleet build artifacts
+.copilot-temp/
+artifacts/verify/
+.copilot-worktrees/
