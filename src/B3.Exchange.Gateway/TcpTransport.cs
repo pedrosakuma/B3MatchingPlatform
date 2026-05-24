@@ -18,8 +18,8 @@ namespace B3.Exchange.Gateway;
 /// liveness watchdog without crossing a callback boundary on every
 /// frame.</para>
 ///
-/// <para>Backpressure: the send queue is bounded with
-/// <c>FullMode = DropWrite</c>. On overflow the transport closes the
+/// <para>Backpressure: the send queue is bounded and uses non-blocking
+/// <c>TryWrite</c> calls. On overflow the transport closes the
 /// connection rather than ballooning memory under a stuck peer; the
 /// session is notified via the <c>onClose</c> delegate.</para>
 /// </summary>
@@ -92,7 +92,7 @@ public sealed class TcpTransport : IAsyncDisposable
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite,
+            FullMode = BoundedChannelFullMode.Wait,
         });
         Volatile.Write(ref _lastOutboundTickMs, Environment.TickCount64);
     }
