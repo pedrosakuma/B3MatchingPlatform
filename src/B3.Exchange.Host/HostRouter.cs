@@ -125,7 +125,7 @@ public sealed class HostRouter : IInboundCommandSink
         bool allOk = true;
         foreach (var (disp, ids) in perChannel)
         {
-            if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd.EnteredAtNanos))
+            if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd))
                 allOk = false;
         }
         return allOk;

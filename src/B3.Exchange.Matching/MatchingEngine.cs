@@ -932,7 +932,7 @@ public sealed class MatchingEngine
             // rest cmd directly with cmd.PriceMantissa.
             if (phase == TradingPhase.Reserved || phase == TradingPhase.FinalClosingCall)
             {
-                RestForAuction(cmd, book);
+                RestForAuction(cmd, rules, book);
                 return;
             }
             ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose);
@@ -986,21 +986,18 @@ public sealed class MatchingEngine
     /// <c>OrderOwnership</c> map, so the engine sees only orderIds.
     /// </summary>
     public int MassCancel(IReadOnlyCollection<long> orderIds, ulong enteredAtNanos)
+        => MassCancel(orderIds, new MassCancelCommand(0, null, enteredAtNanos));
+
+    public int MassCancel(IReadOnlyCollection<long> orderIds, MassCancelCommand command)
     {
         ArgumentNullException.ThrowIfNull(orderIds);
+        ArgumentNullException.ThrowIfNull(command);
         if (orderIds.Count == 0) return 0;
         EnterDispatch();
         try
         {
-            // Single-pass resolution (round-2 perf #8): the previous
-            // implementation walked every (orderId × book) pair twice —
-            // once to bucket the (SecurityId, Side) summary counts and a
-            // second time to emit per-order cancels. We now resolve each
-            // orderId at most once, capture the (book, resting) pair in
-            // a reusable scratch list, and iterate it for both the
-            // grouped summary frames and the per-order cancels.
-            // Orders that no longer resolve are silently dropped,
-            // matching the prior behaviour.
+            // Single-pass resolution (round-2 perf #8): resolve each candidate
+            // once, then apply all MassAction filters before summary/cancel emit.
             var resolved = _massCancelResolved;
             resolved.Clear();
             Dictionary<(long securityId, Side side), int>? groups = null;
@@ -1010,6 +1007,8 @@ public sealed class MatchingEngine
                 {
                     if (book.TryGet(orderId, out var resting))
                     {
+                        if (!MatchesMassCancelFilter(book, resting, command))
+                            break;
                         resolved.Add((book, resting));
                         groups ??= new Dictionary<(long, Side), int>();
                         var key = (book.SecurityId, resting.Side);
@@ -1026,26 +1025,45 @@ public sealed class MatchingEngine
                         SecurityId: kv.Key.securityId,
                         Side: kv.Key.side,
                         CancelledCount: kv.Value,
-                        TransactTimeNanos: enteredAtNanos,
+                        TransactTimeNanos: command.EnteredAtNanos,
                         RptSeq: NextRptSeq()));
                 }
             }
 
             int cancelled = resolved.Count;
-            // Snapshot count BEFORE emitting because EmitCanceled mutates
-            // the underlying book; the scratch list itself is unchanged
-            // but we must not leave entries pointing at stale state if a
-            // sink throws partway through.
             for (int i = 0; i < resolved.Count; i++)
             {
                 var (book, resting) = resolved[i];
-                EmitCanceled(book, resting, enteredAtNanos, CancelReason.MassCancel);
+                EmitCanceled(book, resting, command.EnteredAtNanos, CancelReason.MassCancel);
             }
             resolved.Clear();
             return cancelled;
         }
         finally { ExitDispatch(); }
     }
+
+    private static bool MatchesMassCancelFilter(LimitOrderBook book, RestingOrder resting, MassCancelCommand command)
+    {
+        if (command.SecurityId != 0 && book.SecurityId != command.SecurityId) return false;
+        if (command.SideFilter.HasValue && resting.Side != command.SideFilter.Value) return false;
+        if (command.OrdTagIdFilter != 0 && resting.OrdTagId != command.OrdTagIdFilter) return false;
+        if (command.AssetFilter is { Length: > 0 } asset
+            && !string.Equals(resting.Asset, asset, StringComparison.Ordinal)) return false;
+        if (command.InvestorIdFilter.HasValue && resting.InvestorId != command.InvestorIdFilter) return false;
+        return true;
+    }
+
+    private static string DeriveAsset(string symbol)
+    {
+        int len = 0;
+        while (len < symbol.Length && len < 6 && char.IsLetter(symbol[len]))
+            len++;
+        if (len == 0) len = Math.Min(symbol.Length, 6);
+        return symbol[..len].ToUpperInvariant();
+    }
+
+    private static string OrderAsset(NewOrderCommand cmd, InstrumentTradingRules rules)
+        => string.IsNullOrWhiteSpace(cmd.Asset) ? DeriveAsset(rules.Instrument.Symbol) : cmd.Asset.Trim().ToUpperInvariant();
 
     public void Replace(ReplaceOrderCommand cmd)
     {
@@ -1167,7 +1185,13 @@ public sealed class MatchingEngine
                 PriceMantissa: effectiveType == OrderType.Market ? 0L : cmd.NewPriceMantissa,
                 Quantity: cmd.NewQuantity,
                 EnteringFirm: resting.EnteringFirm,
-                EnteredAtNanos: cmd.EnteredAtNanos);
+                EnteredAtNanos: cmd.EnteredAtNanos)
+            {
+                MaxFloor = resting.MaxFloor > 0 ? (ulong)resting.MaxFloor : 0UL,
+                OrdTagId = resting.OrdTagId,
+                Asset = resting.Asset,
+                InvestorId = resting.InvestorId,
+            };
 
             // Issue #228 / #229 (Onda M): in auction phases the replacement
             // must rest like a fresh accumulation order, not aggress. The
@@ -1175,7 +1199,7 @@ public sealed class MatchingEngine
             // AtClose (FinalClosingCall), both Limit-only.
             if (phase == TradingPhase.Reserved || phase == TradingPhase.FinalClosingCall)
             {
-                RestForAuction(replacement, book);
+                RestForAuction(replacement, rules, book);
                 return;
             }
             ExecuteAggressor(replacement, rules, book, emitUnmatchedIocClose: false);
@@ -1198,7 +1222,7 @@ public sealed class MatchingEngine
     /// (<see cref="NewOrderCommand.MaxFloor"/>) is honored so the visible
     /// slice on the book matches the continuous-Open semantics from #211.
     /// </summary>
-    private void RestForAuction(NewOrderCommand cmd, LimitOrderBook book)
+    private void RestForAuction(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
     {
         long visible = cmd.Quantity;
         long hidden = 0;
@@ -1214,6 +1238,9 @@ public sealed class MatchingEngine
             Side = cmd.Side,
             PriceMantissa = cmd.PriceMantissa,
             EnteringFirm = cmd.EnteringFirm,
+            OrdTagId = cmd.OrdTagId,
+            Asset = OrderAsset(cmd, rules),
+            InvestorId = cmd.InvestorId,
             InsertTimestampNanos = cmd.EnteredAtNanos,
             RemainingQuantity = visible,
             Tif = cmd.Tif,
@@ -1664,6 +1691,9 @@ public sealed class MatchingEngine
                 Side = cmd.Side,
                 PriceMantissa = limitPx,
                 EnteringFirm = cmd.EnteringFirm,
+                OrdTagId = cmd.OrdTagId,
+                Asset = OrderAsset(cmd, rules),
+                InvestorId = cmd.InvestorId,
                 InsertTimestampNanos = cmd.EnteredAtNanos,
                 RemainingQuantity = visible,
                 Tif = cmd.Tif,
