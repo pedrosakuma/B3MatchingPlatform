@@ -71,16 +71,19 @@ public class WalAsyncSnapshotTruncateRaceTests
     private sealed class BlockingPersister : IChannelStatePersister
     {
         private readonly SemaphoreSlim _gate = new(0, int.MaxValue);
-        public int SaveCount { get; private set; }
-        public int SaveEnteredCount;
-        public ChannelStateSnapshot? Last { get; private set; }
+        private readonly TaskCompletionSource _firstSaveEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _saveEnteredCount;
+
+        public Task FirstSaveEntered => _firstSaveEntered.Task;
         public ChannelStateSnapshot? TryLoad(byte channelNumber) => null;
         public long Save(ChannelStateSnapshot snapshot)
         {
-            Interlocked.Increment(ref SaveEnteredCount);
+            if (Interlocked.Increment(ref _saveEnteredCount) == 1)
+            {
+                _firstSaveEntered.TrySetResult();
+            }
             _gate.Wait();
-            SaveCount++;
-            Last = snapshot;
             return 0;
         }
         public void ReleaseOne() => _gate.Release();
@@ -104,11 +107,18 @@ public class WalAsyncSnapshotTruncateRaceTests
         return condition();
     }
 
+    private static async Task<bool> WaitForTaskAsync(Task task, TimeSpan timeout)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false);
+        return completed == task;
+    }
+
     [Fact]
     public async Task AsyncSnapshotSaved_PrefixTruncatesWal_KeepsRecordsBeyondSnapshotSeq()
     {
         using var dir = new TempDir();
         var blocking = new BlockingPersister();
+        var metrics = new ChannelMetrics(84);
         var wal = new FileChannelWriteAheadLog(dir.Path, channelNumber: 84,
             NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false);
         var disp = new ChannelDispatcher(
@@ -119,6 +129,7 @@ public class WalAsyncSnapshotTruncateRaceTests
                 PacketSink = new NoOpPacketSink(),
                 Outbound = new NoOpOutbound(),
                 Logger = NullLogger<ChannelDispatcher>.Instance,
+                Metrics = metrics,
                 Persister = blocking,
                 SnapshotThrottle = null,
                 UseAsyncSnapshotWriter = true,
@@ -136,9 +147,7 @@ public class WalAsyncSnapshotTruncateRaceTests
         Assert.True(EnqueueOrder(disp, session, "CL-1", 0x1, 1UL));
         probe.DrainInbound();
         Assert.Single(wal.ReadAll());
-        Assert.True(await WaitForAsync(
-            () => Volatile.Read(ref blocking.SaveEnteredCount) >= 1,
-            TimeSpan.FromSeconds(5)),
+        Assert.True(await WaitForTaskAsync(blocking.FirstSaveEntered, TimeSpan.FromSeconds(5)),
             "writer thread never entered Save(snap@1) — async writer may not be running");
 
         // Cmd 2 → WAL seq=2 appended while the writer is parked inside
@@ -156,16 +165,13 @@ public class WalAsyncSnapshotTruncateRaceTests
         // release a second time), giving us a stable window to assert
         // the WAL state after the first prefix truncate.
         blocking.ReleaseOne();
-
         // Pre-fix (full Truncate): WAL ends up empty → seq=2 is lost.
         // Post-fix (TruncateThrough): seq=2 survives.
-        Assert.True(await WaitForAsync(() => blocking.SaveCount >= 1, TimeSpan.FromSeconds(2)));
-        Assert.True(await WaitForAsync(() =>
-        {
-            var recs = wal.ReadAll();
-            return recs.Count == 1 && recs[0].Seq == 2;
-        }, TimeSpan.FromSeconds(2)),
-            $"expected WAL to contain only seq=2 after prefix truncate, got [{string.Join(",", wal.ReadAll().Select(r => r.Seq))}]");
+        Assert.True(await WaitForAsync(() => metrics.WalTruncations >= 1,
+            TimeSpan.FromSeconds(2)), "async snapshot writer did not truncate WAL before timeout");
+        var kept = wal.ReadAll();
+        Assert.True(kept.Count == 1 && kept[0].Seq == 2,
+            $"expected WAL to contain only seq=2 after prefix truncate, got [{string.Join(",", kept.Select(r => r.Seq))}]");
 
         // Drain the writer cleanly before disposing.
         blocking.ReleaseOne();

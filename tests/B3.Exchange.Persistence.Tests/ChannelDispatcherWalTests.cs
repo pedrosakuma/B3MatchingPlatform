@@ -55,14 +55,24 @@ public class ChannelDispatcherWalTests
 
     private sealed class InMemoryPersister : IChannelStatePersister
     {
+        private int _saveCount;
+
         public Dictionary<byte, ChannelStateSnapshot> Last { get; } = new();
-        public int SaveCount { get; private set; }
+        public int SaveCount => Volatile.Read(ref _saveCount);
         public ChannelStateSnapshot? TryLoad(byte n)
-            => Last.TryGetValue(n, out var s) ? s : null;
+        {
+            lock (Last)
+            {
+                return Last.TryGetValue(n, out var s) ? s : null;
+            }
+        }
         public long Save(ChannelStateSnapshot s)
         {
-            SaveCount++;
-            Last[s.ChannelNumber] = s;
+            Interlocked.Increment(ref _saveCount);
+            lock (Last)
+            {
+                Last[s.ChannelNumber] = s;
+            }
             return 1;
         }
     }
@@ -118,6 +128,17 @@ public class ChannelDispatcherWalTests
             new NewOrderCommand(clOrdId, Sec, Side.Buy, OrderType.Limit,
                 TimeInForce.Day, Px(10.00m), 100, 100, nanos),
             session, enteringFirm: 700, clOrdIdValue: clOrdIdValue);
+
+    private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition()) return true;
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+        return condition();
+    }
 
     [Fact]
     public void FileWal_Append_ReadAll_RoundTrip()
@@ -236,13 +257,10 @@ public class ChannelDispatcherWalTests
         var dispB = BuildDispatcher(persister, wal2, out var sinkB, out var outB,
             metrics: metricsB, throttle: throttle);
         // Drive RunLoopAsync's initial LoadPersistedStateOnLoopThread by
-        // starting the dispatcher. Use Start + a brief settle window.
+        // starting the dispatcher and waiting for the replayed registry state.
         dispB.Start();
-        // Wait until the loop has applied the replay (looking at
-        // OrderRegistryCount).
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (dispB.OrderRegistryCount < 3 && DateTime.UtcNow < deadline)
-            Thread.Sleep(20);
+        Assert.True(await WaitForAsync(() => dispB.OrderRegistryCount >= 3,
+            TimeSpan.FromSeconds(5)), "dispatcher did not replay WAL tail before timeout");
 
         Assert.Equal(3, dispB.OrderRegistryCount);
         // Replay must NOT publish on the wire or send ERs.
@@ -286,12 +304,11 @@ public class ChannelDispatcherWalTests
         Assert.True(EnqueueOrder(disp, session, "CL-1", 0x1, 1UL));
         probe.DrainInbound();
 
-        // Async writer is on a background thread; allow it a brief
-        // window to drain + truncate.
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while ((persister.SaveCount == 0 || metrics.WalTruncations == 0)
-            && DateTime.UtcNow < deadline)
-            Thread.Sleep(20);
+        // Async writer is on a background thread; wait until it has
+        // drained and truncated instead of sleeping a fixed interval.
+        Assert.True(await WaitForAsync(
+            () => persister.SaveCount >= 1 && metrics.WalTruncations >= 1,
+            TimeSpan.FromSeconds(5)), "async snapshot writer did not save and truncate before timeout");
 
         Assert.True(persister.SaveCount >= 1);
         Assert.True(metrics.WalTruncations >= 1);
@@ -350,9 +367,8 @@ public class ChannelDispatcherWalTests
             metrics: metricsB);
         dispB.Start();
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (dispB.IsWalHealthy && DateTime.UtcNow < deadline)
-            Thread.Sleep(20);
+        Assert.True(await WaitForAsync(() => !dispB.IsWalHealthy,
+            TimeSpan.FromSeconds(5)), "dispatcher did not halt on the snapshot/WAL boundary gap before timeout");
 
         Assert.False(dispB.IsWalHealthy);
         // Engine must remain at the snapshot baseline (2 resting orders);
