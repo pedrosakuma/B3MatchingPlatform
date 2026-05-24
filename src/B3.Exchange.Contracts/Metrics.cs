@@ -106,3 +106,59 @@ public sealed class RetransmitMetrics
     public void IncBufferEvictions() => Interlocked.Increment(ref _bufferEvictions);
     public void IncPassiveErBuffered() => Interlocked.Increment(ref _passiveErBuffered);
 }
+
+/// <summary>
+/// Process-wide gauges/counters for the durable FIXP outbound retransmit
+/// journal. Lives in Contracts so Gateway can update it without referencing
+/// Core.
+/// </summary>
+public sealed class FixpJournalMetrics
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SessionJournalMetrics> _sessions = new();
+
+    public void Observe(uint sessionId, long bytes, long oldestAgeSeconds)
+    {
+        var s = Get(sessionId);
+        Interlocked.Exchange(ref s.Bytes, bytes);
+        Interlocked.Exchange(ref s.OldestAgeSeconds, oldestAgeSeconds);
+    }
+
+    public void IncRotation(uint sessionId, string reason)
+    {
+        var s = Get(sessionId);
+        if (string.Equals(reason, "bytes", StringComparison.Ordinal))
+            Interlocked.Increment(ref s.RotationsBytes);
+        else if (string.Equals(reason, "age", StringComparison.Ordinal))
+            Interlocked.Increment(ref s.RotationsAge);
+    }
+
+    public IReadOnlyList<FixpJournalMetricsSnapshot> Snapshot()
+        => _sessions
+            .Select(kv => new FixpJournalMetricsSnapshot(
+                kv.Key,
+                Interlocked.Read(ref kv.Value.Bytes),
+                Interlocked.Read(ref kv.Value.OldestAgeSeconds),
+                Interlocked.Read(ref kv.Value.RotationsBytes),
+                Interlocked.Read(ref kv.Value.RotationsAge)))
+            .OrderBy(s => s.Session, StringComparer.Ordinal)
+            .ToArray();
+
+    private SessionJournalMetrics Get(uint sessionId)
+        => _sessions.GetOrAdd("0x" + sessionId.ToString("x8", System.Globalization.CultureInfo.InvariantCulture),
+            static _ => new SessionJournalMetrics());
+
+    private sealed class SessionJournalMetrics
+    {
+        public long Bytes;
+        public long OldestAgeSeconds;
+        public long RotationsBytes;
+        public long RotationsAge;
+    }
+}
+
+public readonly record struct FixpJournalMetricsSnapshot(
+    string Session,
+    long Bytes,
+    long OldestAgeSeconds,
+    long RotationsBytes,
+    long RotationsAge);

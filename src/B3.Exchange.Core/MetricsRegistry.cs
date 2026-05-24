@@ -403,11 +403,13 @@ public sealed class MetricsRegistry
     private readonly ThrottleMetrics _throttle = new();
     private readonly TransportMetrics _transport = new();
     private readonly RetransmitMetrics _retransmit = new();
+    private readonly FixpJournalMetrics _journal = new();
     private readonly BoundedSessionFirmCounters _sessionFirmMessages = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
     public ThrottleMetrics Throttle => _throttle;
     public TransportMetrics Transport => _transport;
+    public FixpJournalMetrics Journal => _journal;
 
     /// <summary>
     /// Issue #288: process-wide RetransmitBuffer counters
@@ -665,6 +667,8 @@ public sealed class MetricsRegistry
             }
         }
 
+        EmitFixpJournalMetrics(sb);
+
         // Issue #173: latency histograms. Per-channel buckets in seconds;
         // observed via Stopwatch.GetTimestamp() at the dispatcher
         // boundaries (decode→enqueue, enqueue→pickup, engine entry→exit,
@@ -819,6 +823,50 @@ public sealed class MetricsRegistry
               .Append(EscapeLabel(trigger))
               .Append("\"} ")
               .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+    }
+
+    private void EmitFixpJournalMetrics(StringBuilder sb)
+    {
+        var snap = _journal.Snapshot();
+        if (snap.Count == 0) return;
+
+        sb.Append("# HELP fixp_journal_bytes Current on-disk FIXP outbound retransmit journal bytes per session.\n");
+        sb.Append("# TYPE fixp_journal_bytes gauge\n");
+        foreach (var s in snap)
+        {
+            sb.Append("fixp_journal_bytes{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\"} ")
+              .Append(s.Bytes.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+
+        sb.Append("# HELP fixp_journal_oldest_age_seconds Age in seconds of the oldest retained FIXP outbound retransmit journal entry per session.\n");
+        sb.Append("# TYPE fixp_journal_oldest_age_seconds gauge\n");
+        foreach (var s in snap)
+        {
+            sb.Append("fixp_journal_oldest_age_seconds{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\"} ")
+              .Append(s.OldestAgeSeconds.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+
+        sb.Append("# HELP fixp_journal_rotation_total Total FIXP retransmit journal segment rotations by trigger reason.\n");
+        sb.Append("# TYPE fixp_journal_rotation_total counter\n");
+        foreach (var s in snap)
+        {
+            sb.Append("fixp_journal_rotation_total{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\",reason=\"bytes\"} ")
+              .Append(s.RotationsBytes.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+            sb.Append("fixp_journal_rotation_total{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\",reason=\"age\"} ")
+              .Append(s.RotationsAge.ToString(CultureInfo.InvariantCulture))
               .Append('\n');
         }
     }

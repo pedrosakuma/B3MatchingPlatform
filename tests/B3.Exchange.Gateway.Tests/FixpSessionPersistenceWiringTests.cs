@@ -58,6 +58,7 @@ public sealed class FixpSessionPersistenceWiringTests
             }
             return list;
         }
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
         public void PruneUpTo(uint sessionId, uint uptoSeq) { }
         public uint MaxSeq(uint sessionId)
             => _data.TryGetValue(sessionId, out var s) && s.Count > 0 ? s.Keys.Max() : 0u;

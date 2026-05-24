@@ -448,6 +448,22 @@ public class MetricsRegistryTests
         Assert.DoesNotContain("session=\"conn-2\"", text.Substring(text.IndexOf("exch_fixp_retransmit_buffer_utilization", StringComparison.Ordinal)));
     }
 
+    [Fact]
+    public void Issue431_FixpJournalMetrics_RenderGaugesAndRotationCounters()
+    {
+        var reg = new MetricsRegistry();
+        reg.Journal.Observe(0x431u, bytes: 1234, oldestAgeSeconds: 3600);
+        reg.Journal.IncRotation(0x431u, "bytes");
+        reg.Journal.IncRotation(0x431u, "age");
+
+        var text = reg.RenderProm();
+
+        Assert.Contains("fixp_journal_bytes{session=\"0x00000431\"} 1234\n", text);
+        Assert.Contains("fixp_journal_oldest_age_seconds{session=\"0x00000431\"} 3600\n", text);
+        Assert.Contains("fixp_journal_rotation_total{session=\"0x00000431\",reason=\"bytes\"} 1\n", text);
+        Assert.Contains("fixp_journal_rotation_total{session=\"0x00000431\",reason=\"age\"} 1\n", text);
+    }
+
     private sealed class CapturingSink : IUmdfPacketSink
     {
         public int PublishCount;

@@ -103,7 +103,7 @@ public sealed class TcpConfig
     /// <summary>
     /// Issue #405: per-FIXP-session resync persistence directory.
     /// When non-empty, two artifacts are written under this directory:
-    /// (a) an unbounded append-only journal of every outbound business
+    /// (a) an append-only journal of every outbound business
     /// frame at <c>{dir}/journal/session-{sessionId:x8}/segment-*.log</c>,
     /// and (b) a periodically-rewritten envelope-state snapshot
     /// (SessionVerId, LastIncomingSeqNo, outbound MsgSeqNum, CoD
@@ -121,6 +121,21 @@ public sealed class TcpConfig
     /// back-compat; semantics widened by #405.
     /// </summary>
     [JsonPropertyName("retransmitPersistenceDir")] public string? RetransmitPersistenceDir { get; set; }
+
+    /// <summary>
+    /// Maximum on-disk bytes retained per FIXP retransmit journal session.
+    /// Default 256 MiB. When exceeded, only segments at or below the last
+    /// peer-confirmed ACK watermark may be deleted; otherwise the journal is
+    /// allowed to grow and metrics/logs alert the operator.
+    /// </summary>
+    [JsonPropertyName("maxJournalBytes")] public long MaxJournalBytes { get; set; } = 256L * 1024L * 1024L;
+
+    /// <summary>
+    /// Maximum age, in hours, of the oldest retained FIXP retransmit journal
+    /// entry. Default 24h. Rotation is conservative and never deletes entries
+    /// the peer may need on reconnect.
+    /// </summary>
+    [JsonPropertyName("maxJournalRetentionHours")] public double MaxJournalRetentionHours { get; set; } = 24.0;
 }
 
 /// <summary>
