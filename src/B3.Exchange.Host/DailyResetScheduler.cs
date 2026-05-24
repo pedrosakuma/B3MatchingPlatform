@@ -1,4 +1,5 @@
 using System.Globalization;
+using B3.Exchange.Gateway;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Host;
@@ -19,13 +20,21 @@ public sealed class DailyResetScheduler : IAsyncDisposable
 {
     private readonly TimeSpan _localTime;
     private readonly TimeZoneInfo _timezone;
-    private readonly Action _action;
+    private readonly Action<CloseKind> _action;
     private readonly ILogger<DailyResetScheduler> _logger;
     private readonly Func<DateTimeOffset>? _utcNowOverride;
     private Timer? _timer;
     private int _disposed;
 
     public DailyResetScheduler(string schedule, string timezone, Action action,
+        ILogger<DailyResetScheduler> logger,
+        Func<DateTimeOffset>? utcNowOverride = null)
+        : this(schedule, timezone, _ => action(), logger, utcNowOverride)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+    }
+
+    public DailyResetScheduler(string schedule, string timezone, Action<CloseKind> action,
         ILogger<DailyResetScheduler> logger,
         Func<DateTimeOffset>? utcNowOverride = null)
     {
@@ -60,7 +69,7 @@ public sealed class DailyResetScheduler : IAsyncDisposable
     /// NOT shift the next scheduled firing.</summary>
     public void Trigger()
     {
-        try { _action(); }
+        try { _action(CloseKind.DailyReset); }
         catch (Exception ex)
         {
             _logger.LogError(ex, "daily-reset action threw on manual trigger");
@@ -74,7 +83,7 @@ public sealed class DailyResetScheduler : IAsyncDisposable
         try
         {
             _logger.LogInformation("daily-reset firing (scheduled)");
-            _action();
+            _action(CloseKind.DailyReset);
         }
         catch (Exception ex)
         {

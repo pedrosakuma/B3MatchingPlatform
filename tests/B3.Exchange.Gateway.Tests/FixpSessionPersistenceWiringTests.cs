@@ -246,6 +246,34 @@ public sealed class FixpSessionPersistenceWiringTests
     }
 
     [Fact]
+    public async Task DailyReset_close_removes_journal_and_state()
+    {
+        var (listener, serverSide, client) = await ConnectPairAsync();
+        try
+        {
+            var journal = new FakeJournal();
+            var state = new FakeStatePersister();
+            var session = new FixpSession(
+                connectionId: 1, enteringFirm: 1, sessionId: 88,
+                stream: serverSide,
+                sink: new NoOpEngineSink(),
+                logger: NullLogger<FixpSession>.Instance,
+                outboundJournal: journal,
+                statePersister: state);
+
+            session.Close("daily reset", CloseKind.DailyReset);
+
+            Assert.Equal(1, journal.RemoveCalls);
+            Assert.Equal(1, state.RemoveCalls);
+        }
+        finally
+        {
+            client.Close();
+            listener.Stop();
+        }
+    }
+
+    [Fact]
     public async Task HostShutdown_close_preserves_journal_and_saves_final_snapshot()
     {
         var (listener, serverSide, client) = await ConnectPairAsync();

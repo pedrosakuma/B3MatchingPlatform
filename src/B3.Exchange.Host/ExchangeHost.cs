@@ -79,10 +79,10 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// or -1 if the host has not finished <see cref="StartAsync"/>.
     /// Safe to call from any thread.
     /// </summary>
-    public int TriggerDailyReset(string reason = "operator-trigger")
+    public int TriggerDailyReset(string reason = "operator-trigger", CloseKind closeKind = CloseKind.DailyReset)
     {
         var listener = _listener;
-        int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason);
+        int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason, closeKind);
         // Issue #330 PR-3 (review BLOCKING): drain per-channel inbound
         // queues before reading yesterday's audit log. TerminateAllSessions
         // only closes live FIXP transports; commands already decoded and
@@ -600,7 +600,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 // through TriggerDailyReset so the listener-terminate +
                 // EOD-export chaining (#330 PR-3) is identical for
                 // automated and manual rollovers.
-                action: () => TriggerDailyReset("daily-reset"),
+                action: kind => TriggerDailyReset("daily-reset", kind),
                 logger: _loggerFactory.CreateLogger<DailyResetScheduler>());
             _dailyReset.Start();
         }
