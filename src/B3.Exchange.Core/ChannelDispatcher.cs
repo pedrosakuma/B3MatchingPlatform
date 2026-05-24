@@ -131,6 +131,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly ushort _tradeDate;
     private readonly ChannelMetrics? _metrics;
     private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
+    private readonly OpenOrderMetrics? _openOrderMetrics;
+    private readonly int _maxOpenOrdersPerFirm;
+    private readonly Dictionary<uint, int> _openOrdersByFirm = new();
     private readonly OrderRegistry _orders = new();
     /// <summary>Issue #216 (Onda L · L3a): per-channel UMDF retransmit
     /// ring. Populated on each <c>FlushPacket</c> for the incremental
@@ -388,6 +391,10 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _tradeDate = options.TradeDate;
         _metrics = options.Metrics;
         _sessionFirmCounters = options.SessionFirmCounters;
+        _openOrderMetrics = options.OpenOrders;
+        _maxOpenOrdersPerFirm = options.MaxOpenOrdersPerFirm;
+        if (_maxOpenOrdersPerFirm < 1)
+            throw new ArgumentOutOfRangeException(nameof(options.MaxOpenOrdersPerFirm), "max open orders per firm must be at least 1");
         _retxBuffer = options.RetxBuffer;
         _persister = options.Persister;
         _wal = options.Wal;

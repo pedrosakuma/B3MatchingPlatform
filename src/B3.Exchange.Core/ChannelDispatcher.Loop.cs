@@ -145,6 +145,7 @@ public sealed partial class ChannelDispatcher
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
+        bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
         // observes it. Only New/Cancel/Replace are durable today;
         // operator commands force-snapshot post-flush so the
@@ -155,6 +156,18 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
+        if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
+        {
+            _metrics?.IncOrdersIn();
+            EmitOpenOrderLimitReject(item.NewOrder!);
+            return;
+        }
+        if (item.Kind == WorkKind.Cross && WouldExceedOpenOrderLimit(item.Firm, requiredSlots: 2))
+        {
+            _metrics?.IncOrdersIn();
+            EmitOpenOrderLimitReject(item.Cross!);
+            return;
+        }
         if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
         {
             if (!WalAppendIfEnabled(in item))
@@ -163,7 +176,6 @@ public sealed partial class ChannelDispatcher
                 return;
             }
         }
-        bool succeeded = false;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -471,5 +483,31 @@ public sealed partial class ChannelDispatcher
                 _currentClOrdId, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
         }
+    }
+
+    private bool WouldExceedOpenOrderLimit(uint enteringFirm, int requiredSlots = 1)
+    {
+        int current = _openOrdersByFirm.TryGetValue(enteringFirm, out int count) ? count : 0;
+        return current + requiredSlots > _maxOpenOrdersPerFirm;
+    }
+
+    private void EmitOpenOrderLimitReject(NewOrderCommand order)
+    {
+        if (!_hasCurrentSession) return;
+        _outbound.WriteExecutionReportReject(_currentSession,
+            new RejectEvent(order.ClOrdId, order.SecurityId, 0,
+                RejectReason.OrderExceedsLimit, order.EnteredAtNanos, order.Memo),
+            _currentClOrdId, CurrentDurability);
+        _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
+    }
+
+    private void EmitOpenOrderLimitReject(CrossOrderCommand cross)
+    {
+        if (!_hasCurrentSession) return;
+
+        _currentClOrdId = cross.BuyClOrdIdValue;
+        EmitOpenOrderLimitReject(cross.Buy);
+        _currentClOrdId = cross.SellClOrdIdValue;
+        EmitOpenOrderLimitReject(cross.Sell);
     }
 }

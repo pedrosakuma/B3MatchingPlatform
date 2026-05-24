@@ -416,6 +416,27 @@ public readonly record struct SessionDiagnostics(
 /// </summary>
 public readonly record struct FirmInfo(string Id, string Name, uint EnteringFirmCode);
 
+public sealed class OpenOrderMetrics
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(byte Channel, uint Firm), long> _byFirmChannel = new();
+
+    public void Set(byte channelNumber, uint firm, long count)
+        => _byFirmChannel[(channelNumber, firm)] = Math.Max(0, count);
+
+    public SortedDictionary<uint, long> TotalsByFirm()
+    {
+        var totals = new SortedDictionary<uint, long>();
+        foreach (var kv in _byFirmChannel)
+        {
+            uint firm = kv.Key.Firm;
+            totals[firm] = totals.TryGetValue(firm, out long current)
+                ? current + kv.Value
+                : kv.Value;
+        }
+        return totals;
+    }
+}
+
 /// <summary>
 /// Central registry of channel metrics + a Prometheus text-format
 /// renderer. Hand-rolled to avoid taking a dependency on
@@ -432,6 +453,7 @@ public sealed class MetricsRegistry
     private readonly RetransmitMetrics _retransmit = new();
     private readonly FixpJournalMetrics _journal = new();
     private readonly BoundedSessionFirmCounters _sessionFirmMessages = new();
+    private readonly OpenOrderMetrics _openOrders = new();
 
     public SessionLifecycleMetrics Sessions => _sessionLifecycle;
     public ThrottleMetrics Throttle => _throttle;
@@ -464,6 +486,7 @@ public sealed class MetricsRegistry
     /// <c>"_other"</c> overflow series when the cap is exceeded.
     /// </summary>
     public BoundedSessionFirmCounters SessionFirmMessages => _sessionFirmMessages;
+    public OpenOrderMetrics OpenOrders => _openOrders;
 
     public ChannelMetrics RegisterChannel(byte channelNumber)
     {
@@ -829,6 +852,8 @@ public sealed class MetricsRegistry
 
         EmitSessionFirmCounters(sb);
 
+        EmitOpenOrdersPerFirm(sb);
+
         EmitPhaseTransitions(sb);
 
         EmitHaltMetrics(sb);
@@ -1017,6 +1042,20 @@ public sealed class MetricsRegistry
         {
             sb.Append("rate_limited_total{session=\"")
               .Append(EscapeLabel(kv.Key))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+    }
+
+    private void EmitOpenOrdersPerFirm(StringBuilder sb)
+    {
+        sb.Append("# HELP open_orders_per_firm Current resting open orders per entering firm across all channels (issue #430 pre-trade risk cap).\n");
+        sb.Append("# TYPE open_orders_per_firm gauge\n");
+        foreach (var kv in _openOrders.TotalsByFirm())
+        {
+            sb.Append("open_orders_per_firm{firm=\"")
+              .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
               .Append("\"} ")
               .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
               .Append('\n');

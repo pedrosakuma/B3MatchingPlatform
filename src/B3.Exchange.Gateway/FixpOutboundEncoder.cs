@@ -295,7 +295,7 @@ internal sealed class FixpOutboundEncoder
     /// codes used:
     ///   0  = Broker / exchange option (generic / no closer match)
     ///   1  = Unknown symbol
-    ///   3  = Order exceeds limit (used here for price-band / tick / non-positive price)
+    ///   3  = Order exceeds limit (price-band / tick / non-positive price / risk caps)
     ///   5  = Unknown order
     ///   11 = Unsupported order characteristic (used for invalid quantity and
     ///        Market/IOC-only constraints not satisfied by the inbound order)
@@ -313,6 +313,7 @@ internal sealed class FixpOutboundEncoder
         RejectReason.PriceOutOfBand => 3u,
         RejectReason.PriceNotOnTick => 3u,
         RejectReason.PriceNonPositive => 3u,
+        RejectReason.OrderExceedsLimit => 3u,
         RejectReason.QuantityNonPositive => 11u,
         RejectReason.QuantityNotMultipleOfLot => 11u,
         RejectReason.MarketNotImmediateOrCancel => 11u,

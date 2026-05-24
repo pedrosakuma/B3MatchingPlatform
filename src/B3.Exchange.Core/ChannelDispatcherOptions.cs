@@ -27,6 +27,8 @@ public sealed record ChannelDispatcherOptions
     public int InboundCapacity { get; init; } = ChannelDispatcher.DefaultInboundCapacity;
     public ChannelMetrics? Metrics { get; init; }
     public BoundedSessionFirmCounters? SessionFirmCounters { get; init; }
+    public OpenOrderMetrics? OpenOrders { get; init; }
+    public int MaxOpenOrdersPerFirm { get; init; } = 100_000;
     public UmdfPacketRetransmitBuffer? RetxBuffer { get; init; }
     public IChannelStatePersister? Persister { get; init; }
     public SnapshotThrottlePolicy? SnapshotThrottle { get; init; }

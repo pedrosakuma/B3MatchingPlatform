@@ -322,6 +322,8 @@ public sealed class ExchangeHost : IAsyncDisposable
                     Logger = _loggerFactory.CreateLogger<ChannelDispatcher>(),
                     Metrics = channelMetrics,
                     SessionFirmCounters = _metrics.SessionFirmMessages,
+                    OpenOrders = _metrics.OpenOrders,
+                    MaxOpenOrdersPerFirm = _config.MaxOpenOrdersPerFirm,
                     RetxBuffer = retxBuffer,
                     Persister = persister,
                     SnapshotThrottle = ch.Persistence?.Throttle?.ToPolicy(),
