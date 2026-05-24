@@ -18,6 +18,7 @@
     <ProjectReference Include="..\..\src\B3.Exchange.Instruments\B3.Exchange.Instruments.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Matching\B3.Exchange.Matching.csproj" />
     <ProjectReference Include="..\..\src\B3.Exchange.Persistence\B3.Exchange.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\B3.Exchange.PostTrade\B3.Exchange.PostTrade.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -47,6 +47,13 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.ShutdownBarrier)
+        {
+            FlushPendingSnapshotOnShutdownSafely();
+            item.ShutdownBarrier!.TrySetResult(true);
+            return;
+        }
+
         // Issue #286 follow-up: producer-side gates (RejectIfWalHalted)
         // catch most halts, but a work item already in the channel when
         // the WAL flips to halted would still reach here and mutate the

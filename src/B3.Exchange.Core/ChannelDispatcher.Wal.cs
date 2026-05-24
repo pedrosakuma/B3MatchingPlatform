@@ -279,17 +279,16 @@ public sealed partial class ChannelDispatcher
         var item = new WorkItem(WorkKind.AuditCheckpoint, default, 0, false,
             0, 0, null, null, null, null, AuditCheckpoint: request);
 
-        if (!_inbound.Writer.TryWrite(item))
-        {
-            _metrics?.IncAuditWalTruncateDeferred();
-            _logger.LogWarning(
-                "channel {ChannelNumber}: audit checkpoint enqueue failed; WAL truncation deferred (snapshotSeq={SnapshotSeq})",
-                ChannelNumber, snapshotLastAppliedSeq);
-            return false;
-        }
-
         try
         {
+            if (!_inbound.Writer.TryWrite(item))
+            {
+                var writeTask = _inbound.Writer.WriteAsync(item).AsTask();
+                if (!writeTask.Wait(TimeSpan.FromSeconds(30)))
+                    throw new TimeoutException("timed out waiting to enqueue dispatch-thread audit checkpoint prepare");
+                writeTask.GetAwaiter().GetResult();
+            }
+
             if (!prepared.Task.Wait(TimeSpan.FromSeconds(30)))
                 throw new TimeoutException("timed out waiting for dispatch-thread audit checkpoint prepare");
             using var checkpoint = prepared.Task.GetAwaiter().GetResult();

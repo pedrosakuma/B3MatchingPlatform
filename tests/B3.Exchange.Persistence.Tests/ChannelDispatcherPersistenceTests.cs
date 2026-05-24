@@ -3,6 +3,7 @@ using B3.Exchange.Core;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
 using B3.Exchange.Persistence;
+using B3.Exchange.PostTrade;
 using Microsoft.Extensions.Logging.Abstractions;
 using RejectEvent = B3.Exchange.Matching.RejectEvent;
 using Side = B3.Exchange.Matching.Side;
@@ -77,7 +78,9 @@ public class ChannelDispatcherPersistenceTests
         out NoOpOutbound outbound,
         ChannelMetrics? metrics = null,
         SnapshotThrottlePolicy? throttle = null,
-        bool useAsyncSnapshotWriter = false)
+        bool useAsyncSnapshotWriter = false,
+        IChannelWriteAheadLog? wal = null,
+        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null)
     {
         outbound = new NoOpOutbound();
         var localOutbound = outbound;
@@ -94,6 +97,8 @@ public class ChannelDispatcherPersistenceTests
                 Persister = persister,
                 SnapshotThrottle = throttle,
                 UseAsyncSnapshotWriter = useAsyncSnapshotWriter,
+                Wal = wal,
+                PostTradeSink = postTradeSink,
             });
     }
 
@@ -791,6 +796,77 @@ public class ChannelDispatcherPersistenceTests
         await disp.DisposeAsync();
         Assert.True(persister.SaveCount >= 1);
         Assert.NotNull(persister.TryLoad(84));
+    }
+
+
+    [Fact]
+    public async Task Issue445_DisposeAsync_DrainsAsyncSnapshotAuditCheckpointBeforeClosingInbox()
+    {
+        var root = Path.Combine(AppContext.BaseDirectory, "test-artifacts",
+            $"issue445-{Guid.NewGuid():N}");
+        var snapshotDir = Path.Combine(root, "snapshots");
+        var walDir = Path.Combine(root, "wal");
+        var auditDir = Path.Combine(root, "audit");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var persister = new FileChannelStatePersister(snapshotDir,
+                NullLogger<FileChannelStatePersister>.Instance);
+            long snapshotLastApplied;
+            long durableBeforeRestart;
+            using (var audit = new FileAuditLogWriter(auditDir, channelNumber: 84))
+            {
+                var wal = new FileChannelWriteAheadLog(walDir, channelNumber: 84,
+                    NullLogger<FileChannelWriteAheadLog>.Instance);
+                var disp = BuildDispatcher(persister, out _,
+                    useAsyncSnapshotWriter: true, wal: wal, postTradeSink: audit);
+                var session = new SessionId("80805");
+                disp.Start();
+
+                Assert.True(disp.EnqueueNewOrder(
+                    new NewOrderCommand("CL-SELL", Sec, Side.Sell, OrderType.Limit,
+                        TimeInForce.Day, Px(10.00m), 100, 100, 9000UL),
+                    session, enteringFirm: 801, clOrdIdValue: 0xE44501));
+                Assert.True(disp.EnqueueNewOrder(
+                    new NewOrderCommand("CL-BUY", Sec, Side.Buy, OrderType.Limit,
+                        TimeInForce.Day, Px(10.00m), 100, 100, 9001UL),
+                    session, enteringFirm: 802, clOrdIdValue: 0xE44502));
+
+                await disp.DisposeAsync();
+
+                var snapshot = persister.TryLoad(84);
+                Assert.NotNull(snapshot);
+                snapshotLastApplied = snapshot!.LastAppliedSeq;
+                durableBeforeRestart = audit.DurableThroughCommandSeq;
+                Assert.True(snapshotLastApplied >= 2);
+                Assert.True(durableBeforeRestart >= snapshotLastApplied,
+                    $"audit durable watermark {durableBeforeRestart} must cover snapshot {snapshotLastApplied} before DisposeAsync returns");
+                Assert.Equal(1, audit.RecordsWritten);
+            }
+
+            using (var recoveredAudit = new FileAuditLogWriter(auditDir, channelNumber: 84))
+            {
+                Assert.Equal(durableBeforeRestart, recoveredAudit.DurableThroughCommandSeq);
+                Assert.True(recoveredAudit.DurableThroughCommandSeq >= snapshotLastApplied);
+
+                var restartWal = new FileChannelWriteAheadLog(walDir, channelNumber: 84,
+                    NullLogger<FileChannelWriteAheadLog>.Instance);
+                var restarted = BuildDispatcher(persister, out _,
+                    useAsyncSnapshotWriter: true, wal: restartWal, postTradeSink: recoveredAudit);
+                restarted.Start();
+                await restarted.DisposeAsync();
+            }
+
+            var auditFiles = Directory.GetFiles(Path.Combine(auditDir, "84"), "fills-*.log");
+            Assert.Single(auditFiles);
+            Assert.Single(AuditLogReader.ReadAll(auditFiles[0]));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     [Fact]

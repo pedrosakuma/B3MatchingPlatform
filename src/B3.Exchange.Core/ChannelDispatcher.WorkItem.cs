@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -39,6 +39,7 @@ public sealed partial class ChannelDispatcher
         "OperatorResumeInstrument",
         "OperatorBustV2",
         "AuditCheckpoint",
+        "ShutdownBarrier",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -69,6 +70,7 @@ public sealed partial class ChannelDispatcher
         OperatorBustV2? BustV2 = null,
         TaskCompletionSource<OperatorBustV2Outcome>? BustCompletion = null,
         AuditCheckpointRequest? AuditCheckpoint = null,
+        TaskCompletionSource<bool>? ShutdownBarrier = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 

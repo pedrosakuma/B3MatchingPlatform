@@ -344,6 +344,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private AuctionPrintInfo? _pendingAuctionPrint;
 
     private readonly CancellationTokenSource _cts = new();
+    private int _drainOnCancellation;
     private Task? _loopTask;
     // Single-thread invariant (ADR 0009 / issues #138, #169, #384).
     // Captured on entry to RunLoop; used by AssertOnLoopThread() to enforce
