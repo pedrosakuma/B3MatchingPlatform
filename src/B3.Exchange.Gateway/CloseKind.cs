@@ -23,14 +23,19 @@ namespace B3.Exchange.Gateway;
 public enum CloseKind
 {
     /// <summary>
-    /// Peer-initiated graceful logout (received <c>Terminate(Finished)</c>
-    /// or local code chose to terminate the session for protocol /
-    /// auth reasons). After this close the peer is not expected to
-    /// resume the same session; persisted state should be removed.
-    /// Default for legacy <c>Close(string)</c> call sites to preserve
-    /// pre-#405 behavior until the journal wire-up commit.
+    /// Peer-initiated graceful logout (received <c>Terminate(Finished)</c>).
+    /// After this close the peer is not expected to resume the same session;
+    /// persisted state should be removed. This is also a CoD
+    /// terminate-trigger for modes 2 and 3.
     /// </summary>
     PeerTerminate,
+
+    /// <summary>
+    /// Local code chose to terminate or dispose the session for protocol /
+    /// auth / test-cleanup reasons. Terminal for persistence, but not a
+    /// peer-Terminate CoD trigger.
+    /// </summary>
+    LocalTerminate,
 
     /// <summary>
     /// Host process is shutting down gracefully (SIGTERM,

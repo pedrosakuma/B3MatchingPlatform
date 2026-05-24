@@ -86,15 +86,21 @@ public sealed partial class FixpSession
     /// <summary>
     /// Returns true when the session's Establish-time
     /// <see cref="CancelOnDisconnectType"/> covers the
-    /// transport-disconnect trigger (modes <c>1</c> and <c>3</c>). The
-    /// explicit-Terminate trigger (modes <c>2</c> and <c>3</c>) is
-    /// deferred until inbound peer-Terminate framing is wired.
+    /// close trigger represented by <paramref name="kind"/>. Transport
+    /// disconnects cover modes <c>1</c> and <c>3</c>; peer-initiated
+    /// Terminate frames cover modes <c>2</c> and <c>3</c>.
     /// </summary>
-    private bool CodCoversDisconnect()
+    private bool CodCoversDisconnect(CloseKind kind)
     {
         var t = CancelOnDisconnectType;
-        return t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_ONLY
-            || t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_OR_TERMINATE;
+        return kind switch
+        {
+            CloseKind.TransportError => t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_ONLY
+                || t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_OR_TERMINATE,
+            CloseKind.PeerTerminate => t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_TERMINATE_ONLY
+                || t == B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_OR_TERMINATE,
+            _ => false,
+        };
     }
 
     /// <summary>
@@ -105,7 +111,7 @@ public sealed partial class FixpSession
     private void ScheduleCodTimerLocked()
     {
         if (_codTimer is not null) return;
-        if (!CodCoversDisconnect()) return;
+        if (!CodCoversDisconnect(CloseKind.TransportError)) return;
         var window = CodTimeoutWindowMs;
         if (window < 0) window = 0;
         _logger.LogInformation(
@@ -158,6 +164,14 @@ public sealed partial class FixpSession
         try { originating.Dispose(); } catch { }
         if (!fire) return;
 
+        FireCancelOnDisconnect();
+    }
+
+    /// <summary>
+    /// Fires a session-scoped mass cancel for a committed CoD trigger.
+    /// </summary>
+    private void FireCancelOnDisconnect()
+    {
         // SecurityId=0 + SideFilter=null ⇒ "every resting order owned by
         // this session" — HostRouter resolves the actual order list via
         // OrderOwnershipMap.FilterMassCancel(session, firm, null, 0).

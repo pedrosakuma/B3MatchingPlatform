@@ -99,11 +99,11 @@ public sealed partial class FixpSession
     /// directly to the underlying stream (bypassing the send queue), and
     /// closes the session. <paramref name="kind"/> classifies the close
     /// for the persistence layer (issue #405); defaults to
-    /// <see cref="CloseKind.PeerTerminate"/> for the decoding-error /
+    /// <see cref="CloseKind.LocalTerminate"/> for the decoding-error /
     /// reject paths inside this class.
     /// </summary>
     private async Task TerminateAndCloseAsync(byte terminationCode, string reason,
-        CloseKind kind = CloseKind.PeerTerminate)
+        CloseKind kind = CloseKind.LocalTerminate)
         => await SendTerminateAndCloseAsync(terminationCode, reason, kind).ConfigureAwait(false);
 
     /// <summary>
@@ -118,7 +118,7 @@ public sealed partial class FixpSession
     /// the process exit and the peer can resync on reconnect.
     /// </summary>
     public async Task SendTerminateAndCloseAsync(byte terminationCode, string reason,
-        CloseKind kind = CloseKind.PeerTerminate)
+        CloseKind kind = CloseKind.LocalTerminate)
     {
         if (!IsOpen) { Close(reason, kind); return; }
         var frame = new byte[SessionRejectEncoder.TerminateTotal];
