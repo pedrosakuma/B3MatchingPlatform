@@ -55,7 +55,7 @@ public sealed class HostRouter : IInboundCommandSink
         // Unknown-instrument is a *deterministic business reject* the router
         // emits inline; from the caller's perspective the work is done, so
         // return true (the false return is reserved for backpressure only).
-        RejectUnknownInstrument(cmd.SecurityId, session, clOrdIdValue);
+        RejectUnknownInstrument(cmd.SecurityId, session, clOrdIdValue, cmd.Memo);
         return true;
     }
 
@@ -65,12 +65,12 @@ public sealed class HostRouter : IInboundCommandSink
         var resolved = ResolveOrderIdIfNeeded(cmd, enteringFirm, origClOrdIdValue, out var ok);
         if (!ok)
         {
-            RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue);
+            RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue, cmd.Memo);
             return true;
         }
         if (_bySecId.TryGetValue(resolved.SecurityId, out var disp))
             return disp.EnqueueCancel(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
-        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue, cmd.Memo);
         return true;
     }
 
@@ -80,12 +80,12 @@ public sealed class HostRouter : IInboundCommandSink
         var resolved = ResolveOrderIdIfNeeded(cmd, enteringFirm, origClOrdIdValue, out var ok);
         if (!ok)
         {
-            RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue);
+            RejectUnknownOrderId(cmd.SecurityId, session, clOrdIdValue, cmd.Memo);
             return true;
         }
         if (_bySecId.TryGetValue(resolved.SecurityId, out var disp))
             return disp.EnqueueReplace(resolved, session, enteringFirm, clOrdIdValue, origClOrdIdValue);
-        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue);
+        RejectUnknownInstrument(resolved.SecurityId, session, clOrdIdValue, cmd.Memo);
         return true;
     }
 
@@ -94,7 +94,7 @@ public sealed class HostRouter : IInboundCommandSink
         // Both legs MUST belong to the same security (decoder enforces).
         if (_bySecId.TryGetValue(cmd.Buy.SecurityId, out var disp))
             return disp.EnqueueCross(cmd, session, enteringFirm);
-        RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue);
+        RejectUnknownInstrument(cmd.Buy.SecurityId, session, cmd.BuyClOrdIdValue, cmd.Buy.Memo);
         return true;
     }
 
@@ -199,25 +199,25 @@ public sealed class HostRouter : IInboundCommandSink
         return false;
     }
 
-    private void RejectUnknownInstrument(long secId, SessionId session, ulong clOrdIdValue)
+    private void RejectUnknownInstrument(long secId, SessionId session, ulong clOrdIdValue, byte[]? memo = null)
     {
         _logger.LogWarning("rejecting clOrdId={ClOrdId} from session {Session}: unknown securityId={SecurityId}",
             clOrdIdValue, session, secId);
         _outbound.WriteExecutionReportReject(session,
             new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _timeSource.NowNanos()),
+                Reason: RejectReason.UnknownInstrument, TransactTimeNanos: _timeSource.NowNanos(), Memo: memo),
             clOrdIdValue);
     }
 
-    private void RejectUnknownOrderId(long secId, SessionId session, ulong clOrdIdValue)
+    private void RejectUnknownOrderId(long secId, SessionId session, ulong clOrdIdValue, byte[]? memo = null)
     {
         _logger.LogWarning("rejecting clOrdId={ClOrdId} from session {Session}: unknown orderId / OrigClOrdID",
             clOrdIdValue, session);
         _outbound.WriteExecutionReportReject(session,
             new RejectEvent(ClOrdId: string.Empty,
                 SecurityId: secId, OrderIdOrZero: 0,
-                Reason: RejectReason.UnknownOrderId, TransactTimeNanos: _timeSource.NowNanos()),
+                Reason: RejectReason.UnknownOrderId, TransactTimeNanos: _timeSource.NowNanos(), Memo: memo),
             clOrdIdValue);
     }
 }

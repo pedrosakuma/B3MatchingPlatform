@@ -104,7 +104,7 @@ public sealed partial class FixpSession
     /// <paramref name="clOrdId"/> is forwarded as
     /// <c>businessRejectRefId</c> so the peer can correlate.
     /// </summary>
-    private void WriteApplicationBusinessReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string text)
+    private void WriteApplicationBusinessReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string text, ReadOnlyMemory<byte> memo = default)
     {
         uint refSeqNum = fixedBlock.Length >= 8
             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
@@ -114,7 +114,8 @@ public sealed partial class FixpSession
             refSeqNum: refSeqNum,
             businessRejectRefId: clOrdId,
             businessRejectReason: 33003,
-            text: text);
+            text: text,
+            memo: memo);
         _logger.LogWarning(
             "fixp session {ConnectionId} business reject (unsupported feature) template={Template} text={Text}",
             ConnectionId, templateId, text);
@@ -128,7 +129,7 @@ public sealed partial class FixpSession
     /// are already bumped by the dispatcher (<c>exch_dispatch_queue_full_total</c>);
     /// this method is purely about telling the offending peer.
     /// </summary>
-    internal void WriteSystemBusyReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string workKindLabel)
+    internal void WriteSystemBusyReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string workKindLabel, ReadOnlyMemory<byte> memo = default)
     {
         uint refSeqNum = fixedBlock.Length >= 8
             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
@@ -138,7 +139,8 @@ public sealed partial class FixpSession
             refSeqNum: refSeqNum,
             businessRejectRefId: clOrdId,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.SystemBusy,
-            text: "System busy: dispatcher queue full");
+            text: "System busy: dispatcher queue full",
+            memo: memo);
         _logger.LogWarning(
             "fixp session {ConnectionId} system-busy reject (dispatcher queue full) template={Template} workKind={WorkKind}",
             ConnectionId, templateId, workKindLabel);

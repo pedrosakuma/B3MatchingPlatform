@@ -528,24 +528,25 @@ public sealed partial class FixpSession : IAsyncDisposable
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
-        ulong clOrdIdValue = 0)
-        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue);
+        ulong clOrdIdValue = 0, ReadOnlyMemory<byte> memo = default)
+        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue, memo);
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
-        DurabilityHandle durability = default)
-        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability);
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability, memo);
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
-        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos, durability);
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos, durability, memo);
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default,
+        ReadOnlyMemory<byte> memo = default)
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo);
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
@@ -561,16 +562,16 @@ public sealed partial class FixpSession : IAsyncDisposable
             massActionRejectReason, side, securityId, transactTimeNanos, text);
 
     public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue,
-        DurabilityHandle durability = default)
-        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue, durability);
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue, durability, memo);
 
     public bool WriteSessionReject(byte terminationCode)
         => _outboundEncoder.WriteSessionReject(terminationCode);
 
     public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
-        uint businessRejectReason, string? text = null)
+        uint businessRejectReason, string? text = null, ReadOnlyMemory<byte> memo = default)
         => _outboundEncoder.WriteBusinessMessageReject(refMsgType, refSeqNum, businessRejectRefId,
-            businessRejectReason, text);
+            businessRejectReason, text, memo);
 
     /// <summary>
     /// Maps engine <see cref="RejectReason"/> to the FIX OrdRejReason wire code

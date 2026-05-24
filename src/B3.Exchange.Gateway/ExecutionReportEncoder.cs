@@ -55,12 +55,28 @@ internal static class ExecutionReportEncoder
     public const int ExecReportCancelBlock = 182;
     public const int ExecReportTradeBlock = 174;
     public const int ExecReportRejectBlock = 164;
+    public const int MaxMemoLength = 40;
 
-    public const int ExecReportNewTotal = HeaderSize + ExecReportNewBlock;
-    public const int ExecReportModifyTotal = HeaderSize + ExecReportModifyBlock;
-    public const int ExecReportCancelTotal = HeaderSize + ExecReportCancelBlock;
-    public const int ExecReportTradeTotal = HeaderSize + ExecReportTradeBlock;
-    public const int ExecReportRejectTotal = HeaderSize + ExecReportRejectBlock;
+    public const int ExecReportNewTotal = HeaderSize + ExecReportNewBlock + 1;
+    public const int ExecReportModifyTotal = HeaderSize + ExecReportModifyBlock + 1;
+    public const int ExecReportCancelTotal = HeaderSize + ExecReportCancelBlock + 1;
+    public const int ExecReportTradeTotal = HeaderSize + ExecReportTradeBlock + 1;
+    public const int ExecReportRejectTotal = HeaderSize + ExecReportRejectBlock + 1;
+
+    public static int TotalSize(int blockLength, int memoLength) => HeaderSize + blockLength + 1 + memoLength;
+
+    private static int WriteMemoTrailer(Span<byte> dst, int blockLength, ReadOnlySpan<byte> memo)
+    {
+        if (memo.Length > MaxMemoLength)
+            throw new ArgumentException($"memo exceeds {MaxMemoLength} bytes", nameof(memo));
+        int total = TotalSize(blockLength, memo.Length);
+        if (dst.Length < total)
+            throw new ArgumentException("buffer too small for ExecutionReport", nameof(dst));
+        var trailer = dst.Slice(HeaderSize + blockLength, 1 + memo.Length);
+        trailer[0] = (byte)memo.Length;
+        memo.CopyTo(trailer.Slice(1));
+        return total;
+    }
 
     private const byte SideBuy = (byte)'1';
     private const byte SideSell = (byte)'2';
@@ -122,10 +138,11 @@ internal static class ExecutionReportEncoder
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId, long securityId, long orderId,
         ulong execId, ulong transactTimeNanos, Matching.OrderType ordType, Matching.TimeInForce tif,
-        long orderQty, long? priceMantissa, ulong receivedTimeNanos = UTCTimestampNullValue)
+        long orderQty, long? priceMantissa, ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
     {
-        if (dst.Length < ExecReportNewTotal) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportNewTotal,
+        int total = TotalSize(ExecReportNewBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
             ExecReportNewBlock, EntryPointFrameReader.TidExecutionReportNew, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportNewBlock);
         body.Clear();
@@ -156,7 +173,7 @@ internal static class ExecutionReportEncoder
         body[164] = 255;                                                    // MmProtectionReset null
         // V6 trailing field: tradingSubAccount@172 (uint, null=0) — covered
         // by body.Clear() above. strategyID@168 (int, null=0) ditto.
-        return ExecReportNewTotal;
+        return WriteMemoTrailer(dst, ExecReportNewBlock, memo);
     }
 
     public static int EncodeExecReportModify(Span<byte> dst,
@@ -164,10 +181,11 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long leavesQty, long cumQty, long orderQty, long priceMantissa,
-        ulong receivedTimeNanos = UTCTimestampNullValue)
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
     {
-        if (dst.Length < ExecReportModifyTotal) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportModifyTotal,
+        int total = TotalSize(ExecReportModifyBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
             ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportModifyBlock);
         body.Clear();
@@ -201,7 +219,7 @@ internal static class ExecutionReportEncoder
         body[179] = 255;                                                    // ExecRestatementReason null
         // strategyID@180 (int, null=0) and tradingSubAccount@184 (uint,
         // null=0) covered by body.Clear() above.
-        return ExecReportModifyTotal;
+        return WriteMemoTrailer(dst, ExecReportModifyBlock, memo);
     }
 
     public static int EncodeExecReportCancel(Span<byte> dst,
@@ -209,10 +227,11 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long cumQty, long orderQty, long? priceMantissa,
-        ulong receivedTimeNanos = UTCTimestampNullValue)
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
     {
-        if (dst.Length < ExecReportCancelTotal) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportCancelTotal,
+        int total = TotalSize(ExecReportCancelBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
             ExecReportCancelBlock, EntryPointFrameReader.TidExecutionReportCancel, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportCancelBlock);
         body.Clear();
@@ -240,7 +259,7 @@ internal static class ExecutionReportEncoder
         // V3 trailing fields: receivedTime@156 + ordTagID/investorID/strategyID/actionRequestedFromSessionID
         // null sentinels are all zero (handled by body.Clear() above).
         MemoryMarshal.Write(body.Slice(156, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
-        return ExecReportCancelTotal;
+        return WriteMemoTrailer(dst, ExecReportCancelBlock, memo);
     }
 
     public static int EncodeExecReportTrade(Span<byte> dst,
@@ -248,10 +267,11 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, long lastQty, long lastPxMantissa,
         ulong execId, ulong transactTimeNanos, long leavesQty, long cumQty,
-        bool aggressor, uint tradeId, uint contraBroker, ushort tradeDate, long orderQty)
+        bool aggressor, uint tradeId, uint contraBroker, ushort tradeDate, long orderQty, ReadOnlySpan<byte> memo = default)
     {
-        if (dst.Length < ExecReportTradeTotal) throw new ArgumentException("buffer too small for ER_Trade", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportTradeTotal,
+        int total = TotalSize(ExecReportTradeBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Trade", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
             ExecReportTradeBlock, EntryPointFrameReader.TidExecutionReportTrade, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportTradeBlock);
         body.Clear();
@@ -286,17 +306,18 @@ internal static class ExecutionReportEncoder
         // strategyID@160 (int, null=0), impliedEventID@164 (6 bytes; eventID
         // and noRelatedTrades both null=0) and tradingSubAccount@170 (uint,
         // null=0) are covered by body.Clear() above.
-        return ExecReportTradeTotal;
+        return WriteMemoTrailer(dst, ExecReportTradeBlock, memo);
     }
 
     public static int EncodeExecReportReject(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         ulong clOrdIdValue, ulong origClOrdIdValue, long securityId, long orderIdOrZero,
         uint rejectReason, ulong transactTimeNanos,
-        ulong receivedTimeNanos = UTCTimestampNullValue)
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
     {
-        if (dst.Length < ExecReportRejectTotal) throw new ArgumentException("buffer too small for ER_Reject", nameof(dst));
-        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)ExecReportRejectTotal,
+        int total = TotalSize(ExecReportRejectBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Reject", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
             ExecReportRejectBlock, EntryPointFrameReader.TidExecutionReportReject, version: 6);
         var body = dst.Slice(HeaderSize, ExecReportRejectBlock);
         body.Clear();
@@ -330,6 +351,6 @@ internal static class ExecutionReportEncoder
         // (int null=0), tradingSubAccount@160 (uint null=0) — all covered
         // by body.Clear() above.
         MemoryMarshal.Write(body.Slice(138, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
-        return ExecReportRejectTotal;
+        return WriteMemoTrailer(dst, ExecReportRejectBlock, memo);
     }
 }

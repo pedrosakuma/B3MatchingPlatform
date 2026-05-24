@@ -19,7 +19,8 @@ public readonly record struct OrderAcceptedEvent(
     long RemainingQuantity,
     uint EnteringFirm,
     ulong InsertTimestampNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when a resting order's remaining quantity is reduced as a passive maker
@@ -34,7 +35,8 @@ public readonly record struct OrderQuantityReducedEvent(
     long NewRemainingQuantity,
     ulong InsertTimestampNanos,
     ulong TransactTimeNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when a resting order is removed from the book — either because it was
@@ -49,7 +51,8 @@ public readonly record struct OrderCanceledEvent(
     long RemainingQuantityAtCancel,
     ulong TransactTimeNanos,
     CancelReason Reason,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when a resting order is fully consumed by trades. The integration layer
@@ -82,14 +85,17 @@ public readonly record struct TradeEvent(
     long RestingOrderId,
     uint RestingFirm,
     ulong TransactTimeNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? AggressorMemo = null,
+    byte[]? RestingMemo = null);
 
 public readonly record struct RejectEvent(
     string ClOrdId,
     long SecurityId,
     long OrderIdOrZero,
     RejectReason Reason,
-    ulong TransactTimeNanos);
+    ulong TransactTimeNanos,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when the trading phase for an instrument transitions. Carries
@@ -253,7 +259,8 @@ public readonly record struct StopOrderAcceptedEvent(
     long Quantity,
     uint EnteringFirm,
     ulong InsertTimestampNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when a parked stop order's trigger condition fires. Issue #214.
@@ -287,7 +294,8 @@ public readonly record struct StopOrderCanceledEvent(
     long StopPxMantissa,
     long RemainingQuantityAtCancel,
     ulong TransactTimeNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when a resting order has been successfully replaced by a client
@@ -309,7 +317,8 @@ public readonly record struct OrderModifiedEvent(
     long NewPriceMantissa,
     long NewRemainingQuantity,
     ulong TransactTimeNanos,
-    uint RptSeq);
+    uint RptSeq,
+    byte[]? Memo = null);
 
 /// <summary>
 /// Fired when an instrument is placed into administrative halt via

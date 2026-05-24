@@ -40,16 +40,17 @@ public class RejectEncoderTests
     [Fact]
     public void EncodeBusinessMessageReject_WritesHeaderBlockAndVarData()
     {
-        var buf = new byte[BusinessMessageRejectEncoder.TotalSize(12)];
+        byte[] memoBytes = System.Text.Encoding.ASCII.GetBytes("ABC123");
+        var buf = new byte[BusinessMessageRejectEncoder.TotalSize(memoBytes.Length, 12)];
         int n = BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(buf,
             sessionId: 7u, msgSeqNum: 99u, sendingTimeNanos: 1_700_000_000_000_000_000UL,
             refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(EntryPointFrameReader.TidSimpleNewOrder),
             refSeqNum: 42u,
             businessRejectRefId: 12345UL,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.InvalidField,
-            text: "invalid Side");
+            text: "invalid Side", memo: memoBytes);
 
-        Assert.Equal(BusinessMessageRejectEncoder.TotalSize(12), n);
+        Assert.Equal(BusinessMessageRejectEncoder.TotalSize(memoBytes.Length, 12), n);
 
         // SOFH
         Assert.Equal((ushort)n, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)));
@@ -79,9 +80,11 @@ public class RejectEncoderTests
 
         // VarData: memo (length 0) then text ("invalid Side", 11 ASCII bytes)
         var trailer = buf.AsSpan(EntryPointFrameReader.WireHeaderSize + BusinessMessageRejectEncoder.BusinessRejectBlock);
-        Assert.Equal((byte)0, trailer[0]);          // memo length
-        Assert.Equal((byte)12, trailer[1]);         // text length
-        var text = System.Text.Encoding.ASCII.GetString(trailer.Slice(2, 12));
+        Assert.Equal((byte)memoBytes.Length, trailer[0]);
+        Assert.True(trailer.Slice(1, memoBytes.Length).SequenceEqual(memoBytes));
+        int textLenOffset = 1 + memoBytes.Length;
+        Assert.Equal((byte)12, trailer[textLenOffset]);
+        var text = System.Text.Encoding.ASCII.GetString(trailer.Slice(textLenOffset + 1, 12));
         Assert.Equal("invalid Side", text);
     }
 

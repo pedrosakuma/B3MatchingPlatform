@@ -51,7 +51,7 @@ public sealed class GatewayRouter : ICoreOutbound
         DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
-        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue);
+        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue, e.Memo ?? ReadOnlyMemory<byte>.Empty);
     }
 
     public bool WriteExecutionReportTrade(ContractsSessionId session, in TradeEvent e, bool isAggressor,
@@ -59,7 +59,7 @@ public sealed class GatewayRouter : ICoreOutbound
         DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability);
+        return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability, isAggressor ? (e.AggressorMemo ?? ReadOnlyMemory<byte>.Empty) : (e.RestingMemo ?? ReadOnlyMemory<byte>.Empty));
     }
 
     public bool WriteExecutionReportPassiveTrade(ContractsSessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
@@ -67,7 +67,8 @@ public sealed class GatewayRouter : ICoreOutbound
         DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty, durability);
+        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty, durability,
+            e.RestingMemo ?? ReadOnlyMemory<byte>.Empty);
     }
 
     public bool WriteExecutionReportPassiveCancel(ContractsSessionId ownerSession, ulong ownerClOrdId, long orderId,
@@ -76,7 +77,7 @@ public sealed class GatewayRouter : ICoreOutbound
     {
         if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveCancel"); return false; }
         ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : ownerClOrdId;
-        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos, durability);
+        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos, durability, e.Memo ?? ReadOnlyMemory<byte>.Empty);
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
@@ -94,7 +95,7 @@ public sealed class GatewayRouter : ICoreOutbound
         DurabilityHandle durability = default)
     {
         if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportReject"); return false; }
-        return s.WriteExecutionReportReject(e, clOrdIdValue, durability);
+        return s.WriteExecutionReportReject(e, clOrdIdValue, durability, e.Memo ?? ReadOnlyMemory<byte>.Empty);
     }
 
     private void LogMiss(ContractsSessionId session, string kind)

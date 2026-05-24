@@ -65,7 +65,7 @@ internal sealed class FixpOutboundEncoder
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
-        ulong clOrdIdValue = 0)
+        ulong clOrdIdValue = 0, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
         // Round-2 perf #14: prefer the ulong threaded from the dispatch
@@ -73,7 +73,7 @@ internal sealed class FixpOutboundEncoder
         // fall back to TryParse only when callers don't supply it
         // (legacy tests). Avoids a ~50–100 ns parse on every ER hot path.
         ulong clOrd = clOrdIdValue != 0 ? clOrdIdValue : (ulong.TryParse(e.ClOrdId, out var v) ? v : 0);
-        var exact = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        var exact = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportNewBlock, memo.Length)];
         lock (_outboundLock)
         {
             ExecutionReportEncoder.EncodeExecReportNew(exact,
@@ -82,17 +82,17 @@ internal sealed class FixpOutboundEncoder
                 (ulong)e.RptSeq, e.InsertTimestampNanos,
                 OrderType.Limit, TimeInForce.Day,
                 e.RemainingQuantity, e.PriceMantissa,
-                receivedTimeNanos);
+                memo.Span, receivedTimeNanos);
             return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
         var side = isAggressor ? e.AggressorSide : (e.AggressorSide == Side.Buy ? Side.Sell : Side.Buy);
-        var exact = new byte[ExecutionReportEncoder.ExecReportTradeTotal];
+        var exact = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportTradeBlock, memo.Length)];
         lock (_outboundLock)
         {
             ExecutionReportEncoder.EncodeExecReportTrade(exact,
@@ -103,17 +103,17 @@ internal sealed class FixpOutboundEncoder
                 isAggressor, e.TradeId,
                 isAggressor ? e.RestingFirm : e.AggressorFirm,
                 tradeDate: 0,
-                orderQty: leavesQty + cumQty);
+                orderQty: leavesQty + cumQty, memo.Span);
             return AppendAndEnqueueLocked(exact, durability);
         }
     }
 
     public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
-        var exact = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        var exact = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportCancelBlock, memo.Length)];
         lock (_outboundLock)
         {
             ExecutionReportEncoder.EncodeExecReportCancel(exact,
@@ -121,8 +121,8 @@ internal sealed class FixpOutboundEncoder
                 e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
                 e.SecurityId, e.OrderId,
                 (ulong)e.RptSeq, e.TransactTimeNanos,
-                cumQty: 0, e.RemainingQuantityAtCancel, e.PriceMantissa,
-                receivedTimeNanos);
+                cumQty: 0, orderQty: e.RemainingQuantityAtCancel, priceMantissa: e.PriceMantissa,
+                memo: memo.Span, receivedTimeNanos: receivedTimeNanos);
             return AppendAndEnqueueLocked(exact, durability);
         }
     }
@@ -130,10 +130,10 @@ internal sealed class FixpOutboundEncoder
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
-        var exact = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        var exact = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportModifyBlock, memo.Length)];
         lock (_outboundLock)
         {
             ExecutionReportEncoder.EncodeExecReportModify(exact,
@@ -141,7 +141,7 @@ internal sealed class FixpOutboundEncoder
                 side, clOrdIdValue, origClOrdIdValue, orderId,
                 securityId, orderId, (ulong)rptSeq, transactTimeNanos,
                 leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
-                receivedTimeNanos: receivedTimeNanos);
+                memo: memo.Span, receivedTimeNanos: receivedTimeNanos);
             return AppendAndEnqueueLocked(exact, durability);
         }
     }
@@ -170,17 +170,17 @@ internal sealed class FixpOutboundEncoder
     }
 
     public bool WriteExecutionReportReject(in RejectEvent e, ulong clOrdIdValue,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
         uint rej = MapRejectReason(e.Reason);
-        var exact = new byte[ExecutionReportEncoder.ExecReportRejectTotal];
+        var exact = new byte[ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportRejectBlock, memo.Length)];
         lock (_outboundLock)
         {
             ExecutionReportEncoder.EncodeExecReportReject(exact,
                 _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                 clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
-                rej, e.TransactTimeNanos);
+                rej, e.TransactTimeNanos, memo.Span);
             return AppendAndEnqueueLocked(exact, durability);
         }
     }
@@ -196,17 +196,17 @@ internal sealed class FixpOutboundEncoder
     }
 
     public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
-        uint businessRejectReason, string? text = null)
+        uint businessRejectReason, string? text = null, ReadOnlyMemory<byte> memo = default)
     {
         if (!_isOpen()) return false;
         int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
-        int total = BusinessMessageRejectEncoder.TotalSize(textLen);
+        int total = BusinessMessageRejectEncoder.TotalSize(memo.Length, textLen);
         var exact = new byte[total];
         lock (_outboundLock)
         {
             BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
                 exact, _sessionId(), _nextMsgSeqNum(), _timeSource.NowNanos(),
-                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text);
+                refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text, memo.Span);
             return AppendAndEnqueueLocked(exact);
         }
     }

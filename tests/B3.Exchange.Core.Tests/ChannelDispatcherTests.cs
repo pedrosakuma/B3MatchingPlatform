@@ -153,6 +153,41 @@ public partial class ChannelDispatcherTests
         Assert.Equal(415UL, Assert.Single(reply.RejectClOrdIds));
     }
 
+
+    [Fact]
+    public void NewOrder_WithMemo_ExecReportNewCarriesMemo()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        byte[] memo = System.Text.Encoding.ASCII.GetBytes("ABC123");
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL)
+        {
+            Memo = memo,
+        }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Single(reply.News);
+        Assert.True(reply.News[0].Memo!.SequenceEqual(memo));
+    }
+
+    [Fact]
+    public void RejectedOrder_WithMemo_ExecReportRejectCarriesMemo()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        byte[] memo = System.Text.Encoding.ASCII.GetBytes("ABC123");
+
+        disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 0, 7, 1_000UL)
+        {
+            Memo = memo,
+        }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Single(reply.Rejects);
+        Assert.True(reply.Rejects[0].Memo!.SequenceEqual(memo));
+    }
+
     [Fact]
     public void Crossing_AggressorAndResting_BothGetTradeReportsAndDeleteFrames()
     {
