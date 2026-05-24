@@ -142,7 +142,7 @@ public sealed class NegotiationValidator
         var cred = _firms.FindSessionByWire(req.SessionId);
         if (cred is null)
             return NegotiationOutcome.Reject(
-                FixpSbe.NegotiationRejectCode.CREDENTIALS,
+                FixpSbe.NegotiationRejectCode.INVALID_SESSIONID,
                 $"unknown sessionID {req.SessionId}");
 
         var firm = _firms.FindFirm(cred.FirmId)
