@@ -382,7 +382,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         // after a host restart can replay any business frame from
         // disk. When no journal is wired (tests / standalone), the
         // ring degrades to a pure in-memory cache.
-        Action<uint, byte[]>? onAppendPersist = null;
+        RetxAppendPersistCallback? onAppendPersist = null;
         Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead = null;
         if (outboundJournal is not null)
         {

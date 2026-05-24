@@ -1,6 +1,8 @@
 using B3.EntryPoint.Wire;
 namespace B3.Exchange.Gateway;
 
+internal delegate void RetxAppendPersistCallback(uint seq, ReadOnlySpan<byte> frame);
+
 /// <summary>
 /// Per-session bounded ring buffer of recently-emitted business frames,
 /// keyed by FIXP <c>MsgSeqNum</c>. Used by issue #46 to satisfy
@@ -26,7 +28,7 @@ namespace B3.Exchange.Gateway;
 /// caller distinguish <c>OUT_OF_RANGE</c> (below window) from
 /// <c>INVALID_FROMSEQNO</c> (above window) per #46 acceptance criteria.</para>
 /// </summary>
-internal sealed class RetransmitBuffer
+internal sealed class RetransmitBuffer : IDisposable
 {
     /// <summary>Absolute byte offset of the
     /// <c>OutboundBusinessHeader.EventIndicator</c> within a wire frame
@@ -45,10 +47,11 @@ internal sealed class RetransmitBuffer
 
     private readonly object _lock = new();
     private readonly byte[]?[] _frames;
+    private readonly PooledOutboundFrame?[] _pooledFrames;
     private readonly uint[] _seqs;
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _metrics;
     private readonly Func<bool>? _isSuspended;
-    private readonly Action<uint, byte[]>? _onAppendPersist;
+    private readonly RetxAppendPersistCallback? _onAppendPersist;
     /// <summary>
     /// Issue #405: cold-read callback into the persistent outbound
     /// journal, invoked when a <c>RetransmitRequest.fromSeqNo</c>
@@ -105,12 +108,13 @@ internal sealed class RetransmitBuffer
     public RetransmitBuffer(int capacity,
         B3.Exchange.Contracts.RetransmitMetrics? metrics,
         Func<bool>? isSuspended,
-        Action<uint, byte[]>? onAppendPersist,
+        RetxAppendPersistCallback? onAppendPersist,
         Func<uint, int, IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry>>? coldRead)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         Capacity = capacity;
         _frames = new byte[]?[capacity];
+        _pooledFrames = new PooledOutboundFrame?[capacity];
         _seqs = new uint[capacity];
         _metrics = metrics;
         _isSuspended = isSuspended;
@@ -133,7 +137,9 @@ internal sealed class RetransmitBuffer
         lock (_lock)
         {
             evicted = _count == Capacity;
+            ReleasePooledAt(_head);
             _frames[_head] = frame;
+            _pooledFrames[_head] = null;
             _seqs[_head] = seq;
             _head = (_head + 1) % Capacity;
             if (_count < Capacity) _count++;
@@ -147,6 +153,27 @@ internal sealed class RetransmitBuffer
         // Issue #288: surface eviction + suspended-write counters outside
         // the lock so a slow metrics consumer cannot back-pressure the
         // outbound encoder. Both checks are best-effort.
+        if (evicted) _metrics?.IncBufferEvictions();
+        if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();
+    }
+
+    internal void Append(uint seq, PooledOutboundFrame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        bool evicted;
+        lock (_lock)
+        {
+            evicted = _count == Capacity;
+            ReleasePooledAt(_head);
+            frame.AddRef();
+            _frames[_head] = null;
+            _pooledFrames[_head] = frame;
+            _seqs[_head] = seq;
+            _head = (_head + 1) % Capacity;
+            if (_count < Capacity) _count++;
+            _lastSeq = seq;
+            _onAppendPersist?.Invoke(seq, frame.Buffer.AsSpan(0, frame.Length));
+        }
         if (evicted) _metrics?.IncBufferEvictions();
         if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();
     }
@@ -174,6 +201,21 @@ internal sealed class RetransmitBuffer
     }
 
     public int Count { get { lock (_lock) { return _count; } } }
+
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            for (int i = 0; i < Capacity; i++)
+            {
+                ReleasePooledAt(i);
+                _seqs[i] = 0;
+            }
+            _head = 0;
+            _count = 0;
+            _lastSeq = 0;
+        }
+    }
 
     /// <summary>
     /// Outcome of <see cref="TryGet"/>. On success <see cref="Frames"/>
@@ -301,18 +343,38 @@ internal sealed class RetransmitBuffer
         for (uint i = 0; i < actual; i++)
         {
             int idx = (firstIndex + offsetFromFirst + (int)i) % Capacity;
-            clones[i] = CloneWithPossResend(_frames[idx]!);
+            clones[i] = CloneWithPossResend(FrameSpanAt(idx));
         }
         return clones;
     }
 
     private static byte[] CloneWithPossResend(byte[] src)
+        => CloneWithPossResend(src.AsSpan());
+
+    private static byte[] CloneWithPossResend(ReadOnlySpan<byte> src)
     {
         var clone = new byte[src.Length];
-        Buffer.BlockCopy(src, 0, clone, 0, src.Length);
+        src.CopyTo(clone);
         if (clone.Length > EventIndicatorAbsoluteOffset)
             clone[EventIndicatorAbsoluteOffset] |= PossResendBit;
         return clone;
+    }
+
+    private ReadOnlySpan<byte> FrameSpanAt(int idx)
+    {
+        if (_pooledFrames[idx] is { } pooled)
+            return pooled.Buffer.AsSpan(0, pooled.Length);
+        return _frames[idx]!;
+    }
+
+    private void ReleasePooledAt(int idx)
+    {
+        if (_pooledFrames[idx] is { } pooled)
+        {
+            pooled.Release();
+            _pooledFrames[idx] = null;
+        }
+        _frames[idx] = null;
     }
 
     private IReadOnlyList<B3.Exchange.Gateway.Persistence.OutboundJournalEntry> SafeColdRead(uint fromSeq, int count)
