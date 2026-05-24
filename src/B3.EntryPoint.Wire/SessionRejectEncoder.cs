@@ -39,6 +39,9 @@ public static class SessionRejectEncoder
         /// <summary>Peer sent an application message after Negotiate but
         /// before <c>Establish</c>. Spec §4.5 strict-gating rule.</summary>
         public const byte NotEstablished = 3;
+        /// <summary>Peer liveness was not observed within the negotiated
+        /// keep-alive interval plus watchdog grace.</summary>
+        public const byte KeepaliveIntervalLapsed = 10;
         public const byte UnrecognizedMessage = 15;
         public const byte InvalidSofh = 16;
         public const byte DecodingError = 17;

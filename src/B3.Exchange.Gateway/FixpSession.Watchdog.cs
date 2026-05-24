@@ -76,7 +76,9 @@ public sealed partial class FixpSession
                     // raced in between the snapshot above and the close
                     // call below; CloseIfTransportCurrent re-validates
                     // under _attachLock.
-                    CloseIfTransportCurrent("idle-timeout", ownTransport);
+                    await SendTerminateIfTransportCurrentAndCloseAsync(
+                        SessionRejectEncoder.TerminationCode.KeepaliveIntervalLapsed,
+                        "idle-timeout", ownTransport, CloseKind.KeepaliveLapsed).ConfigureAwait(false);
                     return;
                 }
 

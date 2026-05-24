@@ -204,6 +204,45 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// Generation-aware graceful terminate: writes a Terminate frame to the
+    /// transport observed by the caller, then closes only if that transport is
+    /// still current. Used by the watchdog so stale ticks after re-attach cannot
+    /// tear down a fresh transport.
+    /// </summary>
+    private async Task SendTerminateIfTransportCurrentAndCloseAsync(
+        byte terminationCode, string reason, TcpTransport originatingTransport, CloseKind kind)
+    {
+        uint sessionId;
+        ulong sessionVerId;
+        lock (_attachLock)
+        {
+            if (!ReferenceEquals(_transport, originatingTransport)) return;
+            if (Volatile.Read(ref _isOpen) == 0) return;
+            sessionId = SessionId;
+            sessionVerId = SessionVerId;
+        }
+
+        var frame = new byte[SessionRejectEncoder.TerminateTotal];
+        SessionRejectEncoder.EncodeTerminate(frame, sessionId, sessionVerId, terminationCode);
+        try
+        {
+            await originatingTransport.SendDirectAsync(frame).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to write Terminate({Code})",
+                ConnectionId, terminationCode);
+        }
+
+        lock (_attachLock)
+        {
+            if (!ReferenceEquals(_transport, originatingTransport)) return;
+            CloseLocked(reason, kind);
+        }
+    }
+
+    /// <summary>
     /// Closes the session with a diagnostic reason. Legacy overload
     /// kept for tests and existing call-sites that have not been
     /// classified yet; defaults to <see cref="CloseKind.PeerTerminate"/>
@@ -283,7 +322,9 @@ public sealed partial class FixpSession
         // recoverable serverFlow). Non-removing kinds also save the
         // final state so the resume point on reconnect is accurate.
         bool removePersistence =
-            kind == CloseKind.PeerTerminate || kind == CloseKind.SuspendedTimeout;
+            kind == CloseKind.PeerTerminate ||
+            kind == CloseKind.KeepaliveLapsed ||
+            kind == CloseKind.SuspendedTimeout;
         if (removePersistence)
         {
             if (_outboundJournal is not null && SessionId != 0)

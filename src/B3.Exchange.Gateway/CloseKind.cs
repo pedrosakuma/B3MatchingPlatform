@@ -50,6 +50,13 @@ public enum CloseKind
     TransportError,
 
     /// <summary>
+    /// Local watchdog emitted <c>Terminate(KEEPALIVE_INTERVAL_LAPSED)</c>
+    /// because inbound liveness expired. This is a protocol-level terminal
+    /// close, not an abrupt transport error.
+    /// </summary>
+    KeepaliveLapsed,
+
+    /// <summary>
     /// Suspended-state reaper aged the session out after the
     /// configured Suspended-window expired without re-attach. The
     /// session is considered abandoned; persisted state should be

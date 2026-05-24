@@ -122,7 +122,7 @@ public sealed partial class FixpSession
     {
         if (!IsOpen) { Close(reason, kind); return; }
         var frame = new byte[SessionRejectEncoder.TerminateTotal];
-        SessionRejectEncoder.EncodeTerminate(frame, SessionId, 0, terminationCode);
+        SessionRejectEncoder.EncodeTerminate(frame, SessionId, SessionVerId, terminationCode);
         try
         {
             await _transport.SendDirectAsync(frame).ConfigureAwait(false);
