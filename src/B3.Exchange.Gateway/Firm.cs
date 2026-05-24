@@ -19,7 +19,7 @@ public sealed record Firm(string Id, string Name, uint EnteringFirmCode);
 /// global TCP defaults for backwards-compatibility.
 /// </summary>
 public sealed record SessionPolicy(
-    int ThrottleMessagesPerSecond = 0,
+    int MaxOrderRatePerSecond = 200,
     int KeepAliveIntervalMs = 30_000,
     int IdleTimeoutMs = 30_000,
     int TestRequestGraceMs = 5_000,
@@ -37,8 +37,8 @@ public sealed record SessionPolicy(
             throw new InvalidOperationException("SessionPolicy.TestRequestGraceMs must be > 0");
         if (RetransmitBufferSize <= 0)
             throw new InvalidOperationException("SessionPolicy.RetransmitBufferSize must be > 0");
-        if (ThrottleMessagesPerSecond < 0)
-            throw new InvalidOperationException("SessionPolicy.ThrottleMessagesPerSecond must be >= 0 (0 disables)");
+        if (MaxOrderRatePerSecond < 0)
+            throw new InvalidOperationException("SessionPolicy.MaxOrderRatePerSecond must be >= 0 (0 disables)");
     }
 }
 

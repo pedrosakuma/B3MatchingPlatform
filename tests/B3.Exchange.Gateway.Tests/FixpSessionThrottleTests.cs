@@ -253,6 +253,45 @@ public class FixpSessionThrottleTests
     }
 
     [Fact]
+    public async Task Max_order_rate_plus_one_within_one_second_rejects_exactly_one_with_BMR_other()
+    {
+        var (server, client) = await ConnectPairAsync();
+        try
+        {
+            long now = 1_000_000;
+            var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
+            var session = NewSession(server,
+                new FixpSessionOptions { MaxOrderRatePerSecond = 2, ThrottleMetrics = metrics },
+                () => now);
+
+            Assert.True(session.TryAcceptInboundThrottle(EntryPointFrameReader.TidNewOrderSingle,
+                BuildFixedBlock(100, 1, 9000)));
+            Assert.True(session.TryAcceptInboundThrottle(EntryPointFrameReader.TidOrderCancelReplaceRequest,
+                BuildFixedBlock(100, 2, 9001)));
+            Assert.False(session.TryAcceptInboundThrottle(EntryPointFrameReader.TidOrderCancelRequest,
+                BuildFixedBlock(100, 3, 9002)));
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var (tid, body) = await ReadOneFrameAsync(client.GetStream(), cts.Token);
+            Assert.Equal(EntryPointFrameReader.TidBusinessMessageReject, tid);
+            Assert.Equal((byte)19, body[18]);
+            Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(20, 4)));
+            Assert.Equal(9002UL, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(24, 8)));
+            Assert.Equal(BusinessMessageRejectEncoder.Reason.Other,
+                BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(32, 4)));
+            Assert.Equal(2, metrics.Accepted);
+            Assert.Equal(1, metrics.Rejected);
+            Assert.True(session.IsOpen);
+            session.Close("test");
+        }
+        finally
+        {
+            client.Close();
+            server.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task Window_slides_forward_so_more_messages_admitted_after_time_passes()
     {
         var (server, client) = await ConnectPairAsync();
@@ -302,6 +341,8 @@ public class FixpSessionThrottleTests
             {
                 Assert.True(session.TryAcceptInboundThrottle(EntryPointFrameReader.TidSequence,
                     BuildFixedBlock(100, (uint)(i + 1), 0)));
+                Assert.True(session.TryAcceptInboundThrottle(EntryPointFrameReader.TidNotApplied,
+                    BuildFixedBlock(100, (uint)(i + 100), 0)));
             }
             // No application templates were sent, so neither counter moves.
             Assert.Equal(0, metrics.Accepted);
@@ -312,6 +353,46 @@ public class FixpSessionThrottleTests
         {
             client.Close();
             server.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Rate_limit_is_isolated_per_session()
+    {
+        var (server1, client1) = await ConnectPairAsync();
+        var (server2, client2) = await ConnectPairAsync();
+        try
+        {
+            long now = 1_000_000;
+            var session1 = NewSession(server1,
+                new FixpSessionOptions { MaxOrderRatePerSecond = 1 },
+                () => now);
+            var session2 = new FixpSession(
+                connectionId: 2, enteringFirm: 7, sessionId: 200,
+                stream: server2, sink: new NoOpEngineSink(),
+                logger: NullLogger<FixpSession>.Instance,
+                options: new FixpSessionOptions { MaxOrderRatePerSecond = 1 },
+                nowMs: () => now);
+            session2.Start();
+            session2.ApplyTransition(FixpEvent.Negotiate);
+            session2.ApplyTransition(FixpEvent.Establish);
+
+            Assert.True(session1.TryAcceptInboundThrottle(EntryPointFrameReader.TidSimpleNewOrder,
+                BuildFixedBlock(100, 1, 1)));
+            Assert.False(session1.TryAcceptInboundThrottle(EntryPointFrameReader.TidSimpleNewOrder,
+                BuildFixedBlock(100, 2, 2)));
+            Assert.True(session2.TryAcceptInboundThrottle(EntryPointFrameReader.TidSimpleNewOrder,
+                BuildFixedBlock(200, 1, 3)));
+
+            session1.Close("test");
+            session2.Close("test");
+        }
+        finally
+        {
+            client1.Close();
+            server1.Dispose();
+            client2.Close();
+            server2.Dispose();
         }
     }
 }

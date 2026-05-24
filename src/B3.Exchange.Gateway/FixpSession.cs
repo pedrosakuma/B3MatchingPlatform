@@ -129,7 +129,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// and <see cref="FixpSessionOptions.ThrottleMaxMessages"/> are 0
     /// (throttling disabled). Mutated only on the receive thread.
     /// </summary>
-    private readonly InboundThrottle? _throttle;
+    private InboundThrottle? _throttle;
 
     public long ConnectionId { get; }
 
@@ -420,13 +420,9 @@ public sealed partial class FixpSession : IAsyncDisposable
             getState: () => State,
             logger: _logger,
             connectionId: ConnectionId);
-        if (_options.ThrottleMaxMessages > 0 && _options.ThrottleTimeWindowMs > 0)
-        {
-            _throttle = new InboundThrottle(
-                _options.ThrottleMaxMessages,
-                _options.ThrottleTimeWindowMs,
-                _nowMs);
-        }
+        ConfigureOrderRateLimit(
+            _options.ThrottleMaxMessages > 0 ? _options.ThrottleMaxMessages : _options.MaxOrderRatePerSecond,
+            _options.ThrottleTimeWindowMs > 0 ? _options.ThrottleTimeWindowMs : 1_000);
         _onClosed = onClosed;
         _validator = negotiationValidator;
         _establishValidator = establishValidator;
@@ -492,6 +488,12 @@ public sealed partial class FixpSession : IAsyncDisposable
 
     private static long NowMs() => Environment.TickCount64;
 
+    private void ConfigureOrderRateLimit(int maxOrderRatePerSecond, int timeWindowMs = 1_000)
+    {
+        _throttle = maxOrderRatePerSecond > 0
+            ? new InboundThrottle(maxOrderRatePerSecond, timeWindowMs, _nowMs)
+            : null;
+    }
 
     private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
 

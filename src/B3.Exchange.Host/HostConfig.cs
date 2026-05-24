@@ -180,7 +180,22 @@ public sealed class SessionConfig
 
 public sealed class SessionPolicyConfig
 {
-    [JsonPropertyName("throttleMessagesPerSecond")] public int ThrottleMessagesPerSecond { get; set; }
+    private int _maxOrderRatePerSecond = 200;
+
+    [JsonPropertyName("maxOrderRatePerSecond")]
+    public int MaxOrderRatePerSecond
+    {
+        get => _maxOrderRatePerSecond;
+        set => _maxOrderRatePerSecond = value;
+    }
+
+    [JsonPropertyName("throttleMessagesPerSecond")]
+    public int ThrottleMessagesPerSecond
+    {
+        get => _maxOrderRatePerSecond;
+        set => _maxOrderRatePerSecond = value;
+    }
+
     [JsonPropertyName("keepAliveIntervalMs")] public int KeepAliveIntervalMs { get; set; } = 30_000;
     [JsonPropertyName("idleTimeoutMs")] public int IdleTimeoutMs { get; set; } = 30_000;
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;

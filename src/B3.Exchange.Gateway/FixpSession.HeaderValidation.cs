@@ -16,12 +16,12 @@ namespace B3.Exchange.Gateway;
 public sealed partial class FixpSession
 {
     /// <summary>
-    /// Per-session inbound sliding-window throttle gate (issue #56 /
-    /// GAP-20). Returns <c>true</c> if the inbound frame is admitted
+    /// Per-session Max Order Rate gate (issue #435 / GAP-20). Returns
+    /// <c>true</c> if the inbound order frame is admitted
     /// (the slot is consumed), or <c>false</c> after emitting
     /// <c>BusinessMessageReject(text="Throttle limit exceeded")</c> for
     /// the rejected frame. Session-layer FIXP messages (anything that
-    /// is not an <see cref="IsApplicationTemplate"/> template) and
+    /// is not an <see cref="IsOrderRateLimitedTemplate"/> template) and
     /// sessions configured without a throttle (<c>_throttle == null</c>)
     /// always return <c>true</c>. Exposed as <c>internal</c> so tests can
     /// drive the throttle directly without constructing a fully-decodable
@@ -29,7 +29,7 @@ public sealed partial class FixpSession
     /// </summary>
     internal bool TryAcceptInboundThrottle(ushort templateId, ReadOnlySpan<byte> fixedBlock)
     {
-        if (_throttle is null || !IsApplicationTemplate(templateId))
+        if (_throttle is null || !IsOrderRateLimitedTemplate(templateId))
             return true;
         if (_throttle.TryAccept())
         {
@@ -48,7 +48,7 @@ public sealed partial class FixpSession
             businessRejectRefId: refClOrdId,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
             text: "Throttle limit exceeded");
-        _options.ThrottleMetrics?.IncRejected();
+        _options.ThrottleMetrics?.IncRejected(SessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _logger.LogWarning(
             "fixp session {ConnectionId} throttle reject template={Template} (max={Max}/{WindowMs}ms)",
             ConnectionId, templateId, _throttle.MaxMessages, _throttle.TimeWindowMs);

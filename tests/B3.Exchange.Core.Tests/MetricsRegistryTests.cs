@@ -150,6 +150,21 @@ public class MetricsRegistryTests
     }
 
     [Fact]
+    public void RateLimitedCounter_IsRenderedPerSession()
+    {
+        var reg = new MetricsRegistry();
+        reg.Throttle.IncRejected("123");
+        reg.Throttle.IncRejected("123");
+        reg.Throttle.IncRejected("456");
+
+        var text = reg.RenderProm();
+
+        Assert.Contains("# TYPE rate_limited_total counter\n", text);
+        Assert.Contains("rate_limited_total{session=\"123\"} 2\n", text);
+        Assert.Contains("rate_limited_total{session=\"456\"} 1\n", text);
+    }
+
+    [Fact]
     public void Render_EmitsRuntimeMetrics_Issue177()
     {
         var reg = new MetricsRegistry();

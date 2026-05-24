@@ -146,6 +146,7 @@ public sealed partial class FixpSession
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
+        ConfigureOrderRateLimit(outcome.Credential!.Policy.MaxOrderRatePerSecond);
         // Issue #405 (review finding): commit the new SessionVerID to
         // disk BEFORE acking the Negotiate. If persistence fails, abort
         // the handshake — without this, a transient disk error would

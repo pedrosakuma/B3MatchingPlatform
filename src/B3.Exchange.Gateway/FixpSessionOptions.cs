@@ -73,9 +73,8 @@ public sealed record FixpSessionOptions
     public B3.Exchange.Contracts.SessionLifecycleMetrics? LifecycleMetrics { get; init; }
 
     /// <summary>
-    /// Per-session inbound rate cap (issue #56 / GAP-20, guidelines §4.9):
-    /// at most <see cref="ThrottleMaxMessages"/> application messages
-    /// per <see cref="ThrottleTimeWindowMs"/>-millisecond sliding window.
+    /// Per-session Max Order Rate (issue #435 / GAP-20, guidelines §4.9):
+    /// at most <see cref="MaxOrderRatePerSecond"/> order messages per second.
     /// On violation the session emits
     /// <c>BusinessMessageReject("Throttle limit exceeded")</c> and stays
     /// open (the offending frame is dropped and does NOT consume budget).
@@ -87,6 +86,12 @@ public sealed record FixpSessionOptions
 
     /// <summary>See <see cref="ThrottleTimeWindowMs"/>.</summary>
     public int ThrottleMaxMessages { get; init; }
+
+    /// <summary>
+    /// Preferred per-session order-message cap. Defaults to 200 msg/s.
+    /// Set to <c>0</c> to disable the limiter.
+    /// </summary>
+    public int MaxOrderRatePerSecond { get; init; } = 200;
 
     /// <summary>
     /// Optional process-wide throttle counters. When non-null the session
@@ -116,5 +121,6 @@ public sealed record FixpSessionOptions
         if (RetransmitBufferCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(RetransmitBufferCapacity));
         if (ThrottleTimeWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleTimeWindowMs));
         if (ThrottleMaxMessages < 0) throw new ArgumentOutOfRangeException(nameof(ThrottleMaxMessages));
+        if (MaxOrderRatePerSecond < 0) throw new ArgumentOutOfRangeException(nameof(MaxOrderRatePerSecond));
     }
 }

@@ -469,7 +469,8 @@ public sealed class ExchangeHost : IAsyncDisposable
             LifecycleMetrics = _metrics.Sessions,
             ThrottleTimeWindowMs = _config.Tcp.Throttle?.TimeWindowMs ?? 0,
             ThrottleMaxMessages = _config.Tcp.Throttle?.MaxMessages ?? 0,
-            ThrottleMetrics = _config.Tcp.Throttle is not null ? _metrics.Throttle : null,
+            MaxOrderRatePerSecond = 200,
+            ThrottleMetrics = _metrics.Throttle,
             OnTransportSendQueueFull = _metrics.Transport.IncSendQueueFull,
         };
         // Phase 2 (#42): real Negotiate handshake. The validator is pure
@@ -955,7 +956,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             var policy = sc.Policy is null
                 ? SessionPolicy.Default
                 : new SessionPolicy(
-                    ThrottleMessagesPerSecond: sc.Policy.ThrottleMessagesPerSecond,
+                    MaxOrderRatePerSecond: sc.Policy.MaxOrderRatePerSecond,
                     KeepAliveIntervalMs: sc.Policy.KeepAliveIntervalMs,
                     IdleTimeoutMs: sc.Policy.IdleTimeoutMs,
                     TestRequestGraceMs: sc.Policy.TestRequestGraceMs,

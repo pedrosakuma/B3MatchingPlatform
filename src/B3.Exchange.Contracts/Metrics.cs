@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Threading;
 
 namespace B3.Exchange.Contracts;
@@ -45,6 +46,7 @@ public sealed class SessionLifecycleMetrics
 /// </summary>
 public sealed class ThrottleMetrics
 {
+    private readonly ConcurrentDictionary<string, long[]> _rateLimitedBySession = new();
     private long _accepted;
     private long _rejected;
 
@@ -52,7 +54,20 @@ public sealed class ThrottleMetrics
     public long Rejected => Interlocked.Read(ref _rejected);
 
     public void IncAccepted() => Interlocked.Increment(ref _accepted);
-    public void IncRejected() => Interlocked.Increment(ref _rejected);
+    public void IncRejected() => IncRejected(sessionId: null);
+    public void IncRejected(string? sessionId)
+    {
+        Interlocked.Increment(ref _rejected);
+        if (string.IsNullOrEmpty(sessionId))
+            return;
+        var box = _rateLimitedBySession.GetOrAdd(sessionId, static _ => new long[1]);
+        Interlocked.Increment(ref box[0]);
+    }
+
+    public KeyValuePair<string, long>[] RateLimitedBySessionSnapshot()
+        => _rateLimitedBySession.ToArray()
+            .Select(kv => new KeyValuePair<string, long>(kv.Key, Volatile.Read(ref kv.Value[0])))
+            .ToArray();
 }
 
 /// <summary>
