@@ -156,14 +156,20 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
+        if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
+        {
+            _metrics?.IncOrdersIn();
+            EmitOpenOrderLimitReject(item.NewOrder!);
+            return;
+        }
+        if (item.Kind == WorkKind.Cross && WouldExceedOpenOrderLimit(item.Firm, requiredSlots: 2))
+        {
+            _metrics?.IncOrdersIn();
+            EmitOpenOrderLimitReject(item.Cross!);
+            return;
+        }
         if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
         {
-            if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
-            {
-                _metrics?.IncOrdersIn();
-                EmitOpenOrderLimitReject(item.NewOrder!);
-                return;
-            }
             if (!WalAppendIfEnabled(in item))
             {
                 _metrics?.IncWalHaltReject();
@@ -479,9 +485,11 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private bool WouldExceedOpenOrderLimit(uint enteringFirm)
-        => _openOrdersByFirm.TryGetValue(enteringFirm, out int current)
-           && current >= _maxOpenOrdersPerFirm;
+    private bool WouldExceedOpenOrderLimit(uint enteringFirm, int requiredSlots = 1)
+    {
+        int current = _openOrdersByFirm.TryGetValue(enteringFirm, out int count) ? count : 0;
+        return current + requiredSlots > _maxOpenOrdersPerFirm;
+    }
 
     private void EmitOpenOrderLimitReject(NewOrderCommand order)
     {
@@ -491,5 +499,15 @@ public sealed partial class ChannelDispatcher
                 RejectReason.OrderExceedsLimit, order.EnteredAtNanos, order.Memo),
             _currentClOrdId, CurrentDurability);
         _metrics?.IncExecutionReport(ExecutionReportKind.Reject);
+    }
+
+    private void EmitOpenOrderLimitReject(CrossOrderCommand cross)
+    {
+        if (!_hasCurrentSession) return;
+
+        _currentClOrdId = cross.BuyClOrdIdValue;
+        EmitOpenOrderLimitReject(cross.Buy);
+        _currentClOrdId = cross.SellClOrdIdValue;
+        EmitOpenOrderLimitReject(cross.Sell);
     }
 }

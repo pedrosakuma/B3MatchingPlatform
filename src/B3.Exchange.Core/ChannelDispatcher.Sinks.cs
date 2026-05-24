@@ -478,6 +478,7 @@ public sealed partial class ChannelDispatcher
         {
             _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
                 originalQty: e.Quantity);
+            IncrementOpenOrders(_currentFirm);
             var accepted = new OrderAcceptedEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,
@@ -504,6 +505,7 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
+            DecrementOpenOrders(owner.Firm);
             var canceled = new OrderCanceledEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,

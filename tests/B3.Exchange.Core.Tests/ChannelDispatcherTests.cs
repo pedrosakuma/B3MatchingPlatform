@@ -289,6 +289,100 @@ public partial class ChannelDispatcherTests
         Assert.Contains("open_orders_per_firm{firm=\"7\"} 0\n", metrics.RenderProm());
     }
 
+    [Fact]
+    public void MaxOpenOrdersPerFirm_StopAcceptedCountsTowardCap()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(11m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("L2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        Assert.Single(reply.News);
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(reply.Rejects).Reason);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_StopCancelDecrementsSoNextNewIsAccepted()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(11m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long stopOrderId = Assert.Single(reply.News).OrderId;
+
+        disp.EnqueueCancel(new CancelOrderCommand("C1", Petr, stopOrderId, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("L2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, reply.News.Count);
+        Assert.Single(reply.Cancels);
+        Assert.Empty(reply.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_TriggeredStopThatRestsKeepsSingleCount()
+    {
+        var metrics = new MetricsRegistry();
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1, metrics: metrics);
+        var stopOwner = new FakeSession(outbound) { EnteringFirm = 7 };
+        var maker = new FakeSession(outbound) { EnteringFirm = 8 };
+        var trigger = new FakeSession(outbound) { EnteringFirm = 9 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLimit, TimeInForce.Day, Px(10m), 200, 7, 1_000UL)
+        { StopPxMantissa = Px(10m) }, stopOwner.Id, stopOwner.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("M1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("T1", Petr, Side.Buy, OrderType.Limit, TimeInForce.IOC, Px(10m), 100, 9, 3_000UL),
+            trigger.Id, trigger.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        Assert.Contains("open_orders_per_firm{firm=\"7\"} 1\n", metrics.RenderProm());
+
+        disp.EnqueueNewOrder(new NewOrderCommand("L2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 4_000UL),
+            stopOwner.Id, stopOwner.EnteringFirm, clOrdIdValue: 4UL);
+        DrainInbound(disp);
+
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(stopOwner.Rejects).Reason);
+        Assert.Contains("open_orders_per_firm{firm=\"7\"} 1\n", metrics.RenderProm());
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_RestoreMatchesSteadyStateForStops()
+    {
+        var (live, _, liveOutbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var liveReply = new FakeSession(liveOutbound) { EnteringFirm = 7 };
+
+        live.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(11m) }, liveReply.Id, liveReply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(live);
+        var snapshot = live.CaptureChannelState();
+        live.EnqueueNewOrder(new NewOrderCommand("L2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 2_000UL),
+            liveReply.Id, liveReply.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(live);
+
+        var (restored, _, restoredOutbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        restored.RestoreChannelState(snapshot);
+        var restoredReply = new FakeSession(restoredOutbound) { EnteringFirm = 7 };
+        restored.EnqueueNewOrder(new NewOrderCommand("L2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 2_000UL),
+            restoredReply.Id, restoredReply.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(restored);
+
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(liveReply.Rejects).Reason);
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(restoredReply.Rejects).Reason);
+    }
+
 
     [Fact]
     public void NewOrder_WithMemo_ExecReportNewCarriesMemo()

@@ -50,6 +50,8 @@ public class CrossOrderSemanticsTests
         public List<bool> TradeIsAggressor { get; } = new();
         public List<OrderAcceptedEvent> News { get; } = new();
         public List<OrderCanceledEvent> Cancels { get; } = new();
+        public List<RejectEvent> Rejects { get; } = new();
+        public List<ulong> RejectClOrdIds { get; } = new();
         public FakeSession(RecordingOutbound o) { o.Register(this); }
     }
 
@@ -84,10 +86,15 @@ public class CrossOrderSemanticsTests
 
         public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default) => true;
 
-        public bool WriteExecutionReportReject(SessionId session, in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default) => true;
+        public bool WriteExecutionReportReject(SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default)
+        {
+            if (_sessions.TryGetValue(session, out var s)) { s.Rejects.Add(e); s.RejectClOrdIds.Add(clOrdIdValue); }
+            return true;
+        }
     }
 
-    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher()
+    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher(
+        int maxOpenOrdersPerFirm = 100_000)
     {
         var pkt = new RecordingPacketSink();
         var outbound = new RecordingOutbound();
@@ -100,6 +107,7 @@ public class CrossOrderSemanticsTests
                 Logger = NullLogger<ChannelDispatcher>.Instance,
                 TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
                 TradeDate = 19_000,
+                MaxOpenOrdersPerFirm = maxOpenOrdersPerFirm,
             });
         return (disp, pkt, outbound);
     }
@@ -247,5 +255,25 @@ public class CrossOrderSemanticsTests
         Assert.Single(s.News);
         Assert.Equal(2, s.Trades.Count);
         Assert.Equal(100, s.Trades[0].Quantity);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_CrossAtCapMinusOneIsRejectedForWorstCaseResidual()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 2);
+        var s = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("OPEN", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 1_000UL),
+            s.Id, s.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var cross = new CrossOrderCommand(Buy(200, 11m, 10UL), Sell(100, 10m, 11UL), 10UL, 11UL, CrossId: 999UL);
+        disp.EnqueueCross(cross, s.Id, s.EnteringFirm);
+        DrainInbound(disp);
+
+        Assert.Single(s.News);
+        Assert.Equal(2, s.Rejects.Count);
+        Assert.All(s.Rejects, r => Assert.Equal(RejectReason.OrderExceedsLimit, r.Reason));
+        Assert.Equal(new[] { 10UL, 11UL }, s.RejectClOrdIds);
     }
 }
