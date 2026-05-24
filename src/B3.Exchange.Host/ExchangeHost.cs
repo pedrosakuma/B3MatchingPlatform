@@ -465,6 +465,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
             IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
             TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
+            SendingTimeSkewToleranceNs = (ulong)Math.Max(_config.Tcp.SendingTimeSkewToleranceMs, 0) * 1_000_000UL,
             LifecycleMetrics = _metrics.Sessions,
             ThrottleTimeWindowMs = _config.Tcp.Throttle?.TimeWindowMs ?? 0,
             ThrottleMaxMessages = _config.Tcp.Throttle?.MaxMessages ?? 0,

@@ -56,6 +56,42 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// Validates <c>InboundBusinessHeader.sendingTime</c> against the server
+    /// clock. The B3 schema's <c>UTCTimestampNanosOptional</c> type is a
+    /// uint64 Unix-epoch nanosecond timestamp with null value 0; a null or
+    /// out-of-window value is rejected with <c>BusinessMessageReject</c> and
+    /// the session remains open.
+    /// </summary>
+    internal bool TryAcceptBusinessHeaderSendingTime(ushort templateId, ReadOnlySpan<byte> fixedBlock)
+    {
+        ulong hdrSendingTime = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(8, 8));
+        ulong tolerance = _options.SendingTimeSkewToleranceNs;
+        if (tolerance == 0)
+            return true;
+
+        ulong now = _timeSource.NowNanos();
+        ulong diff = hdrSendingTime > now ? hdrSendingTime - now : now - hdrSendingTime;
+        if (hdrSendingTime != 0 && diff <= tolerance)
+            return true;
+
+        uint hdrMsgSeqNum = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4));
+        ulong refClOrdId = fixedBlock.Length >= 28
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(fixedBlock.Slice(20, 8))
+            : 0UL;
+
+        WriteBusinessMessageReject(
+            refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
+            refSeqNum: hdrMsgSeqNum,
+            businessRejectRefId: refClOrdId,
+            businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
+            text: "sendingTime outside tolerance");
+        _logger.LogWarning(
+            "fixp session {ConnectionId} rejected business message: sendingTime {SendingTime} differs from server clock {Now} by {Diff}ns (tolerance={Tolerance}ns, template={Template})",
+            ConnectionId, hdrSendingTime, now, diff, tolerance, templateId);
+        return false;
+    }
+
+    /// <summary>
     /// Emits a <c>BusinessMessageReject(33003)</c> for an application
     /// frame whose wire body decoded but requested an unsupported
     /// sub-feature (e.g. stop-order, iceberg, RLP, GTC). The session

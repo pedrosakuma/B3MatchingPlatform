@@ -11,7 +11,8 @@
     "enteringFirm": 1,
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
-    "testRequestGraceMs": 5000
+    "testRequestGraceMs": 5000,
+    "sendingTimeSkewToleranceMs": 5000
   },
   // Authentication. devMode=true bypasses access-key validation during
   // FIXP Negotiate (#42) — useful for local dev / tests. Production

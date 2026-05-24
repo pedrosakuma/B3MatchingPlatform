@@ -76,7 +76,8 @@ Exposes:
     "enteringFirm": 1,
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
-    "testRequestGraceMs": 5000
+    "testRequestGraceMs": 5000,
+    "sendingTimeSkewToleranceMs": 5000
   },
   "auth": { "devMode": true },
   "firms": [
@@ -143,6 +144,9 @@ Exposes:
   the session is closed; a `BusinessReject` (templateId=206) framing the
   reason is the responsibility of issue #11 — `EntryPointSession.Close(reason)`
   exposes the seam.
+* `tcp.sendingTimeSkewToleranceMs` — maximum absolute skew tolerated between
+  the server clock and an inbound application message's
+  `InboundBusinessHeader.sendingTime`. Default `5000`; set `0` to disable.
 * `http` — **optional** Kestrel-hosted operability endpoint exposing
   `/health/live`, `/health/ready`, and `/metrics`. Omit the entire block to
   disable HTTP.
