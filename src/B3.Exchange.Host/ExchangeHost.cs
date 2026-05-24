@@ -539,7 +539,9 @@ public sealed class ExchangeHost : IAsyncDisposable
             retransmitMetrics: _metrics.Retransmit,
             outboundJournal: _outboundJournal,
             statePersister: _statePersister,
-            persistedSessionStates: persistedSessionStates);
+            persistedSessionStates: persistedSessionStates,
+            persistedMaxOrderRateResolver: sessionId =>
+                firmRegistry.FindSessionByWire(sessionId)?.Policy.MaxOrderRatePerSecond);
         _listener.Start();
         _logger.LogInformation("entrypoint listening on {Endpoint}", _listener.LocalEndpoint);
 

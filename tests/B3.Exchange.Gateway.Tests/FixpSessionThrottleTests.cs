@@ -292,6 +292,21 @@ public class FixpSessionThrottleTests
     }
 
     [Fact]
+    public void Rejected_metric_numeric_session_id_has_zero_steady_state_allocation()
+    {
+        var metrics = new B3.Exchange.Contracts.ThrottleMetrics();
+        metrics.IncRejected(100u);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 10_000; i++)
+            metrics.IncRejected(100u);
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        Assert.Equal(0, after - before);
+        Assert.Equal(10_001, metrics.Rejected);
+    }
+
+    [Fact]
     public async Task Window_slides_forward_so_more_messages_admitted_after_time_passes()
     {
         var (server, client) = await ConnectPairAsync();

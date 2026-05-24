@@ -48,7 +48,7 @@ public sealed partial class FixpSession
             businessRejectRefId: refClOrdId,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.Other,
             text: "Throttle limit exceeded");
-        _options.ThrottleMetrics?.IncRejected(SessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        _options.ThrottleMetrics?.IncRejected(SessionId);
         _logger.LogWarning(
             "fixp session {ConnectionId} throttle reject template={Template} (max={Max}/{WindowMs}ms)",
             ConnectionId, templateId, _throttle.MaxMessages, _throttle.TimeWindowMs);

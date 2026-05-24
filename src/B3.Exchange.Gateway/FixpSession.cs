@@ -314,7 +314,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
-        bool resumeAsNegotiated = false)
+        bool resumeAsNegotiated = false,
+        int? persistedMaxOrderRatePerSecond = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -329,6 +330,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
+        if (persistedMaxOrderRatePerSecond is < 0)
+            throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
         // Issue #405 rehydration: when a state snapshot survives a
@@ -421,7 +424,8 @@ public sealed partial class FixpSession : IAsyncDisposable
             logger: _logger,
             connectionId: ConnectionId);
         ConfigureOrderRateLimit(
-            _options.ThrottleMaxMessages > 0 ? _options.ThrottleMaxMessages : _options.MaxOrderRatePerSecond,
+            persistedMaxOrderRatePerSecond
+                ?? (_options.ThrottleMaxMessages > 0 ? _options.ThrottleMaxMessages : _options.MaxOrderRatePerSecond),
             _options.ThrottleTimeWindowMs > 0 ? _options.ThrottleTimeWindowMs : 1_000);
         _onClosed = onClosed;
         _validator = negotiationValidator;
