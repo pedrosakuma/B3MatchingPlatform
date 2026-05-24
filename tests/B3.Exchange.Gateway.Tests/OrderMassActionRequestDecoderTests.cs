@@ -94,34 +94,36 @@ public class OrderMassActionRequestDecoderTests
     }
 
     [Fact]
-    public void UnsupportedFeature_OrdTagIdSet()
+    public void Success_OrdTagIdFilter()
     {
         var body = BuildRequest(ordTagId: 7);
         var outcome = InboundMessageDecoder.TryDecodeOrderMassActionRequest(
-            body, 0UL, out _, out _, out var msg);
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("OrdTagID", msg);
+            body, 0UL, out var cmd, out _, out var msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(7, cmd.OrdTagIdFilter);
     }
 
     [Fact]
-    public void UnsupportedFeature_AssetSet()
+    public void Success_AssetFilter()
     {
         var body = BuildRequest(asset: new byte[] { (byte)'D', (byte)'O', (byte)'L', 0, 0, 0 });
         var outcome = InboundMessageDecoder.TryDecodeOrderMassActionRequest(
-            body, 0UL, out _, out _, out var msg);
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("Asset", msg);
+            body, 0UL, out var cmd, out _, out var msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal("DOL", cmd.AssetFilter);
     }
 
     [Fact]
-    public void UnsupportedFeature_InvestorIdSet()
+    public void Success_InvestorIdFilter()
     {
-        // Non-"BVMF" bytes at offset 46 indicate V2 InvestorID is populated.
         var body = BuildRequest(investorId: new byte[] { 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC });
         var outcome = InboundMessageDecoder.TryDecodeOrderMassActionRequest(
-            body, 0UL, out _, out _, out var msg);
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("InvestorID", msg);
+            body, 0UL, out var cmd, out _, out var msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(new InvestorId(0x3412, 0xBC9A7856), cmd.InvestorIdFilter);
     }
 
     [Fact]

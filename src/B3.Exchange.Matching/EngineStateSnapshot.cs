@@ -58,7 +58,10 @@ public sealed record RestingOrderRecord(
     ulong InsertTimestampNanos,
     TimeInForce Tif,
     long MaxFloor,
-    long HiddenQuantity);
+    long HiddenQuantity,
+    byte OrdTagId = 0,
+    string? Asset = null,
+    InvestorId? InvestorId = null);
 
 /// <summary>
 /// Persistable view of a single untriggered stop order (issue #262). Mirrors

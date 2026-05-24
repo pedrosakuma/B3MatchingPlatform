@@ -12,6 +12,9 @@ internal sealed class RestingOrder
     public required Side Side { get; init; }
     public required long PriceMantissa { get; init; }
     public required uint EnteringFirm { get; init; }
+    public byte OrdTagId { get; init; }
+    public string? Asset { get; init; }
+    public InvestorId? InvestorId { get; init; }
 
     /// <summary>
     /// Wall-clock timestamp at which the order entered (or last re-entered)
@@ -302,7 +305,10 @@ internal sealed class LimitOrderBook
                         InsertTimestampNanos: o.InsertTimestampNanos,
                         Tif: o.Tif,
                         MaxFloor: o.MaxFloor,
-                        HiddenQuantity: o.HiddenQuantity);
+                        HiddenQuantity: o.HiddenQuantity,
+                        OrdTagId: o.OrdTagId,
+                        Asset: o.Asset,
+                        InvestorId: o.InvestorId);
                 }
             }
         }
@@ -326,6 +332,9 @@ internal sealed class LimitOrderBook
             Side = record.Side,
             PriceMantissa = record.PriceMantissa,
             EnteringFirm = record.EnteringFirm,
+            OrdTagId = record.OrdTagId,
+            Asset = record.Asset,
+            InvestorId = record.InvestorId,
             InsertTimestampNanos = record.InsertTimestampNanos,
             Tif = record.Tif,
             MaxFloor = record.MaxFloor,

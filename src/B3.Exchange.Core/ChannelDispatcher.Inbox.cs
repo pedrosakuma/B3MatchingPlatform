@@ -141,10 +141,14 @@ public sealed partial class ChannelDispatcher
     /// </summary>
     public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
         ulong enteredAtNanos)
+        => EnqueueResolvedMassCancel(orderIds, session, enteringFirm, new MassCancelCommand(0, null, enteredAtNanos));
+
+    public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
+        MassCancelCommand command)
     {
         if (orderIds == null || orderIds.Count == 0) return true;
         if (RejectIfWalHalted(WorkKind.MassCancel)) return false;
-        var mc = new ResolvedMassCancel(orderIds, enteredAtNanos);
+        var mc = new ResolvedMassCancel(orderIds, command);
         using var act = StartEnqueueSpan(WorkKind.MassCancel, session, enteringFirm, 0, securityId: 0);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,

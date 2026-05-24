@@ -405,7 +405,7 @@ public class ExchangeHostE2ETests
     }
 
     [Fact]
-    public async Task OrderMassActionRequest_OrdTagIdFilter_RejectedAsUnsupportedFeature()
+    public async Task OrderMassActionRequest_OrdTagIdFilter_Accepted()
     {
         var (cfg, sink) = BuildConfig();
         await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
@@ -416,15 +416,14 @@ public class ExchangeHostE2ETests
         await client.ConnectAsync(ep.Address, ep.Port);
         var stream = client.GetStream();
 
-        // Build a request with OrdTagID set (unsupported feature).
+        // Build a request with OrdTagID set; no matching orders exist, but the filter is accepted.
         var frame = BuildOrderMassActionRequest(clOrdId: 9100, secId: Petr);
         frame[EntryPointFrameReader.WireHeaderSize + 29] = 7; // OrdTagID
         await stream.WriteAsync(frame);
 
         var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
-        Assert.Equal((byte)'0', report.Body[44]); // MassActionResponse = REJECTED
-        Assert.Equal((byte)0, report.Body[45]);   // RejectReason = MASS_ACTION_NOT_SUPPORTED
+        Assert.Equal((byte)'1', report.Body[44]); // MassActionResponse = ACCEPTED
     }
 
     private static byte[] BuildOrderCancelRequest(ulong clOrdId, long secId, ulong orderId, ulong origClOrdId, char side)

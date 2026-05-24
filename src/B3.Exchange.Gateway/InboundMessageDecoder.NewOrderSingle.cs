@@ -17,6 +17,7 @@ internal static partial class InboundMessageDecoder
     /// </summary>
     private static class NewOrderSingleOffsets
     {
+        public const int OrdTagID = 18;           // byte (0 == null)
         public const int MmProtectionReset = 19;  // bool byte (0=false)
         public const int ClOrdID = 20;            // ulong
         public const int Stp = 47;                // SelfTradePreventionInstruction (0=NONE)
@@ -31,6 +32,7 @@ internal static partial class InboundMessageDecoder
         public const int MinQty = 84;             // ulong (0 == null)
         public const int MaxFloor = 92;           // ulong (0 == null)
         public const int ExpireDate = 105;        // ushort (0 == null)
+        public const int InvestorID = 119;        // Prefix(2) + Document(4), all-zero == null
         // V6 trailer (BlockLength=133). Both fields use 0 as the SBE
         // null sentinel. Currently the engine rejects non-null values
         // with BMR(33003) since strategy routing / sub-account tagging
@@ -75,11 +77,14 @@ internal static partial class InboundMessageDecoder
         long stopPx = MemoryMarshal.Read<long>(body.Slice(NewOrderSingleOffsets.StopPxMantissa, 8));
         ulong minQty = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.MinQty, 8));
         ulong maxFloor = MemoryMarshal.Read<ulong>(body.Slice(NewOrderSingleOffsets.MaxFloor, 8));
+        byte ordTagId = body[NewOrderSingleOffsets.OrdTagID];
         byte mmpReset = body[NewOrderSingleOffsets.MmProtectionReset];
         byte stp = body[NewOrderSingleOffsets.Stp];
         ushort expireDate = MemoryMarshal.Read<ushort>(body.Slice(NewOrderSingleOffsets.ExpireDate, 2));
 
         clOrdIdValue = clOrdId;
+        var investorSpan = body.Slice(NewOrderSingleOffsets.InvestorID, 6);
+        InvestorId? investorId = IsAllZero(investorSpan) ? null : DecodeInvestorId(investorSpan);
 
         if (!TryMapSide(sideByte, out var side))
         {
@@ -185,6 +190,8 @@ internal static partial class InboundMessageDecoder
             MinQty = minQty,
             MaxFloor = maxFloor,
             StopPxMantissa = engineStopPx,
+            OrdTagId = ordTagId,
+            InvestorId = investorId,
         };
         return InboundDecodeOutcome.Success;
     }

@@ -141,7 +141,7 @@ public sealed partial class ChannelDispatcher
             WorkKind.Cancel => item.Cancel?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Replace => item.Replace?.EnteredAtNanos ?? ulong.MaxValue,
             WorkKind.Cross => item.Cross?.Buy.EnteredAtNanos ?? ulong.MaxValue,
-            WorkKind.MassCancel => item.MassCancel?.EnteredAtNanos ?? ulong.MaxValue,
+            WorkKind.MassCancel => item.MassCancel?.Command.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
         _packetWritten = 0;
@@ -312,7 +312,7 @@ public sealed partial class ChannelDispatcher
                         // Gateway router.
                         var mc = item.MassCancel!;
                         if (mc.OrderIds.Count > 0)
-                            _engine.MassCancel(mc.OrderIds, mc.EnteredAtNanos);
+                            _engine.MassCancel(mc.OrderIds, mc.Command);
                         break;
                     }
                 case WorkKind.DecodeError:

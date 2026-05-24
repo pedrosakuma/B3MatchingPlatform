@@ -74,7 +74,7 @@ public sealed partial class ChannelDispatcher
     /// flat list of engine-assigned <c>OrderID</c>s plus the original
     /// inbound timestamp.
     /// </summary>
-    internal sealed record ResolvedMassCancel(IReadOnlyList<long> OrderIds, ulong EnteredAtNanos);
+    internal sealed record ResolvedMassCancel(IReadOnlyList<long> OrderIds, MassCancelCommand Command);
 
     /// <summary>
     /// Operator-triggered trade-bust payload (issue #15): identifies a

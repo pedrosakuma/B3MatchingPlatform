@@ -26,8 +26,8 @@ internal static partial class InboundMessageDecoder
     /// Decodes an <c>OrderMassActionRequest</c> body (template 701, spec
     /// §4.8 / #GAP-19) into a <see cref="MassCancelCommand"/>. Returns
     /// <see cref="InboundDecodeOutcome.Success"/> when the request maps
-    /// onto the engine's supported subset (cancel-orders, optional Side
-    /// + SecurityID filters). Returns
+    /// onto the engine's supported subset (cancel-orders, optional Side,
+    /// SecurityID, OrdTagID, Asset and InvestorID filters). Returns
     /// <see cref="InboundDecodeOutcome.UnsupportedFeature"/> for
     /// schema-valid but unimplemented variants. Returns
     /// <see cref="InboundDecodeOutcome.DecodeError"/> for wire values
@@ -58,25 +58,13 @@ internal static partial class InboundMessageDecoder
             return InboundDecodeOutcome.DecodeError;
         }
 
-        if (ordTagId != 0)
-        {
-            message = "OrdTagID filter not supported (engine does not track ordTagID per order)";
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
-
         var assetSpan = body.Slice(OrderMassActionRequestOffsets.Asset, 6);
-        if (!IsAllZero(assetSpan))
-        {
-            message = "Asset filter not supported (engine does not track per-instrument asset)";
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
+        string? assetFilter = DecodeOptionalAscii(assetSpan);
 
         var investorSpan = body.Slice(OrderMassActionRequestOffsets.InvestorID, 6);
-        if (!IsMassActionInvestorEmpty(investorSpan))
-        {
-            message = "InvestorID (mass cancel on behalf) not supported";
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
+        InvestorId? investorFilter = IsMassActionInvestorEmpty(investorSpan)
+            ? null
+            : DecodeInvestorId(investorSpan);
 
         Side? sideFilter = null;
         if (sideByte != 0)
@@ -94,9 +82,27 @@ internal static partial class InboundMessageDecoder
         cmd = new MassCancelCommand(
             SecurityId: securityId,
             SideFilter: sideFilter,
-            EnteredAtNanos: enteredAtNanos);
+            EnteredAtNanos: enteredAtNanos)
+        {
+            OrdTagIdFilter = ordTagId,
+            AssetFilter = assetFilter,
+            InvestorIdFilter = investorFilter,
+        };
         return InboundDecodeOutcome.Success;
     }
+
+    private static string? DecodeOptionalAscii(ReadOnlySpan<byte> span)
+    {
+        int end = span.Length;
+        while (end > 0 && (span[end - 1] == 0 || span[end - 1] == (byte)' ')) end--;
+        if (end == 0) return null;
+        return System.Text.Encoding.ASCII.GetString(span[..end]).ToUpperInvariant();
+    }
+
+    private static InvestorId DecodeInvestorId(ReadOnlySpan<byte> span)
+        => new(
+            Prefix: MemoryMarshal.Read<ushort>(span[..2]),
+            Document: MemoryMarshal.Read<uint>(span.Slice(2, 4)));
 
     private static bool IsAllZero(ReadOnlySpan<byte> span)
     {

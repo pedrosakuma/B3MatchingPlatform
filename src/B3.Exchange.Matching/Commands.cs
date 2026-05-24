@@ -182,6 +182,10 @@ public sealed record NewOrderCommand(
     uint EnteringFirm,
     ulong EnteredAtNanos)
 {
+    public byte OrdTagId { get; init; }
+    public string? Asset { get; init; }
+    public InvestorId? InvestorId { get; init; }
+
     /// <summary>
     /// Optional minimum-fill (FIX MinQty). When non-zero, the engine
     /// requires that at submission time the immediately fillable quantity
@@ -360,6 +364,8 @@ public enum CrossPrioritization : byte
     SellPrioritized = 2,
 }
 
+public readonly record struct InvestorId(ushort Prefix, uint Document);
+
 /// <summary>
 /// Mass-cancel command (OrderMassActionRequest template 701, spec §4.8 /
 /// #GAP-19). Carries the wire-level filter as decoded from the inbound
@@ -374,4 +380,9 @@ public enum CrossPrioritization : byte
 public sealed record MassCancelCommand(
     long SecurityId,
     Side? SideFilter,
-    ulong EnteredAtNanos);
+    ulong EnteredAtNanos)
+{
+    public byte OrdTagIdFilter { get; init; }
+    public string? AssetFilter { get; init; }
+    public InvestorId? InvestorIdFilter { get; init; }
+}
