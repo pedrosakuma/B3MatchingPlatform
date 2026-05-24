@@ -423,6 +423,7 @@ public class MetricsRegistryTests
         }));
         var text = reg.RenderProm();
         Assert.DoesNotContain("exch_fixp_retransmit_buffer_utilization", text);
+        Assert.DoesNotContain("exch_fixp_retransmit_buffer_full_percent", text);
     }
 
     [Fact]
@@ -443,6 +444,8 @@ public class MetricsRegistryTests
                 SendQueueDepth: 0, AttachedTransportId: null, LastActivityAtMs: 0),
         }));
         var text = reg.RenderProm();
+        Assert.Contains("# TYPE exch_fixp_retransmit_buffer_full_percent gauge\n", text);
+        Assert.Contains("exch_fixp_retransmit_buffer_full_percent{session=\"conn-1\",firm=\"F1\"} 75\n", text);
         Assert.Contains("# TYPE exch_fixp_retransmit_buffer_utilization gauge\n", text);
         Assert.Contains("exch_fixp_retransmit_buffer_utilization{session=\"conn-1\",firm=\"F1\"} 0.75\n", text);
         Assert.DoesNotContain("session=\"conn-2\"", text.Substring(text.IndexOf("exch_fixp_retransmit_buffer_utilization", StringComparison.Ordinal)));

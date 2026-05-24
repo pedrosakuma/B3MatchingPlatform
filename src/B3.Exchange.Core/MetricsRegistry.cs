@@ -439,15 +439,16 @@ public sealed class MetricsRegistry
     /// <summary>
     /// Issue #288: process-wide RetransmitBuffer counters
     /// (per-session-ring evictions and Suspended-state appends). The
-    /// per-session utilization gauge is rendered separately, gated by
+    /// per-session fill-level gauges are rendered separately, gated by
     /// <see cref="EmitFixpSessionLabels"/>.
     /// </summary>
     public RetransmitMetrics Retransmit => _retransmit;
 
     /// <summary>
     /// Issue #288: when <c>true</c>, the Prometheus renderer emits
-    /// <c>exch_fixp_retransmit_buffer_utilization</c> with a per-session
-    /// label. Default <c>false</c> so deployments with many short-lived
+    /// <c>exch_fixp_retransmit_buffer_utilization</c> and
+    /// <c>exch_fixp_retransmit_buffer_full_percent</c> with per-session
+    /// labels. Default <c>false</c> so deployments with many short-lived
     /// sessions do not blow up scrape cardinality. The aggregate counters
     /// (<c>exch_fixp_retransmit_buffer_evictions_total</c>,
     /// <c>exch_fixp_passive_er_buffered_total</c>) are always emitted.
@@ -626,7 +627,6 @@ public sealed class MetricsRegistry
         EmitSessionGauge(sb, sessionSnap, "fixp_session_retx_buffer_depth",
             "Number of business frames buffered for replay on this session.",
             withFirmLabel: false, s => s.RetxBufferDepth);
-        EmitSessionRetransmitUtilizationPercent(sb, sessionSnap);
         EmitSessionGauge(sb, sessionSnap, "fixp_session_attached_transports",
             "1 if a TCP transport is currently attached, 0 if Suspended.",
             withFirmLabel: false, s => s.AttachedTransportId is null ? 0 : 1);
@@ -667,7 +667,7 @@ public sealed class MetricsRegistry
 
         // Issue #288: FIXP RetransmitBuffer dimensioning observability.
         // Aggregate counters are always emitted; the per-session
-        // utilization gauge below is gated by EmitFixpSessionLabels to
+        // fill-level gauges below are gated by EmitFixpSessionLabels to
         // protect scrape cardinality on deployments with many short-lived
         // sessions.
         EmitProcessCounter(sb, "exch_fixp_retransmit_buffer_evictions_total",
@@ -678,6 +678,7 @@ public sealed class MetricsRegistry
             _retransmit.PassiveErBuffered);
         if (EmitFixpSessionLabels && sessionSnap.Length > 0)
         {
+            EmitSessionRetransmitUtilizationPercent(sb, sessionSnap);
             sb.Append("# HELP exch_fixp_retransmit_buffer_utilization Per-session ratio of buffered frames to RetransmitBufferCapacity (0.0..1.0). Combined with exch_fixp_retransmit_buffer_evictions_total this is the dimensioning signal for issue #288. Per-session labels are opt-in; enable via metrics.fixpSessionLabelsEnabled.\n");
             sb.Append("# TYPE exch_fixp_retransmit_buffer_utilization gauge\n");
             foreach (var s in sessionSnap)

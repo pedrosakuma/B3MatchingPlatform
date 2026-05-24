@@ -38,8 +38,9 @@ public sealed class MetricsConfig
 {
     /// <summary>
     /// When <c>true</c>, the Prometheus renderer emits the
-    /// <c>exch_fixp_retransmit_buffer_utilization</c> gauge with a
-    /// per-session label. Default <c>false</c>; the aggregate counters
+    /// <c>exch_fixp_retransmit_buffer_utilization</c> and
+    /// <c>exch_fixp_retransmit_buffer_full_percent</c> gauges with
+    /// per-session labels. Default <c>false</c>; the aggregate counters
     /// (<c>exch_fixp_retransmit_buffer_evictions_total</c>,
     /// <c>exch_fixp_passive_er_buffered_total</c>) are always emitted.
     /// </summary>

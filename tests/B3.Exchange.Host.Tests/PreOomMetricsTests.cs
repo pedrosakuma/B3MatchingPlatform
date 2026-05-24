@@ -30,6 +30,7 @@ public class PreOomMetricsTests
                 Auth = new AuthConfig { RequireFixpHandshake = false },
                 Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
                 Http = new HttpConfig { Listen = "127.0.0.1:0", LivenessStaleMs = 60000 },
+                Metrics = new MetricsConfig { FixpSessionLabelsEnabled = true },
                 Channels =
                 {
                     new ChannelConfig
@@ -79,6 +80,61 @@ public class PreOomMetricsTests
             Assert.True(MetricValue(body, "exch_wal_last_write_unixms", "channel=\"84\"") > 0, body);
             Assert.True(MetricValue(body, "exch_fixp_retransmit_buffer_full_percent", "firm=\"unknown\"") > 0, body);
             Assert.DoesNotContain("fixp_journal_", body);
+        }
+        finally
+        {
+            TempDirs.TryDelete(dataDir);
+        }
+    }
+
+    [Fact]
+    public async Task MetricsFixpSessionLabelsDisabled_DoesNotEmitRetransmitFullPercent()
+    {
+        var dataDir = Path.Combine(AppContext.BaseDirectory,
+            "wal-metrics-disabled-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dataDir);
+        try
+        {
+            var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
+            var cfg = new HostConfig
+            {
+                Auth = new AuthConfig { RequireFixpHandshake = false },
+                Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
+                Http = new HttpConfig { Listen = "127.0.0.1:0", LivenessStaleMs = 60000 },
+                Metrics = new MetricsConfig { FixpSessionLabelsEnabled = false },
+                Channels =
+                {
+                    new ChannelConfig
+                    {
+                        ChannelNumber = 84,
+                        IncrementalGroup = "239.255.42.84",
+                        IncrementalPort = 30184,
+                        Ttl = 0,
+                        InstrumentsFile = instrumentsPath,
+                        Persistence = new PersistenceConfig
+                        {
+                            DataDir = dataDir,
+                            Throttle = new SnapshotThrottleConfig { EveryNCommands = 1000 },
+                            Wal = new WalConfig { Enabled = true, FsyncPerWrite = false },
+                        },
+                    },
+                },
+            };
+
+            await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink());
+            await host.StartAsync();
+
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync(host.TcpEndpoint!.Address, host.TcpEndpoint.Port);
+            var stream = tcp.GetStream();
+
+            await stream.WriteAsync(BuildSimpleNewOrder(2001, Petr, '1', '2', '0', 100, 123_400));
+            await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+
+            using var http = new HttpClient { BaseAddress = new Uri($"http://{host.HttpEndpoint!}") };
+            string body = await http.GetStringAsync("/metrics");
+
+            Assert.DoesNotContain("exch_fixp_retransmit_buffer_full_percent", body);
         }
         finally
         {
