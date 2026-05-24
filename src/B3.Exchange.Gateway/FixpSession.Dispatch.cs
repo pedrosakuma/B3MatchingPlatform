@@ -50,10 +50,10 @@ public sealed partial class FixpSession
         var fixedBlock = fullBody.Slice(0, info.BlockLength).Span;
         var varData = fullBody.Slice(info.BlockLength).Span;
 
-        // Per-session inbound sliding-window throttle (issue #56 / GAP-20,
-        // guidelines §4.9). Only application templates count toward the
+        // Per-session Max Order Rate throttle (issue #435 / GAP-20,
+        // guidelines §4.9). Only order-entry templates count toward the
         // budget — FIXP session-layer messages (Negotiate, Establish,
-        // Sequence, RetransmitRequest) bypass it. On violation we emit
+        // Sequence, RetransmitRequest, NotApplied) bypass it. On violation we emit
         // BusinessMessageReject with text "Throttle limit exceeded" and
         // KEEP the session open; the offending frame does not consume a
         // slot (so a sustained burst keeps getting rejected, not slowly
@@ -437,6 +437,9 @@ public sealed partial class FixpSession
         || templateId == EntryPointFrameReader.TidOrderCancelRequest
         || templateId == EntryPointFrameReader.TidNewOrderCross
         || templateId == EntryPointFrameReader.TidOrderMassActionRequest;
+
+    private static bool IsOrderRateLimitedTemplate(ushort templateId)
+        => IsApplicationTemplate(templateId);
     private static byte[] ExtractInboundMemo(ushort templateId, ReadOnlySpan<byte> varData)
     {
         if (varData.IsEmpty) return [];

@@ -634,6 +634,7 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_throttle_rejected_total",
             "Total inbound application messages rejected with BusinessMessageReject(\"Throttle limit exceeded\") by the per-session sliding-window throttle (issue #56 / GAP-20).",
             _throttle.Rejected);
+        EmitRateLimitedBySession(sb);
         EmitProcessCounter(sb, "exch_transport_send_queue_full_total",
             "Total times the gateway's TcpTransport closed a session because its bounded outbound send queue overflowed (issue #155). A non-zero value means a stuck/slow consumer is causing teardowns — alert.",
             _transport.SendQueueFull);
@@ -968,6 +969,22 @@ public sealed class MetricsRegistry
           .Append("\"} ")
           .Append(_sessionFirmMessages.SessionOverflowCount.ToString(CultureInfo.InvariantCulture))
           .Append('\n');
+    }
+
+    private void EmitRateLimitedBySession(StringBuilder sb)
+    {
+        sb.Append("# HELP rate_limited_total Total order messages rejected with BusinessMessageReject(\"Throttle limit exceeded\") by the per-session Max Order Rate throttle (issue #435 / GAP-20).\n");
+        sb.Append("# TYPE rate_limited_total counter\n");
+        var sessions = _throttle.RateLimitedBySessionSnapshot();
+        Array.Sort(sessions, (a, b) => StringComparer.Ordinal.Compare(a.Key, b.Key));
+        foreach (var kv in sessions)
+        {
+            sb.Append("rate_limited_total{session=\"")
+              .Append(EscapeLabel(kv.Key))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
     }
 
     private static void EmitRuntimeMetrics(StringBuilder sb)

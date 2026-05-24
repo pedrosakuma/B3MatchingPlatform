@@ -4,6 +4,7 @@ using B3.Exchange.Gateway;
 using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -33,6 +34,15 @@ public class FixpSessionResyncBootRehydrationTests
         public bool EnqueueMassCancel(in MassCancelCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm) => true;
         public void OnDecodeError(B3.Exchange.Contracts.SessionId session, string error) { }
         public void OnSessionClosed(B3.Exchange.Contracts.SessionId session) { }
+    }
+
+    private static byte[] BuildFixedBlock(uint sessionId, uint msgSeqNum, ulong clOrdId)
+    {
+        var fb = new byte[82];
+        BinaryPrimitives.WriteUInt32LittleEndian(fb.AsSpan(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(fb.AsSpan(4, 4), msgSeqNum);
+        BinaryPrimitives.WriteUInt64LittleEndian(fb.AsSpan(20, 8), clOrdId);
+        return fb;
     }
 
     [Fact]
@@ -308,6 +318,99 @@ public class FixpSessionResyncBootRehydrationTests
         {
             try { Directory.Delete(dir, recursive: true); } catch { }
         }
+    }
+
+    [Theory]
+    [InlineData(50, 51, 50, 50, 1)]
+    [InlineData(0, 250, 250, 0, 0)]
+    public async Task ReconnectingEstablish_WithSamePersistedSessionVerId_AppliesCredentialRateLimit(
+        int configuredMaxOrderRatePerSecond,
+        int attemptedOrders,
+        int expectedAccepted,
+        int expectedMetricAccepted,
+        int expectedRejected)
+    {
+        var persistedStates = new Dictionary<uint, FixpSessionStateSnapshot>
+        {
+            [1] = new(
+                SessionId: 1,
+                SessionVerId: 100UL,
+                OutboundMsgSeqNum: 3u,
+                LastIncomingSeqNo: 2u,
+                EnteringFirm: 42u,
+                UpdatedAtNanos: 1_000_000L),
+        };
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[]
+            {
+                new SessionCredential(
+                    SessionId: "1",
+                    FirmId: "F1",
+                    AccessKey: "",
+                    AllowedSourceCidrs: null,
+                    Policy: new SessionPolicy(MaxOrderRatePerSecond: configuredMaxOrderRatePerSecond)),
+            });
+        var claims = new SessionClaimRegistry();
+        foreach (var s in persistedStates.Values)
+            claims.SeedLastVersion(s.SessionId, s.SessionVerId);
+
+        var metrics = new ThrottleMetrics();
+        var negValidator = new NegotiationValidator(firms, claims, devMode: true, timestampSkewToleranceNs: 0);
+        var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            new SessionRegistry(),
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
+            {
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+                MaxOrderRatePerSecond = 200,
+                ThrottleMetrics = metrics,
+            },
+            negotiationValidator: negValidator,
+            sessionClaims: claims,
+            establishValidator: estValidator,
+            persistedSessionStates: persistedStates,
+            persistedMaxOrderRateResolver: sessionId =>
+                firms.FindSessionByWire(sessionId)?.Policy.MaxOrderRatePerSecond);
+        listener.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var buf = new byte[256];
+        int len = EntryPointFixpFrameCodec.EncodeEstablish(buf,
+            sessionId: 1, sessionVerId: 100UL,
+            timestampNanos: 0UL, keepAliveIntervalMillis: 60_000UL,
+            nextSeqNo: 3u,
+            cancelOnDisconnectType: 0, codTimeoutWindowMillis: 0UL,
+            credentials: ReadOnlySpan<byte>.Empty);
+        await client.GetStream().WriteAsync(buf.AsMemory(0, len));
+
+        var establishedSession = await TestUtil.WaitUntilAsync(() =>
+        {
+            var s = listener.ActiveSessions.FirstOrDefault(x => x.SessionId == 1);
+            return s is not null && s.State == FixpState.Established;
+        }, TimeSpan.FromSeconds(5));
+        Assert.True(establishedSession);
+
+        var session = listener.ActiveSessions.Single(s => s.SessionId == 1);
+        for (int i = 0; i < attemptedOrders; i++)
+        {
+            var accepted = session.TryAcceptInboundThrottle(
+                EntryPointFrameReader.TidSimpleNewOrder,
+                BuildFixedBlock(1, (uint)(i + 1), (ulong)(10_000 + i)));
+            Assert.Equal(i < expectedAccepted, accepted);
+        }
+
+        Assert.Equal(expectedMetricAccepted, metrics.Accepted);
+        Assert.Equal(expectedRejected, metrics.Rejected);
     }
 
     private sealed class FaultingStatePersister : IFixpSessionStatePersister

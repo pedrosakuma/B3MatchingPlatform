@@ -167,7 +167,7 @@ public class FirmRegistryTests
     [Fact]
     public void SessionPolicy_rejects_negative_throttle()
     {
-        var p = new SessionPolicy(ThrottleMessagesPerSecond: -1);
+        var p = new SessionPolicy(MaxOrderRatePerSecond: -1);
         Assert.Throws<InvalidOperationException>(p.Validate);
     }
 }

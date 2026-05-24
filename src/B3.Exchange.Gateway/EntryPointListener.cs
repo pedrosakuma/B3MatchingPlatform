@@ -32,6 +32,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
     private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
     private readonly IDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
+    private readonly Func<uint, int?>? _persistedMaxOrderRateResolver;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
     private Task? _acceptTask;
@@ -70,7 +71,8 @@ public sealed class EntryPointListener : IAsyncDisposable
         B3.Exchange.Contracts.RetransmitMetrics? retransmitMetrics = null,
         B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? outboundJournal = null,
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
-        IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? persistedSessionStates = null)
+        IReadOnlyDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? persistedSessionStates = null,
+        Func<uint, int?>? persistedMaxOrderRateResolver = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         ArgumentNullException.ThrowIfNull(registry);
@@ -92,6 +94,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         _persistedSessionStates = persistedSessionStates is null
             ? null
             : new Dictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>(persistedSessionStates);
+        _persistedMaxOrderRateResolver = persistedMaxOrderRateResolver;
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
             throw new ArgumentException(
@@ -442,6 +445,7 @@ public sealed class EntryPointListener : IAsyncDisposable
         // hot path (same-process Suspended session); this block handles
         // the cold path where the prior incarnation died.
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? rehydrateState = null;
+        int? persistedMaxOrderRatePerSecond = null;
         bool resumeAsNegotiated = false;
         if (_persistedSessionStates is not null
             && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize)
@@ -478,6 +482,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (decoded && _persistedSessionStates.TryGetValue(sessionIdFromFrame, out var snap))
             {
                 rehydrateState = snap;
+                persistedMaxOrderRatePerSecond = _persistedMaxOrderRateResolver?.Invoke(snap.SessionId);
                 // Only the Establish-with-matching-SessionVerId shape
                 // should resume in Negotiated state. A Negotiate frame
                 // (any SessionVerId) and an Establish with a different
@@ -493,12 +498,15 @@ public sealed class EntryPointListener : IAsyncDisposable
             }
         }
 
-        ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState, resumeAsNegotiated: resumeAsNegotiated);
+        ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState,
+            resumeAsNegotiated: resumeAsNegotiated,
+            persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond);
     }
 
     private void ConstructAndStartSession(NetworkStream stream, Socket sock, byte[]? firstFrame,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState,
-        bool resumeAsNegotiated = false)
+        bool resumeAsNegotiated = false,
+        int? persistedMaxOrderRatePerSecond = null)
     {
         var identity = _identityFactory(SafeRemote(sock));
         _logger.LogInformation("accepted connection {ConnectionId} from {Remote} sessionId={SessionId}",
@@ -522,7 +530,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             outboundJournal: _outboundJournal,
             statePersister: _statePersister,
             persistedState: persistedState,
-            resumeAsNegotiated: resumeAsNegotiated);
+            resumeAsNegotiated: resumeAsNegotiated,
+            persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();
