@@ -18,8 +18,8 @@ namespace B3.Exchange.Gateway;
 /// liveness watchdog without crossing a callback boundary on every
 /// frame.</para>
 ///
-/// <para>Backpressure: the send queue is bounded with
-/// <c>FullMode = DropWrite</c>. On overflow the transport closes the
+/// <para>Backpressure: the send queue is bounded and uses non-blocking
+/// <c>TryWrite</c> calls. On overflow the transport closes the
 /// connection rather than ballooning memory under a stuck peer; the
 /// session is notified via the <c>onClose</c> delegate.</para>
 /// </summary>
@@ -43,7 +43,15 @@ public sealed class TcpTransport : IAsyncDisposable
     /// (the default for non-ER frames such as keep-alive,
     /// SessionReject, BusinessMessageReject) skips the wait.
     /// </summary>
-    private readonly record struct OutboundFrame(byte[] Bytes, DurabilityHandle Durability);
+    private readonly record struct OutboundFrame(byte[]? Bytes, PooledOutboundFrame? PooledFrame, DurabilityHandle Durability)
+    {
+        public ReadOnlyMemory<byte> Memory => PooledFrame is { } pooled ? pooled.Memory : Bytes!;
+
+        public void Release()
+        {
+            PooledFrame?.Release();
+        }
+    }
 
     /// <summary>
     /// Underlying stream. Exposed for the session-level receive loop —
@@ -84,7 +92,7 @@ public sealed class TcpTransport : IAsyncDisposable
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite,
+            FullMode = BoundedChannelFullMode.Wait,
         });
         Volatile.Write(ref _lastOutboundTickMs, Environment.TickCount64);
     }
@@ -115,7 +123,19 @@ public sealed class TcpTransport : IAsyncDisposable
     public bool TryEnqueueFrame(byte[] frame, DurabilityHandle durability = default)
     {
         if (!IsOpen) return false;
-        if (_sendQueue.Writer.TryWrite(new OutboundFrame(frame, durability))) return true;
+        if (_sendQueue.Writer.TryWrite(new OutboundFrame(frame, null, durability))) return true;
+        try { _onSendQueueFull?.Invoke(); } catch { }
+        Close("send-queue-full");
+        return false;
+    }
+
+    internal bool TryEnqueueFrame(PooledOutboundFrame frame, DurabilityHandle durability = default)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        if (!IsOpen) return false;
+        frame.AddRef();
+        if (_sendQueue.Writer.TryWrite(new OutboundFrame(null, frame, durability))) return true;
+        frame.Release();
         try { _onSendQueueFull?.Invoke(); } catch { }
         Close("send-queue-full");
         return false;
@@ -151,25 +171,32 @@ public sealed class TcpTransport : IAsyncDisposable
             {
                 try
                 {
-                    // Issue #312: never let an ER (or any frame tagged
-                    // with a durability handle) hit the wire before its
-                    // covering WAL record is fsynced. Synchronous wait
-                    // is fine here — the send loop is the only consumer
-                    // of the queue and we WANT it to back-pressure on
-                    // un-durable frames; that's the whole point of the
-                    // gating contract.
-                    if (frame.Durability.IsActive)
-                    {
-                        frame.Durability.Barrier!.WaitForDurable(frame.Durability.Seq, ct);
-                    }
-                    await _streamWriteLock.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
-                        await _stream.WriteAsync(frame.Bytes, ct).ConfigureAwait(false);
+                        // Issue #312: never let an ER (or any frame tagged
+                        // with a durability handle) hit the wire before its
+                        // covering WAL record is fsynced. Synchronous wait
+                        // is fine here — the send loop is the only consumer
+                        // of the queue and we WANT it to back-pressure on
+                        // un-durable frames; that's the whole point of the
+                        // gating contract.
+                        if (frame.Durability.IsActive)
+                        {
+                            frame.Durability.Barrier!.WaitForDurable(frame.Durability.Seq, ct);
+                        }
+                        await _streamWriteLock.WaitAsync(ct).ConfigureAwait(false);
+                        try
+                        {
+                            await _stream.WriteAsync(frame.Memory, ct).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            _streamWriteLock.Release();
+                        }
                     }
                     finally
                     {
-                        _streamWriteLock.Release();
+                        frame.Release();
                     }
                     Volatile.Write(ref _lastOutboundTickMs, Environment.TickCount64);
                 }
@@ -185,6 +212,15 @@ public sealed class TcpTransport : IAsyncDisposable
         finally
         {
             Close("send-loop-exit");
+            ReleaseQueuedFrames();
+        }
+    }
+
+    private void ReleaseQueuedFrames()
+    {
+        while (_sendQueue.Reader.TryRead(out var frame))
+        {
+            frame.Release();
         }
     }
 
@@ -206,6 +242,7 @@ public sealed class TcpTransport : IAsyncDisposable
     {
         Close("dispose");
         try { if (_sendTask != null) await _sendTask.ConfigureAwait(false); } catch { }
+        ReleaseQueuedFrames();
         _streamWriteLock.Dispose();
     }
 }

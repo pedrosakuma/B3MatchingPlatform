@@ -335,6 +335,7 @@ public sealed partial class FixpSession
             || kind == CloseKind.DailyReset;
         if (removePersistence)
         {
+            _retxBuffer.Dispose();
             if (_outboundJournal is not null && SessionId != 0)
             {
                 try { _outboundJournal.Remove(SessionId); }
@@ -516,6 +517,7 @@ public sealed partial class FixpSession
                 ConnectionId);
         }
         await _transport.DisposeAsync().ConfigureAwait(false);
+        _retxBuffer.Dispose();
         _cts.Dispose();
     }
 }
