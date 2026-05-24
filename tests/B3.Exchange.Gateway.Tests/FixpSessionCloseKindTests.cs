@@ -111,6 +111,7 @@ public sealed class FixpSessionCloseKindTests
     [InlineData(CloseKind.PeerTerminate)]
     [InlineData(CloseKind.HostShutdown)]
     [InlineData(CloseKind.TransportError)]
+    [InlineData(CloseKind.KeepaliveLapsed)]
     [InlineData(CloseKind.SuspendedTimeout)]
     public async Task Every_CloseKind_propagates(CloseKind kind)
     {
