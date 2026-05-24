@@ -280,14 +280,15 @@ public class NewOrderSingleAndReplaceDecoderTests
     [Theory]
     [InlineData((byte)'W')] // RLP
     [InlineData((byte)'P')] // PEGGED_MIDPOINT
-    public void NewOrderSingle_UnsupportedOrdTypeReturnsBmr(byte ordTypeByte)
+    public void NewOrderSingle_UnsupportedOrdTypeReturnsEngineRejectCommand(byte ordTypeByte)
     {
         var body = BuildNewOrderSingleV2(ordType: ordTypeByte);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-            body, 1, 0, out _, out _, out var msg);
+            body, 1, 0, out var cmd, out _, out var msg);
 
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.True(cmd.UnsupportedOrderCharacteristic);
         Assert.Contains("OrdType", msg);
     }
 

@@ -74,14 +74,29 @@ internal static partial class InboundMessageDecoder
             message = $"invalid Side={sideByte}";
             return InboundDecodeOutcome.DecodeError;
         }
+
+        ReplaceOrderCommand UnsupportedCommand(OrderType? type, TimeInForce? tifOverride)
+        {
+            long unsupportedPrice = type == OrderType.Market ? 0L : (priceMantissa == PriceNull ? 0L : priceMantissa);
+            return new ReplaceOrderCommand(clOrdId.ToString(), secId, (long)orderId, unsupportedPrice, qty, enteredAtNanos)
+            {
+                NewOrdType = type,
+                NewTif = tifOverride,
+                UnsupportedOrderCharacteristic = true,
+            };
+        }
+
+        TimeInForce? tifForUnsupported = tifByte != TimeInForceOptionalNull
+            && TryClassifyTif(tifByte, out var preclassifiedTif, out _) ? preclassifiedTif : null;
         if (!TryClassifyOrdType(ordTypeByte, out var ordType, out var ordTypeUnsupported))
         {
             message = ordTypeUnsupported is not null
                 ? $"OrdType={ordTypeByte:X2} not supported (only Market, Limit)"
                 : $"invalid OrdType={ordTypeByte}";
-            return ordTypeUnsupported is not null
-                ? InboundDecodeOutcome.UnsupportedFeature
-                : InboundDecodeOutcome.DecodeError;
+            if (ordTypeUnsupported is null)
+                return InboundDecodeOutcome.DecodeError;
+            cmd = UnsupportedCommand(OrderType.Limit, tifForUnsupported);
+            return InboundDecodeOutcome.UnsupportedFeature;
         }
         // #204: TimeInForce on this template is optional; absence means
         // "preserve the resting order's original TIF". When present, any
@@ -94,45 +109,53 @@ internal static partial class InboundMessageDecoder
                 message = tifUnsupported is not null
                     ? $"TimeInForce={(char)tifByte} not supported"
                     : $"invalid TimeInForce={tifByte}";
-                return tifUnsupported is not null
-                    ? InboundDecodeOutcome.UnsupportedFeature
-                    : InboundDecodeOutcome.DecodeError;
+                if (tifUnsupported is null)
+                    return InboundDecodeOutcome.DecodeError;
+                cmd = UnsupportedCommand(ordType, null);
+                return InboundDecodeOutcome.UnsupportedFeature;
             }
             newTif = tifValue;
         }
         if (stopPx != PriceNull)
         {
             message = "Stop orders not supported (StopPx must be NULL)";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (maxFloor != 0)
         {
             message = "Iceberg orders not supported (MaxFloor must be NULL)";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (minQty != 0)
         {
             message = "Minimum-fill orders not supported (MinQty must be NULL)";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (routing != RoutingInstructionNull && routing != RoutingInstructionDefault)
         {
             message = $"RoutingInstruction={routing} not supported";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (mmpReset != 0)
         {
             message = "MMProtectionReset not supported";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (stp != 0)
         {
             message = "SelfTradePreventionInstruction not supported";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (expireDate != 0)
         {
             message = "ExpireDate not supported (only Day/IOC/FOK)";
+            cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         // #238: V6 trailer reject — see NewOrderSingle decoder.
@@ -143,11 +166,13 @@ internal static partial class InboundMessageDecoder
             if (strategyId != 0)
             {
                 message = $"StrategyID={strategyId} not supported";
+                cmd = UnsupportedCommand(ordType, newTif);
                 return InboundDecodeOutcome.UnsupportedFeature;
             }
             if (tradingSubAccount != 0)
             {
                 message = $"TradingSubAccount={tradingSubAccount} not supported";
+                cmd = UnsupportedCommand(ordType, newTif);
                 return InboundDecodeOutcome.UnsupportedFeature;
             }
         }

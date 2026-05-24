@@ -11,9 +11,9 @@ internal static partial class InboundMessageDecoder
     /// OrdType/TimeInForce/OrderQty/Price) plus the sub-feature flags
     /// (StopPx/MinQty/MaxFloor/RoutingInstruction/MmProtectionReset/
     /// SelfTradePreventionInstruction/ExpireDate) that the engine does
-    /// not implement; presence of the latter triggers a
-    /// <c>BusinessMessageReject(33003)</c> rather than terminating the
-    /// session (#GAP-15).
+    /// not implement; presence of the latter is forwarded to the engine as
+    /// an <c>ExecutionReport_Reject</c> rather than terminating the session
+    /// (#GAP-15 / #415).
     /// </summary>
     private static class NewOrderSingleOffsets
     {
@@ -34,9 +34,9 @@ internal static partial class InboundMessageDecoder
         public const int ExpireDate = 105;        // ushort (0 == null)
         public const int InvestorID = 119;        // Prefix(2) + Document(4), all-zero == null
         // V6 trailer (BlockLength=133). Both fields use 0 as the SBE
-        // null sentinel. Currently the engine rejects non-null values
-        // with BMR(33003) since strategy routing / sub-account tagging
-        // aren't supported (issue #238).
+        // null sentinel. Currently the engine rejects non-null values with
+        // ER_Reject since strategy routing / sub-account tagging aren't
+        // supported (issue #238).
         public const int StrategyID = 125;        // int32 (0 == null)
         public const int TradingSubAccount = 129; // uint32 (0 == null)
     }
@@ -51,9 +51,10 @@ internal static partial class InboundMessageDecoder
     /// onto the engine's supported subset (Market/Limit, Day/IOC/FOK, no
     /// stop / iceberg / minimum-fill / RLP). Returns
     /// <see cref="InboundDecodeOutcome.UnsupportedFeature"/> with a
-    /// <c>BusinessMessageReject(33003)</c>-bound text when the wire fields
-    /// are individually valid but request a feature the engine does not
-    /// implement; the caller emits BMR and keeps the session open.
+    /// diagnostic text when the wire fields are individually valid but
+    /// request a feature the engine does not implement; the caller enqueues
+    /// the populated command so the engine emits ER_Reject and keeps the
+    /// session open.
     /// Returns <see cref="InboundDecodeOutcome.DecodeError"/> for wire
     /// values that violate the SBE schema (unmapped Side / OrdType / TIF
     /// bytes); the caller terminates with DECODING_ERROR.
@@ -91,23 +92,43 @@ internal static partial class InboundMessageDecoder
             message = $"invalid Side={sideByte}";
             return InboundDecodeOutcome.DecodeError;
         }
+
+        NewOrderCommand UnsupportedCommand(OrderType type, TimeInForce tifValue, long stopPxForCommand = 0L)
+        {
+            long unsupportedPrice = (type == OrderType.Market || type == OrderType.MarketWithLeftover)
+                ? 0L
+                : (priceMantissa == PriceNull ? 0L : priceMantissa);
+            return new NewOrderCommand(clOrdId.ToString(), secId, side, type, tifValue, unsupportedPrice, qty, enteringFirm, enteredAtNanos)
+            {
+                MinQty = minQty,
+                MaxFloor = maxFloor,
+                StopPxMantissa = stopPxForCommand,
+                UnsupportedOrderCharacteristic = true,
+            };
+        }
+
+        TimeInForce tifForUnsupported = TryClassifyTif(tifByte, out var preclassifiedTif, out _)
+            ? preclassifiedTif
+            : TimeInForce.Day;
         if (!TryClassifyOrdType(ordTypeByte, out var ordType, out var ordTypeUnsupported))
         {
             message = ordTypeUnsupported is not null
                 ? $"OrdType={ordTypeByte:X2} not supported (only Market, Limit)"
                 : $"invalid OrdType={ordTypeByte}";
-            return ordTypeUnsupported is not null
-                ? InboundDecodeOutcome.UnsupportedFeature
-                : InboundDecodeOutcome.DecodeError;
+            if (ordTypeUnsupported is null)
+                return InboundDecodeOutcome.DecodeError;
+            cmd = UnsupportedCommand(OrderType.Limit, tifForUnsupported);
+            return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (!TryClassifyTif(tifByte, out var tif, out var tifUnsupported))
         {
             message = tifUnsupported is not null
                 ? $"TimeInForce={(char)tifByte} not supported (only Day, IOC, FOK)"
                 : $"invalid TimeInForce={tifByte}";
-            return tifUnsupported is not null
-                ? InboundDecodeOutcome.UnsupportedFeature
-                : InboundDecodeOutcome.DecodeError;
+            if (tifUnsupported is null)
+                return InboundDecodeOutcome.DecodeError;
+            cmd = UnsupportedCommand(ordType, TimeInForce.Day);
+            return InboundDecodeOutcome.UnsupportedFeature;
         }
         bool isStop = ordType == OrderType.StopLoss || ordType == OrderType.StopLimit;
         if (isStop)
@@ -115,12 +136,14 @@ internal static partial class InboundMessageDecoder
             if (stopPx == PriceNull)
             {
                 message = "Stop orders require StopPx";
+                cmd = UnsupportedCommand(ordType, tif);
                 return InboundDecodeOutcome.UnsupportedFeature;
             }
         }
         else if (stopPx != PriceNull)
         {
             message = "StopPx only valid on Stop orders";
+            cmd = UnsupportedCommand(ordType, tif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (maxFloor != 0)
@@ -131,21 +154,25 @@ internal static partial class InboundMessageDecoder
         if (routing != RoutingInstructionNull && routing != RoutingInstructionDefault)
         {
             message = $"RoutingInstruction={routing} not supported";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (mmpReset != 0)
         {
             message = "MMProtectionReset not supported";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (stp != 0)
         {
             message = "SelfTradePreventionInstruction not supported";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
         if (expireDate != 0)
         {
             message = "ExpireDate not supported (only Day/IOC/FOK)";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
 
@@ -153,7 +180,7 @@ internal static partial class InboundMessageDecoder
         // +tradingSubAccount@129 (uint32, 0=null). The body span has
         // already been sliced to BlockLength by the FIXP dispatch, so
         // the trailer is present iff body.Length > V2 size. Engine
-        // doesn't honor either field — surface a BMR rather than
+        // doesn't honor either field — surface an ER_Reject rather than
         // silently ignore so partners notice.
         if (body.Length > NewOrderSingleV2BodySize)
         {
@@ -162,11 +189,13 @@ internal static partial class InboundMessageDecoder
             if (strategyId != 0)
             {
                 message = $"StrategyID={strategyId} not supported";
+                cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
                 return InboundDecodeOutcome.UnsupportedFeature;
             }
             if (tradingSubAccount != 0)
             {
                 message = $"TradingSubAccount={tradingSubAccount} not supported";
+                cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
                 return InboundDecodeOutcome.UnsupportedFeature;
             }
         }

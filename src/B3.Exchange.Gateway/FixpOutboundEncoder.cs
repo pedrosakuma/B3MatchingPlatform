@@ -270,6 +270,7 @@ internal sealed class FixpOutboundEncoder
         // surfaced in the audit log.
         RejectReason.InstrumentHalted => 13u,
         RejectReason.TimeInForceNotSupported => 11u,
+        RejectReason.UnsupportedOrderCharacteristic => 11u,
         RejectReason.MinQtyNotMet => 0u,
         RejectReason.InvalidField => 11u,
         _ => 0u,

@@ -92,10 +92,12 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
-    /// Emits a <c>BusinessMessageReject(33003)</c> for an application
-    /// frame whose wire body decoded but requested an unsupported
-    /// sub-feature (e.g. stop-order, iceberg, RLP, GTC). The session
-    /// stays open; spec §4.10 / #GAP-15. <paramref name="fixedBlock"/>
+    /// Emits a <c>BusinessMessageReject(33003)</c> for unsupported
+    /// application messages that do not have a per-order ER reject path
+    /// (for example unsupported cross variants). Per-order unsupported
+    /// characteristics are routed to the engine as
+    /// <c>ExecutionReport_Reject</c>. The session stays open; spec §4.10 /
+    /// #GAP-15. <paramref name="fixedBlock"/>
     /// is the inbound body whose first 8 bytes are the
     /// <c>InboundBusinessHeader</c>: <c>sessionID</c> (offset 0) and
     /// <c>msgSeqNum</c> (offset 4). The supplied

@@ -29,6 +29,7 @@ public class MapRejectReasonTests
     [InlineData(RejectReason.SelfTradePrevention, 0u)]
     [InlineData(RejectReason.MinQtyNotMet, 0u)]
     [InlineData(RejectReason.InvalidField, 11u)]
+    [InlineData(RejectReason.UnsupportedOrderCharacteristic, 11u)]
     public void MapRejectReason_ProducesExpectedWireCode(RejectReason reason, uint expected)
     {
         Assert.Equal(expected, FixpSession.MapRejectReason(reason));
