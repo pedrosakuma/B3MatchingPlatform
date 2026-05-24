@@ -107,6 +107,11 @@ public sealed partial class FixpSession : IAsyncDisposable
     private long _msgSeqNum;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    /// <summary>De-dup CAS guard for <c>SuspendLocked</c>. Distinct from
+    /// <c>_isAttached</c> so that the public <c>IsAttached</c> flag can stay
+    /// true throughout teardown + state transition and only flip to false
+    /// once Suspend has fully published.</summary>
+    private int _suspendInProgress;
     /// <summary>
     /// Issue #405: classification of the most recent close (or null
     /// when the session is still open / has never closed). Set

@@ -150,10 +150,28 @@ public sealed partial class FixpSession
     /// </summary>
     private void SuspendLocked(string reason)
     {
-        // Atomically flip the attachment flag; second caller is a no-op.
-        if (Interlocked.Exchange(ref _isAttached, 0) == 0) return;
+        // Atomically claim the right to suspend; second caller is a no-op.
+        // We use a separate CAS guard (not _isAttached) so the public
+        // IsAttached flag stays true until after teardown + state transition,
+        // preserving the invariant that observers seeing !IsAttached can rely
+        // on State == Suspended AND the transport already being down.
+        if (Interlocked.Exchange(ref _suspendInProgress, 1) == 1) return;
+        if (Volatile.Read(ref _isAttached) == 0)
+        {
+            // A concurrent Close already cleared attachment; nothing to do.
+            Volatile.Write(ref _suspendInProgress, 0);
+            return;
+        }
         _logger.LogInformation("fixp session {ConnectionId} suspending (reason={Reason})",
             ConnectionId, reason);
+        // Best-effort teardown of cancellation + transport before publishing
+        // Suspended. Tests and diagnostics use State==Suspended as the contract
+        // that the transport is already detached/down; publishing the state
+        // first races observers against the close side effect on fast machines.
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
+        try { _transport.Close(reason); } catch (ObjectDisposedException) { /* transport already disposed */ }
+        try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
+
         var action = ApplyTransition(FixpEvent.Detach);
         if (action != FixpAction.Accept || State != FixpState.Suspended)
         {
@@ -166,18 +184,15 @@ public sealed partial class FixpSession
             CloseLocked(reason, CloseKind.TransportError);
             return;
         }
-        // Best-effort teardown of cancellation + transport during Suspend; each
-        // step may legitimately fail if a concurrent Close has already raced
-        // ahead (e.g. transport callback while suspend was being decided).
-        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose */ }
-        try { _transport.Close(reason); } catch (ObjectDisposedException) { /* transport already disposed */ }
-        try { _transport.Stream.Dispose(); } catch (ObjectDisposedException) { /* stream already disposed */ }
         Volatile.Write(ref _suspendedSinceMs, NowMs());
         ScheduleCodTimerLocked();
         // Issue #405: persist the envelope on suspend so a host crash
         // while the session is parked still produces an
         // EstablishmentAck.lastIncomingSeqNo matching reality.
         SaveStateSnapshotSafe();
+        // Publish !IsAttached only after state transition + teardown so
+        // consumers observing IsAttached==false see a fully-suspended session.
+        Volatile.Write(ref _isAttached, 0);
     }
 
     /// <summary>
