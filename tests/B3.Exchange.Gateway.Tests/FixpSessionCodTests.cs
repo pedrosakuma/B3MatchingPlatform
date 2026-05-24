@@ -1,3 +1,4 @@
+using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
 using System.Collections.Concurrent;
 using System.Net;
@@ -22,10 +23,9 @@ namespace B3.Exchange.Gateway.Tests;
 /// gateway-side <c>OrderOwnershipMap</c> resolves it to the resting
 /// orders this session owned. A reconnect (TryReattach) inside the
 /// grace window must cancel the pending CoD trigger; full
-/// <c>Close</c> must dispose the timer too. The on-terminate half of
-/// modes <c>CANCEL_ON_TERMINATE_ONLY</c> /
-/// <c>CANCEL_ON_DISCONNECT_OR_TERMINATE</c> is deferred until inbound
-/// peer-Terminate framing is wired (out of scope for this PR).
+/// <c>Close</c> must dispose the timer too. Peer-initiated Terminate
+/// frames must trigger modes <c>CANCEL_ON_TERMINATE_ONLY</c> and
+/// <c>CANCEL_ON_DISCONNECT_OR_TERMINATE</c>.
 /// </summary>
 public class FixpSessionCodTests
 {
@@ -77,6 +77,26 @@ public class FixpSessionCodTests
         session.ApplyTransition(FixpEvent.Establish);
         session.SetCancelOnDisconnectForTest(codType, codWindowMs);
         return session;
+    }
+
+    private static byte[] EncodeInboundTerminate(uint sessionId, ulong sessionVerId)
+    {
+        var buf = new byte[EntryPointFixpFrameCodec.TerminateBlock + EntryPointFrameReader.WireHeaderSize];
+        EntryPointFixpFrameCodec.EncodeTerminate(
+            buf,
+            sessionId,
+            sessionVerId,
+            SessionRejectEncoder.TerminationCode.Finished);
+        return buf;
+    }
+
+    private static async Task SendPeerTerminateAndAwaitCloseAsync(FixpSession session, TcpClient client)
+    {
+        var frame = EncodeInboundTerminate(session.SessionId, session.SessionVerId);
+        await client.GetStream().WriteAsync(frame);
+        Assert.True(await TestUtil.WaitUntilAsync(() => session.LastCloseKind is not null,
+            TimeSpan.FromSeconds(3)));
+        Assert.Equal(CloseKind.PeerTerminate, session.LastCloseKind);
     }
 
     private static async Task DropAndAwaitSuspendAsync(FixpSession session, TcpClient client)
@@ -173,8 +193,7 @@ public class FixpSessionCodTests
     {
         // CANCEL_ON_TERMINATE_ONLY must NOT fire on a bare transport
         // drop — the trigger is an explicit Terminate frame from the
-        // peer (deferred from this PR until inbound Terminate framing
-        // lands). Verifying this guard here so a future change that
+        // peer. Verifying this guard here so a future change that
         // mis-classifies the trigger fails loudly.
         var (tcp, serverStream, client) = await ConnectPairAsync();
         try
@@ -188,6 +207,75 @@ public class FixpSessionCodTests
             await Task.Delay(200);
             Assert.Empty(sink.MassCancels);
             session.Close("test-cleanup");
+        }
+        finally
+        {
+            try { serverStream.Dispose(); } catch { }
+            try { client.Dispose(); } catch { }
+            tcp.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task Mode2_FiresMassCancel_OnPeerTerminate()
+    {
+        var (tcp, serverStream, client) = await ConnectPairAsync();
+        try
+        {
+            var sink = new RecordingEngineSink();
+            var session = DriveToSuspended(serverStream, sink,
+                FixpSbe.CancelOnDisconnectType.CANCEL_ON_TERMINATE_ONLY,
+                codWindowMs: 50);
+
+            await SendPeerTerminateAndAwaitCloseAsync(session, client);
+
+            Assert.Single(sink.MassCancels);
+        }
+        finally
+        {
+            try { serverStream.Dispose(); } catch { }
+            try { client.Dispose(); } catch { }
+            tcp.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task Mode3_FiresMassCancel_OnPeerTerminate()
+    {
+        var (tcp, serverStream, client) = await ConnectPairAsync();
+        try
+        {
+            var sink = new RecordingEngineSink();
+            var session = DriveToSuspended(serverStream, sink,
+                FixpSbe.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_OR_TERMINATE,
+                codWindowMs: 50);
+
+            await SendPeerTerminateAndAwaitCloseAsync(session, client);
+
+            Assert.Single(sink.MassCancels);
+        }
+        finally
+        {
+            try { serverStream.Dispose(); } catch { }
+            try { client.Dispose(); } catch { }
+            tcp.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task Mode0_DoesNotFire_OnPeerTerminate()
+    {
+        var (tcp, serverStream, client) = await ConnectPairAsync();
+        try
+        {
+            var sink = new RecordingEngineSink();
+            var session = DriveToSuspended(serverStream, sink,
+                FixpSbe.CancelOnDisconnectType.DO_NOT_CANCEL_ON_DISCONNECT_OR_TERMINATE,
+                codWindowMs: 50);
+
+            await SendPeerTerminateAndAwaitCloseAsync(session, client);
+
+            Assert.Empty(sink.MassCancels);
         }
         finally
         {

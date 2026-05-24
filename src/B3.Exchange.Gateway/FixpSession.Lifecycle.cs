@@ -245,11 +245,11 @@ public sealed partial class FixpSession
     /// <summary>
     /// Closes the session with a diagnostic reason. Legacy overload
     /// kept for tests and existing call-sites that have not been
-    /// classified yet; defaults to <see cref="CloseKind.PeerTerminate"/>
-    /// to preserve pre-#405 behavior (the persistence delete-vs-keep
-    /// decision is wired in a later commit).
+    /// classified yet; defaults to <see cref="CloseKind.LocalTerminate"/>
+    /// so generic local teardown remains terminal without being treated
+    /// as a peer-Terminate CoD trigger.
     /// </summary>
-    public void Close(string reason) => Close(reason, CloseKind.PeerTerminate);
+    public void Close(string reason) => Close(reason, CloseKind.LocalTerminate);
 
     /// <summary>
     /// Classified close (issue #405). The <paramref name="kind"/>
@@ -285,6 +285,10 @@ public sealed partial class FixpSession
         _logger.LogInformation(
             "fixp session {ConnectionId} closing (kind={Kind})",
             ConnectionId, kind);
+        if (CodCoversDisconnect(kind))
+        {
+            FireCancelOnDisconnect();
+        }
         try { _cts.Cancel(); } catch (ObjectDisposedException) { /* concurrent dispose race; benign */ }
         // The transport may have already closed (it's the source of the
         // callback in IO-error paths). Either way, ensure it's down so the
@@ -316,15 +320,16 @@ public sealed partial class FixpSession
         }
         // Issue #289 / #405: terminal close ⇒ drop the persisted
         // retransmit ring file AND the unbounded outbound journal AND
-        // the state snapshot. Scoped to {PeerTerminate, SuspendedTimeout}
+        // the state snapshot. Scoped to terminal close kinds
         // so transport-error and host-shutdown closes preserve state for
         // the reconnecting peer to resync against (SBE 5.2 §1.5
         // recoverable serverFlow). Non-removing kinds also save the
         // final state so the resume point on reconnect is accurate.
         bool removePersistence =
-            kind == CloseKind.PeerTerminate ||
-            kind == CloseKind.KeepaliveLapsed ||
-            kind == CloseKind.SuspendedTimeout;
+            kind == CloseKind.PeerTerminate
+            || kind == CloseKind.LocalTerminate
+            || kind == CloseKind.KeepaliveLapsed
+            || kind == CloseKind.SuspendedTimeout;
         if (removePersistence)
         {
             if (_outboundJournal is not null && SessionId != 0)

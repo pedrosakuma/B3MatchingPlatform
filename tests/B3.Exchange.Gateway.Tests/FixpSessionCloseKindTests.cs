@@ -61,7 +61,7 @@ public sealed class FixpSessionCloseKindTests
             var session = NewSession(serverSide);
             Assert.Null(session.LastCloseKind);
             session.Close("test");
-            Assert.Equal(CloseKind.PeerTerminate, session.LastCloseKind);
+            Assert.Equal(CloseKind.LocalTerminate, session.LastCloseKind);
         }
         finally
         {
@@ -109,6 +109,7 @@ public sealed class FixpSessionCloseKindTests
 
     [Theory]
     [InlineData(CloseKind.PeerTerminate)]
+    [InlineData(CloseKind.LocalTerminate)]
     [InlineData(CloseKind.HostShutdown)]
     [InlineData(CloseKind.TransportError)]
     [InlineData(CloseKind.KeepaliveLapsed)]
