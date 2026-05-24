@@ -369,6 +369,15 @@ public sealed class MatchingEngine
 
     public int OrderCount(long securityId) => _booksById[securityId].OrderCount;
 
+    public IReadOnlyList<(long SecurityId, int Count)> OrderCountsSnapshot()
+    {
+        AssertOnOwnerThread();
+        var result = new List<(long SecurityId, int Count)>(_booksById.Count);
+        foreach (var kv in _booksById)
+            result.Add((kv.Key, kv.Value.OrderCount));
+        return result;
+    }
+
     /// <summary>
     /// Total number of untriggered stop orders parked across every
     /// instrument. Issue #262 — exposes a counter the persistence tests

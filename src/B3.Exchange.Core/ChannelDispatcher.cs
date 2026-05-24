@@ -448,6 +448,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
             {
                 try { _phaseSnapshot[secId] = _engine.GetTradingPhase(secId); }
                 catch (KeyNotFoundException) { /* engine doesn't know this id; skip */ }
+                _metrics?.SetBookLiveOrders(secId, 0);
             }
         }
     }
