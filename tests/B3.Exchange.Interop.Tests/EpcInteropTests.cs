@@ -58,7 +58,12 @@ public class EpcInteropTests : IAsyncLifetime
         var hostCfg = new HostConfig
         {
             Auth = new AuthConfig { RequireFixpHandshake = true, DevMode = true },
-            Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = EnteringFirm },
+            Tcp = new TcpConfig
+            {
+                Listen = "127.0.0.1:0",
+                EnteringFirm = EnteringFirm,
+                SendingTimeSkewToleranceMs = 0,
+            },
             Firms = new()
             {
                 new FirmConfig { Id = "firmA", Name = "Firm A", EnteringFirmCode = EnteringFirm },

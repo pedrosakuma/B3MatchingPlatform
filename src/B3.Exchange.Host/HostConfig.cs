@@ -87,6 +87,12 @@ public sealed class TcpConfig
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
 
     /// <summary>
+    /// Maximum absolute skew tolerated for inbound application
+    /// InboundBusinessHeader.sendingTime. Default: 5 s. Set to 0 to disable.
+    /// </summary>
+    [JsonPropertyName("sendingTimeSkewToleranceMs")] public int SendingTimeSkewToleranceMs { get; set; } = 5_000;
+
+    /// <summary>
     /// Per-session inbound sliding-window throttle (issue #56 / GAP-20,
     /// guidelines §4.9). Omit (or set both fields to 0) to disable
     /// throttling. Defaults to 100 application messages per 1000 ms when

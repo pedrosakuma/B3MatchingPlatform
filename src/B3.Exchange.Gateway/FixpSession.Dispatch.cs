@@ -100,6 +100,12 @@ public sealed partial class FixpSession
             if (!TryAcceptBusinessHeaderSessionId(info.TemplateId, fixedBlock))
                 return true;
 
+            // §4.6.3.1: sendingTime is an epoch-nanos client timestamp.
+            // Reject out-of-tolerance clocks with BMR and do not consume
+            // MsgSeqNum.
+            if (!TryAcceptBusinessHeaderSendingTime(info.TemplateId, fixedBlock))
+                return true;
+
             // §4.5.5 / §4.6.2 (#GAP-07): inbound MsgSeqNum gap detection.
             // On gap (received > expected) emit NotApplied(fromSeqNo=expected,
             // count=received-expected) AND advance expected past the gap

@@ -146,13 +146,14 @@ public sealed class FixpClient : IAsyncDisposable
     /// <summary>
     /// Patches the 18-byte <c>InboundBusinessHeader</c> at the start of
     /// <paramref name="bodyAfterWireHeader"/>: <c>sessionID</c>(4) at
-    /// offset 0 and <c>msgSeqNum</c>(4) at offset 4. Returns the assigned
+    /// offset 0, <c>msgSeqNum</c>(4) at offset 4, and
+    /// <c>sendingTime</c>(8) at offset 8. Returns the assigned
     /// <c>msgSeqNum</c>. Thread-safe; serializes assignment so the wire
     /// order matches numeric order.
     /// </summary>
     public uint AssignOutboundBusinessHeader(Span<byte> bodyAfterWireHeader)
     {
-        if (bodyAfterWireHeader.Length < 8)
+        if (bodyAfterWireHeader.Length < 16)
             throw new ArgumentException("body too small for InboundBusinessHeader", nameof(bodyAfterWireHeader));
         uint assigned;
         lock (_seqLock)
@@ -161,6 +162,7 @@ public sealed class FixpClient : IAsyncDisposable
         }
         BinaryPrimitives.WriteUInt32LittleEndian(bodyAfterWireHeader.Slice(0, 4), _sessionIdNumeric);
         BinaryPrimitives.WriteUInt32LittleEndian(bodyAfterWireHeader.Slice(4, 4), assigned);
+        BinaryPrimitives.WriteUInt64LittleEndian(bodyAfterWireHeader.Slice(8, 8), NowNanos());
         return assigned;
     }
 

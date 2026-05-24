@@ -41,6 +41,15 @@ public sealed record FixpSessionOptions
     public int FirstFrameTimeoutMs { get; init; } = 5_000;
 
     /// <summary>
+    /// Maximum tolerated absolute clock skew between the server clock and an
+    /// inbound application message's <c>InboundBusinessHeader.sendingTime</c>.
+    /// The schema defines the field as Unix-epoch nanoseconds; no tighter
+    /// venue-specific window is documented in the vendored schema, so the
+    /// default is 5 seconds. Set to <c>0</c> to disable the check.
+    /// </summary>
+    public ulong SendingTimeSkewToleranceNs { get; init; } = 5UL * 1_000_000_000UL;
+
+    /// <summary>
     /// Per-session capacity (in frames) of the outbound retransmission
     /// ring buffer that backs FIXP <c>RetransmitRequest</c> recovery
     /// (issue #46, spec §4.5.6). Buffered templates are
