@@ -59,11 +59,8 @@ public sealed class EstablishValidator
     /// check (used by tests). Default 5 minutes.</summary>
     public ulong TimestampSkewToleranceNs { get; }
 
-    /// <summary>Inclusive lower bound for <c>keepAliveInterval</c> (ms).
-    /// Issue #43 acceptance criterion specifies <c>[1, 60000]</c>; the
-    /// SBE schema field description says <c>1000–60000</c>. We follow
-    /// the issue.</summary>
-    public const ulong MinKeepAliveIntervalMs = 1;
+    /// <summary>Inclusive lower bound for <c>keepAliveInterval</c> (ms).</summary>
+    public const ulong MinKeepAliveIntervalMs = 1_000;
     /// <summary>Inclusive upper bound for <c>keepAliveInterval</c> (ms).</summary>
     public const ulong MaxKeepAliveIntervalMs = 60_000;
 

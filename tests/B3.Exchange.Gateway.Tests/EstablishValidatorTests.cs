@@ -67,6 +67,7 @@ public class EstablishValidatorTests
 
     [Theory]
     [InlineData(0UL)]
+    [InlineData(999UL)]
     [InlineData(60_001UL)]
     public void Rejects_keepalive_out_of_range(ulong keep)
     {
@@ -74,6 +75,17 @@ public class EstablishValidatorTests
         var req = Req(sid: 100, ver: 1, keep: keep);
         var o = v.Validate(req, FixpState.Negotiated, 100, 1, 0);
         Assert.Equal(FixpSbe.EstablishRejectCode.INVALID_KEEPALIVE_INTERVAL, o.RejectCode);
+    }
+
+    [Theory]
+    [InlineData(1_000UL)]
+    [InlineData(60_000UL)]
+    public void Accepts_keepalive_at_spec_bounds(ulong keep)
+    {
+        var v = new EstablishValidator(timestampSkewToleranceNs: 0);
+        var req = Req(sid: 100, ver: 1, keep: keep);
+        var o = v.Validate(req, FixpState.Negotiated, 100, 1, 0);
+        Assert.True(o.IsAccepted);
     }
 
     [Fact]
