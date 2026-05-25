@@ -116,8 +116,6 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where("securityId must be > 0"));
         if (r.TickSize is null || r.TickSize.Value <= 0)
             throw new InstrumentConfigException(Where("tickSize must be > 0"));
-        if (r.LotSize is null || r.LotSize.Value <= 0)
-            throw new InstrumentConfigException(Where("lotSize must be > 0"));
         if (string.IsNullOrWhiteSpace(r.Currency))
             throw new InstrumentConfigException(Where("currency is required"));
         if (string.IsNullOrWhiteSpace(r.Isin))
@@ -126,6 +124,18 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where("securityType is required"));
 
         var isOption = InstrumentSecurityTypes.IsOption(r.SecurityType);
+        var lotSize = r.LotSize;
+        if (isOption)
+        {
+            if (lotSize is null)
+                lotSize = 1;
+            else if (lotSize.Value != 1)
+                throw new InstrumentConfigException(Where("lotSize must be 1 for option securityTypes"));
+        }
+        else if (lotSize is null || lotSize.Value <= 0)
+        {
+            throw new InstrumentConfigException(Where("lotSize must be > 0"));
+        }
 
         if (r.MinPrice is null || r.MinPrice.Value < 0 || (!isOption && r.MinPrice.Value == 0))
             throw new InstrumentConfigException(Where(isOption ? "minPx must be >= 0" : "minPx must be > 0"));
@@ -144,6 +154,9 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where("strikePrice is required"));
 
         var expirationDate = ParseDateOnly(r.ExpirationDate, "expirationDate", Where, required: isOption);
+        if (expirationDate is { } parsedExpirationDate && parsedExpirationDate < DateOnly.FromDateTime(DateTime.UtcNow))
+            throw new InstrumentConfigException(Where("expirationDate must be today or later"));
+
         var putOrCall = ParseEnum<PutOrCall>(r.PutOrCall, "putOrCall", Where, required: isOption);
         var exerciseStyle = ParseEnum<ExerciseStyle>(r.ExerciseStyle, "exerciseStyle", Where, required: isOption);
         var optPayoutType = ParseEnum<OptPayoutType>(r.OptPayoutType, "optPayoutType", Where, required: false);
@@ -167,7 +180,7 @@ public static class InstrumentLoader
             Symbol = r.Symbol!,
             SecurityId = r.SecurityId.Value,
             TickSize = r.TickSize.Value,
-            LotSize = r.LotSize.Value,
+            LotSize = lotSize!.Value,
             MinPrice = r.MinPrice.Value,
             MaxPrice = r.MaxPrice.Value,
             Currency = r.Currency!,

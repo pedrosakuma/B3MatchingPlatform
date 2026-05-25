@@ -41,6 +41,20 @@ public class InstrumentLoaderOptionsTests
     }
 
     [Fact]
+    public void Load_OptionWithoutLotSize_DefaultsToOneContract()
+    {
+        var inst = InstrumentLoader.LoadFromString(BuildOptionJson(omitFields: ["lotSize"]))[0];
+        Assert.Equal(1, inst.LotSize);
+    }
+
+    [Fact]
+    public void Load_OptionLotSizeOtherThanOne_Throws()
+    {
+        var ex = Assert.Throws<InstrumentConfigException>(() => InstrumentLoader.LoadFromString(BuildOptionJson(("lotSize", "100"))));
+        Assert.Contains("lotSize must be 1", ex.Message);
+    }
+
+    [Fact]
     public void Load_OptionMinPxZero_IsAccepted()
     {
         var inst = InstrumentLoader.LoadFromString(BuildOptionJson(("minPx", "\"0.00\"")))[0];
@@ -61,6 +75,14 @@ public class InstrumentLoaderOptionsTests
     {
         var ex = Assert.Throws<InstrumentConfigException>(() => InstrumentLoader.LoadFromString(BuildOptionJson(("contractMultiplier", contractMultiplier))));
         Assert.Contains("contractMultiplier must be > 0", ex.Message);
+    }
+
+    [Fact]
+    public void Load_ExpiredOption_Throws()
+    {
+        var expiredDate = DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-1).ToString("yyyy-MM-dd");
+        var ex = Assert.Throws<InstrumentConfigException>(() => InstrumentLoader.LoadFromString(BuildOptionJson(("expirationDate", $"\"{expiredDate}\""))));
+        Assert.Contains("expirationDate must be today or later", ex.Message);
     }
 
     private static string BuildOptionJson((string Key, string Value)? overrideField = null, string[]? omitFields = null)
