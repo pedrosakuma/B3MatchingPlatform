@@ -19,6 +19,9 @@ public sealed class InstrumentTradingRules
     public long LotSize { get; }
     public decimal? ContractMultiplier { get; }
     public long? ExpirationTimestamp { get; }
+    public long? LowerPriceBandMantissa { get; }
+    public long? UpperPriceBandMantissa { get; }
+    public bool HasPriceBand => LowerPriceBandMantissa.HasValue && UpperPriceBandMantissa.HasValue;
 
     public InstrumentTradingRules(Instrument instrument)
     {
@@ -27,6 +30,12 @@ public sealed class InstrumentTradingRules
         TickSizeMantissa = ToMantissaChecked(instrument.TickSize, nameof(instrument.TickSize));
         MinPriceMantissa = ToMantissaChecked(instrument.MinPrice, nameof(instrument.MinPrice));
         MaxPriceMantissa = ToMantissaChecked(instrument.MaxPrice, nameof(instrument.MaxPrice));
+        LowerPriceBandMantissa = instrument.LowerPriceBand.HasValue
+            ? ToMantissaChecked(instrument.LowerPriceBand.Value, nameof(instrument.LowerPriceBand))
+            : null;
+        UpperPriceBandMantissa = instrument.UpperPriceBand.HasValue
+            ? ToMantissaChecked(instrument.UpperPriceBand.Value, nameof(instrument.UpperPriceBand))
+            : null;
         LotSize = instrument.LotSize;
         ContractMultiplier = instrument.ContractMultiplier;
         ExpirationTimestamp = instrument.ExpirationDate is { } expirationDate
@@ -42,6 +51,24 @@ public sealed class InstrumentTradingRules
         if (MaxPriceMantissa < MinPriceMantissa) throw new ArgumentException("MaxPrice < MinPrice", nameof(instrument));
         if (MinPriceMantissa % TickSizeMantissa != 0) throw new ArgumentException("MinPrice not a multiple of TickSize", nameof(instrument));
         if (MaxPriceMantissa % TickSizeMantissa != 0) throw new ArgumentException("MaxPrice not a multiple of TickSize", nameof(instrument));
+        if (LowerPriceBandMantissa.HasValue != UpperPriceBandMantissa.HasValue)
+            throw new ArgumentException("LowerPriceBand and UpperPriceBand must both be set or both be null", nameof(instrument));
+        if (LowerPriceBandMantissa is { } lower)
+        {
+            if (lower < MinPriceMantissa || lower > MaxPriceMantissa)
+                throw new ArgumentException("LowerPriceBand outside instrument bounds", nameof(instrument));
+            if (lower % TickSizeMantissa != 0)
+                throw new ArgumentException("LowerPriceBand not a multiple of TickSize", nameof(instrument));
+        }
+        if (UpperPriceBandMantissa is { } upper)
+        {
+            if (upper < MinPriceMantissa || upper > MaxPriceMantissa)
+                throw new ArgumentException("UpperPriceBand outside instrument bounds", nameof(instrument));
+            if (upper % TickSizeMantissa != 0)
+                throw new ArgumentException("UpperPriceBand not a multiple of TickSize", nameof(instrument));
+        }
+        if (LowerPriceBandMantissa is { } low && UpperPriceBandMantissa is { } high && high < low)
+            throw new ArgumentException("UpperPriceBand < LowerPriceBand", nameof(instrument));
     }
 
     private static long ToMantissaChecked(decimal value, string name)

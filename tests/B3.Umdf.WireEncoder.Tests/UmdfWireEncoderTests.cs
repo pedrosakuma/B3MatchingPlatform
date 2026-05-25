@@ -396,6 +396,42 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void PriceBand_Roundtrip()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WritePriceBandFrame(buf,
+            securityId: 4242L,
+            lowLimitPriceMantissa: 123_450L,
+            highLimitPriceMantissa: 234_560L,
+            mdEntryTimestampNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 42,
+            priceBandType: (byte)PriceBandType.HARD_LIMIT,
+            priceLimitType: (byte)PriceLimitType.PRICE_UNIT,
+            tradingReferencePriceMantissa: long.MinValue,
+            priceBandMidpointPriceType: 255);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.PriceBandBlockLength, n);
+
+        Assert.True(PriceBand_22Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.PriceBandBlockLength), out var rdr));
+        Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
+        Assert.Equal(PriceBandType.HARD_LIMIT, rdr.Data.PriceBandType);
+        Assert.Equal(PriceLimitType.PRICE_UNIT, rdr.Data.PriceLimitType);
+        Assert.Null(rdr.Data.PriceBandMidpointPriceType);
+        Assert.Equal(123_450L, rdr.Data.LowLimitPrice.Mantissa);
+        Assert.Equal(234_560L, rdr.Data.HighLimitPrice.Mantissa);
+        Assert.Null(rdr.Data.TradingReferencePrice.Mantissa);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.MDEntryTimestamp.Time);
+        Assert.Equal(42u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void PriceBand_WireOffsetsMatchGeneratedCodec()
+    {
+        Assert.Equal(WireOffsets.PriceBandBlockLength, PriceBand_22Data.BLOCK_LENGTH);
+        Assert.Equal(WireOffsets.PriceBandBlockLength, Marshal.SizeOf<PriceBand_22Data>());
+    }
+
+    [Fact]
     public void TheoreticalOpeningPrice_Roundtrip_HasTop()
     {
         var buf = new byte[80];

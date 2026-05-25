@@ -116,6 +116,14 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where("securityId must be > 0"));
         if (r.TickSize is null || r.TickSize.Value <= 0)
             throw new InstrumentConfigException(Where("tickSize must be > 0"));
+        if (r.LowerPriceBand.HasValue != r.UpperPriceBand.HasValue)
+            throw new InstrumentConfigException(Where("lowerPriceBand and upperPriceBand must both be set or both be null"));
+        if (r.LowerPriceBand is { } lowerBand && lowerBand <= 0)
+            throw new InstrumentConfigException(Where("lowerPriceBand must be > 0"));
+        if (r.UpperPriceBand is { } upperBand && upperBand <= 0)
+            throw new InstrumentConfigException(Where("upperPriceBand must be > 0"));
+        if (r.LowerPriceBand is { } bandLow && r.UpperPriceBand is { } bandHigh && bandHigh < bandLow)
+            throw new InstrumentConfigException(Where($"upperPriceBand ({bandHigh}) must be >= lowerPriceBand ({bandLow})"));
         if (string.IsNullOrWhiteSpace(r.Currency))
             throw new InstrumentConfigException(Where("currency is required"));
         if (string.IsNullOrWhiteSpace(r.Isin))
@@ -148,6 +156,20 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where($"minPx ({r.MinPrice.Value}) is not a multiple of tickSize ({r.TickSize.Value})"));
         if (decimal.Remainder(r.MaxPrice.Value, r.TickSize.Value) != 0)
             throw new InstrumentConfigException(Where($"maxPx ({r.MaxPrice.Value}) is not a multiple of tickSize ({r.TickSize.Value})"));
+        if (r.LowerPriceBand is { } lowerPriceBand)
+        {
+            if (lowerPriceBand < r.MinPrice.Value || lowerPriceBand > r.MaxPrice.Value)
+                throw new InstrumentConfigException(Where($"lowerPriceBand ({lowerPriceBand}) must be within minPx/maxPx bounds"));
+            if (decimal.Remainder(lowerPriceBand, r.TickSize.Value) != 0)
+                throw new InstrumentConfigException(Where($"lowerPriceBand ({lowerPriceBand}) is not a multiple of tickSize ({r.TickSize.Value})"));
+        }
+        if (r.UpperPriceBand is { } upperPriceBand)
+        {
+            if (upperPriceBand < r.MinPrice.Value || upperPriceBand > r.MaxPrice.Value)
+                throw new InstrumentConfigException(Where($"upperPriceBand ({upperPriceBand}) must be within minPx/maxPx bounds"));
+            if (decimal.Remainder(upperPriceBand, r.TickSize.Value) != 0)
+                throw new InstrumentConfigException(Where($"upperPriceBand ({upperPriceBand}) is not a multiple of tickSize ({r.TickSize.Value})"));
+        }
 
         var strikePrice = r.StrikePrice;
         if (isOption && strikePrice is null)
@@ -183,6 +205,8 @@ public static class InstrumentLoader
             LotSize = lotSize!.Value,
             MinPrice = r.MinPrice.Value,
             MaxPrice = r.MaxPrice.Value,
+            LowerPriceBand = r.LowerPriceBand,
+            UpperPriceBand = r.UpperPriceBand,
             Currency = r.Currency!,
             Isin = r.Isin!,
             SecurityType = r.SecurityType!,
@@ -205,6 +229,8 @@ public static class InstrumentLoader
         [JsonPropertyName("lotSize")] public int? LotSize { get; set; }
         [JsonPropertyName("minPx")] public decimal? MinPrice { get; set; }
         [JsonPropertyName("maxPx")] public decimal? MaxPrice { get; set; }
+        [JsonPropertyName("lowerPriceBand")] public decimal? LowerPriceBand { get; set; }
+        [JsonPropertyName("upperPriceBand")] public decimal? UpperPriceBand { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("isin")] public string? Isin { get; set; }
         [JsonPropertyName("securityType")] public string? SecurityType { get; set; }

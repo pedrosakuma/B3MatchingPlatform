@@ -296,6 +296,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private long? _crossSweepFilledQty;
 
     private SnapshotRotator? _snapshotRotator;
+    private PriceBandPublisher? _priceBandPublisher;
 
     /// <summary>
     /// Issue #319: outermost-command aggressor cumulative tracking. Set at
@@ -358,6 +359,13 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// work item so it observes a stable book.
     /// </summary>
     public SnapshotRotator? SnapshotRotator => _snapshotRotator;
+
+    /// <summary>
+    /// Static periodic <c>PriceBand_22</c> publisher bound to this dispatcher,
+    /// if any. Invoked only on the dispatch thread via
+    /// <see cref="WorkKind.PriceBandPublish"/>.
+    /// </summary>
+    public PriceBandPublisher? PriceBandPublisher => _priceBandPublisher;
 
     /// <summary>
     /// Issue #286: <c>false</c> once the channel has refused a WAL

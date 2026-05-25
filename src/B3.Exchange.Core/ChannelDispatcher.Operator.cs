@@ -86,6 +86,20 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
+    /// Attaches a <see cref="PriceBandPublisher"/> to this dispatcher. May only
+    /// be called once. After this returns, any caller may invoke
+    /// <see cref="EnqueuePriceBandTick"/> to schedule a publish on the
+    /// dispatch thread.
+    /// </summary>
+    public void AttachPriceBandPublisher(PriceBandPublisher publisher)
+    {
+        ArgumentNullException.ThrowIfNull(publisher);
+        if (_priceBandPublisher != null)
+            throw new InvalidOperationException("price-band publisher already attached");
+        _priceBandPublisher = publisher;
+    }
+
+    /// <summary>
     /// Posts a snapshot tick into the inbound queue. Returns <c>false</c> if
     /// the queue is full (snapshots are idempotent — losing a tick simply
     /// defers the next refresh by one period). Safe to call from any thread.
@@ -93,6 +107,16 @@ public sealed partial class ChannelDispatcher
     public bool EnqueueSnapshotTick()
         => _inbound.Writer.TryWrite(new WorkItem(WorkKind.SnapshotRotation, default, 0, false,
             0, 0, null, null, null, null));
+
+    /// <summary>
+    /// Posts a price-band tick into the inbound queue. Returns <c>false</c>
+    /// when no publisher is attached or the queue is full. Safe to call from
+    /// any thread.
+    /// </summary>
+    public bool EnqueuePriceBandTick()
+        => _priceBandPublisher != null
+            && _inbound.Writer.TryWrite(new WorkItem(WorkKind.PriceBandPublish, default, 0, false,
+                0, 0, null, null, null, null));
 
     /// <summary>
     /// Operator command (issue #6): forces an immediate snapshot publish on

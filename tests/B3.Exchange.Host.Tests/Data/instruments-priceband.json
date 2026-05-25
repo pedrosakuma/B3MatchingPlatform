@@ -1,0 +1,15 @@
+[
+  {
+    "symbol": "PETR4",
+    "securityId": 900000000001,
+    "tickSize": "0.01",
+    "lotSize": 100,
+    "minPx": "10.00",
+    "maxPx": "99.99",
+    "lowerPriceBand": "11.50",
+    "upperPriceBand": "18.25",
+    "currency": "BRL",
+    "isin": "BRPETRACNPR6",
+    "securityType": "CS"
+  }
+]

@@ -28,6 +28,8 @@ public class InstrumentLoaderTests
         Assert.Equal("BRL", i.Currency);
         Assert.Equal("BRPETRACNPR6", i.Isin);
         Assert.Equal("CS", i.SecurityType);
+        Assert.Null(i.LowerPriceBand);
+        Assert.Null(i.UpperPriceBand);
     }
 
     [Fact]
@@ -129,6 +131,56 @@ public class InstrumentLoaderTests
             """;
         var insts = InstrumentLoader.LoadFromString(json);
         Assert.Single(insts);
+    }
+
+    [Fact]
+    public void Load_WithStaticPriceBands_RoundTripsOptionalFields()
+    {
+        var json = """
+            [
+              {
+                "symbol": "PETR4",
+                "securityId": 1,
+                "tickSize": "0.01",
+                "lotSize": 100,
+                "minPx": "10.00",
+                "maxPx": "99.99",
+                "lowerPriceBand": "11.50",
+                "upperPriceBand": "18.25",
+                "currency": "BRL",
+                "isin": "BRPETRACNPR6",
+                "securityType": "CS"
+              }
+            ]
+            """;
+
+        var inst = Assert.Single(InstrumentLoader.LoadFromString(json));
+        Assert.Equal(11.50m, inst.LowerPriceBand);
+        Assert.Equal(18.25m, inst.UpperPriceBand);
+    }
+
+    [Fact]
+    public void Load_WithOnlyOnePriceBandBound_Throws()
+    {
+        var json = """
+            [
+              {
+                "symbol": "PETR4",
+                "securityId": 1,
+                "tickSize": "0.01",
+                "lotSize": 100,
+                "minPx": "10.00",
+                "maxPx": "99.99",
+                "lowerPriceBand": "11.50",
+                "currency": "BRL",
+                "isin": "BRPETRACNPR6",
+                "securityType": "CS"
+              }
+            ]
+            """;
+
+        var ex = Assert.Throws<InstrumentConfigException>(() => InstrumentLoader.LoadFromString(json));
+        Assert.Contains("lowerPriceBand and upperPriceBand", ex.Message);
     }
 
     [Fact]

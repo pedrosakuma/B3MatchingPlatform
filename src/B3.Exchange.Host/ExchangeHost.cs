@@ -35,6 +35,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private readonly List<InstrumentDefinitionPublisher> _instrumentDefPublishers = new();
     private readonly List<IDisposable> _ownedSinks = new();
     private readonly List<Timer> _snapshotTimers = new();
+    private readonly List<Timer> _priceBandTimers = new();
     private readonly List<B3.Exchange.PostTrade.FileAuditLogWriter> _auditWriters = new();
     private readonly List<Timer> _auditRetentionTimers = new();
     private readonly Dictionary<byte, EodExportContext> _eodExportByChannel = new();
@@ -435,6 +436,26 @@ public sealed class ExchangeHost : IAsyncDisposable
                 _snapshotTimers.Add(timer);
                 _logger.LogInformation("channel {ChannelNumber}: snapshot → {Group}:{Port} every {CadenceMs:n0}ms",
                     ch.ChannelNumber, snap.Group, snap.Port, cadence.TotalMilliseconds);
+            }
+
+            if (ch.PriceBandPublishIntervalMs > 0)
+            {
+                var cadence = TimeSpan.FromMilliseconds(Math.Max(1, ch.PriceBandPublishIntervalMs));
+                var publisher = new PriceBandPublisher(instruments, cadence);
+                if (publisher.Count > 0)
+                {
+                    disp.AttachPriceBandPublisher(publisher);
+                    var capturedDisp = disp;
+                    var timer = new Timer(_ => capturedDisp.EnqueuePriceBandTick(), null, cadence, cadence);
+                    _priceBandTimers.Add(timer);
+                    _logger.LogInformation("channel {ChannelNumber}: price-band on incremental feed every {CadenceMs:n0}ms for {InstrumentCount} instruments",
+                        ch.ChannelNumber, cadence.TotalMilliseconds, publisher.Count);
+                }
+                else
+                {
+                    _logger.LogInformation("channel {ChannelNumber}: price-band cadence configured but no instruments carry lowerPriceBand/upperPriceBand",
+                        ch.ChannelNumber);
+                }
             }
 
             if (ch.InstrumentDefinition is { } idCfg)
@@ -1041,6 +1062,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         if (_phaseScheduler != null) await _phaseScheduler.DisposeAsync().ConfigureAwait(false);
         if (_http != null) await _http.DisposeAsync().ConfigureAwait(false);
         foreach (var t in _snapshotTimers) await t.DisposeAsync().ConfigureAwait(false);
+        foreach (var t in _priceBandTimers) await t.DisposeAsync().ConfigureAwait(false);
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var p in _instrumentDefPublishers) await p.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
@@ -1170,6 +1192,11 @@ public sealed class ExchangeHost : IAsyncDisposable
             try { await t.DisposeAsync().ConfigureAwait(false); } catch { }
         }
         _snapshotTimers.Clear();
+        foreach (var t in _priceBandTimers)
+        {
+            try { await t.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+        _priceBandTimers.Clear();
         foreach (var p in _instrumentDefPublishers)
         {
             try { await p.DisposeAsync().ConfigureAwait(false); } catch { }

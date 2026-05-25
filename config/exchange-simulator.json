@@ -65,6 +65,10 @@
       "ttl": 1,
       "selfTradePrevention": "none",
       "instruments": "config/instruments-eqt.json",
+      // Optional static PriceBand_22 cadence on the incremental feed.
+      // 0 (default) disables emission; instruments without lower/upper
+      // price-band fields are always skipped.
+      "priceBandPublishIntervalMs": 0,
       // Optional snapshot publisher. Multicast group/port MUST be distinct
       // from the incremental channel; consumers subscribe to both
       // independently and use the snapshot to bootstrap the order book on

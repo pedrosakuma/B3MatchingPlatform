@@ -19,6 +19,18 @@ public sealed record Instrument
     public required decimal MinPrice { get; init; }
     public required decimal MaxPrice { get; init; }
 
+    /// <summary>
+    /// Optional static lower price-band limit in human price units. When null,
+    /// the host does not emit <c>PriceBand_22</c> for this instrument.
+    /// </summary>
+    public decimal? LowerPriceBand { get; init; }
+
+    /// <summary>
+    /// Optional static upper price-band limit in human price units. When null,
+    /// the host does not emit <c>PriceBand_22</c> for this instrument.
+    /// </summary>
+    public decimal? UpperPriceBand { get; init; }
+
     public required string Currency { get; init; }
     public required string Isin { get; init; }
 
