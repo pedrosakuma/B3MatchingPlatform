@@ -16,10 +16,14 @@ public class InboundMessageDecoderTests
         ulong clOrdId = 12345UL,
         long secId = 99887766L,
         long qty = 100L,
-        long price = 12_3450L)
+        long price = 12_3450L,
+        byte ordTagId = 0,
+        ushort investorPrefix = 0,
+        uint investorDocument = 0)
     {
         var body = new byte[82];
         Span<byte> s = body;
+        s[18] = ordTagId;
         MemoryMarshal.Write(s.Slice(20, 8), in clOrdId);
         MemoryMarshal.Write(s.Slice(48, 8), in secId);
         s[56] = (byte)'1';
@@ -27,6 +31,8 @@ public class InboundMessageDecoderTests
         s[58] = (byte)'0';
         MemoryMarshal.Write(s.Slice(60, 8), in qty);
         MemoryMarshal.Write(s.Slice(68, 8), in price);
+        MemoryMarshal.Write(s.Slice(76, 2), in investorPrefix);
+        MemoryMarshal.Write(s.Slice(78, 4), in investorDocument);
         return body;
     }
 
@@ -71,6 +77,38 @@ public class InboundMessageDecoderTests
         Assert.Equal(qty, cmd.Quantity);
         Assert.Equal(price, cmd.PriceMantissa);
         Assert.Equal(7u, cmd.EnteringFirm);
+        Assert.Equal((byte)0, cmd.OrdTagId);
+        Assert.Null(cmd.InvestorId);
+    }
+
+    [Fact]
+    public void SimpleNewOrder_PopulatesOrdTagIdAndInvestorId()
+    {
+        // #449 — SimpleNewOrder must propagate ordTagID (id 35505) and
+        // investorID (id 35508) so mass-cancel-on-behalf filters work.
+        var body = BuildSimpleNewOrder(ordTagId: 99, investorPrefix: 7, investorDocument: 123456789);
+
+        var ok = InboundMessageDecoder.TryDecodeNewOrder(body, enteringFirm: 7, enteredAtNanos: 1_000_000UL,
+            out var cmd, out _, out var err);
+
+        Assert.True(ok, err);
+        Assert.Equal((byte)99, cmd.OrdTagId);
+        Assert.NotNull(cmd.InvestorId);
+        Assert.Equal((ushort)7, cmd.InvestorId!.Value.Prefix);
+        Assert.Equal(123456789u, cmd.InvestorId!.Value.Document);
+    }
+
+    [Fact]
+    public void SimpleNewOrder_AllZeroInvestorIdDecodesAsNull()
+    {
+        var body = BuildSimpleNewOrder(ordTagId: 0, investorPrefix: 0, investorDocument: 0);
+
+        var ok = InboundMessageDecoder.TryDecodeNewOrder(body, enteringFirm: 7, enteredAtNanos: 1_000_000UL,
+            out var cmd, out _, out var err);
+
+        Assert.True(ok, err);
+        Assert.Equal((byte)0, cmd.OrdTagId);
+        Assert.Null(cmd.InvestorId);
     }
 
     [Fact]
