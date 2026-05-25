@@ -43,8 +43,11 @@ closing auction (`FinalClosingCall` / `Close`). Concretely, in scope:
 - **Order-handling protections that are exchange-side** — Self-Trading
   Prevention (STPC, GAP-27), market protections (price collars / fat
   finger / max value, GAP-28), inbound throttling.
-- **Market-making protocols** — `MassQuote` / `QuoteRequest`; necessary
-  for any non-trivial options or futures venue simulation.
+- **Market-making protocols** — *future scope, not yet implemented.*
+  `MassQuote` / `QuoteRequest` are necessary for any non-trivial options
+  or futures venue simulation; they live inside this boundary even though
+  no concrete consumer has driven implementation yet (tracked separately
+  as a gap in `docs/B3-ENTRYPOINT-COMPLIANCE.md`).
 - **Operational surface needed to run the venue 24/7** — phase
   scheduling, daily reset, halt/resume, durable WAL+snapshot, EOD fills
   drop, per-trade audit log (ADRs 0001/0002).
