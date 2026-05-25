@@ -10,6 +10,7 @@ internal static partial class InboundMessageDecoder
     /// </summary>
     private static class SimpleNewOrderOffsets
     {
+        public const int OrdTagID = 18;       // byte (0 == null)
         public const int ClOrdID = 20;        // ulong
         public const int SecurityID = 48;     // ulong
         public const int Side = 56;           // byte (overlaps SecurityExchange constant)
@@ -17,6 +18,7 @@ internal static partial class InboundMessageDecoder
         public const int TimeInForce = 58;    // byte
         public const int OrderQty = 60;       // ulong
         public const int PriceMantissa = 68;  // long (PriceOptional, MinValue == NULL)
+        public const int InvestorID = 76;     // Prefix(2) + Document(4), all-zero == null
     }
 
     public static bool TryDecodeNewOrder(ReadOnlySpan<byte> body, uint enteringFirm, ulong enteredAtNanos,
@@ -34,6 +36,10 @@ internal static partial class InboundMessageDecoder
         byte tifByte = body[SimpleNewOrderOffsets.TimeInForce];
         long qty = (long)MemoryMarshal.Read<ulong>(body.Slice(SimpleNewOrderOffsets.OrderQty, 8));
         long priceMantissa = MemoryMarshal.Read<long>(body.Slice(SimpleNewOrderOffsets.PriceMantissa, 8));
+        byte ordTagId = body[SimpleNewOrderOffsets.OrdTagID];
+
+        var investorSpan = body.Slice(SimpleNewOrderOffsets.InvestorID, 6);
+        InvestorId? investorId = IsAllZero(investorSpan) ? null : DecodeInvestorId(investorSpan);
 
         if (!TryMapSide(sideByte, out var side)) { error = $"invalid Side={sideByte}"; return false; }
         if (!TryMapOrdType(ordTypeByte, out var ordType)) { error = $"invalid OrdType={ordTypeByte}"; return false; }
@@ -59,6 +65,8 @@ internal static partial class InboundMessageDecoder
             EnteringFirm: enteringFirm,
             EnteredAtNanos: enteredAtNanos)
         {
+            OrdTagId = ordTagId,
+            InvestorId = investorId,
             PreTradeRejectReason = preTradeRejectReason,
         };
         return true;
