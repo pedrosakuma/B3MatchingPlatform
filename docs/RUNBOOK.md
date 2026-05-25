@@ -278,15 +278,17 @@ Tune from `/metrics`, not from the table above. Watch the aggregate
 `rate_limited_total{session="..."}` series (fed from `ThrottleMetrics`) to see
 which sessions are actually hitting the gate.
 
-Also calibrate `maxOpenOrdersPerFirm` for MM-heavy hosts. The host-level knob
-lives at `HostConfig.MaxOpenOrdersPerFirm`
+Also calibrate `maxOpenOrdersPerFirm` for MM-heavy hosts. The knob is defined
+once in `HostConfig.MaxOpenOrdersPerFirm`
 (`src/B3.Exchange.Host/HostConfig.cs:22`) and defaults to `100_000`; GAP-21a
 records the current behavior in
-[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md). This cap
-is **per firm, per host** — not per session. On multi-firm deployments, make
-sure the value is high enough for the aggregate resting quote count you expect,
-or bursts of new option quotes can devolve into `OrdRejReason=3
-(OrderExceedsLimit)` storms.
+[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md). Today the
+host copies that value into each `ChannelDispatcher`, so enforcement is **per
+firm, per channel/dispatcher** — not per session, and not a single host-wide
+aggregate cap. On multi-firm deployments, make sure the value is high enough
+for the resting quote count you expect on each busy options channel, or bursts
+of new option quotes can devolve into `OrdRejReason=3 (OrderExceedsLimit)`
+storms.
 
 What the venue does **not** do for MMs is just as important. Per ADR 0012 and
 RFC 0002 §2.3, the simulator does not enforce market-maker obligations such as
