@@ -1,0 +1,60 @@
+[
+  // Real-ish B3 equity options sample (RFC 0002 §3.1 / OPT-04). Three
+  // PETR4 options on the dedicated OPT channel, paired to the PETR4
+  // equity carried on the EQT channel (instruments-eqt.json, securityId
+  // 900000000001).
+  //
+  // SecurityIDs use the 902xxx high-bit prefix so they stay disjoint
+  // from instruments-eqt.json (900xxx) and instruments-drv.json (901xxx).
+  //
+  // Per RFC §3.5 / future ADR:
+  //   - lotSize is 1 (the engine matches in contracts; the share-side
+  //     economic size is reconstructed by the broker / clearing tier
+  //     from contractMultiplier × matched contracts).
+  //   - contractMultiplier is 100 (one equity-option contract represents
+  //     100 underlying shares on B3). Carried as metadata only.
+  //
+  // Per RFC §3.1, cross-channel stop triggers (e.g. a stop on PETRL200
+  // firing on the last trade of PETR4) are an explicit MVP non-goal:
+  // each channel owns its own _stopsBySymbol / _lastTradePriceBySecurity,
+  // and the underlying lives on a different dispatcher.
+  //
+  // Symbols here loosely follow the B3 series-naming convention
+  // (PETR + month-code + strike) — December calls use L, December puts
+  // use X — but the venue does NOT parse symbol naming; operators are
+  // free to use any unique ticker. See RFC §8.
+  //
+  // expirationDate must be today-or-later (InstrumentLoader rejects
+  // past-dated series). Until T-3 / OPT-03 ships an expiry-aware
+  // auto-Close path, refresh this file's dates if they ever lapse.
+  {
+    "symbol": "PETRL200", "securityId": 902000000001,
+    "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
+    "currency": "BRL", "isin": "BRPETROPCL200",
+    "securityType": "OPTION",
+    "strikePrice": "20.00", "expirationDate": "2030-12-20",
+    "putOrCall": "Call", "exerciseStyle": "American",
+    "underlyingSecurityId": 900000000001, "underlyingSymbol": "PETR4",
+    "contractMultiplier": "100", "optPayoutType": "Vanilla"
+  },
+  {
+    "symbol": "PETRX250", "securityId": 902000000002,
+    "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
+    "currency": "BRL", "isin": "BRPETROPPX250",
+    "securityType": "OPTION",
+    "strikePrice": "25.00", "expirationDate": "2030-12-20",
+    "putOrCall": "Put", "exerciseStyle": "European",
+    "underlyingSecurityId": 900000000001, "underlyingSymbol": "PETR4",
+    "contractMultiplier": "100", "optPayoutType": "Vanilla"
+  },
+  {
+    "symbol": "PETRL220", "securityId": 902000000003,
+    "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
+    "currency": "BRL", "isin": "BRPETROPCL220",
+    "securityType": "OPTION",
+    "strikePrice": "22.00", "expirationDate": "2030-12-20",
+    "putOrCall": "Call", "exerciseStyle": "American",
+    "underlyingSecurityId": 900000000001, "underlyingSymbol": "PETR4",
+    "contractMultiplier": "100", "optPayoutType": "Vanilla"
+  }
+]

@@ -119,6 +119,39 @@
         "ttl": 1,
         "cadenceMs": 5000
       }
+    },
+    // Third channel group (OPT) — equity options (RFC 0002 §3.1 /
+    // T-4 / OPT-04). Real B3 publishes equity options on a channel
+    // distinct from cash equities; mirror that here. SecurityIDs in
+    // config/instruments-opt.json use the 902xxx prefix to stay
+    // disjoint from EQT (900xxx) and DRV (901xxx) so HostRouter can
+    // partition cleanly by SecurityId. Per ADR 0009 the OPT
+    // dispatcher owns its own MatchingEngine, OrderRegistry,
+    // _stopsBySymbol and _lastTradePriceBySecurity — options
+    // trading cannot perturb equities and vice versa. Cross-channel
+    // stop triggers (e.g. an option stop firing on the underlying's
+    // last trade) are an explicit MVP non-goal (RFC §3.1).
+    {
+      "channelNumber": 78,
+      "incrementalGroup": "224.0.20.78",
+      "incrementalPort": 30078,
+      "ttl": 1,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-opt.json",
+      "snapshot": {
+        "group": "224.0.20.178",
+        "port": 30178,
+        "ttl": 1,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 178,
+        "group": "224.0.21.78",
+        "port": 31078,
+        "ttl": 1,
+        "cadenceMs": 5000
+      }
     }
   ]
 }
