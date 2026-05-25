@@ -17,6 +17,8 @@ public sealed class InstrumentTradingRules
     public long MinPriceMantissa { get; }
     public long MaxPriceMantissa { get; }
     public long LotSize { get; }
+    public decimal? ContractMultiplier { get; }
+    public long? ExpirationTimestamp { get; }
 
     public InstrumentTradingRules(Instrument instrument)
     {
@@ -26,9 +28,17 @@ public sealed class InstrumentTradingRules
         MinPriceMantissa = ToMantissaChecked(instrument.MinPrice, nameof(instrument.MinPrice));
         MaxPriceMantissa = ToMantissaChecked(instrument.MaxPrice, nameof(instrument.MaxPrice));
         LotSize = instrument.LotSize;
+        ContractMultiplier = instrument.ContractMultiplier;
+        ExpirationTimestamp = instrument.ExpirationDate is { } expirationDate
+            ? expirationDate.ToDateTime(TimeOnly.MaxValue).Ticks
+            : null;
+
+        var isOption = InstrumentSecurityTypes.IsOption(instrument.SecurityType);
+
         if (TickSizeMantissa <= 0) throw new ArgumentException("TickSize must be > 0 after scale", nameof(instrument));
         if (LotSize <= 0) throw new ArgumentException("LotSize must be > 0", nameof(instrument));
-        if (MinPriceMantissa <= 0) throw new ArgumentException("MinPrice must be > 0 after scale", nameof(instrument));
+        if (MinPriceMantissa < 0 || (!isOption && MinPriceMantissa == 0))
+            throw new ArgumentException(isOption ? "MinPrice must be >= 0 after scale" : "MinPrice must be > 0 after scale", nameof(instrument));
         if (MaxPriceMantissa < MinPriceMantissa) throw new ArgumentException("MaxPrice < MinPrice", nameof(instrument));
         if (MinPriceMantissa % TickSizeMantissa != 0) throw new ArgumentException("MinPrice not a multiple of TickSize", nameof(instrument));
         if (MaxPriceMantissa % TickSizeMantissa != 0) throw new ArgumentException("MaxPrice not a multiple of TickSize", nameof(instrument));
