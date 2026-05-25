@@ -24,4 +24,32 @@ public sealed record Instrument
 
     /// <summary>FIX SecurityType, e.g. "CS" (common stock), "OPT", "FUT".</summary>
     public required string SecurityType { get; init; }
+
+    public decimal? StrikePrice { get; init; }
+    public DateOnly? ExpirationDate { get; init; }
+    public PutOrCall? PutOrCall { get; init; }
+    public ExerciseStyle? ExerciseStyle { get; init; }
+    public long? UnderlyingSecurityId { get; init; }
+    public string? UnderlyingSymbol { get; init; }
+    public decimal? ContractMultiplier { get; init; }
+    public OptPayoutType? OptPayoutType { get; init; }
+}
+
+public enum PutOrCall
+{
+    Put,
+    Call,
+}
+
+public enum ExerciseStyle
+{
+    European,
+    American,
+}
+
+public enum OptPayoutType
+{
+    Vanilla,
+    Capped,
+    Binary,
 }
