@@ -41,7 +41,10 @@ namespace B3.Exchange.Persistence;
 /// <para><b>Resting stop record:</b> int64 OrderId, len-prefixed UTF-8
 /// ClOrdId, int64 SecurityId, byte Side, byte StopType, byte Tif, int64
 /// StopPxMantissa, int64 LimitPriceMantissa, int64 Quantity, uint32
-/// EnteringFirm, uint64 EnteredAtNanos.</para>
+/// EnteringFirm, uint64 EnteredAtNanos. Issue #453 (codec v4) appends
+/// a trailer: byte OrdTagId, byte InvestorPresence (0=null, 1=present),
+/// and when present uint16 Prefix + uint32 Document. Older versions omit
+/// the trailer and decode with OrdTagId=0 / InvestorId=null.</para>
 ///
 /// <para><b>Owner record:</b> int64 OrderId, len-prefixed UTF-8
 /// SessionValue, uint32 Firm, uint64 ClOrdId, byte Side, int64 SecurityId.</para>
@@ -118,7 +121,7 @@ public static class BinaryChannelStateSnapshotCodec
         else
         {
             w.WriteUVarInt((ulong)stops.Count);
-            foreach (var s in stops) WriteRestingStop(w, s);
+            foreach (var s in stops) WriteRestingStop(w, s, snapshot.Version);
         }
 
         w.WriteUVarInt((ulong)snapshot.Owners.Count);
@@ -245,7 +248,7 @@ public static class BinaryChannelStateSnapshotCodec
         else
         {
             var arr = new RestingStopRecord[stopCount];
-            for (ulong i = 0; i < stopCount; i++) arr[i] = ReadRestingStop(ref r);
+            for (ulong i = 0; i < stopCount; i++) arr[i] = ReadRestingStop(ref r, version);
             stops = arr;
         }
 
@@ -332,7 +335,10 @@ public static class BinaryChannelStateSnapshotCodec
         // Issue #322: v2 → v3 is also a clean migration — v2 files have no
         // halts section, and the decoder above leaves <c>halts</c> null,
         // so re-stamping here is safe.
-        int effectiveVersion = (version == 1 || version == 2) ? ChannelStateSnapshot.CurrentVersion : version;
+        // Issue #453: v3 → v4 is also a clean migration — v3 files have
+        // no per-stop OrdTagId/InvestorId trailer, and ReadRestingStop
+        // defaults them to 0/null for older versions.
+        int effectiveVersion = (version == 1 || version == 2 || version == 3) ? ChannelStateSnapshot.CurrentVersion : version;
         return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,
@@ -369,7 +375,7 @@ public static class BinaryChannelStateSnapshotCodec
             (TimeInForce)tif, maxFloor, hidden);
     }
 
-    private static void WriteRestingStop(BinaryBufferWriter w, RestingStopRecord s)
+    private static void WriteRestingStop(BinaryBufferWriter w, RestingStopRecord s, int version)
     {
         w.WriteInt64(s.OrderId);
         w.WriteString(s.ClOrdId);
@@ -382,9 +388,28 @@ public static class BinaryChannelStateSnapshotCodec
         w.WriteInt64(s.Quantity);
         w.WriteUInt32(s.EnteringFirm);
         w.WriteUInt64(s.EnteredAtNanos);
+        // Issue #453 (codec v4): on-behalf-of identifiers tail so the
+        // triggered residual remains mass-cancellable by OrdTagID /
+        // InvestorID across a snapshot+restore round-trip. Older
+        // versions wrote nothing here; ReadRestingStop defaults to 0/
+        // null when the trailer is absent.
+        if (version >= 4)
+        {
+            w.WriteByte(s.OrdTagId);
+            if (s.InvestorId is { } iid)
+            {
+                w.WriteByte(1);
+                w.WriteUInt16(iid.Prefix);
+                w.WriteUInt32(iid.Document);
+            }
+            else
+            {
+                w.WriteByte(0);
+            }
+        }
     }
 
-    private static RestingStopRecord ReadRestingStop(ref BinaryBufferReader r)
+    private static RestingStopRecord ReadRestingStop(ref BinaryBufferReader r, int version)
     {
         long orderId = r.ReadInt64();
         string clOrdId = r.ReadString();
@@ -397,8 +422,22 @@ public static class BinaryChannelStateSnapshotCodec
         long qty = r.ReadInt64();
         uint firm = r.ReadUInt32();
         ulong enteredAt = r.ReadUInt64();
+        byte ordTagId = 0;
+        InvestorId? investor = null;
+        if (version >= 4)
+        {
+            ordTagId = r.ReadByte();
+            byte hasInvestor = r.ReadByte();
+            if (hasInvestor != 0)
+            {
+                ushort prefix = r.ReadUInt16();
+                uint document = r.ReadUInt32();
+                investor = new InvestorId(prefix, document);
+            }
+        }
         return new RestingStopRecord(orderId, clOrdId, securityId, (Side)side,
-            (OrderType)stopType, (TimeInForce)tif, stopPx, limit, qty, firm, enteredAt);
+            (OrderType)stopType, (TimeInForce)tif, stopPx, limit, qty, firm, enteredAt,
+            ordTagId, investor);
     }
 
     private static void WriteOwner(BinaryBufferWriter w, OrderOwnerSnapshot o)

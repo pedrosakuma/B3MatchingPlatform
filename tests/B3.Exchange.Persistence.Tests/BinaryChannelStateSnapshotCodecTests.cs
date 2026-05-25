@@ -31,10 +31,15 @@ public class BinaryChannelStateSnapshotCodecTests
                 StopType: OrderType.StopLoss, Tif: TimeInForce.Day,
                 StopPxMantissa: 245000, LimitPriceMantissa: 0,
                 Quantity: 200, EnteringFirm: 7, EnteredAtNanos: 111UL),
+            // Issue #453: exercise the new OrdTagId/InvestorId trailer
+            // so AssertEqual catches any regression in the codec
+            // round-trip (record equality covers them).
             new RestingStopRecord(202, "S-2", SecurityId: 999_001, Side.Sell,
                 StopType: OrderType.StopLimit, Tif: TimeInForce.Gtc,
                 StopPxMantissa: 255000, LimitPriceMantissa: 256000,
-                Quantity: 300, EnteringFirm: 9, EnteredAtNanos: 222UL),
+                Quantity: 300, EnteringFirm: 9, EnteredAtNanos: 222UL,
+                OrdTagId: 99,
+                InvestorId: new InvestorId(0x4321, 7_654_321u)),
         };
         var phases = new[]
         {
@@ -117,6 +122,44 @@ public class BinaryChannelStateSnapshotCodecTests
         var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
         var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
         Assert.Null(decoded.Engine.Stops);
+    }
+
+    [Fact]
+    public void Encode_AtV3_OmitsRestingStopTrailer_AndV3DecodeFillsDefaults()
+    {
+        // Issue #453 backward-compat: a snapshot stamped at Version=3
+        // (the codec's pre-#453 schema) MUST round-trip without the
+        // OrdTagId/InvestorId trailer. Re-decoded fields default to
+        // 0 / null and the codec re-stamps the loaded snapshot at
+        // CurrentVersion so RestoreChannelState's strict version check
+        // accepts it.
+        var stops = new[]
+        {
+            new RestingStopRecord(201, "S-1", SecurityId: 999_001, Side.Buy,
+                StopType: OrderType.StopLoss, Tif: TimeInForce.Day,
+                StopPxMantissa: 245000, LimitPriceMantissa: 0,
+                Quantity: 200, EnteringFirm: 7, EnteredAtNanos: 111UL,
+                // These would be written under v4 but MUST NOT be on
+                // the wire when Version=3.
+                OrdTagId: 99,
+                InvestorId: new InvestorId(0x1234, 567u)),
+        };
+        var engine = new EngineStateSnapshot(
+            NextOrderId: 1, NextTradeId: 1, RptSeq: 0,
+            Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+            Books: Array.Empty<EngineStateSnapshot.BookSnapshot>(),
+            Stops: stops);
+        var snap = new ChannelStateSnapshot(
+            Version: 3, ChannelNumber: 1, SequenceNumber: 0, SequenceVersion: 0,
+            Engine: engine, Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+        var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
+
+        Assert.Equal(ChannelStateSnapshot.CurrentVersion, decoded.Version);
+        var roundTripped = Assert.Single(decoded.Engine.Stops!);
+        Assert.Equal((byte)0, roundTripped.OrdTagId);
+        Assert.Null(roundTripped.InvestorId);
     }
 
     [Fact]

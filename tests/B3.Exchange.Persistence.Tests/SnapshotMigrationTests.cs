@@ -49,9 +49,9 @@ public class SnapshotMigrationTests
             var p = new FileChannelStatePersister(dir, NullLogger<FileChannelStatePersister>.Instance);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            // Issue #322: chain now upgrades to v3, the new
-            // CurrentVersion (was v2 in #319).
-            Assert.Equal(3, loaded!.Version);
+            // Issue #453: chain now upgrades to v4, the new
+            // CurrentVersion (was v3 in #322).
+            Assert.Equal(4, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -82,10 +82,10 @@ public class SnapshotMigrationTests
                 migrations: migrations);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            // Issue #322: chain is 0→1 (registered here) followed by
-            // 1→2 and 2→3 (registered by BuildDefault), so the loaded
-            // version reflects CurrentVersion = 3.
-            Assert.Equal(3, loaded!.Version);
+            // Issue #453: chain is 0→1 (registered here) followed by
+            // 1→2, 2→3, and 3→4 (registered by BuildDefault), so the
+            // loaded version reflects CurrentVersion = 4.
+            Assert.Equal(4, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

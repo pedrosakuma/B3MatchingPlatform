@@ -197,7 +197,9 @@ public sealed class MatchingEngine
                     LimitPriceMantissa: s.LimitPriceMantissa,
                     Quantity: s.Quantity,
                     EnteringFirm: s.EnteringFirm,
-                    EnteredAtNanos: s.EnteredAtNanos)
+                    EnteredAtNanos: s.EnteredAtNanos,
+                    OrdTagId: s.OrdTagId,
+                    InvestorId: s.InvestorId)
                 { Memo = s.Memo });
             }
         }
@@ -295,6 +297,8 @@ public sealed class MatchingEngine
                     EnteredAtNanos = s.EnteredAtNanos,
                     SecurityId = s.SecurityId,
                     Memo = s.Memo,
+                    OrdTagId = s.OrdTagId,
+                    InvestorId = s.InvestorId,
                 };
                 bucket.Add(stop);
                 _stopById.Add(s.OrderId, stop);
@@ -1824,6 +1828,13 @@ public sealed class MatchingEngine
         public ulong EnteredAtNanos { get; init; }
         public long SecurityId { get; init; }
         public byte[] Memo { get; init; } = [];
+
+        // Issue #453: on-behalf-of identifiers must survive both the
+        // park-then-trigger transition (so the triggered residual
+        // remains mass-cancellable by OrdTagID/InvestorID) and a
+        // snapshot+restore round-trip.
+        public byte OrdTagId { get; init; }
+        public InvestorId? InvestorId { get; init; }
     }
 
     private void SubmitStop(NewOrderCommand cmd, InstrumentTradingRules rules)
@@ -1878,6 +1889,8 @@ public sealed class MatchingEngine
             EnteredAtNanos = cmd.EnteredAtNanos,
             SecurityId = cmd.SecurityId,
             Memo = cmd.Memo,
+            OrdTagId = cmd.OrdTagId,
+            InvestorId = cmd.InvestorId,
         };
         _stopsBySymbol[cmd.SecurityId].Add(stop);
         _stopById.Add(oid, stop);
@@ -1972,7 +1985,7 @@ public sealed class MatchingEngine
             Quantity: s.Quantity,
             EnteringFirm: s.EnteringFirm,
             EnteredAtNanos: txnNanos)
-        { Memo = s.Memo };
+        { Memo = s.Memo, OrdTagId = s.OrdTagId, InvestorId = s.InvestorId };
 
         // Triggered StopLoss sees an empty opposite side → no fills,
         // silently dropped. We do NOT emit MarketNoLiquidity reject

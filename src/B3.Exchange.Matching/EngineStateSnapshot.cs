@@ -85,7 +85,9 @@ public sealed record RestingStopRecord(
     long LimitPriceMantissa,
     long Quantity,
     uint EnteringFirm,
-    ulong EnteredAtNanos)
+    ulong EnteredAtNanos,
+    byte OrdTagId = 0,
+    InvestorId? InvestorId = null)
 {
     public byte[] Memo { get; init; } = [];
 }
