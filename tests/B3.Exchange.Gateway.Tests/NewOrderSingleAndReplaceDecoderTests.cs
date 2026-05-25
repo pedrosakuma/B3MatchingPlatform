@@ -62,7 +62,9 @@ public class NewOrderSingleAndReplaceDecoderTests
         ulong origClOrdId = 99UL,
         long stopPx = PriceNull,
         ulong minQty = 0UL,
-        ulong maxFloor = 0UL)
+        ulong maxFloor = 0UL,
+        ushort investorPrefix = 0,
+        uint investorDocument = 0)
     {
         var body = new byte[142];
         Span<byte> s = body;
@@ -79,6 +81,8 @@ public class NewOrderSingleAndReplaceDecoderTests
         MemoryMarshal.Write(s.Slice(92, 8), in stopPx);
         MemoryMarshal.Write(s.Slice(100, 8), in minQty);
         MemoryMarshal.Write(s.Slice(108, 8), in maxFloor);
+        MemoryMarshal.Write(s.Slice(136, 2), in investorPrefix);
+        MemoryMarshal.Write(s.Slice(138, 4), in investorDocument);
         return body;
     }
 
@@ -521,6 +525,39 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Equal(42L, cmd.OrderId);
         Assert.Equal(25L, cmd.NewQuantity);
         Assert.Equal(50_0000L, cmd.NewPriceMantissa);
+    }
+
+    // Issue #451: B3 Binary EntryPoint Messaging Guidelines §7.4 allows
+    // InvestorID mutation via OCRR (Add ✓, Change ✓). A non-zero composite
+    // on the OCRR body must surface on ReplaceOrderCommand.NewInvestorId so
+    // the engine can apply it to the resting order.
+    [Fact]
+    public void OrderCancelReplace_InvestorIdNonZero_PopulatesNewInvestorId()
+    {
+        var body = BuildOrderCancelReplaceV2(investorPrefix: 7, investorDocument: 123_456);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out var cmd, out _, out _, out _);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.NotNull(cmd.NewInvestorId);
+        Assert.Equal((ushort)7, cmd.NewInvestorId!.Value.Prefix);
+        Assert.Equal(123_456u, cmd.NewInvestorId.Value.Document);
+    }
+
+    // Spec §7.4 footer: "Fields that are not sent will be considered the
+    // same as the original order." An all-zero composite is the wire NULL
+    // sentinel → command carries null → engine preserves resting value.
+    [Fact]
+    public void OrderCancelReplace_InvestorIdAllZero_LeavesNewInvestorIdNull()
+    {
+        var body = BuildOrderCancelReplaceV2(); // defaults leave composite all-zero
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out var cmd, out _, out _, out _);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(cmd.NewInvestorId);
     }
 
     [Fact]

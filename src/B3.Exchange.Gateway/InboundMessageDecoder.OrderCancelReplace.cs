@@ -26,6 +26,10 @@ internal static partial class InboundMessageDecoder
         public const int MinQty = 100;            // ulong (0 == null)
         public const int MaxFloor = 108;          // ulong (0 == null)
         public const int ExpireDate = 122;        // ushort (0 == null)
+        // Issue #451: spec §7.4 allows InvestorID mutation via OCRR
+        // (Add ✓, Change ✓). Composite (Prefix uint16 + Document uint32),
+        // all-zero == null sentinel == "preserve original".
+        public const int InvestorID = 136;        // Prefix(2) + Document(4), all-zero == null
         // V6 trailer (BlockLength=150). Same semantics as
         // NewOrderSingle's trailer — see issue #238.
         public const int StrategyID = 142;        // int32 (0 == null)
@@ -68,6 +72,8 @@ internal static partial class InboundMessageDecoder
         byte mmpReset = body[OrderCancelReplaceOffsets.MmProtectionReset];
         byte stp = body[OrderCancelReplaceOffsets.Stp];
         ushort expireDate = MemoryMarshal.Read<ushort>(body.Slice(OrderCancelReplaceOffsets.ExpireDate, 2));
+        var investorSpan = body.Slice(OrderCancelReplaceOffsets.InvestorID, 6);
+        InvestorId? investorId = IsAllZero(investorSpan) ? null : DecodeInvestorId(investorSpan);
 
         clOrdIdValue = clOrdId;
         origClOrdIdValue = origClOrdId;
@@ -210,6 +216,7 @@ internal static partial class InboundMessageDecoder
                 NewOrdType = ordType,
                 NewTif = newTif,
                 PreTradeRejectReason = preTradeRejectReason,
+                NewInvestorId = investorId,
             };
             return InboundDecodeOutcome.UnsupportedFeature;
         }
@@ -224,6 +231,7 @@ internal static partial class InboundMessageDecoder
         {
             NewOrdType = ordType,
             NewTif = newTif,
+            NewInvestorId = investorId,
         };
         return InboundDecodeOutcome.Success;
     }

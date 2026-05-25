@@ -135,6 +135,112 @@ public class CancelReplaceTests
         eng.Replace(new ReplaceOrderCommand("c1", PetrSecId, 999L, Px(10m), 100, 2000));
         Assert.Equal(RejectReason.UnknownOrderId, sink.Rejects[0].Reason);
     }
+
+    // Issue #451: B3 Binary EntryPoint Messaging Guidelines §7.4 lists
+    // InvestorID with Add ✓ Change ✓ — clients must be able to mutate the
+    // resting order's InvestorId via OCRR. Verified via MassCancel filter
+    // (the only externally observable view on the resting order's
+    // InvestorId), which must match the NEW value, not the original.
+    [Fact]
+    public void Replace_PriorityKept_WithNewInvestorId_AppliesToRestingOrder()
+    {
+        var eng = NewEngine(out var sink);
+        var orig = new InvestorId(1, 100);
+        var changed = new InvestorId(2, 200);
+        eng.Submit(new NewOrderCommand("c1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 500, 11, 1000)
+        {
+            InvestorId = orig,
+        });
+        var oid = sink.Accepted[0].OrderId;
+        sink.Clear();
+
+        // Qty decrease at same price → priority kept (in-place mutation path).
+        eng.Replace(new ReplaceOrderCommand("c1", PetrSecId, oid, Px(10m), 300, 2000)
+        {
+            NewInvestorId = changed,
+        });
+        Assert.Single(sink.QtyReduced);
+        sink.Clear();
+
+        // MassCancel filtered by the ORIGINAL InvestorId must NOT match
+        // (proves the mutation happened); filtered by the NEW value MUST.
+        int byOriginal = eng.MassCancel(new[] { oid }, new MassCancelCommand(0, null, 9_000)
+        {
+            InvestorIdFilter = orig,
+        });
+        Assert.Equal(0, byOriginal);
+        Assert.Empty(sink.Canceled);
+
+        int byChanged = eng.MassCancel(new[] { oid }, new MassCancelCommand(0, null, 9_001)
+        {
+            InvestorIdFilter = changed,
+        });
+        Assert.Equal(1, byChanged);
+        Assert.Equal(oid, Assert.Single(sink.Canceled).OrderId);
+    }
+
+    // Issue #451: spec §7.4 "Fields that are not sent will be considered
+    // the same as the original order." → null NewInvestorId must preserve
+    // the resting order's existing InvestorId (backward-compat with
+    // pre-#451 callers and with InvestorID-less OCRRs).
+    [Fact]
+    public void Replace_PriorityKept_NullNewInvestorId_PreservesOriginal()
+    {
+        var eng = NewEngine(out var sink);
+        var orig = new InvestorId(3, 300);
+        eng.Submit(new NewOrderCommand("c1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 500, 11, 1000)
+        {
+            InvestorId = orig,
+        });
+        var oid = sink.Accepted[0].OrderId;
+        sink.Clear();
+
+        eng.Replace(new ReplaceOrderCommand("c1", PetrSecId, oid, Px(10m), 300, 2000));
+        Assert.Single(sink.QtyReduced);
+        sink.Clear();
+
+        int n = eng.MassCancel(new[] { oid }, new MassCancelCommand(0, null, 9_000)
+        {
+            InvestorIdFilter = orig,
+        });
+        Assert.Equal(1, n);
+        Assert.Equal(oid, Assert.Single(sink.Canceled).OrderId);
+    }
+
+    // Issue #451: when Replace forces a DEL+NEW (priority lost), the
+    // replacement resting order must also carry the new InvestorId; the
+    // synthesized NewOrderCommand must use cmd.NewInvestorId ?? resting.InvestorId.
+    [Fact]
+    public void Replace_PriorityLost_WithNewInvestorId_PropagatesToReplacement()
+    {
+        var eng = NewEngine(out var sink);
+        var orig = new InvestorId(1, 100);
+        var changed = new InvestorId(2, 200);
+        eng.Submit(new NewOrderCommand("c1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 11, 1000)
+        {
+            InvestorId = orig,
+        });
+        var oldOid = sink.Accepted[0].OrderId;
+        sink.Clear();
+
+        // Price change → priority lost (DEL + fresh NEW path).
+        eng.Replace(new ReplaceOrderCommand("c1", PetrSecId, oldOid, Px(10.05m), 100, 2000)
+        {
+            NewInvestorId = changed,
+        });
+        Assert.Equal(CancelReason.ReplaceLostPriority, Assert.Single(sink.Canceled).Reason);
+        var newOid = Assert.Single(sink.Accepted).OrderId;
+        Assert.NotEqual(oldOid, newOid);
+        sink.Clear();
+
+        // Replacement resting order must carry the NEW InvestorId.
+        int n = eng.MassCancel(new[] { newOid }, new MassCancelCommand(0, null, 9_000)
+        {
+            InvestorIdFilter = changed,
+        });
+        Assert.Equal(1, n);
+        Assert.Equal(newOid, Assert.Single(sink.Canceled).OrderId);
+    }
 }
 
 public class SnapshotEnumerationTests

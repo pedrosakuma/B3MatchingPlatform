@@ -1176,6 +1176,14 @@ public sealed class MatchingEngine
                 long delta = resting.RemainingQuantity - cmd.NewQuantity;
                 resting.RemainingQuantity = cmd.NewQuantity;
                 resting.Level!.TotalQuantity -= delta;
+                // Issue #451: spec §7.4 allows InvestorID mutation via OCRR
+                // (Add ✓, Change ✓). Apply before emitting events so the
+                // resting order — and subsequent MassCancel filtering — see
+                // the new identifier. Null means preserve.
+                if (cmd.NewInvestorId is { } newInvestorKept)
+                {
+                    resting.InvestorId = newInvestorKept;
+                }
                 uint rptSeq = NextRptSeq();
                 _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
                     SecurityId: book.SecurityId,
@@ -1230,7 +1238,7 @@ public sealed class MatchingEngine
                 MaxFloor = resting.MaxFloor > 0 ? (ulong)resting.MaxFloor : 0UL,
                 OrdTagId = resting.OrdTagId,
                 Asset = resting.Asset,
-                InvestorId = resting.InvestorId,
+                InvestorId = cmd.NewInvestorId ?? resting.InvestorId,
                 Memo = cmd.Memo,
             };
 
