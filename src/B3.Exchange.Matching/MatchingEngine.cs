@@ -1210,7 +1210,13 @@ public sealed class MatchingEngine
                     NewRemainingQuantity: cmd.NewQuantity,
                     TransactTimeNanos: cmd.EnteredAtNanos,
                     RptSeq: rptSeq,
-                    Memo: cmd.Memo));
+                    Memo: cmd.Memo,
+                    // Issue #459: echo post-replace InvestorId on
+                    // ER_Modify so clients can reconcile the working
+                    // order's identity. resting.InvestorId has already
+                    // been mutated above when cmd.NewInvestorId was set,
+                    // so this is the canonical post-replace value.
+                    InvestorId: resting.InvestorId));
                 RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }

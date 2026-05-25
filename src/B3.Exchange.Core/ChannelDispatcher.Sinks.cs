@@ -85,7 +85,8 @@ public sealed partial class ChannelDispatcher
             newRemainingQty: e.NewRemainingQuantity,
             transactTimeNanos: e.TransactTimeNanos, rptSeq: e.RptSeq,
             receivedTimeNanos: _currentReceivedTimeNanos,
-            durability: CurrentDurability);
+            durability: CurrentDurability,
+            investorId: e.InvestorId);
         _metrics?.IncExecutionReport(ExecutionReportKind.Replace);
 
         // Refresh the canonical (Firm, ClOrdID) → OrderId index so

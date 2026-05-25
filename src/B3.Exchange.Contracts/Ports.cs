@@ -69,7 +69,8 @@ public interface ICoreOutbound
         ulong clOrdIdValue, ulong origClOrdIdValue,
         MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default);
+        DurabilityHandle durability = default,
+        InvestorId? investorId = null);
 
     bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default);

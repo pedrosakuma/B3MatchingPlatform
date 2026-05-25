@@ -49,7 +49,7 @@ public class TracingTests
         public bool WriteExecutionReportTrade(SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default) => true;
     }
 

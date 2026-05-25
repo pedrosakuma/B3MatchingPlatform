@@ -84,7 +84,7 @@ public class CrossOrderSemanticsTests
             return true;
         }
 
-        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
 
         public bool WriteExecutionReportReject(SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default)
         {

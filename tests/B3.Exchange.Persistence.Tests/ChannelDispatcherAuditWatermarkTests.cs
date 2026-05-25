@@ -47,7 +47,7 @@ public class ChannelDispatcherAuditWatermarkTests
         public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong rc, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportModify(SessionId s, long sid, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rs, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public bool WriteExecutionReportModify(SessionId s, long sid, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rs, ulong r = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default) => true;
     }
 

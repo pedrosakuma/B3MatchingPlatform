@@ -520,7 +520,8 @@ public sealed partial class ChannelDispatcher
             ulong clOrdIdValue, ulong origClOrdIdValue,
             MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos,
             uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue,
-            DurabilityHandle durability = default) => true;
+            DurabilityHandle durability = default,
+            InvestorId? investorId = null) => true;
         public bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e,
             ulong clOrdIdValue, DurabilityHandle durability = default) => true;
     }
