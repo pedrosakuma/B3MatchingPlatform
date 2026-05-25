@@ -80,6 +80,12 @@ public sealed class SnapshotMigrationSet
         // version; STJ's missing-property tolerance leaves the new
         // fields at their record defaults (0 / null) on deserialise.
         set.Register(3, MigrateV3ToV4);
+        // Issue #455: v5 only adds optional OrdTagId / Asset / InvestorId
+        // fields on each RestingOrderRecord. v4 trees upgrade by
+        // stamping the version; STJ's missing-property tolerance leaves
+        // the new fields at their record defaults (0 / null / null) on
+        // deserialise.
+        set.Register(4, MigrateV4ToV5);
         return set;
     }
 
@@ -101,6 +107,13 @@ public sealed class SnapshotMigrationSet
     {
         if (previous is JsonObject obj)
             obj["Version"] = 4;
+        return previous;
+    }
+
+    private static JsonNode MigrateV4ToV5(JsonNode previous)
+    {
+        if (previous is JsonObject obj)
+            obj["Version"] = 5;
         return previous;
     }
 

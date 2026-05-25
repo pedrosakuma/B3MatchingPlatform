@@ -20,10 +20,16 @@ public class BinaryChannelStateSnapshotCodecTests
                 PriceMantissa: 250000, RemainingQuantity: 100,
                 EnteringFirm: 7, InsertTimestampNanos: 123456789UL,
                 Tif: TimeInForce.Day, MaxFloor: 100, HiddenQuantity: 0),
+            // Issue #455: exercise the new OrdTagId/Asset/InvestorId
+            // trailer so AssertEqual catches any regression in the codec
+            // round-trip (record equality covers them).
             new RestingOrderRecord(102, "iceberg-Ω-✓", Side.Sell,
                 PriceMantissa: 250100, RemainingQuantity: 50_000,
                 EnteringFirm: 9, InsertTimestampNanos: 987654321UL,
-                Tif: TimeInForce.Gtc, MaxFloor: 1000, HiddenQuantity: 49_000),
+                Tif: TimeInForce.Gtc, MaxFloor: 1000, HiddenQuantity: 49_000,
+                OrdTagId: 77,
+                Asset: "PETR",
+                InvestorId: new InvestorId(0xABCD, 1_234_567u)),
         };
         var stops = new[]
         {
@@ -122,6 +128,50 @@ public class BinaryChannelStateSnapshotCodecTests
         var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
         var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
         Assert.Null(decoded.Engine.Stops);
+    }
+
+    [Fact]
+    public void Encode_AtV4_OmitsRestingOrderTrailer_AndV4DecodeFillsDefaults()
+    {
+        // Issue #455 backward-compat: a snapshot stamped at Version=4
+        // (the codec's pre-#455 schema) MUST round-trip without the
+        // OrdTagId/Asset/InvestorId per-resting-order trailer. Re-
+        // decoded fields default to 0 / null / null and the codec re-
+        // stamps the loaded snapshot at CurrentVersion so
+        // RestoreChannelState's strict version check accepts it.
+        var orders = new[]
+        {
+            new RestingOrderRecord(101, "CLI-A", Side.Buy,
+                PriceMantissa: 250000, RemainingQuantity: 100,
+                EnteringFirm: 7, InsertTimestampNanos: 123456789UL,
+                Tif: TimeInForce.Day, MaxFloor: 100, HiddenQuantity: 0,
+                // These would be written under v5 but MUST NOT be on
+                // the wire when Version=4.
+                OrdTagId: 77,
+                Asset: "PETR",
+                InvestorId: new InvestorId(0xABCD, 1_234_567u)),
+        };
+        var books = new[]
+        {
+            new EngineStateSnapshot.BookSnapshot(999_001, orders),
+        };
+        var engine = new EngineStateSnapshot(
+            NextOrderId: 102, NextTradeId: 1, RptSeq: 0,
+            Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+            Books: books,
+            Stops: null);
+        var snap = new ChannelStateSnapshot(
+            Version: 4, ChannelNumber: 1, SequenceNumber: 0, SequenceVersion: 0,
+            Engine: engine, Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+        var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
+
+        Assert.Equal(ChannelStateSnapshot.CurrentVersion, decoded.Version);
+        var roundTripped = Assert.Single(decoded.Engine.Books[0].Orders);
+        Assert.Equal((byte)0, roundTripped.OrdTagId);
+        Assert.Null(roundTripped.Asset);
+        Assert.Null(roundTripped.InvestorId);
     }
 
     [Fact]

@@ -36,7 +36,11 @@ namespace B3.Exchange.Persistence;
 /// <para><b>Resting order record:</b> int64 OrderId, len-prefixed UTF-8
 /// ClOrdId, byte Side, int64 PriceMantissa, int64 RemainingQuantity,
 /// uint32 EnteringFirm, uint64 InsertTimestampNanos, byte Tif, int64
-/// MaxFloor, int64 HiddenQuantity.</para>
+/// MaxFloor, int64 HiddenQuantity. Issue #455 (codec v5) appends a
+/// trailer: byte OrdTagId, len-prefixed UTF-8 Asset (empty = null),
+/// byte InvestorPresence (0=null, 1=present), and when present uint16
+/// Prefix + uint32 Document. Older versions omit the trailer and decode
+/// with OrdTagId=0 / Asset=null / InvestorId=null.</para>
 ///
 /// <para><b>Resting stop record:</b> int64 OrderId, len-prefixed UTF-8
 /// ClOrdId, int64 SecurityId, byte Side, byte StopType, byte Tif, int64
@@ -108,7 +112,7 @@ public static class BinaryChannelStateSnapshotCodec
         {
             w.WriteInt64(b.SecurityId);
             w.WriteUVarInt((ulong)b.Orders.Count);
-            foreach (var o in b.Orders) WriteRestingOrder(w, o);
+            foreach (var o in b.Orders) WriteRestingOrder(w, o, snapshot.Version);
         }
 
         // null and empty stops are operationally identical to the
@@ -231,7 +235,7 @@ public static class BinaryChannelStateSnapshotCodec
             long securityId = r.ReadInt64();
             ulong orderCount = ReadBoundedCount(ref r, bytes.Length, "order");
             var orders = new RestingOrderRecord[orderCount];
-            for (ulong j = 0; j < orderCount; j++) orders[j] = ReadRestingOrder(ref r);
+            for (ulong j = 0; j < orderCount; j++) orders[j] = ReadRestingOrder(ref r, version);
             books[i] = new EngineStateSnapshot.BookSnapshot(securityId, orders);
         }
 
@@ -338,14 +342,18 @@ public static class BinaryChannelStateSnapshotCodec
         // Issue #453: v3 → v4 is also a clean migration — v3 files have
         // no per-stop OrdTagId/InvestorId trailer, and ReadRestingStop
         // defaults them to 0/null for older versions.
-        int effectiveVersion = (version == 1 || version == 2 || version == 3) ? ChannelStateSnapshot.CurrentVersion : version;
+        // Issue #455: v4 → v5 is also a clean migration — v4 files have
+        // no per-resting-order OrdTagId/Asset/InvestorId trailer, and
+        // ReadRestingOrder defaults them to 0/null/null for older
+        // versions.
+        int effectiveVersion = (version == 1 || version == 2 || version == 3 || version == 4) ? ChannelStateSnapshot.CurrentVersion : version;
         return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,
         };
     }
 
-    private static void WriteRestingOrder(BinaryBufferWriter w, RestingOrderRecord o)
+    private static void WriteRestingOrder(BinaryBufferWriter w, RestingOrderRecord o, int version)
     {
         w.WriteInt64(o.OrderId);
         w.WriteString(o.ClOrdId);
@@ -357,9 +365,29 @@ public static class BinaryChannelStateSnapshotCodec
         w.WriteByte((byte)o.Tif);
         w.WriteInt64(o.MaxFloor);
         w.WriteInt64(o.HiddenQuantity);
+        // Issue #455 (codec v5): on-behalf-of identifiers tail so the
+        // restored resting order remains mass-cancellable by OrdTagID /
+        // Asset / InvestorID across a snapshot+restore round-trip.
+        // Older versions wrote nothing here; ReadRestingOrder defaults
+        // to 0 / null / null when the trailer is absent.
+        if (version >= 5)
+        {
+            w.WriteByte(o.OrdTagId);
+            w.WriteString(o.Asset);
+            if (o.InvestorId is { } iid)
+            {
+                w.WriteByte(1);
+                w.WriteUInt16(iid.Prefix);
+                w.WriteUInt32(iid.Document);
+            }
+            else
+            {
+                w.WriteByte(0);
+            }
+        }
     }
 
-    private static RestingOrderRecord ReadRestingOrder(ref BinaryBufferReader r)
+    private static RestingOrderRecord ReadRestingOrder(ref BinaryBufferReader r, int version)
     {
         long orderId = r.ReadInt64();
         string clOrdId = r.ReadString();
@@ -371,8 +399,24 @@ public static class BinaryChannelStateSnapshotCodec
         byte tif = r.ReadByte();
         long maxFloor = r.ReadInt64();
         long hidden = r.ReadInt64();
+        byte ordTagId = 0;
+        string? asset = null;
+        InvestorId? investor = null;
+        if (version >= 5)
+        {
+            ordTagId = r.ReadByte();
+            string assetField = r.ReadString();
+            asset = string.IsNullOrEmpty(assetField) ? null : assetField;
+            byte hasInvestor = r.ReadByte();
+            if (hasInvestor != 0)
+            {
+                ushort prefix = r.ReadUInt16();
+                uint document = r.ReadUInt32();
+                investor = new InvestorId(prefix, document);
+            }
+        }
         return new RestingOrderRecord(orderId, clOrdId, (Side)side, price, qty, firm, ts,
-            (TimeInForce)tif, maxFloor, hidden);
+            (TimeInForce)tif, maxFloor, hidden, ordTagId, asset, investor);
     }
 
     private static void WriteRestingStop(BinaryBufferWriter w, RestingStopRecord s, int version)
