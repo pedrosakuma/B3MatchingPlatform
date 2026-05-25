@@ -54,3 +54,4 @@ changes, a new ADR supersedes the old one.
 | 0009 | Single-writer threading model for per-channel state            | Accepted |
 | 0010 | Post-trade orchestration boundary                              | Accepted |
 | 0011 | Contracts is a shared-primitives layer (Matching is canonical) | Accepted |
+| 0012 | Exchange-day boundary: what the simulator does and what it doesn't | Accepted |

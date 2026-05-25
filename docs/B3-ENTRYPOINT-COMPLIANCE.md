@@ -150,19 +150,22 @@ termination code. Missing ([GAP-06], [GAP-08]).
 
 ### Order types / TIF / advanced functionality
 
-These are tracked here for completeness; most are explicit non-goals today.
+Following [ADR 0012 — Exchange-day boundary](adr/0012-exchange-day-boundary.md),
+order-handling protections (STPC, Market Protections) and matching-side
+extensions (Sweep & Cross) are in-scope; pricing / greeks / settlement of
+options are out-of-scope (delegated to companion repos).
 
 | # | Spec § | Item | Status | Severity | Issue |
 | --- | --- | --- | --- | --- | --- |
-| <a id="gap-22"></a>GAP-22 | 7.1.1–7.1.6 | Stop / StopLimit / Market-with-leftover-as-Limit (`K`) / RLP (`W`) order types | missing | low (non-goal) | [#53](https://github.com/pedrosakuma/SbeB3Exchange/issues/53) |
-| <a id="gap-23"></a>GAP-23 | 7.1.7–7.1.14 | `GTC` / `GTD` / `MOC` / `MOA` time-in-force | missing | low (non-goal) | [#54](https://github.com/pedrosakuma/SbeB3Exchange/issues/54) |
-| <a id="gap-24"></a>GAP-24 | 7.1.16–7.1.17 | Iceberg / disclosed quantity, MinQty | missing | low (non-goal) | [#55](https://github.com/pedrosakuma/SbeB3Exchange/issues/55) |
-| <a id="gap-25"></a>GAP-25 | 7.1.20 | In-flight modification semantics (priority loss rules) | partial | medium | [#56](https://github.com/pedrosakuma/SbeB3Exchange/issues/56) |
-| <a id="gap-26"></a>GAP-26 | 8.3 | Daily GTC/GTD restatement | missing | low (depends on GAP-23) | [#57](https://github.com/pedrosakuma/SbeB3Exchange/issues/57) |
-| <a id="gap-27"></a>GAP-27 | 15.4 | Self-Trading Prevention | missing | medium | covered by #14 |
-| <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections | missing | low (non-goal) | — |
-| <a id="gap-29"></a>GAP-29 | 15.1 | User-Defined Spreads (UDS) | missing | low | — |
-| <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low | — |
+| <a id="gap-22"></a>GAP-22 | 7.1.1–7.1.6 | Stop / StopLimit / Market-with-leftover-as-Limit (`K`) / RLP (`W`) / Pegged Midpoint (`P`) order types | partial | low (RLP+Pegged are non-goals) | Stop / StopLimit / `K` are implemented end-to-end (engine trigger book + retired ER + UMDF). RLP (`W`) and Pegged Midpoint (`P`) are decoded but rejected with `OrdRejReason=11 (UnsupportedOrderCharacteristic)`. |
+| <a id="gap-23"></a>GAP-23 | 7.1.7–7.1.14 | `GTC` / `GTD` / `MOC` (AtClose) / `MOA` (GoodForAuction) time-in-force | partial | medium | `GTC`, `MOC` (AtClose), `MOA` (GoodForAuction) are end-to-end (decoder + phase gating in `MatchingEngine.NewOrder`). **`GTD` is decoded but engine-rejected with `RejectReason.TimeInForceNotSupported`** because `ExpireDate` is not yet plumbed through `NewOrderCommand` (see `MatchingEngine.cs:813-818` and `ExtendedTimeInForceTests.Gtd_AlwaysRejected_UntilExpireDatePlumbed`). |
+| <a id="gap-24"></a>GAP-24 | 7.1.16–7.1.17 | Iceberg / disclosed quantity (`MaxFloor`), `MinQty` | done | — | Both implemented with validation (`MaxFloor` in `(0, Quantity]`, multiple of `lotSize`; `MinQty` in `(0, Quantity]`) and rejection paths (`RejectReason.InvalidField` / `RejectReason.MinQtyNotMet`). |
+| <a id="gap-25"></a>GAP-25 | 7.1.20 | In-flight modification semantics (priority loss rules) | partial | medium | — |
+| <a id="gap-26"></a>GAP-26 | 8.3 | Daily GTC/GTD restatement at session boundary (carry-over + re-emit ER) | missing | medium | `DailyResetScheduler` exists but does not yet restate GTC/GTD orders. |
+| <a id="gap-27"></a>GAP-27 | 15.4 | Self-Trading Prevention (STPC) | missing | medium (in-scope per ADR 0012) | covered by [#14](https://github.com/pedrosakuma/B3MatchingPlatform/issues/14) |
+| <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections (price collars / fat-finger / max value) | missing | medium (in-scope per ADR 0012) | — |
+| <a id="gap-29"></a>GAP-29 | 15.1 | User-Defined Spreads (UDS) — synthetic multi-leg instruments | missing | low (boundary case; borderline between exchange-side and broker-side) | — |
+| <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low (in-scope per ADR 0012) | — |
 
 ## Maintenance notes
 
