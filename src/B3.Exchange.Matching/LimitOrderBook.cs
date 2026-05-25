@@ -14,7 +14,7 @@ internal sealed class RestingOrder
     public required uint EnteringFirm { get; init; }
     public byte OrdTagId { get; init; }
     public string? Asset { get; init; }
-    public InvestorId? InvestorId { get; init; }
+    public InvestorId? InvestorId { get; set; }
     public byte[] Memo { get; init; } = [];
 
     /// <summary>

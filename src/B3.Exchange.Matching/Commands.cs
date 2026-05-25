@@ -300,6 +300,17 @@ public sealed record ReplaceOrderCommand(
     /// </summary>
     public TimeInForce? NewTif { get; init; }
 
+    /// <summary>
+    /// Optional new <see cref="Matching.InvestorId"/> for the working order.
+    /// Mutable per B3 Binary EntryPoint Messaging Guidelines §7.4 (Add ✓,
+    /// Change ✓ for InvestorID). <c>null</c> means "preserve the resting
+    /// order's existing InvestorId" (spec §7.4: "Fields that are not sent
+    /// will be considered the same as the original order"). The spec table
+    /// does not include InvestorID in the Remove column, so explicit
+    /// clearing is intentionally not supported. Issue #451.
+    /// </summary>
+    public InvestorId? NewInvestorId { get; init; }
+
     public bool UnsupportedOrderCharacteristic { get; init; }
 
     public RejectReason? PreTradeRejectReason { get; init; }
