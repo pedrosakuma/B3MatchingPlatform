@@ -39,6 +39,26 @@ public class InstrumentDefinitionPublisherTests
         SecurityType = type,
     };
 
+    private static Instrument OptionInst(string sym, long secId, string isin) => new()
+    {
+        Symbol = sym,
+        SecurityId = secId,
+        TickSize = 0.01m,
+        LotSize = 1,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000m,
+        Currency = "BRL",
+        Isin = isin,
+        SecurityType = "OPT",
+        StrikePrice = 28.50m,
+        ExpirationDate = new DateOnly(2025, 12, 19),
+        PutOrCall = B3.Exchange.Instruments.PutOrCall.Call,
+        ExerciseStyle = B3.Exchange.Instruments.ExerciseStyle.American,
+        UnderlyingSecurityId = 900_000_000_001L,
+        UnderlyingSymbol = "PETR4",
+        ContractMultiplier = 100m,
+    };
+
     [Fact]
     public void PublishOnce_EmitsOneFramePerInstrument_AcrossPackets()
     {
@@ -191,5 +211,78 @@ public class InstrumentDefinitionPublisherTests
         var sink = new RecordingPacketSink();
         Assert.Throws<ArgumentOutOfRangeException>(() => new InstrumentDefinitionPublisher(
             1, instruments, sink, TimeSpan.Zero));
+    }
+
+    [Fact]
+    public void PublishOnce_OptionInstrument_EmitsOptionFieldsAndOneUnderlying()
+    {
+        // T-2 / OPT-02: the publisher must translate option Instrument
+        // metadata into the SBE option fields on SecurityDefinition_12.
+        var instruments = new List<Instrument> { OptionInst("PETRZ285", 900_111_111_111L, "BROPTPETRZ285") };
+        var sink = new RecordingPacketSink();
+        var pub = new InstrumentDefinitionPublisher(
+            channelNumber: 84, instruments, sink, TimeSpan.FromMinutes(1), new FakeNanosTimeSource(0UL));
+
+        pub.PublishOnce();
+
+        Assert.Single(sink.Packets);
+        var packet = sink.Packets[0];
+
+        // SBE message starts after PacketHeader + FramingHeader; reader
+        // expects the slice to start at the SBE message header.
+        var sbeMessage = packet.AsSpan(
+            WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize);
+        var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(
+            bodyAndTail, blockLength: WireOffsets.SecDefBlockLength, out var rdr));
+
+        Assert.Equal(900_111_111_111L, (long)(ulong)rdr.Data.SecurityID.Value);
+        Assert.Equal(285_000L, rdr.Data.StrikePrice.Mantissa);
+        Assert.Equal(100L * 100_000_000L, rdr.Data.ContractMultiplier.Mantissa);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V16.PutOrCall.CALL, rdr.Data.PutOrCall);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.AMERICAN, rdr.Data.ExerciseStyle);
+        Assert.Equal((ushort)2025, rdr.Data.MaturityMonthYear.Year);
+        Assert.Equal((byte)12, rdr.Data.MaturityMonthYear.Month);
+        Assert.Equal((byte)19, rdr.Data.MaturityMonthYear.Day);
+
+        int underlyingCount = 0;
+        long underlyingId = 0L;
+        rdr.ReadGroups(
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoUnderlyingsData u) =>
+            {
+                underlyingCount++;
+                underlyingId = (long)(ulong)u.UnderlyingSecurityID.Value;
+            },
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V16.TextEncoding _) => { });
+        Assert.Equal(1, underlyingCount);
+        Assert.Equal(900_000_000_001L, underlyingId);
+    }
+
+    [Fact]
+    public void PublishOnce_MixedEquityAndOption_FlushesPacketWhenOptionFrameOverflows()
+    {
+        // Mixing equity (242-byte body) and option (270-byte body) frames
+        // exercises the variable-frame-size branch in SecDefFrameSizeFor;
+        // crank up the count to force at least one packet boundary so the
+        // overflow path runs.
+        var instruments = new List<Instrument>();
+        for (int i = 0; i < 6; i++)
+        {
+            instruments.Add(Inst($"EQ{i:00}", 2_000_000L + i, "BR" + i.ToString("D10")));
+            instruments.Add(OptionInst($"OPT{i:00}", 3_000_000L + i, "BR" + (1000 + i).ToString("D10")));
+        }
+        var sink = new RecordingPacketSink();
+        var pub = new InstrumentDefinitionPublisher(
+            channelNumber: 7, instruments, sink, TimeSpan.FromMinutes(1), new FakeNanosTimeSource(0UL));
+
+        pub.PublishOnce();
+
+        Assert.True(sink.Packets.Count >= 2, $"expected ≥2 packets to exercise overflow path, got {sink.Packets.Count}");
+        foreach (var p in sink.Packets)
+        {
+            Assert.True(p.Length <= InstrumentDefinitionPublisher.MaxPacketBytes);
+        }
     }
 }

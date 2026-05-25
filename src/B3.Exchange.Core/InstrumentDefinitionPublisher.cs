@@ -31,8 +31,8 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
     /// </summary>
     public const int MaxPacketBytes = 1400;
 
-    private const int FrameSize =
-        WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotal;
+    private const int FrameSizeMax =
+        WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotalOneUnderlying;
 
     public byte ChannelNumber { get; }
     public ushort SequenceVersion { get; }
@@ -60,12 +60,13 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(sink);
         if (cadence <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(cadence), "cadence must be positive");
-        // SecDef frame is ~251 bytes; we need to fit at least one with the
-        // 16-byte PacketHeader inside MaxPacketBytes — guaranteed by const,
-        // but keep the assertion in case future schema bumps grow the body.
-        if (FrameSize + WireOffsets.PacketHeaderSize > MaxPacketBytes)
+        // SecDef option frame (one NoUnderlyings entry) is ~279 bytes; we
+        // need to fit at least one with the 16-byte PacketHeader inside
+        // MaxPacketBytes — guaranteed by const, but keep the assertion in
+        // case future schema bumps grow the body.
+        if (FrameSizeMax + WireOffsets.PacketHeaderSize > MaxPacketBytes)
             throw new InvalidOperationException(
-                $"SecurityDefinition frame ({FrameSize} bytes) does not fit in InstrumentDef packet ({MaxPacketBytes} bytes).");
+                $"SecurityDefinition frame ({FrameSizeMax} bytes) does not fit in InstrumentDef packet ({MaxPacketBytes} bytes).");
 
         ChannelNumber = channelNumber;
         _instruments = instruments;
@@ -121,25 +122,95 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
             int packetWritten = StartPacket();
             for (int i = 0; i < _instruments.Count; i++)
             {
-                if (packetWritten + FrameSize > MaxPacketBytes)
+                var inst = _instruments[i];
+                int frameSize = SecDefFrameSizeFor(inst);
+                if (packetWritten + frameSize > MaxPacketBytes)
                 {
                     FlushPacket(packetWritten);
                     packetWritten = StartPacket();
                 }
 
-                var inst = _instruments[i];
                 int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(
                     _packetBuf.AsSpan(packetWritten),
                     securityId: inst.SecurityId,
                     symbol: inst.Symbol,
                     isin: inst.Isin,
                     securityTypeByte: SecurityTypeMap.ToSbeByte(inst.SecurityType),
-                    totNoRelatedSym: (uint)_instruments.Count);
+                    totNoRelatedSym: (uint)_instruments.Count,
+                    optionFields: BuildOptionFields(inst));
                 packetWritten += n;
             }
             if (packetWritten > WireOffsets.PacketHeaderSize)
                 FlushPacket(packetWritten);
         }
+    }
+
+    private static int SecDefFrameSizeFor(Instrument inst)
+    {
+        int body = InstrumentSecurityTypes.IsOption(inst.SecurityType)
+            ? WireOffsets.SecDefBodyTotalOneUnderlying
+            : WireOffsets.SecDefBodyTotalNoUnderlyings;
+        return WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + body;
+    }
+
+    /// <summary>
+    /// Translates an option <see cref="Instrument"/> into the
+    /// <see cref="UmdfWireEncoder.OptionDefinitionFields"/> payload expected
+    /// by the encoder. Returns <c>null</c> for non-option instruments so the
+    /// encoder writes SBE NULL sentinels for every option field. Throws when
+    /// an option instrument is missing a required field — the loader and
+    /// trading-rules layer should have rejected such a config long before
+    /// we get here, but a clear error here beats a silently-mis-encoded
+    /// frame on the wire.
+    /// </summary>
+    private static UmdfWireEncoder.OptionDefinitionFields? BuildOptionFields(Instrument inst)
+    {
+        if (!InstrumentSecurityTypes.IsOption(inst.SecurityType))
+            return null;
+
+        decimal strike = inst.StrikePrice
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required StrikePrice.");
+        DateOnly expiry = inst.ExpirationDate
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ExpirationDate.");
+        var putOrCall = inst.PutOrCall
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required PutOrCall.");
+        var exerciseStyle = inst.ExerciseStyle
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ExerciseStyle.");
+        long underlyingId = inst.UnderlyingSecurityId
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required UnderlyingSecurityId.");
+        string underlyingSymbol = inst.UnderlyingSymbol
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required UnderlyingSymbol.");
+        decimal multiplier = inst.ContractMultiplier
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ContractMultiplier.");
+
+        return new UmdfWireEncoder.OptionDefinitionFields
+        {
+            StrikePrice = strike,
+            ContractMultiplier = multiplier,
+            ExpirationDate = expiry,
+            PutOrCallByte = putOrCall switch
+            {
+                B3.Exchange.Instruments.PutOrCall.Put => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.PUT,
+                B3.Exchange.Instruments.PutOrCall.Call => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.CALL,
+                _ => throw new InvalidOperationException($"Unsupported PutOrCall value: {putOrCall}"),
+            },
+            ExerciseStyleByte = exerciseStyle switch
+            {
+                B3.Exchange.Instruments.ExerciseStyle.European => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.EUROPEAN,
+                B3.Exchange.Instruments.ExerciseStyle.American => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.AMERICAN,
+                _ => throw new InvalidOperationException($"Unsupported ExerciseStyle value: {exerciseStyle}"),
+            },
+            OptPayoutTypeByte = inst.OptPayoutType switch
+            {
+                null => null,
+                B3.Exchange.Instruments.OptPayoutType.Vanilla => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.VANILLA,
+                B3.Exchange.Instruments.OptPayoutType.Capped => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.CAPPED,
+                B3.Exchange.Instruments.OptPayoutType.Binary => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.BINARY,
+                _ => throw new InvalidOperationException($"Unsupported OptPayoutType value: {inst.OptPayoutType}"),
+            },
+            UnderlyingSecurityId = underlyingId,
+            UnderlyingSymbol = underlyingSymbol,
+        };
     }
 
     private int StartPacket()
