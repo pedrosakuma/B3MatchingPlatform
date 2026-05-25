@@ -30,7 +30,7 @@
   {
     "symbol": "PETRL200", "securityId": 902000000001,
     "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
-    "currency": "BRL", "isin": "BRPETROPCL200",
+    "currency": "BRL", "isin": "BRPETROPL200",
     "securityType": "OPTION",
     "strikePrice": "20.00", "expirationDate": "2030-12-20",
     "putOrCall": "Call", "exerciseStyle": "American",
@@ -40,7 +40,7 @@
   {
     "symbol": "PETRX250", "securityId": 902000000002,
     "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
-    "currency": "BRL", "isin": "BRPETROPPX250",
+    "currency": "BRL", "isin": "BRPETROPX250",
     "securityType": "OPTION",
     "strikePrice": "25.00", "expirationDate": "2030-12-20",
     "putOrCall": "Put", "exerciseStyle": "European",
@@ -50,7 +50,7 @@
   {
     "symbol": "PETRL220", "securityId": 902000000003,
     "tickSize": "0.01", "lotSize": 1, "minPx": "0.01", "maxPx": "999.99",
-    "currency": "BRL", "isin": "BRPETROPCL220",
+    "currency": "BRL", "isin": "BRPETROPL220",
     "securityType": "OPTION",
     "strikePrice": "22.00", "expirationDate": "2030-12-20",
     "putOrCall": "Call", "exerciseStyle": "American",
