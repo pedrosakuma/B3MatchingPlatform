@@ -47,3 +47,4 @@ for one specific question, you are writing an ADR.
 | #    | Title                                  | Status             |
 |------|----------------------------------------|--------------------|
 | 0001 | Post-trade architecture                | Draft (umbrella)   |
+| 0002 | Equity options support (MVP)           | Draft (umbrella)   |
