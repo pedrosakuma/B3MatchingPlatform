@@ -221,4 +221,78 @@ public class StopOrderTests
         var r = Assert.Single(sink.Rejects);
         Assert.Equal(RejectReason.InvalidField, r.Reason);
     }
+
+    // Issue #453: a StopLimit whose triggered residual ends up resting
+    // on the book must keep the parked stop's OrdTagID / InvestorID so
+    // a later OrderMassActionRequest filtered by those identifiers
+    // still cancels it. Before #453 the triggered NewOrderCommand
+    // dropped both fields and the residual was silently exempt.
+    [Fact]
+    public void Triggered_stoplimit_residual_preserves_ordtagid_and_investorid()
+    {
+        var engine = TestFactory.NewEngine(out var sink);
+        var investor = new InvestorId(0x1234, 999_000_111u);
+
+        // Seller sits at 10@100. Park a BuyStopLimit at stop=10 limit=10
+        // for 200 with OrdTagId=99 + InvestorId set. A second buyer
+        // (AGG) trades 10@100 — the resulting print arms the stop. The
+        // triggered limit-buy then sees an empty book (AGG already
+        // consumed the offer) and the full 200 rests on the bid.
+        engine.Submit(Limit("S1", Side.Sell, 10m, 100, firm: 9));
+        engine.Submit(new NewOrderCommand("STP", TestFactory.PetrSecId, Side.Buy,
+            OrderType.StopLimit, TimeInForce.Day,
+            PriceMantissa: TestFactory.Px(10m), Quantity: 200, EnteringFirm: 1, EnteredAtNanos: 0)
+        {
+            StopPxMantissa = TestFactory.Px(10m),
+            OrdTagId = 99,
+            InvestorId = investor,
+        });
+        var parkedStopId = sink.StopAccepted.Single().OrderId;
+        sink.Clear();
+        engine.Submit(Limit("AGG", Side.Buy, 10m, 100, firm: 8));
+
+        // The triggered residual rests under the parked stop's OrderId.
+        Assert.Single(sink.StopTriggered);
+        var residual = sink.Accepted.Single(a => a.OrderId == parkedStopId);
+        Assert.Equal(200, residual.RemainingQuantity);
+
+        // Mass-cancel by OrdTagID=99 ONLY (no firm / no side / no
+        // SecurityId) must reach the residual.
+        sink.Clear();
+        int cancelled = engine.MassCancel(
+            new[] { parkedStopId },
+            new MassCancelCommand(SecurityId: 0, SideFilter: null, EnteredAtNanos: 1)
+            { OrdTagIdFilter = 99 });
+        Assert.Equal(1, cancelled);
+        var c = Assert.Single(sink.Canceled);
+        Assert.Equal(parkedStopId, c.OrderId);
+        Assert.Equal(CancelReason.MassCancel, c.Reason);
+    }
+
+    [Fact]
+    public void Triggered_stoplimit_residual_matches_investorid_filter()
+    {
+        var engine = TestFactory.NewEngine(out var sink);
+        var investor = new InvestorId(0x1234, 999_000_111u);
+
+        engine.Submit(Limit("S1", Side.Sell, 10m, 100, firm: 9));
+        engine.Submit(new NewOrderCommand("STP", TestFactory.PetrSecId, Side.Buy,
+            OrderType.StopLimit, TimeInForce.Day,
+            PriceMantissa: TestFactory.Px(10m), Quantity: 200, EnteringFirm: 1, EnteredAtNanos: 0)
+        {
+            StopPxMantissa = TestFactory.Px(10m),
+            OrdTagId = 99,
+            InvestorId = investor,
+        });
+        var parkedStopId = sink.StopAccepted.Single().OrderId;
+        engine.Submit(Limit("AGG", Side.Buy, 10m, 100, firm: 8));
+        sink.Clear();
+
+        int cancelled = engine.MassCancel(
+            new[] { parkedStopId },
+            new MassCancelCommand(SecurityId: 0, SideFilter: null, EnteredAtNanos: 1)
+            { InvestorIdFilter = investor });
+        Assert.Equal(1, cancelled);
+        Assert.Equal(parkedStopId, sink.Canceled.Single().OrderId);
+    }
 }

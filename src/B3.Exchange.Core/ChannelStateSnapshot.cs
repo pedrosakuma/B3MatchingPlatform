@@ -53,7 +53,7 @@ public sealed record ChannelStateSnapshot(
     EngineStateSnapshot Engine,
     IReadOnlyList<OrderOwnerSnapshot> Owners)
 {
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 
     /// <summary>
     /// Issue #269: monotonic counter of commands the dispatcher has
