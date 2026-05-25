@@ -318,7 +318,8 @@ public readonly record struct OrderModifiedEvent(
     long NewRemainingQuantity,
     ulong TransactTimeNanos,
     uint RptSeq,
-    byte[]? Memo = null);
+    byte[]? Memo = null,
+    InvestorId? InvestorId = null);
 
 /// <summary>
 /// Fired when an instrument is placed into administrative halt via

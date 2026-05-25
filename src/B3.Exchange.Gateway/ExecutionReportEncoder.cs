@@ -181,7 +181,8 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long leavesQty, long cumQty, long orderQty, long priceMantissa,
-        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
+        Matching.InvestorId? investorId = null)
     {
         int total = TotalSize(ExecReportModifyBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
@@ -214,7 +215,18 @@ internal static class ExecutionReportEncoder
         // execRestatementReason@179 (was strategyID@179 in V3 — V6 inserts
         // execRestatementReason here and shifts strategyID/tradingSubAccount).
         MemoryMarshal.Write(body.Slice(160, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
-        // ordTagID@171 null=0 already, investorID@172 null=zeros already.
+        // ordTagID@171 null=0 already.
+        // Issue #459: echo the post-replace InvestorID at @172 (composite
+        // Prefix uint16@172 + Document uint32@174). Null leaves the slot
+        // all-zero (spec NULL sentinel) — matches the original behaviour
+        // and the inbound decoder's IsAllZero rule.
+        if (investorId is { } iv)
+        {
+            ushort prefix = iv.Prefix;
+            uint document = iv.Document;
+            MemoryMarshal.Write(body.Slice(172, 2), in prefix);
+            MemoryMarshal.Write(body.Slice(174, 4), in document);
+        }
         body[178] = 255;                                                    // MmProtectionReset null
         body[179] = 255;                                                    // ExecRestatementReason null
         // strategyID@180 (int, null=0) and tradingSubAccount@184 (uint,

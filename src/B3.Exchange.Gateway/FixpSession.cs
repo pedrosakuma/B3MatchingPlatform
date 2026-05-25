@@ -556,9 +556,10 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
-        ReadOnlyMemory<byte> memo = default)
+        ReadOnlyMemory<byte> memo = default,
+        B3.Exchange.Matching.InvestorId? investorId = null)
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId);
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,

@@ -286,6 +286,42 @@ public class ExecutionReportEncoderTests
         Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(184, 4))); // TradingSubAccount null
     }
 
+    // Issue #459: ER_Modify must echo the post-replace InvestorID so that
+    // clients observing only the ER stream can reconcile the working
+    // order's identity after an OCRR that mutated InvestorID
+    // (spec §7.4, Add ✓ Change ✓). When the optional investorId arg is
+    // null the slot stays all-zero (wire NULL sentinel) — matches the
+    // pre-issue-#459 behaviour and the inbound IsAllZero decode rule.
+    [Fact]
+    public void EncodeModify_InvestorIdNonNull_WritesCompositeAt172()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L,
+            investorId: new B3.Exchange.Matching.InvestorId(Prefix: 9, Document: 987_654));
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)0, body[171]);                                       // OrdTagID still null (spec §7.4 omits OrdTagID)
+        Assert.Equal((ushort)9, MemoryMarshal.Read<ushort>(body.Slice(172, 2)));
+        Assert.Equal(987_654u, MemoryMarshal.Read<uint>(body.Slice(174, 4)));
+    }
+
+    [Fact]
+    public void EncodeModify_InvestorIdNull_LeavesCompositeAllZero()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L);
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((ushort)0, MemoryMarshal.Read<ushort>(body.Slice(172, 2)));
+        Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(174, 4)));
+    }
+
     [Fact]
     public void EncodeCancel_V6Header_VersionIs6()
     {

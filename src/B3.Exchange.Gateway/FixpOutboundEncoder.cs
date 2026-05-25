@@ -151,7 +151,8 @@ internal sealed class FixpOutboundEncoder
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
-        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default,
+        Matching.InvestorId? investorId = null)
     {
         if (!_isOpen()) return false;
         var exact = PooledOutboundFrame.Rent(ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportModifyBlock, memo.Length));
@@ -164,7 +165,8 @@ internal sealed class FixpOutboundEncoder
                     side, clOrdIdValue, origClOrdIdValue, orderId,
                     securityId, orderId, (ulong)rptSeq, transactTimeNanos,
                     leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
-                    memo: memo.Span, receivedTimeNanos: receivedTimeNanos);
+                    memo: memo.Span, receivedTimeNanos: receivedTimeNanos,
+                    investorId: investorId);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }
