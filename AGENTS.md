@@ -77,8 +77,13 @@ on-disk format / no shared `ChannelDispatcher` state machine), prefer
 **one sub-agent per trail in parallel** over serialising them in the
 main loop:
 
-- In Copilot CLI: `task` tool with `mode: "background"`. The main
-  loop keeps coordination + the gpt-5.5 review of each PR before
+- Dispatch **one background sub-agent per trail in parallel** rather
+  than serialising them in the main loop. Each agent CLI exposes a
+  different mechanism (e.g. Copilot CLI supports `/fleet` for
+  user-initiated parallel sub-agents, and exposes a `task` tool with
+  background dispatch to the agent itself; Codex, Claude Code, etc.
+  have analogous primitives — pick whatever your CLI surfaces). The
+  main loop keeps coordination + the gpt-5.5 review of each PR before
   promoting draft → ready.
 - Real examples that paid off: the perf/OOM fleet (7 PRs, #437–#443,
   all from one user message); the FIXP resync persistence work
@@ -133,16 +138,19 @@ held by a worktree. This has bitten the workflow more than once.
 Before adding "should the exchange do X?" features (think:
 self-trading prevention, market protections, options chain modelling,
 exercise/assignment), apply [ADR 0012 — Exchange-day
-boundary](docs/adr/0012-exchange-day-boundary.md):
+boundary](docs/adr/0012-exchange-day-boundary.md). Its rule, quoted
+verbatim:
 
-> Does a real B3 venue do X **between the opening bell and the
-> closing bell**, inside the matching engine or the EntryPoint/UMDF
-> gateway?
+> Does a real B3 venue do X **between the opening bell and the closing
+> bell**, inside the matching engine or the EntryPoint/UMDF gateway?
 >
 > - **Yes** → in scope; file an issue here.
-> - **No** → out of scope; the work belongs in a companion repo
->   (`B3TradingPlatform`, `B3MarketDataPlatform`, hypothetical
->   clearing/analytics repos).
+> - **No** → out of scope; the work belongs in another repo
+>   (`B3TradingPlatform` for broker-side, `B3MarketDataPlatform` for
+>   subscriber-side, hypothetical clearing/analytics repos for the rest).
+> - **It's exchange-side but only after the bell** → out (the post-trade
+>   audit log and EOD drop are the only after-bell artifacts this repo
+>   owns; further extension is gated on a future ADR).
 
 If unsure, raise the question with the user before writing code. A
 30-second scope check beats a 3-PR re-scope.
