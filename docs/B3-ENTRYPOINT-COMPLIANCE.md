@@ -150,10 +150,17 @@ termination code. Missing ([GAP-06], [GAP-08]).
 
 ### Order types / TIF / advanced functionality
 
-Following [ADR 0012 — Exchange-day boundary](adr/0012-exchange-day-boundary.md),
-order-handling protections (STPC, Market Protections) and matching-side
-extensions (Sweep & Cross) are in-scope; pricing / greeks / settlement of
-options are out-of-scope (delegated to companion repos).
+Following ADR 0012 — Exchange-day boundary, order-handling
+protections (STPC, Market Protections), matching-side extensions
+(Sweep & Cross), and **options as listed instruments — order
+entry, matching, market data emission, expiry-driven
+SecurityStatus** — are in-scope. Pricing / greeks / settlement /
+exercise / assignment of options are out-of-scope (delegated to
+companion repos: hypothetical `B3OptionsAnalytics` for
+pricing, clearing simulator per ADR 0005 for exercise and
+settlement). Market-maker contract enforcement (spread,
+presence, minimum quantity) is out — the venue accepts orders;
+contract supervision is a post-trade analytics concern.
 
 | # | Spec § | Item | Status | Severity | Issue |
 | --- | --- | --- | --- | --- | --- |
@@ -166,6 +173,8 @@ options are out-of-scope (delegated to companion repos).
 | <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections (price collars / fat-finger / max value) | missing | medium (in-scope per ADR 0012) | — |
 | <a id="gap-29"></a>GAP-29 | 15.1 | User-Defined Spreads (UDS) — synthetic multi-leg instruments | missing | low (boundary case; borderline between exchange-side and broker-side) | — |
 | <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low (in-scope per ADR 0012) | — |
+| <a id="gap-31"></a>GAP-31 | 7.1.19 / UMDF v2.2.0 `SecurityDefinition_12` | `SecurityDefinition_12` does not emit option fields (`strikePrice`, `putOrCall`, `exerciseStyle`, `contractMultiplier`, `noUnderlyings`, `optPayoutType`, `maturityMonthYear`). | missing | high | tracked via [RFC 0002](rfc/0002-equity-options-support.md) issue OPT-02 |
+| <a id="gap-32"></a>GAP-32 | 8.3 / lifecycle | Expiring option series are not automatically moved to `Close` based on `ExpirationDate`. | missing | medium | tracked via [RFC 0002](rfc/0002-equity-options-support.md) issue OPT-03 |
 
 ## Maintenance notes
 
