@@ -226,6 +226,81 @@ To add a third firm:
 There is no hot reload today (intentional — the FirmRegistry is read
 once at startup so the inbound recv thread has a fixed identity table).
 
+### 3.1 Market-maker session tuning
+
+Market-maker sessions usually need a higher inbound order-rate budget than
+regular client sessions. A regular client may place occasional child orders;
+an MM often quotes both sides across many option series and refreshes on every
+underlying tick. On active options days that can reach thousands of order
+messages per second per session. The default
+`SessionPolicyConfig.MaxOrderRatePerSecond = 200`
+(`src/B3.Exchange.Host/HostConfig.cs:217`) was sized for regular client
+sessions and will throttle active MMs aggressively.
+
+Configure the override per session in `exchange-simulator.json` via
+`sessions[].policy.maxOrderRatePerSecond`:
+
+```json
+"sessions": [
+  {
+    "sessionId": "30101",
+    "firmId": "FIRM_MM",
+    "accessKey": "mm-dev-key",
+    "policy": {
+      "maxOrderRatePerSecond": 5000
+    }
+  }
+]
+```
+
+The budget is enforced by the gateway's `InboundThrottle`
+(`src/B3.Exchange.Gateway/InboundThrottle.cs`) as an exact sliding
+**1-second window**. The throttle helper lives in
+`FixpSession.HeaderValidation` and is invoked by the receive/dispatch path
+before the frame is handed to `ChannelDispatcher.Enqueue`
+(`src/B3.Exchange.Gateway/FixpSession.HeaderValidation.cs:30-55`,
+`src/B3.Exchange.Gateway/FixpSession.Dispatch.cs:53-63`). Throttled frames are
+rejected with `BusinessMessageReject("Throttle limit exceeded")` and never
+reach the matching engine. That is intentional: admission control stays in the
+gateway so the single-writer dispatch thread from ADR 0009 does not pay per-
+message throttle overhead.
+
+Typical **starting points** (guidance, not venue specs):
+
+| Session type | Starting point |
+| --- | --- |
+| Regular client | `200/s` (default) |
+| Equity MM | `1000-3000/s` |
+| Options MM on an active vol day | `5000-10000/s` |
+
+Tune from `/metrics`, not from the table above. Watch the aggregate
+`exch_throttle_rejected_total` counter and the per-session
+`rate_limited_total{session="..."}` series (fed from `ThrottleMetrics`) to see
+which sessions are actually hitting the gate.
+
+Also calibrate `maxOpenOrdersPerFirm` for MM-heavy hosts. The host-level knob
+lives at `HostConfig.MaxOpenOrdersPerFirm`
+(`src/B3.Exchange.Host/HostConfig.cs:22`) and defaults to `100_000`; GAP-21a
+records the current behavior in
+[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md). This cap
+is **per firm, per host** — not per session. On multi-firm deployments, make
+sure the value is high enough for the aggregate resting quote count you expect,
+or bursts of new option quotes can devolve into `OrdRejReason=3
+(OrderExceedsLimit)` storms.
+
+What the venue does **not** do for MMs is just as important. Per ADR 0012 and
+RFC 0002 §2.3, the simulator does not enforce market-maker obligations such as
+maximum spread, minimum presence, or minimum displayed quantity per side.
+Those checks belong to post-trade analytics / surveillance. The venue only
+admits, matches, and publishes orders.
+
+Finally, note the current market-making protocol boundary. MMs use the regular
+order-entry flow today (`SimpleNewOrder`, `NewOrderSingle`,
+`OrderCancelReplaceRequest`) with a tuned per-session throttle. The vendored
+EntryPoint v8.4.2 schema has no `MassQuote` template; the existing `Quote*`
+templates are for Termo/Forward, not options. Future schema research is
+tracked as OPT-08 in [#464](https://github.com/pedrosakuma/B3MatchingPlatform/issues/464).
+
 ---
 
 ## 4. Synthetic trader recipes
