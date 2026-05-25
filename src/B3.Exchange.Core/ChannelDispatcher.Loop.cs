@@ -35,8 +35,20 @@ public sealed partial class ChannelDispatcher
         if (item.Kind == WorkKind.PriceBandPublish)
         {
             AssertOnLoopThread();
+            if (Volatile.Read(ref _walHalted) != 0)
+            {
+                _metrics?.IncWalHaltReject();
+                LogWalHalted(ChannelNumber, item.Kind);
+                return;
+            }
+
             if (_priceBandPublisher?.PublishOnce(FrameSink, _engine.AllocateNextRptSeq, _timeSource.NowNanos()) > 0)
+            {
                 FlushPacket();
+                // PriceBand_22 republish consumes engine RptSeq values, so persist
+                // them like the other synthetic incremental emissions.
+                OnAfterCommandFlushed(force: true);
+            }
             return;
         }
 
