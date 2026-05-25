@@ -94,11 +94,24 @@ day**".
 - **`PriceBand_22` emission** for both EQT and OPT channels (split
   out as a companion trail; see §6).
 
-### Out of scope (delegated elsewhere)
+### 2.2 Deferred but in-repo (venue-side, future scope)
 
-Per ADR 0012's exchange-day rule, every concern below is **not** in
-this repo. The cell below names the companion repo / module that
-owns it.
+These items are venue-side per ADR 0012 (lines 46-50 explicitly
+place MM protocols inside the boundary) but are **not** in the
+MVP — they remain in this repo's roadmap, just behind external
+prerequisites or future demand.
+
+| Concern | Why deferred |
+| --- | --- |
+| `MassQuote` / `QuoteRequest` / `QuoteCancel` market-making protocol | Blocked on B3 publishing a `MassQuote` template in a future EntryPoint schema release. The vendored EntryPoint v8.4.2 carries no such template (its `Quote*` templates are for Termo/Forward). MMs use regular order entry with a calibrated per-session throttle (§3.6) in the MVP. Tracked as OPT-08. |
+| Index options on IBOV, options on futures (DI, dólar) | Future RFC — equity options first per Q1 (see §7). Schema fields are shared, so the follow-up reuses most infrastructure. |
+| User-Defined Spreads (UDS, GAP-29) | Out of MVP — separate issue if/when demand surfaces. ADR 0012 lists UDS as a boundary case. |
+
+### 2.3 Out of scope (delegated to companion repos)
+
+Per ADR 0012's exchange-day rule, every concern below is **not**
+in this repo. The cell below names the companion repo / module
+that owns it.
 
 | Concern | Belongs to |
 | --- | --- |
@@ -106,12 +119,9 @@ owns it.
 | Exercise (auto-exercise of ITM at expiry), assignment, exercise notice | Clearing simulator (ADR 0005) |
 | Expiry-day settlement (cash or physical) | Clearing simulator (ADR 0005) |
 | Position keeping, margin, guarantee fund | Clearing simulator (ADR 0005) |
-| Index options on IBOV, options on futures (DI, dólar) | Future RFC — equity options first per Q1 (see §7) |
-| `MassQuote` / `QuoteRequest` market-making protocol | Deferred — blocked on B3 publishing a `MassQuote` template in a future EntryPoint schema release. Tracked as OPT-08 research issue. |
 | Market-maker contract enforcement (spread, presence, minimum quantity per side) | Analytics / surveillance consumer (out per ADR 0012 — the venue accepts orders; obligation checking is a post-trade analytical concern) |
 | Series naming convention encoder (`PETRH320` ↔ `PETR4`/2026-08/call/32.00) | Convenience tooling — out of scope for the venue. Consumers parse the symbol or read `SecurityDefinition`. |
 | OCO / brackets / option spreads / trailing stops | `B3TradingPlatform` (broker tier, ADR 0012) |
-| User-Defined Spreads (UDS, GAP-29) | Out of MVP — separate issue if/when demand surfaces |
 
 ## 3. Architecture
 
@@ -135,18 +145,23 @@ This means options trading cannot perturb equities trading and
 vice versa — no shared mutable state across channels.
 
 **Stop orders and cross-channel pricing:** stops in the current
-engine fire on the last trade of the **same** `SecurityId` they
-were submitted on, via the channel-local
-`_lastTradePriceBySecurity` map. That semantics is preserved for
-options: a stop on `PETRH320` fires on the last trade of
-`PETRH320`, not on the last trade of the underlying `PETR4`
+engine fire on the just-executed trade price via the per-security
+`_stopsBySymbol` list inside `MatchingEngine`
+(`src/B3.Exchange.Matching/MatchingEngine.cs:1784` and
+`:1940-1951`). That trigger path is keyed by `SecurityId` and is
+already channel-local by construction (each channel has its own
+engine). Therefore a stop on `PETRH320` fires on the last trade
+of `PETRH320`, not on the last trade of the underlying `PETR4`
 (which lives on a different channel and is therefore inaccessible
-from this dispatcher). Cross-channel triggers (e.g. "stop in
-option series triggered by underlying crossing X") are an
-explicit non-goal for the MVP — they would require either a
-bridge component or merging option and equity channels, both of
-which violate ADR 0009's single-writer guarantee. If a concrete
-consumer needs that, it is a separate follow-up RFC.
+from this dispatcher). The dispatcher-level
+`_lastTradePriceBySecurity` exists for metrics / informational
+read paths only and is not part of the stop-trigger mechanism.
+Cross-channel triggers (e.g. "stop in option series triggered by
+underlying crossing X") are an explicit non-goal for the MVP —
+they would require either a bridge component or merging option
+and equity channels, both of which violate ADR 0009's
+single-writer guarantee. If a concrete consumer needs that, it is
+a separate follow-up RFC.
 
 ### 3.2 Instrument model extensions
 
@@ -163,11 +178,17 @@ Add to `Instrument` and `InstrumentLoader`:
 | `ContractMultiplier` | `contractMultiplier` | `decimal` | option types | Default 100 for equity options. Carried as metadata only; the book matches in contracts. |
 | `OptPayoutType` | `optPayoutType` | enum `{Vanilla, Capped, Binary}` | option types, optional | Defaults to `Vanilla`. |
 
-Validation in `InstrumentLoader`:
+Validation in `InstrumentLoader` **and** `InstrumentTradingRules`:
 
-- `minPx` may be `0` or below the equity-style tick for near-zero
-  options (deep OTM); current `minPx > 0` check is relaxed for
-  option types. See OPT-05.
+- `minPx` may equal `0` (or be below the equity-style tick) for
+  near-zero options (deep OTM). Both layers reject this today:
+  `InstrumentLoader` at `src/B3.Exchange.Instruments/InstrumentLoader.cs:86-87`
+  and `InstrumentTradingRules` at
+  `src/B3.Exchange.Matching/InstrumentTradingRules.cs:31`. OPT-05
+  relaxes the check on both layers for option `securityType`s
+  (allow `minPx >= 0`) while keeping the original constraint for
+  equities. This is a targeted validation change — no other
+  matching logic is affected.
 - `expirationDate` must be a future date at load time (or rejected
   / auto-Closed per OPT-03 policy).
 - `underlyingSecurityId` is **not** cross-validated against the EQT
@@ -175,11 +196,14 @@ Validation in `InstrumentLoader`:
   for consumers.
 - `contractMultiplier > 0`.
 
-`MatchingEngine` is unchanged. The engine treats an option as any
-other instrument indexed by `SecurityId`. No bump of
-`EngineStateSnapshot.CurrentVersion` is required — the engine
-holds no option-specific state (the option-ness is metadata on
-the instrument, which is not part of engine state).
+The matching loop itself (`MatchingEngine.NewOrder` and successors)
+is unchanged. The engine treats an option as any other instrument
+indexed by `SecurityId`. No bump of
+`ChannelStateSnapshot.CurrentVersion`
+(`src/B3.Exchange.Core/ChannelStateSnapshot.cs:46-56`) is required
+— the engine holds no option-specific state (the option-ness is
+metadata on the instrument, which is loaded from
+`instruments-opt.json` at boot, not from the snapshot).
 
 ### 3.3 SecurityDefinition encoder
 
