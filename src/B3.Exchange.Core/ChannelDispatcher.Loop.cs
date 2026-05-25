@@ -32,6 +32,14 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.PriceBandPublish)
+        {
+            AssertOnLoopThread();
+            if (_priceBandPublisher?.PublishOnce(FrameSink, _engine.AllocateNextRptSeq, _timeSource.NowNanos()) > 0)
+                FlushPacket();
+            return;
+        }
+
         if (item.Kind == WorkKind.OperatorPersistSnapshot)
         {
             // Issue #271: admin "snapshot/force" — capture + persist the

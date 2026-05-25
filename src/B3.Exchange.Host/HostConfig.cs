@@ -370,6 +370,14 @@ public sealed class ChannelConfig
     [JsonPropertyName("instrumentDefinition")] public InstrumentDefinitionConfig? InstrumentDefinition { get; set; }
 
     /// <summary>
+    /// Optional periodic <c>PriceBand_22</c> cadence for the incremental feed.
+    /// <c>0</c> (default) disables the publisher; a positive value schedules a
+    /// dispatch-thread tick that emits one static price-band frame per
+    /// configured instrument carrying <c>lowerPriceBand</c>/<c>upperPriceBand</c>.
+    /// </summary>
+    [JsonPropertyName("priceBandPublishIntervalMs")] public int PriceBandPublishIntervalMs { get; set; }
+
+    /// <summary>
     /// Optional UMDF retransmit ring sizing (issue #216 / Onda L · L3a).
     /// When omitted, the default ring size is used. Set
     /// <c>bufferSize=0</c> to disable retransmit buffering entirely (the

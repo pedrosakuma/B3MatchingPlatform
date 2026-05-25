@@ -222,6 +222,39 @@ public static class UmdfFrameBuilder
     }
 
     /// <summary>
+    /// Writes a <c>PriceBand_22</c> frame.
+    /// </summary>
+    public static void WritePriceBand(
+        IUmdfFrameSink sink,
+        long securityId,
+        long lowLimitPriceMantissa,
+        long highLimitPriceMantissa,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq,
+        byte priceBandType = (byte)B3.Umdf.Mbo.Sbe.V16.PriceBandType.HARD_LIMIT,
+        byte priceLimitType = (byte)B3.Umdf.Mbo.Sbe.V16.PriceLimitType.PRICE_UNIT,
+        long tradingReferencePriceMantissa = long.MinValue,
+        byte priceBandMidpointPriceType = 255)
+    {
+        const int size = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.PriceBandBlockLength;
+        var dst = sink.Reserve(size);
+        int n = UmdfWireEncoder.WritePriceBandFrame(
+            dst,
+            securityId,
+            lowLimitPriceMantissa,
+            highLimitPriceMantissa,
+            mdEntryTimestampNanos,
+            rptSeq,
+            priceBandType,
+            priceLimitType,
+            tradingReferencePriceMantissa,
+            priceBandMidpointPriceType);
+        sink.Commit(n);
+    }
+
+    /// <summary>
     /// Writes a <c>TheoreticalOpeningPrice_16</c> frame. Used for the first
     /// frame in <c>OnAuctionTopChanged</c>.
     /// </summary>

@@ -564,6 +564,50 @@ public static class UmdfWireEncoder
     }
 
     /// <summary>
+    /// Writes <c>PriceBand_22</c> (V16). Returns total bytes. The schema carries
+    /// one effective low/high envelope per instrument, so callers pass the
+    /// already-resolved absolute limit prices.
+    /// </summary>
+    public static int WritePriceBandFrame(
+        Span<byte> dst,
+        long securityId,
+        long lowLimitPriceMantissa,
+        long highLimitPriceMantissa,
+        ulong mdEntryTimestampNanos,
+        uint rptSeq,
+        byte priceBandType = (byte)PriceBandType.HARD_LIMIT,
+        byte priceLimitType = (byte)PriceLimitType.PRICE_UNIT,
+        long tradingReferencePriceMantissa = long.MinValue,
+        byte priceBandMidpointPriceType = 255)
+    {
+        const int total = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.PriceBandBlockLength;
+        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
+
+        WriteFramingHeader(dst, total);
+        B3.Umdf.Mbo.Sbe.V16.PriceBand_22Data.WriteHeader(
+            dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+
+        var body = dst.Slice(
+            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+            WireOffsets.PriceBandBlockLength);
+        body.Clear();
+
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodySecurityIdOffset, 8), in securityId);
+        body[WireOffsets.PriceBandBodyPriceBandTypeOffset] = priceBandType;
+        body[WireOffsets.PriceBandBodyPriceLimitTypeOffset] = priceLimitType;
+        body[WireOffsets.PriceBandBodyPriceBandMidpointPriceTypeOffset] = priceBandMidpointPriceType;
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodyLowLimitPriceOffset, 8), in lowLimitPriceMantissa);
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodyHighLimitPriceOffset, 8), in highLimitPriceMantissa);
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodyTradingReferencePriceOffset, 8), in tradingReferencePriceMantissa);
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodyMdEntryTimestampOffset, 8), in mdEntryTimestampNanos);
+        MemoryMarshal.Write(body.Slice(WireOffsets.PriceBandBodyRptSeqOffset, 4), in rptSeq);
+
+        return total;
+    }
+
+    /// <summary>
     /// Writes <c>SecurityGroupPhase_10</c> (V16). Returns total bytes.
     /// Emitted when a security group's phase transitions
     /// (gap-functional §5 / #201). <paramref name="securityGroup"/> is an

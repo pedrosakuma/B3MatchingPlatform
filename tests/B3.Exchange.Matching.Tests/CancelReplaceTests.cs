@@ -341,4 +341,28 @@ public class InstrumentRulesTests
         };
         Assert.Throws<ArgumentException>((Action)(() => { _ = new InstrumentTradingRules(bad); }));
     }
+
+    [Fact]
+    public void PriceBands_AreScaledToMantissas()
+    {
+        var inst = new Instrument
+        {
+            Symbol = "X",
+            SecurityId = 1,
+            TickSize = 0.05m,
+            LotSize = 1,
+            MinPrice = 10m,
+            MaxPrice = 20m,
+            LowerPriceBand = 10.50m,
+            UpperPriceBand = 19.95m,
+            Currency = "BRL",
+            Isin = "X",
+            SecurityType = "EQUITY",
+        };
+
+        var rules = new InstrumentTradingRules(inst);
+        Assert.True(rules.HasPriceBand);
+        Assert.Equal(105_000L, rules.LowerPriceBandMantissa);
+        Assert.Equal(199_500L, rules.UpperPriceBandMantissa);
+    }
 }

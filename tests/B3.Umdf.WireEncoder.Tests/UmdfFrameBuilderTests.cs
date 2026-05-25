@@ -254,6 +254,23 @@ public class UmdfFrameBuilderTests
     }
 
     [Fact]
+    public void WritePriceBand_ReservesAndCommitsCorrectSize()
+    {
+        var sink = MakeSink();
+        UmdfFrameBuilder.WritePriceBand(sink,
+            securityId: 1L,
+            lowLimitPriceMantissa: 100_0000L,
+            highLimitPriceMantissa: 110_0000L,
+            mdEntryTimestampNanos: 0ul,
+            rptSeq: 12u);
+
+        int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.PriceBandBlockLength;
+        Assert.Equal(expected, sink.ReservedSize);
+        Assert.Equal(expected, sink.CommittedBytes);
+    }
+
+    [Fact]
     public void WriteTrade_ReservesAndCommitsCorrectSize()
     {
         var sink = MakeSink();

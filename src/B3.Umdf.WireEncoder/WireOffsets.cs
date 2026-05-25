@@ -148,6 +148,26 @@ public static class WireOffsets
     public const int SecurityStatusBodyTransactTimeOffset = 24;
     public const int SecurityStatusBodyRptSeqOffset = 32;
 
+    // ---- PriceBand_22 (V16) ----
+    // Body layout (BLOCK_LENGTH=48): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); priceBandType@9
+    // (byte, 255 = NULL); priceLimitType@10 (byte, 255 = NULL);
+    // priceBandMidpointPriceType@11 (byte, 255 = NULL); lowLimitPrice@12
+    // (PriceOptional); highLimitPrice@20 (PriceOptional);
+    // tradingReferencePrice@28 (Fixed8, long.MinValue = NULL);
+    // mDEntryTimestamp@36 (ulong nanos); rptSeq@44 (uint, 0 = NULL).
+    public const int PriceBandBlockLength = 48;
+    public const int PriceBandBodySecurityIdOffset = 0;
+    public const int PriceBandBodyMatchEventIndicatorOffset = 8;
+    public const int PriceBandBodyPriceBandTypeOffset = 9;
+    public const int PriceBandBodyPriceLimitTypeOffset = 10;
+    public const int PriceBandBodyPriceBandMidpointPriceTypeOffset = 11;
+    public const int PriceBandBodyLowLimitPriceOffset = 12;
+    public const int PriceBandBodyHighLimitPriceOffset = 20;
+    public const int PriceBandBodyTradingReferencePriceOffset = 28;
+    public const int PriceBandBodyMdEntryTimestampOffset = 36;
+    public const int PriceBandBodyRptSeqOffset = 44;
+
     // ---- SecurityGroupPhase_10 (V16) ----
     // Body layout (BLOCK_LENGTH=32): securityGroup@0 (8-byte char array);
     // matchEventIndicator@8 (byte); tradingSessionID@9 (byte);
