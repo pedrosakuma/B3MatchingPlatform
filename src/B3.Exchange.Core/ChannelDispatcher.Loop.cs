@@ -276,6 +276,16 @@ public sealed partial class ChannelDispatcher
                             EmitUnknownOrderIdReject(replace.ClOrdId, replace.SecurityId, replace.EnteredAtNanos);
                             break;
                         }
+                        // Issue #482: for priority-lost Replace (price change → DEL + NEW),
+                        // the engine emits OrderAcceptedEvent for the replacement order.
+                        // Pre-seed the aggressor tracker with the original order's CumQty
+                        // so OnOrderAccepted registers the new order with inherited fills
+                        // instead of resetting to zero.
+                        if (_orders.TryResolve(replace.OrderId, out var orig))
+                        {
+                            _aggressorOrigQty = orig.CumQty + replace.NewQuantity;
+                            _aggressorCumQty = orig.CumQty;
+                        }
                         _engine.Replace(replace);
                         break;
                     }

@@ -1083,6 +1083,46 @@ public partial class ChannelDispatcherTests
         Assert.Equal((0L, 200L), maker.TradeQty[^1]);
     }
 
+    [Fact]
+    public void Issue482_Replace_PriorityLost_AfterPartialFill_PreservesCumQty()
+    {
+        // Issue #482: when a Replace changes the price (priority lost → DEL + NEW),
+        // the replacement order must inherit the original's CumQty so subsequent
+        // fills continue from there, not from zero.
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker = new FakeSession(outbound);
+
+        // Maker rests SELL 200 @ 10.
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 50UL);
+        DrainInbound(disp);
+        long makerOrderId = maker.News[0].OrderId;
+
+        // First taker eats 100 → maker cum=100, leaves=100.
+        disp.EnqueueNewOrder(new NewOrderCommand("T1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 201UL);
+        DrainInbound(disp);
+        Assert.Equal((100L, 100L), maker.TradeQty[^1]); // leaves=100, cum=100
+
+        // Maker replaces to a different price (priority lost → DEL + NEW).
+        // NewQuantity = 100 (new remaining). With prior cum=100, the new
+        // effective OrderQty becomes 200 and leaves stays 100.
+        disp.EnqueueReplace(new ReplaceOrderCommand("M2", Petr, makerOrderId, Px(9m), 100, 3_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 51UL, origClOrdIdValue: 50UL);
+        DrainInbound(disp);
+
+        // Second taker fills the remaining 100 → terminal fill.
+        // Maker's ER must carry cumQty=200, leaves=0 (not cumQty=100 as if
+        // the replacement started from scratch).
+        disp.EnqueueNewOrder(new NewOrderCommand("T2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 9, 4_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 202UL);
+        DrainInbound(disp);
+
+        Assert.Equal(2, maker.TradeQty.Count);
+        Assert.Equal((0L, 200L), maker.TradeQty[^1]); // leaves=0, cum=200
+    }
+
     // ===== Issue #321 =====
 
     [Fact]
