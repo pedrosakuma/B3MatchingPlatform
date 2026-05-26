@@ -50,6 +50,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private HttpServer? _http;
     private DailyResetScheduler? _dailyReset;
     private PhaseScheduler? _phaseScheduler;
+    private OptionExpirySweeper? _optionExpirySweeper;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
     private B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal? _outboundJournal;
     private B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister? _statePersister;
@@ -82,6 +83,21 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// </summary>
     public int TriggerDailyReset(string reason = "operator-trigger", CloseKind closeKind = CloseKind.DailyReset)
     {
+        // OPT-03 / ADR 0013: sweep expired option series BEFORE the
+        // listener tears down. Each per-order ER_Cancel from the
+        // sweep's MassCancel must route back to its originating TCP
+        // session via the OrderRegistry → IEntryPointResponseChannel
+        // path — that path is only live while the gateway sessions
+        // are still attached.
+        //
+        // SweepExpiredSeries blocks on a per-channel
+        // TaskCompletionSource until every enqueued ExpireSecurity
+        // work item has been processed end-to-end (MassCancel +
+        // SetTradingPhase Close + UMDF packet flushed + ER_Cancel
+        // frames handed to the outbound encoder). That ordering
+        // guarantees the resting orders' cancels reach the wire
+        // before TerminateAllSessions closes the sockets.
+        _optionExpirySweeper?.SweepExpiredSeries(reason, waitTimeout: TimeSpan.FromSeconds(15));
         var listener = _listener;
         int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason, closeKind);
         // Issue #330 PR-3 (review BLOCKING): drain per-channel inbound
@@ -224,6 +240,10 @@ public sealed class ExchangeHost : IAsyncDisposable
         var firmRegistry = FirmRegistry;
         var defaultSession = ResolveDefaultSession(firmRegistry);
         var routing = new Dictionary<long, ChannelDispatcher>();
+        // OPT-03 / ADR 0013: accumulate (instrument, dispatcher) pairs
+        // across every channel so OptionExpirySweeper can fan out per
+        // option series at end-of-trading-day.
+        var instrumentDispatcherPairs = new List<(Instrument Instrument, ChannelDispatcher Dispatcher)>();
         foreach (var ch in _config.Channels)
         {
             var instruments = InstrumentLoader.LoadFromFile(ch.InstrumentsFile);
@@ -347,6 +367,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 if (routing.ContainsKey(inst.SecurityId))
                     throw new InvalidOperationException($"SecurityId {inst.SecurityId} mapped to multiple channels");
                 routing.Add(inst.SecurityId, disp);
+                instrumentDispatcherPairs.Add((inst, disp));
             }
             _logger.LogInformation("channel {ChannelNumber}: {InstrumentCount} instruments → {Group}:{Port}",
                 ch.ChannelNumber, instruments.Count, ch.IncrementalGroup, ch.IncrementalPort);
@@ -487,6 +508,23 @@ public sealed class ExchangeHost : IAsyncDisposable
         }
 
         _router = new HostRouter(routing, gatewayRouter, _loggerFactory.CreateLogger<HostRouter>());
+
+        // OPT-03 / ADR 0013: stand up the option-expiry sweeper once
+        // every channel dispatcher has been built. Only instruments
+        // whose SecurityType is option and that carry an
+        // ExpirationDate are admitted as sinks; non-option channels
+        // therefore pay nothing here.
+        {
+            var sinks = OptionExpirySweeper.BuildSinks(instrumentDispatcherPairs);
+            _optionExpirySweeper = new OptionExpirySweeper(sinks,
+                _loggerFactory.CreateLogger<OptionExpirySweeper>());
+            if (sinks.Count > 0)
+            {
+                _logger.LogInformation(
+                    "option-expiry sweeper armed for {SeriesCount} option series across {ChannelCount} channels",
+                    sinks.Count, _dispatchers.Count);
+            }
+        }
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions
         {
