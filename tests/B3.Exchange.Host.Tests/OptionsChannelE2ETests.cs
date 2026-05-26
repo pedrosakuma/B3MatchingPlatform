@@ -9,7 +9,7 @@ namespace B3.Exchange.Host.Tests;
 
 /// <summary>
 /// Validates the OPT channel wiring shipped by T-4 / OPT-04 (RFC 0002
-/// §3.1, ADR 0013):
+/// §3.1, ADR 0014):
 ///
 /// <list type="number">
 ///   <item>The bundled <c>config/exchange-simulator.json</c> declares

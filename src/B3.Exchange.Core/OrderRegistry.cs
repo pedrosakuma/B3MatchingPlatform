@@ -206,6 +206,26 @@ public sealed class OrderRegistry
     }
 
     /// <summary>
+    /// Returns every <c>OrderId</c> currently registered for
+    /// <paramref name="securityId"/> on this channel, regardless of
+    /// owning session/firm. Used by the end-of-day option-expiry sweep
+    /// (OPT-03, ADR 0014) to enumerate the full set of orders to
+    /// cancel before transitioning the security to <c>Close</c>. Must
+    /// be called from the dispatch thread (the only writer to the
+    /// registry under ADR 0009 single-writer semantics).
+    /// </summary>
+    public IReadOnlyList<long> SnapshotForSecurity(long securityId)
+    {
+        List<long>? matches = null;
+        foreach (var kv in _byOrderId)
+        {
+            if (kv.Value.SecurityId != securityId) continue;
+            (matches ??= new List<long>()).Add(kv.Key);
+        }
+        return (IReadOnlyList<long>?)matches ?? Array.Empty<long>();
+    }
+
+    /// <summary>
     /// Drops every entry owned by <paramref name="session"/>. Called when
     /// a transport closes so the orders themselves stay on the book but
     /// passive fills against them no longer route to a (now-defunct)

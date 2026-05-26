@@ -615,4 +615,97 @@ public sealed partial class ChannelDispatcher
             throw;
         }
     }
+
+    /// <summary>
+    /// OPT-03 (ADR 0014): enqueue an end-of-trading-day expiry sweep for
+    /// <paramref name="securityId"/>. On the dispatch thread the
+    /// dispatcher (a) snapshots every resting <c>OrderID</c> for the
+    /// security from the local <see cref="OrderRegistry"/>, (b) calls
+    /// <see cref="MatchingEngine.MassCancel(IReadOnlyCollection{long}, MassCancelCommand)"/>
+    /// to cancel them (driving per-order <c>ER_Cancel</c> +
+    /// UMDF <c>OrderDelete</c> frames via the existing
+    /// <c>OnOrderCanceled</c> sink path), and (c) calls
+    /// <see cref="MatchingEngine.SetTradingPhase"/> to transition the
+    /// security to <see cref="B3.Exchange.Matching.TradingPhase.Close"/>
+    /// (emitting one terminal UMDF <c>SecurityStatus_3</c> CLOSE). Both
+    /// effects pack into one packet via the standard per-command
+    /// <c>FlushPacket</c> flow, so consumers observe the cancellations
+    /// and the terminal status atomically.
+    /// <para>
+    /// Idempotent: a no-op call (no resting orders + already
+    /// <c>Close</c>) returns <c>ExpireSecurityOutcome(0, false)</c>
+    /// and emits no frames. Safe to call from any thread.
+    /// </para>
+    /// </summary>
+    public bool EnqueueOperatorExpireSecurity(long securityId,
+        TaskCompletionSource<ExpireSecurityOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorExpireSecurity))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; ExpireSecurity rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorExpireSecurity, default, 0, false,
+            0, 0, null, null, null, null,
+            ExpireSecurity: new OperatorExpireSecurity(securityId),
+            ExpireCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; ExpireSecurity rejected"));
+        return false;
+    }
+
+    private void ProcessExpireSecurity(OperatorExpireSecurity op,
+        TaskCompletionSource<ExpireSecurityOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _packetWritten = 0;
+        try
+        {
+            // Snapshot every order owned for this security (regardless of
+            // session/firm). The registry is single-writer per ADR 0009,
+            // so iterating it on the dispatch thread is race-free.
+            var orderIds = _orders.SnapshotForSecurity(op.SecurityId);
+            int cancelled = 0;
+            if (orderIds.Count > 0)
+            {
+                try
+                {
+                    cancelled = _engine.MassCancel(orderIds,
+                        new B3.Exchange.Matching.MassCancelCommand(op.SecurityId, null, _timeSource.NowNanos()));
+                }
+                catch (KeyNotFoundException ex)
+                {
+                    completion?.TrySetException(ex);
+                    return;
+                }
+            }
+
+            bool phaseChanged;
+            try
+            {
+                phaseChanged = _engine.SetTradingPhase(op.SecurityId,
+                    B3.Exchange.Matching.TradingPhase.Close, _timeSource.NowNanos());
+            }
+            catch (KeyNotFoundException ex)
+            {
+                // Flush any cancel frames already buffered so we don't
+                // drop them on the floor when the phase transition fails.
+                if (_packetWritten > 0) FlushPacket();
+                completion?.TrySetException(ex);
+                return;
+            }
+
+            if (_packetWritten > 0) FlushPacket();
+            completion?.TrySetResult(new ExpireSecurityOutcome(cancelled, phaseChanged));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
 }

@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -41,6 +41,7 @@ public sealed partial class ChannelDispatcher
         "OperatorBustV2",
         "AuditCheckpoint",
         "ShutdownBarrier",
+        "OperatorExpireSecurity",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -72,6 +73,8 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<OperatorBustV2Outcome>? BustCompletion = null,
         AuditCheckpointRequest? AuditCheckpoint = null,
         TaskCompletionSource<bool>? ShutdownBarrier = null,
+        OperatorExpireSecurity? ExpireSecurity = null,
+        TaskCompletionSource<ExpireSecurityOutcome>? ExpireCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -120,6 +123,25 @@ public sealed partial class ChannelDispatcher
     /// Issue #322: operator-triggered resume payload.
     /// </summary>
     internal sealed record OperatorResume(long SecurityId);
+
+    /// <summary>
+    /// OPT-03 (ADR 0014): end-of-trading-day expiry payload. Carries the
+    /// security id whose option series has reached its terminal trading
+    /// day. The dispatcher cancels every resting order on that security
+    /// (per-order <c>ER_Cancel</c> + UMDF <c>OrderDelete</c>) and
+    /// transitions the trading phase to <c>Close</c>
+    /// (UMDF <c>SecurityStatus_3</c> CLOSE) in one dispatch-thread
+    /// step so consumers observe the cancellations and the terminal
+    /// status under one packet.
+    /// </summary>
+    internal sealed record OperatorExpireSecurity(long SecurityId);
+
+    /// <summary>
+    /// OPT-03 (ADR 0014): outcome of an expire-security command. Reports
+    /// how many resting orders were cancelled and whether the trading
+    /// phase actually changed (false if it was already <c>Close</c>).
+    /// </summary>
+    public readonly record struct ExpireSecurityOutcome(int CancelledOrderCount, bool PhaseChanged);
 
     /// <summary>
     /// ADR 0008 PR-2: operator bust request payload (post-trade audit
