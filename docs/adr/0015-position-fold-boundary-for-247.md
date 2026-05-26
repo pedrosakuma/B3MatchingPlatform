@@ -38,44 +38,71 @@ us having to model clearing?**
 
 ## Decision
 
-The exchange exposes three artifacts that, together, are sufficient
+The exchange exposes four artifacts that, together, are sufficient
 for a consumer to maintain positions and cash via continuous fold —
 no clearing module required:
 
 1. **`ExecutionReport`** stream on the FIXP TCP session
-   (in-session, low-latency feedback to the order's owner).
+   (in-session, low-latency feedback to the order's owner; carries
+   the consumer's own `ClOrdID`, which is what lets the consumer
+   stitch a fill back to one of its own end-customer accounts).
 2. **`Trade_201`** frames on UMDF multicast (out-of-band,
-   broadcast to anyone subscribing to the channel).
+   broadcast to anyone subscribing to the channel; firm-anonymous).
 3. **`fills.csv`** post-trade EOD/snapshot drop (durable, replayable,
-   contains every executed fill — see ADR 0001 §3).
+   carries `buyClOrdId` / `sellClOrdId` and `buyFirm` / `sellFirm` —
+   see ADR 0001 §3 for the frozen column set).
+4. **`amendments.csv`** post-trade drop for post-EOD busts and
+   corrections (ADR 0008 §3b / §4). Any fold that needs to be
+   bust-correct **must** consume both `fills.csv` and `amendments.csv`
+   together; folding fills alone retains busted trades and produces
+   wrong position/cash after a late correction.
 
 The recommended downstream model for 24/7 environments is
 **continuous T+0 fold over the audit log**:
 
 ```
-position(account, security) =
-    Σ(fill.qty where side=Buy and account matches)
-  − Σ(fill.qty where side=Sell and account matches)
+position(firm, security) =
+    Σ(fill.qty where side=Buy and firm matches)
+  − Σ(fill.qty where side=Sell and firm matches)
+  ± amendments.csv adjustments
 
-cash(account) =
-    bootstrap_cash(account)
+cash(firm) =
+    bootstrap_cash(firm)
   − Σ(buy.qty × buy.price × contract_multiplier + fees)
   + Σ(sell.qty × sell.price × contract_multiplier − fees)
+  ± amendments.csv adjustments
 ```
 
 Where `bootstrap_cash` is a consumer-side configuration ("each new
-session starts with R$ 1M fictitious cash") — the exchange does not
+firm starts with R$ 1M fictitious cash") — the exchange does not
 allocate or track it.
+
+**Account-level fold caveat.** `fills.csv` is keyed by `(buyFirm,
+sellFirm, buyClOrdId, sellClOrdId)` — it identifies firms, not
+end-customer accounts. The exchange does not model end-customer
+accounts; it only knows firms and sessions (ADR 0012). A consumer
+that wants per-account positions/cash (e.g. one firm hosting many
+retail accounts) must keep its own durable `ClOrdID → account` map
+and stitch fills back to accounts itself. Two consequences:
+
+- Per-firm fold is **fully replayable** from `fills.csv` +
+  `amendments.csv` alone (no consumer state needed beyond the fold).
+- Per-account fold is **not** replayable from exchange artifacts
+  alone — the consumer's own `ClOrdID → account` mapping is part of
+  its durable state, and must survive recovery alongside the fold.
 
 This model has three properties that make it well-suited to 24/7
 deployments:
 
 - **No day boundary.** Position and cash are derived state at any
-  instant `t` from the fills up to `t`. There is no SOD/EOD reset to
-  coordinate.
-- **Idempotent recovery.** The consumer can rebuild full state by
-  replaying `fills.csv` from byte zero. No separate position snapshot
-  is needed (which is also why ADR 0007 stays deferred).
+  instant `t` from the audit log up to `t`. There is no SOD/EOD reset
+  to coordinate.
+- **Idempotent recovery (per firm).** The consumer can rebuild
+  full firm-level state by replaying `fills.csv` + `amendments.csv`
+  from byte zero. No separate position snapshot is needed from the
+  exchange (which is also why ADR 0007 stays deferred). Per-account
+  recovery additionally requires the consumer's own `ClOrdID →
+  account` map (see caveat above).
 - **Multiplier-aware.** Options carry a `contract_multiplier` (100
   for equity options on B3; see RFC 0002 §3.3 / `InstrumentTradingRules`).
   Cash settlement of an option fill is `qty × price × multiplier`, not
@@ -86,7 +113,8 @@ deployments:
 
 **For B3MatchingPlatform:**
 - No new code or schema. We continue to expose exactly what we expose
-  today (ExecutionReport + Trade + fills.csv + SecurityDefinition_12).
+  today (ExecutionReport + Trade + fills.csv + amendments.csv +
+  SecurityDefinition_12).
 - The post-trade audit log (`B3.Exchange.PostTrade`) becomes the
   canonical replay source — protect its on-disk format (ADRs 0002,
   0008) accordingly.
@@ -97,11 +125,14 @@ deployments:
   expiry and folds the cash settlement into its own state.
 
 **For B3TradingPlatform (downstream consumer):**
-- Implements the fold described above. The state machine is small —
-  essentially `Dictionary<(Account, SecurityId), long>` for positions
-  and `Dictionary<Account, decimal>` for cash, folded from fills.
-- Bootstraps each new account/session with configurable fictitious
-  cash. No starting position (positions begin at zero).
+- Implements the fold described above, consuming **both** `fills.csv`
+  and `amendments.csv` so bust corrections land correctly.
+- Firm-level fold is the safe default and is fully replayable from
+  exchange artifacts. Per-account fold (one firm fronting many end
+  customers) layers a consumer-owned `ClOrdID → account` map on top
+  and treats that map as durable state.
+- Bootstraps each new firm with configurable fictitious cash. No
+  starting position (positions begin at zero).
 - Pre-trade risk check ("can this account afford this buy?") runs
   against the folded state before the order is sent to the exchange.
 - For options, fold uses `contract_multiplier` from
