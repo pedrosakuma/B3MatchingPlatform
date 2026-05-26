@@ -4,7 +4,7 @@ using B3.Exchange.Instruments;
 namespace B3.Exchange.Host.Tests;
 
 /// <summary>
-/// OPT-03 / ADR 0013 — host-level integration test confirming that an
+/// OPT-03 / ADR 0014 — host-level integration test confirming that an
 /// option series whose expirationDate has already passed is rejected
 /// at <see cref="ExchangeHost.StartAsync"/> time. The actual rejection
 /// lives in <see cref="InstrumentLoader"/> (T-1); this test pins the

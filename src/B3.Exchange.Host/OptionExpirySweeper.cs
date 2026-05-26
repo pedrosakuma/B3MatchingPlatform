@@ -5,7 +5,7 @@ using Microsoft.Extensions.Logging;
 namespace B3.Exchange.Host;
 
 /// <summary>
-/// OPT-03 / ADR 0013 — end-of-trading-day option-series expiry sweep.
+/// OPT-03 / ADR 0014 — end-of-trading-day option-series expiry sweep.
 ///
 /// <para>At the end of each trading day the host walks the configured
 /// option instruments and, for every series whose
@@ -147,7 +147,7 @@ public sealed class OptionExpirySweeper
                 int incomplete = pending.Count(t => !t.IsCompleted);
                 // Loud, distinctive log so an operator running daily-reset
                 // can correlate a stuck dispatcher with the resulting
-                // missing ER_Cancel / lingering Open phase. See ADR 0013
+                // missing ER_Cancel / lingering Open phase. See ADR 0014
                 // — by design we do NOT abort the rest of the daily-reset
                 // flow on this timeout (a wedged dispatcher is already a
                 // fatal-failure scenario and TerminateAllSessions must

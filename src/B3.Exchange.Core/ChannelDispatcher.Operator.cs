@@ -617,7 +617,7 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
-    /// OPT-03 (ADR 0013): enqueue an end-of-trading-day expiry sweep for
+    /// OPT-03 (ADR 0014): enqueue an end-of-trading-day expiry sweep for
     /// <paramref name="securityId"/>. On the dispatch thread the
     /// dispatcher (a) snapshots every resting <c>OrderID</c> for the
     /// security from the local <see cref="OrderRegistry"/>, (b) calls

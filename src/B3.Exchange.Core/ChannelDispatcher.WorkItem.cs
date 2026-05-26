@@ -125,7 +125,7 @@ public sealed partial class ChannelDispatcher
     internal sealed record OperatorResume(long SecurityId);
 
     /// <summary>
-    /// OPT-03 (ADR 0013): end-of-trading-day expiry payload. Carries the
+    /// OPT-03 (ADR 0014): end-of-trading-day expiry payload. Carries the
     /// security id whose option series has reached its terminal trading
     /// day. The dispatcher cancels every resting order on that security
     /// (per-order <c>ER_Cancel</c> + UMDF <c>OrderDelete</c>) and
@@ -137,7 +137,7 @@ public sealed partial class ChannelDispatcher
     internal sealed record OperatorExpireSecurity(long SecurityId);
 
     /// <summary>
-    /// OPT-03 (ADR 0013): outcome of an expire-security command. Reports
+    /// OPT-03 (ADR 0014): outcome of an expire-security command. Reports
     /// how many resting orders were cancelled and whether the trading
     /// phase actually changed (false if it was already <c>Close</c>).
     /// </summary>

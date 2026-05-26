@@ -83,7 +83,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     /// </summary>
     public int TriggerDailyReset(string reason = "operator-trigger", CloseKind closeKind = CloseKind.DailyReset)
     {
-        // OPT-03 / ADR 0013: sweep expired option series BEFORE the
+        // OPT-03 / ADR 0014: sweep expired option series BEFORE the
         // listener tears down. Each per-order ER_Cancel from the
         // sweep's MassCancel must route back to its originating TCP
         // session via the OrderRegistry → IEntryPointResponseChannel
@@ -240,7 +240,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         var firmRegistry = FirmRegistry;
         var defaultSession = ResolveDefaultSession(firmRegistry);
         var routing = new Dictionary<long, ChannelDispatcher>();
-        // OPT-03 / ADR 0013: accumulate (instrument, dispatcher) pairs
+        // OPT-03 / ADR 0014: accumulate (instrument, dispatcher) pairs
         // across every channel so OptionExpirySweeper can fan out per
         // option series at end-of-trading-day.
         var instrumentDispatcherPairs = new List<(Instrument Instrument, ChannelDispatcher Dispatcher)>();
@@ -509,7 +509,7 @@ public sealed class ExchangeHost : IAsyncDisposable
 
         _router = new HostRouter(routing, gatewayRouter, _loggerFactory.CreateLogger<HostRouter>());
 
-        // OPT-03 / ADR 0013: stand up the option-expiry sweeper once
+        // OPT-03 / ADR 0014: stand up the option-expiry sweeper once
         // every channel dispatcher has been built. Only instruments
         // whose SecurityType is option and that carry an
         // ExpirationDate are admitted as sinks; non-option channels

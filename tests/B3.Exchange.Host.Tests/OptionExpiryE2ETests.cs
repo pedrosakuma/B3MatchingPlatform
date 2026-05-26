@@ -7,7 +7,7 @@ using B3.Exchange.Gateway;
 namespace B3.Exchange.Host.Tests;
 
 /// <summary>
-/// OPT-03 / ADR 0013 — end-to-end: boot an <see cref="ExchangeHost"/> with
+/// OPT-03 / ADR 0014 — end-to-end: boot an <see cref="ExchangeHost"/> with
 /// a single option series that expires today, place a resting limit order
 /// on it, then call <see cref="ExchangeHost.TriggerDailyReset"/> and assert
 /// the originating session receives an <c>ER_Cancel</c> and at least one

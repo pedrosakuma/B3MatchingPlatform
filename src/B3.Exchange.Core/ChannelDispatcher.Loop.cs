@@ -96,7 +96,7 @@ public sealed partial class ChannelDispatcher
             item.HaltCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; halt/resume command rejected"));
-            // OPT-03 (ADR 0013): expiry sweep awaits ExpireCompletion.
+            // OPT-03 (ADR 0014): expiry sweep awaits ExpireCompletion.
             item.ExpireCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; ExpireSecurity rejected"));
@@ -170,7 +170,7 @@ public sealed partial class ChannelDispatcher
         if (item.Kind == WorkKind.OperatorExpireSecurity)
         {
             ProcessExpireSecurity(item.ExpireSecurity!, item.ExpireCompletion);
-            // OPT-03 (ADR 0013): force-persist after expiry so the engine's
+            // OPT-03 (ADR 0014): force-persist after expiry so the engine's
             // _phaseById flip to Close and any RptSeq consumed by the
             // SecurityStatus_3 + per-order ER_Cancel frames survive a
             // restart — mirroring the OperatorSetTradingPhase path.

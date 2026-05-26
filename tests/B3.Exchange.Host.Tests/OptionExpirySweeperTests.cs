@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace B3.Exchange.Host.Tests;
 
 /// <summary>
-/// OPT-03 / ADR 0013 — unit tests for <see cref="OptionExpirySweeper"/>.
+/// OPT-03 / ADR 0014 — unit tests for <see cref="OptionExpirySweeper"/>.
 /// Uses a fake <see cref="OptionExpirySweeper.IExpireSink"/> so the test
 /// never touches a live <see cref="ChannelDispatcher"/>.
 /// </summary>

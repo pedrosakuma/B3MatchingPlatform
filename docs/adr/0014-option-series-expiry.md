@@ -1,4 +1,4 @@
-# 0013 — Option series expiry: two-path scheduling at the day boundary
+# 0014 — Option series expiry: two-path scheduling at the day boundary
 
 - **Status**: Accepted
 - **Date**: 2026-05-25

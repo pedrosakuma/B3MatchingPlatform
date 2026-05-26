@@ -209,7 +209,7 @@ public sealed class OrderRegistry
     /// Returns every <c>OrderId</c> currently registered for
     /// <paramref name="securityId"/> on this channel, regardless of
     /// owning session/firm. Used by the end-of-day option-expiry sweep
-    /// (OPT-03, ADR 0013) to enumerate the full set of orders to
+    /// (OPT-03, ADR 0014) to enumerate the full set of orders to
     /// cancel before transitioning the security to <c>Close</c>. Must
     /// be called from the dispatch thread (the only writer to the
     /// registry under ADR 0009 single-writer semantics).
