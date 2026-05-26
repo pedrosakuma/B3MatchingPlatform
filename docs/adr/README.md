@@ -55,3 +55,6 @@ changes, a new ADR supersedes the old one.
 | 0010 | Post-trade orchestration boundary                              | Accepted |
 | 0011 | Contracts is a shared-primitives layer (Matching is canonical) | Accepted |
 | 0012 | Exchange-day boundary: what the simulator does and what it doesn't | Accepted |
+| 0013 | Options channel topology                                       | Accepted |
+| 0014 | Option series expiry handling                                  | Accepted |
+| 0015 | Position/cash fold boundary for 24/7 simulation environments   | Accepted |
