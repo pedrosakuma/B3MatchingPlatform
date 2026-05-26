@@ -258,6 +258,25 @@ public class InstrumentDefinitionPublisherTests
             (B3.Umdf.Mbo.Sbe.V16.TextEncoding _) => { });
         Assert.Equal(1, underlyingCount);
         Assert.Equal(900_000_000_001L, underlyingId);
+
+        // securityValidityTimestamp must be derived from ExpirationDate
+        // end-of-day (23:59:59 BRT/BRST) and emitted as UTC seconds — not
+        // left at 0. (RFC 0002 / #463.) The OptionInst helper expires on
+        // 2025-12-19, so re-derive the expected stamp from the same helper.
+        long expectedValidity = InstrumentDefinitionPublisher.ComputeOptionValidityUtcSeconds(
+            new DateOnly(2025, 12, 19));
+        Assert.NotEqual(0L, expectedValidity);
+        Assert.Equal(expectedValidity, rdr.Data.SecurityValidityTimestamp.Time);
+    }
+
+    [Fact]
+    public void ComputeOptionValidityUtcSeconds_IsEndOfDayInVenueTimezone()
+    {
+        // 2025-12-19 23:59:59 BRT (UTC-3, no DST since 2019) == 2025-12-20 02:59:59 UTC.
+        long actual = InstrumentDefinitionPublisher.ComputeOptionValidityUtcSeconds(
+            new DateOnly(2025, 12, 19));
+        long expected = new DateTimeOffset(2025, 12, 20, 2, 59, 59, TimeSpan.Zero).ToUnixTimeSeconds();
+        Assert.Equal(expected, actual);
     }
 
     [Fact]

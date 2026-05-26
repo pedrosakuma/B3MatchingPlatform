@@ -130,6 +130,10 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
                     packetWritten = StartPacket();
                 }
 
+                var optionFields = BuildOptionFields(inst);
+                long validityTs = optionFields.HasValue
+                    ? ComputeOptionValidityUtcSeconds(inst.ExpirationDate!.Value)
+                    : 0L;
                 int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(
                     _packetBuf.AsSpan(packetWritten),
                     securityId: inst.SecurityId,
@@ -137,7 +141,8 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
                     isin: inst.Isin,
                     securityTypeByte: SecurityTypeMap.ToSbeByte(inst.SecurityType),
                     totNoRelatedSym: (uint)_instruments.Count,
-                    optionFields: BuildOptionFields(inst));
+                    securityValidityTimestamp: validityTs,
+                    optionFields: optionFields);
                 packetWritten += n;
             }
             if (packetWritten > WireOffsets.PacketHeaderSize)
@@ -211,6 +216,37 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
             UnderlyingSecurityId = underlyingId,
             UnderlyingSymbol = underlyingSymbol,
         };
+    }
+
+    // B3 venue timezone. The RFC requires the option securityValidityTimestamp
+    // to be derived from ExpirationDate end-of-day in venue local time, then
+    // expressed as a UTC second count.
+    private static readonly TimeZoneInfo VenueTimezone = ResolveVenueTimezone();
+
+    private static TimeZoneInfo ResolveVenueTimezone()
+    {
+        // America/Sao_Paulo is the IANA id and also works on Windows via the
+        // ICU TZ database that ships with .NET 6+. Fall back to UTC only if
+        // the host has no TZ data at all — better to encode UTC seconds than
+        // to crash the publisher.
+        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Sao_Paulo"); }
+        catch (TimeZoneNotFoundException) { return TimeZoneInfo.Utc; }
+        catch (InvalidTimeZoneException) { return TimeZoneInfo.Utc; }
+    }
+
+    /// <summary>
+    /// Returns the UTC Unix-seconds timestamp marking the end of the
+    /// expiration day in the venue timezone (the moment trading for the
+    /// option is no longer valid). End-of-day is defined as the last second
+    /// of the calendar date in venue local time (23:59:59 BRT/BRST).
+    /// </summary>
+    internal static long ComputeOptionValidityUtcSeconds(DateOnly expirationDate)
+    {
+        var localEod = new DateTime(
+            expirationDate.Year, expirationDate.Month, expirationDate.Day,
+            23, 59, 59, DateTimeKind.Unspecified);
+        var utc = TimeZoneInfo.ConvertTimeToUtc(localEod, VenueTimezone);
+        return new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeSeconds();
     }
 
     private int StartPacket()
