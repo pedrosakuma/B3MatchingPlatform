@@ -130,15 +130,31 @@ public sealed class OptionExpirySweeper
         }
         if (pending is { Count: > 0 })
         {
+            bool completedInTime;
             try
             {
-                Task.WaitAll(pending.ToArray(), waitTimeout!.Value);
+                completedInTime = Task.WaitAll(pending.ToArray(), waitTimeout!.Value);
             }
             catch (AggregateException ex)
             {
+                completedInTime = pending.TrueForAll(t => t.IsCompleted);
                 _logger.LogWarning(ex,
                     "option-expiry sweep ({Trigger}): one or more ExpireSecurity completions faulted",
                     trigger);
+            }
+            if (!completedInTime)
+            {
+                int incomplete = pending.Count(t => !t.IsCompleted);
+                // Loud, distinctive log so an operator running daily-reset
+                // can correlate a stuck dispatcher with the resulting
+                // missing ER_Cancel / lingering Open phase. See ADR 0013
+                // — by design we do NOT abort the rest of the daily-reset
+                // flow on this timeout (a wedged dispatcher is already a
+                // fatal-failure scenario and TerminateAllSessions must
+                // still run).
+                _logger.LogError(
+                    "option-expiry sweep ({Trigger}): timed out after {TimeoutMs}ms with {Incomplete} of {Enqueued} ExpireSecurity completions still pending — TerminateAllSessions may close sessions before ER_Cancel reaches the wire",
+                    trigger, (int)waitTimeout!.Value.TotalMilliseconds, incomplete, enqueued);
             }
         }
         _logger.LogInformation(
