@@ -31,8 +31,8 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
     /// </summary>
     public const int MaxPacketBytes = 1400;
 
-    private const int FrameSize =
-        WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotal;
+    private const int FrameSizeMax =
+        WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotalOneUnderlying;
 
     public byte ChannelNumber { get; }
     public ushort SequenceVersion { get; }
@@ -60,12 +60,13 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(sink);
         if (cadence <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(cadence), "cadence must be positive");
-        // SecDef frame is ~251 bytes; we need to fit at least one with the
-        // 16-byte PacketHeader inside MaxPacketBytes — guaranteed by const,
-        // but keep the assertion in case future schema bumps grow the body.
-        if (FrameSize + WireOffsets.PacketHeaderSize > MaxPacketBytes)
+        // SecDef option frame (one NoUnderlyings entry) is ~279 bytes; we
+        // need to fit at least one with the 16-byte PacketHeader inside
+        // MaxPacketBytes — guaranteed by const, but keep the assertion in
+        // case future schema bumps grow the body.
+        if (FrameSizeMax + WireOffsets.PacketHeaderSize > MaxPacketBytes)
             throw new InvalidOperationException(
-                $"SecurityDefinition frame ({FrameSize} bytes) does not fit in InstrumentDef packet ({MaxPacketBytes} bytes).");
+                $"SecurityDefinition frame ({FrameSizeMax} bytes) does not fit in InstrumentDef packet ({MaxPacketBytes} bytes).");
 
         ChannelNumber = channelNumber;
         _instruments = instruments;
@@ -121,25 +122,131 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
             int packetWritten = StartPacket();
             for (int i = 0; i < _instruments.Count; i++)
             {
-                if (packetWritten + FrameSize > MaxPacketBytes)
+                var inst = _instruments[i];
+                int frameSize = SecDefFrameSizeFor(inst);
+                if (packetWritten + frameSize > MaxPacketBytes)
                 {
                     FlushPacket(packetWritten);
                     packetWritten = StartPacket();
                 }
 
-                var inst = _instruments[i];
+                var optionFields = BuildOptionFields(inst);
+                long validityTs = optionFields.HasValue
+                    ? ComputeOptionValidityUtcSeconds(inst.ExpirationDate!.Value)
+                    : 0L;
                 int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(
                     _packetBuf.AsSpan(packetWritten),
                     securityId: inst.SecurityId,
                     symbol: inst.Symbol,
                     isin: inst.Isin,
                     securityTypeByte: SecurityTypeMap.ToSbeByte(inst.SecurityType),
-                    totNoRelatedSym: (uint)_instruments.Count);
+                    totNoRelatedSym: (uint)_instruments.Count,
+                    securityValidityTimestamp: validityTs,
+                    optionFields: optionFields);
                 packetWritten += n;
             }
             if (packetWritten > WireOffsets.PacketHeaderSize)
                 FlushPacket(packetWritten);
         }
+    }
+
+    private static int SecDefFrameSizeFor(Instrument inst)
+    {
+        int body = InstrumentSecurityTypes.IsOption(inst.SecurityType)
+            ? WireOffsets.SecDefBodyTotalOneUnderlying
+            : WireOffsets.SecDefBodyTotalNoUnderlyings;
+        return WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + body;
+    }
+
+    /// <summary>
+    /// Translates an option <see cref="Instrument"/> into the
+    /// <see cref="UmdfWireEncoder.OptionDefinitionFields"/> payload expected
+    /// by the encoder. Returns <c>null</c> for non-option instruments so the
+    /// encoder writes SBE NULL sentinels for every option field. Throws when
+    /// an option instrument is missing a required field — the loader and
+    /// trading-rules layer should have rejected such a config long before
+    /// we get here, but a clear error here beats a silently-mis-encoded
+    /// frame on the wire.
+    /// </summary>
+    private static UmdfWireEncoder.OptionDefinitionFields? BuildOptionFields(Instrument inst)
+    {
+        if (!InstrumentSecurityTypes.IsOption(inst.SecurityType))
+            return null;
+
+        decimal strike = inst.StrikePrice
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required StrikePrice.");
+        DateOnly expiry = inst.ExpirationDate
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ExpirationDate.");
+        var putOrCall = inst.PutOrCall
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required PutOrCall.");
+        var exerciseStyle = inst.ExerciseStyle
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ExerciseStyle.");
+        long underlyingId = inst.UnderlyingSecurityId
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required UnderlyingSecurityId.");
+        string underlyingSymbol = inst.UnderlyingSymbol
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required UnderlyingSymbol.");
+        decimal multiplier = inst.ContractMultiplier
+            ?? throw new InvalidOperationException($"Option instrument {inst.Symbol} ({inst.SecurityId}) is missing required ContractMultiplier.");
+
+        return new UmdfWireEncoder.OptionDefinitionFields
+        {
+            StrikePrice = strike,
+            ContractMultiplier = multiplier,
+            ExpirationDate = expiry,
+            PutOrCallByte = putOrCall switch
+            {
+                B3.Exchange.Instruments.PutOrCall.Put => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.PUT,
+                B3.Exchange.Instruments.PutOrCall.Call => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.CALL,
+                _ => throw new InvalidOperationException($"Unsupported PutOrCall value: {putOrCall}"),
+            },
+            ExerciseStyleByte = exerciseStyle switch
+            {
+                B3.Exchange.Instruments.ExerciseStyle.European => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.EUROPEAN,
+                B3.Exchange.Instruments.ExerciseStyle.American => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.AMERICAN,
+                _ => throw new InvalidOperationException($"Unsupported ExerciseStyle value: {exerciseStyle}"),
+            },
+            OptPayoutTypeByte = inst.OptPayoutType switch
+            {
+                null => null,
+                B3.Exchange.Instruments.OptPayoutType.Vanilla => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.VANILLA,
+                B3.Exchange.Instruments.OptPayoutType.Capped => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.CAPPED,
+                B3.Exchange.Instruments.OptPayoutType.Binary => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.BINARY,
+                _ => throw new InvalidOperationException($"Unsupported OptPayoutType value: {inst.OptPayoutType}"),
+            },
+            UnderlyingSecurityId = underlyingId,
+            UnderlyingSymbol = underlyingSymbol,
+        };
+    }
+
+    // B3 venue timezone. The RFC requires the option securityValidityTimestamp
+    // to be derived from ExpirationDate end-of-day in venue local time, then
+    // expressed as a UTC second count.
+    private static readonly TimeZoneInfo VenueTimezone = ResolveVenueTimezone();
+
+    private static TimeZoneInfo ResolveVenueTimezone()
+    {
+        // America/Sao_Paulo is the IANA id and also works on Windows via the
+        // ICU TZ database that ships with .NET 6+. Fall back to UTC only if
+        // the host has no TZ data at all — better to encode UTC seconds than
+        // to crash the publisher.
+        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Sao_Paulo"); }
+        catch (TimeZoneNotFoundException) { return TimeZoneInfo.Utc; }
+        catch (InvalidTimeZoneException) { return TimeZoneInfo.Utc; }
+    }
+
+    /// <summary>
+    /// Returns the UTC Unix-seconds timestamp marking the end of the
+    /// expiration day in the venue timezone (the moment trading for the
+    /// option is no longer valid). End-of-day is defined as the last second
+    /// of the calendar date in venue local time (23:59:59 BRT/BRST).
+    /// </summary>
+    internal static long ComputeOptionValidityUtcSeconds(DateOnly expirationDate)
+    {
+        var localEod = new DateTime(
+            expirationDate.Year, expirationDate.Month, expirationDate.Day,
+            23, 59, 59, DateTimeKind.Unspecified);
+        var utc = TimeZoneInfo.ConvertTimeToUtc(localEod, VenueTimezone);
+        return new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeSeconds();
     }
 
     private int StartPacket()

@@ -266,19 +266,42 @@ public static class WireOffsets
     public const int ChannelResetBodyMdEntryTimestampOffset = 4;
 
     // ---- SecurityDefinition_12 (V16) ----
-    public const int SecDefBlockLength = 230;
+    // BlockLength bumped from 230 (V6) to 232 (V16) to make room for
+    // impliedMarketIndicator@230 and optPayoutType@231. The V16 reader is
+    // backwards-compatible — it dispatches on the explicit BlockLength field
+    // in the SBE message header.
+    public const int SecDefBlockLength = 232;
     public const int SecDefSecurityIdOffset = 0;
     public const int SecDefSecurityExchangeOffset = 8;
     public const int SecDefSymbolOffset = 16;
     public const int SecDefSecurityTypeOffset = 37;
     public const int SecDefTotNoRelatedSymOffset = 40;
+    public const int SecDefStrikePriceOffset = 52;            // PriceOptional (long mantissa, /10000; long.MinValue = NULL)
+    public const int SecDefContractMultiplierOffset = 60;     // Fixed8 (long mantissa, /1e8; long.MinValue = NULL)
     public const int SecDefSecurityValidityTimestampOffset = 76;
     public const int SecDefMaturityDateOffset = 140;
     public const int SecDefIsinNumberOffset = 164;
+    public const int SecDefMaturityMonthYearOffset = 188;     // MaturityMonthYear (5 bytes: year@0 ushort, month@2 byte, day@3 byte, week@4 byte; 0 = NULL)
+    public const int SecDefMaturityMonthYearSize = 5;
+    public const int SecDefExerciseStyleOffset = 213;         // byte (255 = NULL)
+    public const int SecDefPutOrCallOffset = 214;             // byte (255 = NULL)
+    public const int SecDefImpliedMarketIndicatorOffset = 230; // byte (255 = NULL)
+    public const int SecDefOptPayoutTypeOffset = 231;         // byte (255 = NULL)
 
-    // SecDef body emits three empty repeating-group headers
+    // SecDef body emits three repeating-group headers
     // (NoUnderlyings, NoLegs, NoInstrAttribs) so consumer ReadGroups paths stay safe.
     public const int GroupSizeEncodingSize = 3;
+
+    // NoUnderlyings group entry (V16, MESSAGE_SIZE = 28):
+    // @0  underlyingSecurityID (long, 8 bytes)
+    // @8  underlyingSymbol (Symbol, 20-byte fixed ASCII; underlyingSecurityExchange
+    //     overlaps at @8 with a zero-byte SecurityExchangeBVMF constant
+    //     "BVMF", so it consumes no wire bytes)
+    public const int SecDefNoUnderlyingsEntrySize = 28;
+    public const int SecDefNoUnderlyingsEntrySecurityIdOffset = 0;
+    public const int SecDefNoUnderlyingsEntrySymbolOffset = 8;
+    public const int SecDefNoUnderlyingsEntrySymbolSize = 20;
+
     // Trailing var-data section: TextEncoding 'securityDesc' (uint8 length
     // prefix + 0..250 UTF-8 bytes). Required by the consumer's generated
     // SecurityDefinition_12DataReader — when omitted, TextEncoding.Create
@@ -287,5 +310,23 @@ public static class WireOffsets
     // (empty description) so the prefix is present even when no text is
     // attached.
     public const int SecDefSecurityDescLengthSize = 1;
-    public const int SecDefBodyTotal = SecDefBlockLength + GroupSizeEncodingSize * 3 + SecDefSecurityDescLengthSize;
+
+    /// <summary>
+    /// Total body bytes for a SecurityDefinition_12 frame that emits zero
+    /// entries in every repeating group (equity / non-option instrument).
+    /// </summary>
+    public const int SecDefBodyTotalNoUnderlyings = SecDefBlockLength + GroupSizeEncodingSize * 3 + SecDefSecurityDescLengthSize;
+
+    /// <summary>
+    /// Total body bytes for a SecurityDefinition_12 frame that emits one
+    /// entry in the NoUnderlyings group (single-underlying equity option).
+    /// </summary>
+    public const int SecDefBodyTotalOneUnderlying = SecDefBodyTotalNoUnderlyings + SecDefNoUnderlyingsEntrySize;
+
+    /// <summary>
+    /// Legacy alias preserved for callers that pre-allocate a fixed-size
+    /// buffer. Equal to the no-underlyings body total; option frames now
+    /// require <see cref="SecDefBodyTotalOneUnderlying"/> bytes.
+    /// </summary>
+    public const int SecDefBodyTotal = SecDefBodyTotalNoUnderlyings;
 }

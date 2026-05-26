@@ -295,6 +295,162 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void SecurityDefinition_Equity_OptionFields_AreSbeNullSentinels()
+    {
+        // Regression: equity (non-option) instruments must encode the
+        // optional option fields as SBE NULL sentinels — not as a stray
+        // zero — so a consumer that filters by "options only" sees null.
+        var buf = new byte[512];
+        int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(buf, securityId: 900_000_000_001L,
+            symbol: "PETR4", isin: "BRPETRACNPR6", securityTypeByte: 1, totNoRelatedSym: 1);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotalNoUnderlyings, n);
+
+        var body = buf.AsSpan(FrameOffset, WireOffsets.SecDefBlockLength);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(WireOffsets.SecDefStrikePriceOffset, 8)));
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(WireOffsets.SecDefContractMultiplierOffset, 8)));
+        Assert.Equal((byte)255, body[WireOffsets.SecDefExerciseStyleOffset]);
+        Assert.Equal((byte)255, body[WireOffsets.SecDefPutOrCallOffset]);
+        Assert.Equal((byte)255, body[WireOffsets.SecDefImpliedMarketIndicatorOffset]);
+        Assert.Equal((byte)255, body[WireOffsets.SecDefOptPayoutTypeOffset]);
+        // MaturityMonthYear: year (ushort)@0 = 0 → SBE NULL.
+        var mmy = body.Slice(WireOffsets.SecDefMaturityMonthYearOffset, WireOffsets.SecDefMaturityMonthYearSize);
+        Assert.Equal((ushort)0, MemoryMarshal.Read<ushort>(mmy.Slice(0, 2)));
+
+        // NoUnderlyings dimension header: NumInGroup byte (offset +2) = 0 for equity.
+        int noUnderlyingsHeaderOffset = FrameOffset + WireOffsets.SecDefBlockLength;
+        Assert.Equal((byte)0, buf[noUnderlyingsHeaderOffset + 2]);
+    }
+
+    [Fact]
+    public void SecurityDefinition_Option_Call_EncodesAllFields()
+    {
+        var buf = new byte[512];
+        var optionFields = new UmdfWireEncoder.OptionDefinitionFields
+        {
+            StrikePrice = 28.50m,
+            ContractMultiplier = 100m,
+            ExpirationDate = new DateOnly(2025, 12, 19),
+            PutOrCallByte = (byte)PutOrCall.CALL,
+            ExerciseStyleByte = (byte)ExerciseStyle.AMERICAN,
+            OptPayoutTypeByte = (byte)OptPayoutType.VANILLA,
+            UnderlyingSecurityId = 900_000_000_001L,
+            UnderlyingSymbol = "PETR4",
+        };
+        int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(buf, securityId: 900_111_111_111L,
+            symbol: "PETRZ285", isin: "BROPTPETRZ285",
+            securityTypeByte: (byte)SecurityType.OPT, totNoRelatedSym: 1,
+            optionFields: optionFields);
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotalOneUnderlying, n);
+
+        var body = buf.AsSpan(FrameOffset, WireOffsets.SecDefBlockLength);
+
+        // StrikePrice: PriceOptional mantissa = price * 10_000.
+        Assert.Equal(285_000L, MemoryMarshal.Read<long>(body.Slice(WireOffsets.SecDefStrikePriceOffset, 8)));
+        // ContractMultiplier: Fixed8 mantissa = value * 1e8.
+        Assert.Equal(100L * 100_000_000L, MemoryMarshal.Read<long>(body.Slice(WireOffsets.SecDefContractMultiplierOffset, 8)));
+        // MaturityMonthYear: ushort year@0, byte month@2, byte day@3, byte week@4.
+        var mmy = body.Slice(WireOffsets.SecDefMaturityMonthYearOffset, WireOffsets.SecDefMaturityMonthYearSize);
+        Assert.Equal((ushort)2025, MemoryMarshal.Read<ushort>(mmy.Slice(0, 2)));
+        Assert.Equal((byte)12, mmy[2]);
+        Assert.Equal((byte)19, mmy[3]);
+        Assert.Equal((byte)0, mmy[4]);
+        Assert.Equal((byte)ExerciseStyle.AMERICAN, body[WireOffsets.SecDefExerciseStyleOffset]);
+        Assert.Equal((byte)PutOrCall.CALL, body[WireOffsets.SecDefPutOrCallOffset]);
+        Assert.Equal((byte)OptPayoutType.VANILLA, body[WireOffsets.SecDefOptPayoutTypeOffset]);
+        Assert.Equal((byte)255, body[WireOffsets.SecDefImpliedMarketIndicatorOffset]);
+
+        // NoUnderlyings dimension header: BlockLength=28, NumInGroup=1.
+        int noUnderlyingsHeaderOffset = FrameOffset + WireOffsets.SecDefBlockLength;
+        Assert.Equal((ushort)WireOffsets.SecDefNoUnderlyingsEntrySize,
+            MemoryMarshal.Read<ushort>(buf.AsSpan(noUnderlyingsHeaderOffset, 2)));
+        Assert.Equal((byte)1, buf[noUnderlyingsHeaderOffset + 2]);
+
+        // NoUnderlyings entry: underlyingSecurityID@0, underlyingSymbol@8 (20-byte ASCII).
+        int entryOffset = noUnderlyingsHeaderOffset + WireOffsets.GroupSizeEncodingSize;
+        Assert.Equal(900_000_000_001L,
+            MemoryMarshal.Read<long>(buf.AsSpan(entryOffset + WireOffsets.SecDefNoUnderlyingsEntrySecurityIdOffset, 8)));
+        Assert.Equal("PETR4",
+            System.Text.Encoding.ASCII.GetString(buf.AsSpan(
+                entryOffset + WireOffsets.SecDefNoUnderlyingsEntrySymbolOffset, 5)));
+    }
+
+    [Fact]
+    public void SecurityDefinition_Option_Put_EncodesPutOrCallPut()
+    {
+        var buf = new byte[512];
+        var optionFields = new UmdfWireEncoder.OptionDefinitionFields
+        {
+            StrikePrice = 30m,
+            ContractMultiplier = 100m,
+            ExpirationDate = new DateOnly(2025, 6, 20),
+            PutOrCallByte = (byte)PutOrCall.PUT,
+            ExerciseStyleByte = (byte)ExerciseStyle.EUROPEAN,
+            OptPayoutTypeByte = null, // unspecified → SBE NULL sentinel
+            UnderlyingSecurityId = 42L,
+            UnderlyingSymbol = "VALE3",
+        };
+        UmdfWireEncoder.WriteSecurityDefinitionFrame(buf, securityId: 100L,
+            symbol: "VALER300", isin: "BROPTVALER300",
+            securityTypeByte: (byte)SecurityType.OPT, totNoRelatedSym: 1,
+            optionFields: optionFields);
+
+        var body = buf.AsSpan(FrameOffset, WireOffsets.SecDefBlockLength);
+        Assert.Equal((byte)PutOrCall.PUT, body[WireOffsets.SecDefPutOrCallOffset]);
+        Assert.Equal((byte)ExerciseStyle.EUROPEAN, body[WireOffsets.SecDefExerciseStyleOffset]);
+        // OptPayoutType: caller passed null → encoder writes NULL sentinel.
+        Assert.Equal((byte)255, body[WireOffsets.SecDefOptPayoutTypeOffset]);
+    }
+
+    [Fact]
+    public void SecurityDefinition_Option_RoundtripsViaGeneratedReader()
+    {
+        var buf = new byte[512];
+        var optionFields = new UmdfWireEncoder.OptionDefinitionFields
+        {
+            StrikePrice = 28.50m,
+            ContractMultiplier = 100m,
+            ExpirationDate = new DateOnly(2025, 12, 19),
+            PutOrCallByte = (byte)PutOrCall.CALL,
+            ExerciseStyleByte = (byte)ExerciseStyle.AMERICAN,
+            OptPayoutTypeByte = (byte)OptPayoutType.VANILLA,
+            UnderlyingSecurityId = 900_000_000_001L,
+            UnderlyingSymbol = "PETR4",
+        };
+        int n = UmdfWireEncoder.WriteSecurityDefinitionFrame(buf, securityId: 900_111_111_111L,
+            symbol: "PETRZ285", isin: "BROPTPETRZ285",
+            securityTypeByte: (byte)SecurityType.OPT, totNoRelatedSym: 1,
+            optionFields: optionFields);
+
+        var sbeMessage = buf.AsSpan(WireOffsets.FramingHeaderSize, n - WireOffsets.FramingHeaderSize);
+        var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(bodyAndTail,
+            blockLength: WireOffsets.SecDefBlockLength, out var rdr));
+
+        Assert.Equal(285_000L, rdr.Data.StrikePrice.Mantissa);
+        Assert.Equal(100L * 100_000_000L, rdr.Data.ContractMultiplier.Mantissa);
+        Assert.Equal((ushort)2025, rdr.Data.MaturityMonthYear.Year);
+        Assert.Equal((byte)12, rdr.Data.MaturityMonthYear.Month);
+        Assert.Equal((byte)19, rdr.Data.MaturityMonthYear.Day);
+        Assert.Equal(ExerciseStyle.AMERICAN, rdr.Data.ExerciseStyle);
+        Assert.Equal(PutOrCall.CALL, rdr.Data.PutOrCall);
+        Assert.Equal(OptPayoutType.VANILLA, rdr.Data.OptPayoutType);
+
+        int underlyings = 0;
+        long underlyingSecId = 0L;
+        rdr.ReadGroups(
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoUnderlyingsData u) =>
+            {
+                underlyings++;
+                underlyingSecId = (long)(ulong)u.UnderlyingSecurityID.Value;
+            },
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V16.TextEncoding _) => { });
+        Assert.Equal(1, underlyings);
+        Assert.Equal(900_000_000_001L, underlyingSecId);
+    }
+
+    [Fact]
     public void Sequence_Roundtrip()
     {
         var buf = new byte[64];

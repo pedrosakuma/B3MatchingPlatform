@@ -287,16 +287,71 @@ public static class UmdfWireEncoder
     }
 
     /// <summary>
-    /// Writes <c>SecurityDefinition_12</c> with the minimum fields needed
-    /// for the consumer's instrument pipeline (SecurityID, SecurityExchange,
+    /// Optional option-specific payload for <see cref="WriteSecurityDefinitionFrame"/>.
+    /// When supplied, the encoder fills in the SBE option fields
+    /// (strikePrice, contractMultiplier, maturityMonthYear, exerciseStyle,
+    /// putOrCall, optPayoutType) and emits one entry in the NoUnderlyings
+    /// repeating group. Equity / non-option instruments must pass
+    /// <c>null</c>; the encoder then writes SBE NULL sentinels for every
+    /// option field and a zero-entry NoUnderlyings group.
+    /// </summary>
+    public readonly struct OptionDefinitionFields
+    {
+        /// <summary>Human-units strike price (e.g. 28.50). Required.</summary>
+        public required decimal StrikePrice { get; init; }
+
+        /// <summary>Contract size multiplier (e.g. 100 shares per contract). Required.</summary>
+        public required decimal ContractMultiplier { get; init; }
+
+        /// <summary>Last trading / expiration date.</summary>
+        public required DateOnly ExpirationDate { get; init; }
+
+        /// <summary>0 = Put, 1 = Call (SBE PutOrCall enum).</summary>
+        public required byte PutOrCallByte { get; init; }
+
+        /// <summary>0 = European, 1 = American (SBE ExerciseStyle enum).</summary>
+        public required byte ExerciseStyleByte { get; init; }
+
+        /// <summary>SBE OptPayoutType enum byte (1=Vanilla, 2=Capped, 3=Binary). Null = SBE NULL sentinel (255).</summary>
+        public byte? OptPayoutTypeByte { get; init; }
+
+        /// <summary>SecurityID of the underlying instrument (e.g. the equity series the option references).</summary>
+        public required long UnderlyingSecurityId { get; init; }
+
+        /// <summary>Ticker symbol of the underlying instrument (≤ 20 ASCII chars, space-padded on the wire).</summary>
+        public required string UnderlyingSymbol { get; init; }
+    }
+
+    // SBE NULL sentinels for the optional SecurityDefinition_12 fields.
+    // Centralised here so encoder+tests share one source of truth.
+    private const long SecDefPriceOptionalNull = long.MinValue;  // PriceOptional & Fixed8 mantissa NULL.
+    private const byte SecDefByteEnumNull = 255;                 // ExerciseStyle / PutOrCall / OptPayoutType / ImpliedMarketIndicator NULL.
+    private const long SecDefPriceMantissaScale = 10_000L;       // PriceOptional exponent = -4.
+    private const long SecDefFixed8MantissaScale = 100_000_000L; // Fixed8 exponent = -8.
+    private const ushort SecDefNoUnderlyingsEntryBlockLength = (ushort)WireOffsets.SecDefNoUnderlyingsEntrySize;
+
+    /// <summary>
+    /// Writes <c>SecurityDefinition_12</c> (V16) with the fields the
+    /// consumer's instrument pipeline needs (SecurityID, SecurityExchange,
     /// Symbol, SecurityType, TotNoRelatedSym, ISIN, optional ValidityTimestamp,
-    /// optional MaturityDate). Trailing 9 bytes encode three empty groups
-    /// (NoUnderlyings, NoLegs, NoInstrAttribs); the final byte is the
-    /// <c>securityDesc</c> TextEncoding length prefix, written as 0 (empty
-    /// description). The length prefix is mandatory even when no text is
-    /// attached — without it the consumer's generated
-    /// <c>SecurityDefinition_12DataReader</c> reads past the SBE message
-    /// boundary and throws (issue #222).
+    /// optional MaturityDate). When <paramref name="optionFields"/> is
+    /// non-null the encoder additionally fills the SBE option fields
+    /// (StrikePrice, ContractMultiplier, MaturityMonthYear, ExerciseStyle,
+    /// PutOrCall, OptPayoutType) and emits one entry in the NoUnderlyings
+    /// repeating group. Equity callers pass <c>null</c> and the corresponding
+    /// optional fields are written as SBE NULL sentinels.
+    /// <para>
+    /// Trailing 9 bytes encode three empty group dimension headers
+    /// (NoUnderlyings, NoLegs, NoInstrAttribs) plus the <c>securityDesc</c>
+    /// TextEncoding length prefix (uint8, always 0 — empty description).
+    /// The length prefix is mandatory even when no text is attached —
+    /// without it the consumer's generated <c>SecurityDefinition_12DataReader</c>
+    /// reads past the SBE message boundary and throws (issue #222).
+    /// </para>
+    /// Returns total bytes written; the value depends on whether
+    /// <paramref name="optionFields"/> is null (no NoUnderlyings entry,
+    /// <see cref="WireOffsets.SecDefBodyTotalNoUnderlyings"/>) or non-null
+    /// (one NoUnderlyings entry, <see cref="WireOffsets.SecDefBodyTotalOneUnderlying"/>).
     /// </summary>
     public static int WriteSecurityDefinitionFrame(
         Span<byte> dst,
@@ -306,18 +361,27 @@ public static class UmdfWireEncoder
         byte securityTypeByte,
         uint totNoRelatedSym,
         long securityValidityTimestamp = 0L,
-        int maturityDate = 0)
+        int maturityDate = 0,
+        OptionDefinitionFields? optionFields = null)
     {
-        int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SecDefBodyTotal;
+        bool hasOption = optionFields.HasValue;
+        int bodyTotal = hasOption
+            ? WireOffsets.SecDefBodyTotalOneUnderlying
+            : WireOffsets.SecDefBodyTotalNoUnderlyings;
+        int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + bodyTotal;
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.WriteHeader(
+        // V16 WriteHeader stamps BlockLength=232, TemplateId=12, SchemaId=2, Version=16.
+        // The consumer's V16 reader dispatches on the explicit BlockLength
+        // field, so equity and option frames share the same header shape
+        // and only differ in the trailing NoUnderlyings group dimensions.
+        B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
             WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
-            WireOffsets.SecDefBodyTotal);
+            bodyTotal);
         body.Clear();
 
         MemoryMarshal.Write(body.Slice(WireOffsets.SecDefSecurityIdOffset, 8), in securityId);
@@ -329,8 +393,83 @@ public static class UmdfWireEncoder
         MemoryMarshal.Write(body.Slice(WireOffsets.SecDefSecurityValidityTimestampOffset, 8), in securityValidityTimestamp);
         MemoryMarshal.Write(body.Slice(WireOffsets.SecDefMaturityDateOffset, 4), in maturityDate);
         WriteFixedAscii(body.Slice(WireOffsets.SecDefIsinNumberOffset, 12), isin);
-        // Trailing GroupSizeEncodings already zero from body.Clear().
+
+        // Option-related optional fields: default to SBE NULL sentinels so
+        // equity decoders observe null rather than a stray zero
+        // (e.g. PriceOptional mantissa 0 == 0.0, not NULL). Overwritten
+        // below when optionFields is supplied.
+        long priceNull = SecDefPriceOptionalNull;
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecDefStrikePriceOffset, 8), in priceNull);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SecDefContractMultiplierOffset, 8), in priceNull);
+        body[WireOffsets.SecDefExerciseStyleOffset] = SecDefByteEnumNull;
+        body[WireOffsets.SecDefPutOrCallOffset] = SecDefByteEnumNull;
+        body[WireOffsets.SecDefImpliedMarketIndicatorOffset] = SecDefByteEnumNull;
+        body[WireOffsets.SecDefOptPayoutTypeOffset] = SecDefByteEnumNull;
+        // MaturityMonthYear: all-zero bytes are the SBE NULL representation
+        // (year=0 sentinel), already written by body.Clear().
+
+        // Trailing group dimensions + securityDesc length prefix layout:
+        //   [NoUnderlyings dim 3][N×28 entries][NoLegs dim 3][NoInstrAttribs dim 3][descLen 1]
+        int p = WireOffsets.SecDefBlockLength;
+
+        if (hasOption)
+        {
+            var opt = optionFields!.Value;
+
+            // Option scalar fields.
+            long strikeMantissa = ToScaledMantissa(opt.StrikePrice, SecDefPriceMantissaScale, nameof(opt.StrikePrice));
+            long multiplierMantissa = ToScaledMantissa(opt.ContractMultiplier, SecDefFixed8MantissaScale, nameof(opt.ContractMultiplier));
+            MemoryMarshal.Write(body.Slice(WireOffsets.SecDefStrikePriceOffset, 8), in strikeMantissa);
+            MemoryMarshal.Write(body.Slice(WireOffsets.SecDefContractMultiplierOffset, 8), in multiplierMantissa);
+
+            // MaturityMonthYear: year (ushort)@0, month (byte)@2, day (byte)@3, week (byte)@4.
+            var mmy = body.Slice(WireOffsets.SecDefMaturityMonthYearOffset, WireOffsets.SecDefMaturityMonthYearSize);
+            ushort year = (ushort)opt.ExpirationDate.Year;
+            byte month = (byte)opt.ExpirationDate.Month;
+            byte day = (byte)opt.ExpirationDate.Day;
+            MemoryMarshal.Write(mmy.Slice(0, 2), in year);
+            mmy[2] = month;
+            mmy[3] = day;
+            mmy[4] = 0; // week: not modelled by the venue simulator.
+
+            body[WireOffsets.SecDefExerciseStyleOffset] = opt.ExerciseStyleByte;
+            body[WireOffsets.SecDefPutOrCallOffset] = opt.PutOrCallByte;
+            body[WireOffsets.SecDefOptPayoutTypeOffset] = opt.OptPayoutTypeByte ?? SecDefByteEnumNull;
+
+            // NoUnderlyings dimension header: BlockLength=28 (ushort), NumInGroup=1 (byte).
+            ushort entryBlockLen = SecDefNoUnderlyingsEntryBlockLength;
+            MemoryMarshal.Write(body.Slice(p, 2), in entryBlockLen);
+            body[p + 2] = 1;
+            p += WireOffsets.GroupSizeEncodingSize;
+
+            // Single entry: underlyingSecurityID@0, underlyingSymbol@8 (20 ASCII).
+            var entry = body.Slice(p, WireOffsets.SecDefNoUnderlyingsEntrySize);
+            long underlyingSecId = opt.UnderlyingSecurityId;
+            MemoryMarshal.Write(entry.Slice(WireOffsets.SecDefNoUnderlyingsEntrySecurityIdOffset, 8), in underlyingSecId);
+            WriteFixedAscii(
+                entry.Slice(
+                    WireOffsets.SecDefNoUnderlyingsEntrySymbolOffset,
+                    WireOffsets.SecDefNoUnderlyingsEntrySymbolSize),
+                opt.UnderlyingSymbol);
+            p += WireOffsets.SecDefNoUnderlyingsEntrySize;
+        }
+        else
+        {
+            // Empty NoUnderlyings dimension header — zeros from body.Clear().
+            p += WireOffsets.GroupSizeEncodingSize;
+        }
+
+        // NoLegs + NoInstrAttribs dimension headers and securityDesc length
+        // prefix are all zero (from body.Clear()). No further writes needed.
         return total;
+    }
+
+    private static long ToScaledMantissa(decimal value, long scale, string fieldName)
+    {
+        decimal scaled = decimal.Round(value * scale, 0, MidpointRounding.AwayFromZero);
+        if (scaled < long.MinValue + 1 || scaled > long.MaxValue)
+            throw new ArgumentOutOfRangeException(fieldName, value, "value does not fit in a SBE Fixed8/PriceOptional mantissa");
+        return (long)scaled;
     }
 
     /// <summary>
