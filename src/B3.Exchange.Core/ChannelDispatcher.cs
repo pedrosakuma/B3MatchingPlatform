@@ -310,6 +310,31 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// </summary>
     private long _aggressorOrigQty;
     private long _aggressorCumQty;
+    /// <summary>
+    /// Issue #484: true when the current aggressor command is IOC or FOK.
+    /// IOC/FOK aggressors are always terminal: the engine never emits
+    /// <c>IocUnmatched</c> when there were any trades, so the terminal
+    /// state must be signalled by the LAST ER_Trade carrying leavesQty=0.
+    /// We achieve this by buffering each aggressor ER_Trade and flushing
+    /// it one step behind: when the NEXT fill arrives the previous buffered
+    /// ER is emitted with its natural leavesQty (intermediate fill), and
+    /// the last buffered ER is emitted with leavesQty=0 in the
+    /// <c>finally</c> block of <c>ProcessOne</c> (terminal fill).
+    /// </summary>
+    private bool _aggressorIsIoc;
+    private bool _hasPendingIocER;
+    private PendingIocTradeER _pendingIocER;
+
+    private struct PendingIocTradeER
+    {
+        public SessionId Session;
+        public TradeEvent Event;
+        public long OwnerOrderId;
+        public ulong ClOrdId;
+        public long LeavesQty;
+        public long CumQty;
+        public DurabilityHandle Durability;
+    }
 
     /// <summary>
     /// Issue #321: per-securityId snapshot of the most-recently observed

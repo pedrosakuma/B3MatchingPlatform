@@ -1123,7 +1123,87 @@ public partial class ChannelDispatcherTests
         Assert.Equal((0L, 200L), maker.TradeQty[^1]); // leaves=0, cum=200
     }
 
-    // ===== Issue #321 =====
+    [Fact]
+    public void Issue484_IOC_Replace_AfterPartialFill_TerminalER_HasLeavesQtyZero()
+    {
+        // Issue #484: IOC Replace after a partial fill must emit leavesQty=0
+        // on the terminal ER_Trade even when _aggressorOrigQty inherited prior fills.
+        //
+        // Scenario:
+        //   1. Maker rests SELL 200 @ 10
+        //   2. Taker1 fills 100 → maker cum=100, leaves=100
+        //   3. Maker replaces to IOC @ 9, qty=200 (new total order qty)
+        //   4. Only 100 available at 9 (taker2's resting BUY 100 @ 9)
+        //   5. IOC fills 100, residual 100 dropped
+        //   6. Maker's ER_Trade must have cumQty=200, leavesQty=0 (NOT 100)
+        var (disp, _, outbound) = NewDispatcher();
+        var maker = new FakeSession(outbound);
+        var taker1 = new FakeSession(outbound);
+        var taker2 = new FakeSession(outbound);
+
+        // Step 1: Maker rests SELL 200 @ 10.
+        disp.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 7, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 50UL);
+        DrainInbound(disp);
+        long makerOrderId = maker.News[0].OrderId;
+
+        // Step 2: First taker fills 100 → maker cum=100, leaves=100.
+        disp.EnqueueNewOrder(new NewOrderCommand("T1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 2_000UL),
+            taker1.Id, taker1.EnteringFirm, clOrdIdValue: 201UL);
+        DrainInbound(disp);
+        Assert.Equal((100L, 100L), maker.TradeQty[^1]); // leaves=100, cum=100
+
+        // Step 3: Second taker rests 100 @ 9 to provide partial liquidity.
+        // Quantity must be a lot-size multiple (100). The IOC will fill this
+        // 100 but still have a 100-lot residual that gets dropped.
+        disp.EnqueueNewOrder(new NewOrderCommand("T2", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 9, 3_000UL),
+            taker2.Id, taker2.EnteringFirm, clOrdIdValue: 202UL);
+        DrainInbound(disp);
+
+        // Step 4: Maker replaces to IOC @ 9, qty=200 (priority lost → DEL + NEW as IOC).
+        // _aggressorOrigQty = orig.CumQty(100) + NewQuantity(200) = 300
+        // Only 100 lots are available at 9, so IOC fills 100 and drops residual 100.
+        disp.EnqueueReplace(new ReplaceOrderCommand("M2", Petr, makerOrderId, Px(9m), 200, 4_000UL) { NewTif = TimeInForce.IOC },
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 51UL, origClOrdIdValue: 50UL);
+        DrainInbound(disp);
+
+        // Step 5: verify terminal ER_Trade: cumQty=200, leavesQty=0.
+        // Without the fix _aggressorOrigQty=300, aggCum=200, naive leaves=100.
+        Assert.Equal(2, maker.TradeQty.Count);
+        Assert.Equal((0L, 200L), maker.TradeQty[^1]); // leavesQty=0, cumQty=200
+    }
+
+    [Fact]
+    public void Issue484_IOC_MultiFill_IntermediateERsHaveNaturalLeavesQty()
+    {
+        // Issue #484 (multi-fill guard): an IOC aggressor that sweeps multiple
+        // resting orders must emit the correct natural leavesQty on all
+        // intermediate fills and only 0 on the final fill.
+        var (disp, _, outbound) = NewDispatcher();
+        var m1 = new FakeSession(outbound) { EnteringFirm = 7 };
+        var m2 = new FakeSession(outbound) { EnteringFirm = 8 };
+        var taker = new FakeSession(outbound) { EnteringFirm = 9 };
+
+        // Two resting SELLs at 10.
+        disp.EnqueueNewOrder(new NewOrderCommand("M1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            m1.Id, m1.EnteringFirm, clOrdIdValue: 11UL);
+        DrainInbound(disp);
+        disp.EnqueueNewOrder(new NewOrderCommand("M2", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 1_500UL),
+            m2.Id, m2.EnteringFirm, clOrdIdValue: 12UL);
+        DrainInbound(disp);
+
+        // IOC BUY 300 @ 10 — only 200 available, fills 100 + 100, drops residual 100.
+        disp.EnqueueNewOrder(new NewOrderCommand("T", Petr, Side.Buy, OrderType.Limit, TimeInForce.IOC, Px(10m), 300, 9, 2_000UL),
+            taker.Id, taker.EnteringFirm, clOrdIdValue: 99UL);
+        DrainInbound(disp);
+
+        // Taker (aggressor IOC) gets 2 fills:
+        //   fill 1 (intermediate): cumQty=100, leavesQty=200  (NOT 0)
+        //   fill 2 (terminal):     cumQty=200, leavesQty=0
+        Assert.Equal(2, taker.TradeQty.Count);
+        Assert.Equal((200L, 100L), taker.TradeQty[0]); // intermediate: leaves=200, cum=100
+        Assert.Equal((0L, 200L), taker.TradeQty[1]);   // terminal: leaves=0, cum=200
+    }
 
     [Fact]
     public async Task Issue321_OperatorUncrossAuction_ReservedToOpen_EmitsAuctionPrintAndPhaseChange()

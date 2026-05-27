@@ -250,7 +250,17 @@ public sealed partial class ChannelDispatcher
         {
             switch (item.Kind)
             {
-                case WorkKind.New: _metrics?.IncOrdersIn(); BeginAggressor(item.NewOrder!.Quantity); _engine.Submit(item.NewOrder!); break;
+                case WorkKind.New:
+                    {
+                        _metrics?.IncOrdersIn();
+                        var newOrder = item.NewOrder!;
+                        BeginAggressor(newOrder.Quantity);
+                        // Issue #484: IOC/FOK orders are always terminal — never rest.
+                        // Flag so OnTrade forces leavesQty=0 on every fill.
+                        _aggressorIsIoc = newOrder.Tif is B3.Exchange.Matching.TimeInForce.IOC or B3.Exchange.Matching.TimeInForce.FOK;
+                        _engine.Submit(newOrder);
+                        break;
+                    }
                 case WorkKind.Cancel:
                     {
                         _metrics?.IncOrdersIn();
@@ -286,6 +296,10 @@ public sealed partial class ChannelDispatcher
                             _aggressorOrigQty = orig.CumQty + replace.NewQuantity;
                             _aggressorCumQty = orig.CumQty;
                         }
+                        // Issue #484: if the Replace changes TIF to IOC/FOK the
+                        // replacement order is terminal and leavesQty must be 0
+                        // on every ER_Trade (see OnTrade / _aggressorIsIoc).
+                        _aggressorIsIoc = replace.NewTif is B3.Exchange.Matching.TimeInForce.IOC or B3.Exchange.Matching.TimeInForce.FOK;
                         _engine.Replace(replace);
                         break;
                     }
@@ -470,6 +484,18 @@ public sealed partial class ChannelDispatcher
             _currentReceivedTimeNanos = ulong.MaxValue;
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
+            // Issue #484: flush the last buffered IOC aggressor ER with
+            // leavesQty=0 before clearing the IOC flag and session context.
+            if (_hasPendingIocER)
+            {
+                _outbound.WriteExecutionReportTrade(_pendingIocER.Session, _pendingIocER.Event,
+                    isAggressor: true, ownerOrderId: _pendingIocER.OwnerOrderId,
+                    clOrdIdValue: _pendingIocER.ClOrdId,
+                    leavesQty: 0, cumQty: _pendingIocER.CumQty,
+                    durability: _pendingIocER.Durability);
+                _hasPendingIocER = false;
+            }
+            _aggressorIsIoc = false;
             engineSpan?.Dispose();
         }
     }
