@@ -35,6 +35,13 @@ public sealed class TcpTransport : IAsyncDisposable
     private int _isOpen = 1;
     private long _lastOutboundTickMs;
     private Task? _sendTask;
+    /// <summary>
+    /// Issue #487: tracks frames that have been dequeued but not yet fully
+    /// written to the socket. WaitForSendQueueDrainAsync must wait for both
+    /// SendQueueDepth == 0 AND this counter == 0 to guarantee all frames
+    /// have reached the wire.
+    /// </summary>
+    private int _inFlightFrames;
 
     /// <summary>
     /// Issue #312: per-frame envelope tying the encoded bytes to the
@@ -78,9 +85,9 @@ public sealed class TcpTransport : IAsyncDisposable
     public long LastOutboundTickMs => Volatile.Read(ref _lastOutboundTickMs);
 
     /// <summary>
-    /// Issue #487: waits until the send queue drains to empty (all queued
-    /// frames have been written to the socket) or the timeout expires.
-    /// Returns true if the queue drained within the timeout, false if
+    /// Issue #487: waits until the send queue drains to empty AND all
+    /// in-flight frames have been written to the socket, or the timeout
+    /// expires. Returns true if drained within the timeout, false if
     /// timed out or transport closed. Call before <see cref="Close"/> to
     /// ensure pending frames reach the wire.
     /// </summary>
@@ -88,7 +95,10 @@ public sealed class TcpTransport : IAsyncDisposable
     {
         if (!IsOpen) return false;
         var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
-        while (SendQueueDepth > 0)
+        // Must wait for both: queued frames AND in-flight frame (dequeued but
+        // not yet written). The send loop increments _inFlightFrames before
+        // dequeue and decrements after WriteAsync completes.
+        while (SendQueueDepth > 0 || Volatile.Read(ref _inFlightFrames) > 0)
         {
             if (!IsOpen) return false;
             if (Environment.TickCount64 >= deadline) return false;
@@ -189,6 +199,9 @@ public sealed class TcpTransport : IAsyncDisposable
         {
             await foreach (var frame in _sendQueue.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
+                // Issue #487: track in-flight frame for drain synchronization.
+                // Increment immediately after dequeue, decrement after write.
+                Interlocked.Increment(ref _inFlightFrames);
                 try
                 {
                     try
@@ -225,6 +238,10 @@ public sealed class TcpTransport : IAsyncDisposable
                     _logger.LogWarning(ex, "tcp transport {ConnectionId} send IO error; closing", _connectionId);
                     Close("send-io-error");
                     return;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _inFlightFrames);
                 }
             }
         }
