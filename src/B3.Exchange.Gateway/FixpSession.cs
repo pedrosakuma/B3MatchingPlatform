@@ -135,6 +135,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// (throttling disabled). Mutated only on the receive thread.
     /// </summary>
     private InboundThrottle? _throttle;
+    /// <summary>
+    /// Issue #485: callback invoked when <see cref="Identity"/> changes
+    /// (after successful Negotiate). Used by <see cref="SessionRegistry"/>
+    /// to re-index the session under its new stable identity.
+    /// </summary>
+    private readonly Action<FixpSession, ContractsSessionId, ContractsSessionId>? _onIdentityChanged;
 
     public long ConnectionId { get; }
 
@@ -181,9 +187,43 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// <summary>Stable, transport-neutral identity of this session as seen
     /// by Core / Contracts. Routing key the Gateway uses to resolve
     /// outbound ExecutionReports back to this <see cref="FixpSession"/>.
-    /// Derived from <see cref="ConnectionId"/> until Phase 2 introduces a
-    /// <c>SessionRegistry</c> backed by authentication.</summary>
-    public ContractsSessionId Identity { get; }
+    ///
+    /// <para>Issue #485: derived from the FIXP <see cref="SessionId"/> (uint)
+    /// so order ownership survives TCP reconnections. Format is the decimal
+    /// string of the FIXP SessionId (e.g. "12345"). For sessions that have
+    /// not yet completed Negotiate, uses a temporary "pending-{connectionId}"
+    /// format; the dispatcher will not accept business messages from such
+    /// sessions (Establish gate enforces this), so no orders can be registered
+    /// under a pending identity.</para></summary>
+    public ContractsSessionId Identity { get; private set; }
+
+    /// <summary>
+    /// Issue #485: updates <see cref="Identity"/> to the stable FIXP SessionId
+    /// after successful Negotiate and notifies the registry to re-index.
+    /// Called from both the legacy and credentials-based Negotiate paths.
+    /// Returns the old identity so the caller can roll back if needed.
+    /// </summary>
+    private ContractsSessionId UpdateIdentityAfterNegotiate(uint fixpSessionId)
+    {
+        var oldIdentity = Identity;
+        var newIdentity = new ContractsSessionId(fixpSessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Identity = newIdentity;
+        _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+        return oldIdentity;
+    }
+
+    /// <summary>
+    /// Issue #485: restores <see cref="Identity"/> to a previous value and
+    /// re-indexes the registry. Used when Negotiate rollback is needed
+    /// (e.g., persistence failure after identity update).
+    /// </summary>
+    private void RollbackIdentity(ContractsSessionId oldIdentity)
+    {
+        var current = Identity;
+        Identity = oldIdentity;
+        _onIdentityChanged?.Invoke(this, current, oldIdentity);
+    }
+
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
 
     /// <summary>
@@ -320,13 +360,21 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
         bool resumeAsNegotiated = false,
-        int? persistedMaxOrderRatePerSecond = null)
+        int? persistedMaxOrderRatePerSecond = null,
+        Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
-        Identity = new ContractsSessionId("conn-" + connectionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        // Issue #485: Identity is now based on FIXP SessionId (stable across
+        // reconnections) rather than connectionId. For sessions rehydrating
+        // from persisted state, use the known SessionId immediately. For
+        // fresh sessions (SessionId=0 until Negotiate), use a temporary
+        // "pending-" prefix; UpdateIdentity() will be called after Negotiate.
+        Identity = sessionId != 0
+            ? new ContractsSessionId(sessionId.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            : new ContractsSessionId("pending-" + connectionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _sink = sink;
         _logger = logger;
         _transportLogger = transportLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<TcpTransport>.Instance;
@@ -335,6 +383,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         _nowMs = nowMs ?? (() => Environment.TickCount64);
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
+        _onIdentityChanged = onIdentityChanged;
         if (persistedMaxOrderRatePerSecond is < 0)
             throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;
@@ -351,6 +400,8 @@ public sealed partial class FixpSession : IAsyncDisposable
             SessionVerId = state.SessionVerId;
             EnteringFirm = state.EnteringFirm;
             LastIncomingSeqNo = state.LastIncomingSeqNo;
+            // Issue #485: update Identity to match the rehydrated SessionId.
+            Identity = new ContractsSessionId(state.SessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
             // Reconcile: prefer max(snapshot, journal.MaxSeq) so an
             // older snapshot doesn't roll the outbound seq backwards
             // and collide with frames already persisted in the journal.

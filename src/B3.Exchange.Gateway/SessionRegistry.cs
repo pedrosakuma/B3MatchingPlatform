@@ -44,6 +44,22 @@ public sealed class SessionRegistry
         _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(session.Identity, session));
     }
 
+    /// <summary>
+    /// Issue #485: atomically re-indexes a session when its Identity changes
+    /// (after successful Negotiate). Removes the session under the old identity
+    /// and registers it under the new identity. No-op when identities match.
+    /// </summary>
+    public void UpdateIdentity(FixpSession session, SessionId oldIdentity, SessionId newIdentity)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        // Avoid unnecessary churn when identity hasn't changed (e.g., rehydrated sessions)
+        if (oldIdentity == newIdentity) return;
+        // Publish new key BEFORE removing old key to minimize routing miss window
+        _sessions[newIdentity] = session;
+        // Remove old key only if it still points to this session
+        _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(oldIdentity, session));
+    }
+
     public bool TryGet(SessionId session, out FixpSession value)
         => _sessions.TryGetValue(session, out value!);
 }

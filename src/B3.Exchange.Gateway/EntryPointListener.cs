@@ -519,6 +519,11 @@ public sealed class EntryPointListener : IAsyncDisposable
             _onSessionClosed?.Invoke(s, reason);
         };
 
+        // Issue #485: callback to re-index the session in the registry when
+        // Identity changes from pending-{connId} to the stable FIXP SessionId.
+        Action<FixpSession, B3.Exchange.Contracts.SessionId, B3.Exchange.Contracts.SessionId> onIdentityChanged =
+            (s, oldId, newId) => _registry.UpdateIdentity(s, oldId, newId);
+
         Stream sessionStream = firstFrame is null ? stream : new PrependedStream(firstFrame, stream);
         var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
             sessionStream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
@@ -531,7 +536,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             statePersister: _statePersister,
             persistedState: persistedState,
             resumeAsNegotiated: resumeAsNegotiated,
-            persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond);
+            persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond,
+            onIdentityChanged: onIdentityChanged);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();
