@@ -143,4 +143,97 @@ public class SessionClaimRegistryTests
         Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted, result);
         Assert.Equal(11UL, r.CurrentSessionVerId(42));
     }
+
+    // ===== TryForceTakeOver (issue #488) =====
+
+    [Fact]
+    public void TryForceTakeOver_HigherVersion_EvictsExistingClaim()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        var result = r.TryForceTakeOver(42, 6, newToken, out var evicted);
+
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted, result);
+        Assert.Same(oldToken, evicted);
+        Assert.Equal(6UL, r.CurrentSessionVerId(42));
+        Assert.Equal(1, r.ActiveCount);
+        // New token is now the claim holder.
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
+        Assert.Same(newToken, holder);
+    }
+
+    [Fact]
+    public void TryForceTakeOver_SameVersion_RejectsAsStale()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var result = r.TryForceTakeOver(42, 5, new object(), out var evicted);
+
+        Assert.Equal(SessionClaimRegistry.ClaimResult.StaleVersion, result);
+        Assert.Null(evicted);
+        // Old claim is still active.
+        Assert.Equal(1, r.ActiveCount);
+    }
+
+    [Fact]
+    public void TryForceTakeOver_LowerVersion_RejectsAsStale()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 10, oldToken);
+
+        var result = r.TryForceTakeOver(42, 9, new object(), out var evicted);
+
+        Assert.Equal(SessionClaimRegistry.ClaimResult.StaleVersion, result);
+        Assert.Null(evicted);
+    }
+
+    [Fact]
+    public void TryForceTakeOver_ZeroVersion_RejectsAsZero()
+    {
+        var r = new SessionClaimRegistry();
+        r.TryClaim(42, 5, new object());
+        var result = r.TryForceTakeOver(42, 0, new object(), out var evicted);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.ZeroVersion, result);
+        Assert.Null(evicted);
+    }
+
+    [Fact]
+    public void TryForceTakeOver_NoClaim_AcceptsAndRegisters()
+    {
+        // No existing claim: TryForceTakeOver behaves like a regular TryClaim.
+        var r = new SessionClaimRegistry();
+        var token = new object();
+        var result = r.TryForceTakeOver(42, 7, token, out var evicted);
+
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted, result);
+        Assert.Null(evicted); // nothing was evicted
+        Assert.Equal(7UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void TryForceTakeOver_OldSessionRelease_IsNoopAfterTakeover()
+    {
+        // After TryForceTakeOver, the old session calls Release. Since the
+        // registry now holds the new token, Release must be a no-op (it
+        // should NOT evict the new session's claim).
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _);
+        // Simulate old session calling Release during its CloseLocked.
+        r.Release(42, oldToken);
+
+        // New claim must still be active.
+        Assert.Equal(1, r.ActiveCount);
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
+        Assert.Same(newToken, holder);
+    }
 }

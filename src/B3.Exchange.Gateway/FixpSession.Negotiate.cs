@@ -126,6 +126,28 @@ public sealed partial class FixpSession
         // sessionID (or the version is stale by the time we commit), we
         // must reject — spec §4.5.2.
         var claim = _claims.TryClaim(req.SessionId, req.SessionVerId, this);
+        // Issue #488: track a stale session evicted by TryForceTakeOver. The
+        // close is deferred until AFTER TrySaveStateSnapshot succeeds so that
+        // a persistence rollback does not leave order ownership orphaned with
+        // no live session to own it — the old session's TCP will time out
+        // naturally and call OnSessionClosed via the TransportError path.
+        FixpSession? evictedByTakeOver = null;
+        if (claim == SessionClaimRegistry.ClaimResult.DuplicateConnection)
+        {
+            // Session takeover — the peer crashed and reconnected before our
+            // idle-timeout detected the dead TCP. If the new sessionVerId is
+            // strictly greater, atomically evict the stale claim and continue
+            // to the accept path.
+            claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
+                out var evicted);
+            if (claim == SessionClaimRegistry.ClaimResult.Accepted && evicted is FixpSession oldSession)
+            {
+                _logger.LogInformation(
+                    "session {ConnectionId} taking over sessionId={SessionId} from {OldConnectionId} (new verId={NewVerId})",
+                    ConnectionId, req.SessionId, oldSession.ConnectionId, req.SessionVerId);
+                evictedByTakeOver = oldSession;
+            }
+        }
         if (claim != SessionClaimRegistry.ClaimResult.Accepted)
         {
             var code = claim switch
@@ -187,6 +209,9 @@ public sealed partial class FixpSession
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,
             req.TimestampNanos, outcome.Firm.EnteringFirmCode,
             semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
+        // Issue #488: persistence committed — safe to evict the stale session now.
+        // Its Release() call is a no-op (registry already holds this session's token).
+        evictedByTakeOver?.Close("session-takeover:evicted-by-newer-verId", CloseKind.SessionTakeOver);
         return NegotiateStep.Accepted(responseFrame,
             $"negotiate-accept (sid={req.SessionId} firm={outcome.Firm.Id})");
     }

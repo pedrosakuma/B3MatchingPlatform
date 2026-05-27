@@ -24,8 +24,8 @@ namespace B3.Exchange.Gateway;
 /// </summary>
 public sealed record FixpSessionOptions
 {
-    public int HeartbeatIntervalMs { get; init; } = 30_000;
-    public int IdleTimeoutMs { get; init; } = 30_000;
+    public int HeartbeatIntervalMs { get; init; } = 10_000;
+    public int IdleTimeoutMs { get; init; } = 10_000;
     public int TestRequestGraceMs { get; init; } = 5_000;
     public int SuspendedTimeoutMs { get; init; } = 5 * 60_000;
     /// <summary>
