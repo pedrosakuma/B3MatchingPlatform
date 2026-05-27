@@ -253,6 +253,56 @@ public sealed class EntryPointListener : IAsyncDisposable
     }
 
     /// <summary>
+    /// Issue #487: waits for all live sessions' outbound queues to drain
+    /// before closing. Prevents frames (e.g., ER_Cancel from option expiry
+    /// sweep) from being lost when <see cref="TerminateAllSessions"/> closes
+    /// sockets. Per-session failures are logged and swallowed so one stuck
+    /// session never blocks the rest.
+    /// </summary>
+    public async Task DrainAllSessionsOutboundAsync(TimeSpan timeout)
+    {
+        FixpSession[] snapshot;
+        lock (_lock) snapshot = _sessions.ToArray();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int drained = 0, pending = 0, closed = 0;
+        var tasks = new List<Task<(FixpSession s, bool ok)>>(snapshot.Length);
+        foreach (var s in snapshot)
+        {
+            if (!s.IsOpen) { closed++; continue; }
+            if (s.SendQueueDepth == 0) { drained++; continue; }
+            pending++;
+            tasks.Add(DrainOneAsync(s, timeout));
+        }
+        if (tasks.Count > 0)
+        {
+            var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+            foreach (var (s, ok) in results)
+            {
+                if (ok) drained++;
+                else _logger.LogWarning(
+                    "drain-outbound: session {ConnectionId} timed out with {Depth} frames pending",
+                    s.ConnectionId, s.SendQueueDepth);
+            }
+        }
+        _logger.LogInformation(
+            "drain-outbound: drained={Drained} timedOut={TimedOut} alreadyClosed={Closed} duration={DurationMs}ms",
+            drained, pending - (drained - (snapshot.Length - pending - closed)), closed, sw.ElapsedMilliseconds);
+    }
+
+    private static async Task<(FixpSession s, bool ok)> DrainOneAsync(FixpSession s, TimeSpan timeout)
+    {
+        try
+        {
+            var ok = await s.WaitForSendQueueDrainAsync(timeout).ConfigureAwait(false);
+            return (s, ok);
+        }
+        catch
+        {
+            return (s, false);
+        }
+    }
+
+    /// <summary>
     /// Graceful-shutdown phase 1 (issue #171 / A7): stop accepting new TCP
     /// connections without closing the existing sessions or unbinding the
     /// listening socket. The accept loop and the suspended-session reaper

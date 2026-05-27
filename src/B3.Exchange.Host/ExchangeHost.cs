@@ -98,6 +98,13 @@ public sealed class ExchangeHost : IAsyncDisposable
         // guarantees the resting orders' cancels reach the wire
         // before TerminateAllSessions closes the sockets.
         _optionExpirySweeper?.SweepExpiredSeries(reason, waitTimeout: TimeSpan.FromSeconds(15));
+        // Issue #487: drain outbound queues BEFORE closing sockets.
+        // ER_Cancel frames from the sweep are enqueued to the session's
+        // send queue but may not have been written to the socket yet.
+        // Without this drain, TerminateAllSessions can close the socket
+        // while frames are still pending, causing clients to see EOF
+        // instead of the ER_Cancel.
+        _listener?.DrainAllSessionsOutboundAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
         var listener = _listener;
         int terminated = listener is null ? -1 : listener.TerminateAllSessions(reason, closeKind);
         // Issue #330 PR-3 (review BLOCKING): drain per-channel inbound
@@ -1217,7 +1224,17 @@ public sealed class ExchangeHost : IAsyncDisposable
                 sw.ElapsedMilliseconds, residual);
         }
 
-        // Phase 4: broadcast Terminate(Finished) and close each session.
+        // Phase 4: drain outbound queues then broadcast Terminate(Finished).
+        // Issue #487: ensure pending ER frames reach the wire before close.
+        sw.Restart();
+        if (_listener != null)
+        {
+            try { await _listener.DrainAllSessionsOutboundAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "drain-outbound threw"); }
+        }
+        sw.Stop();
+        _logger.LogInformation("shutdown phase=drain-outbound duration={DurationMs}ms", sw.ElapsedMilliseconds);
+
         sw.Restart();
         int terminated = 0;
         if (_listener != null)
