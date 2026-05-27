@@ -146,9 +146,8 @@ public sealed partial class FixpSession
         _claimedSessionId = req.SessionId;
         _ = ApplyTransition(FixpEvent.Negotiate);
         // Issue #485: update Identity to the stable FIXP SessionId and notify
-        // the registry to re-index. This must happen BEFORE TrySaveStateSnapshot
-        // so the persisted state uses the correct identity format.
-        UpdateIdentityAfterNegotiate(req.SessionId);
+        // the registry to re-index. Capture the old identity for rollback.
+        var pendingIdentity = UpdateIdentityAfterNegotiate(req.SessionId);
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
@@ -170,6 +169,9 @@ public sealed partial class FixpSession
             SessionId = 0;
             SessionVerId = 0;
             EnteringFirm = 0;
+            // Issue #485: roll back Identity to the pending format so
+            // OnSessionClosed doesn't evict ownership for a real session.
+            RollbackIdentity(pendingIdentity);
             // No spec-defined "internal error" reject code; UNSPECIFIED
             // (0) is the closest match. The peer will retry.
             var rejectFrame = new byte[NegotiateRejectEncoder.Total];

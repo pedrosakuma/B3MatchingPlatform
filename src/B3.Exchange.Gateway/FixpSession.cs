@@ -201,13 +201,27 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Issue #485: updates <see cref="Identity"/> to the stable FIXP SessionId
     /// after successful Negotiate and notifies the registry to re-index.
     /// Called from both the legacy and credentials-based Negotiate paths.
+    /// Returns the old identity so the caller can roll back if needed.
     /// </summary>
-    private void UpdateIdentityAfterNegotiate(uint fixpSessionId)
+    private ContractsSessionId UpdateIdentityAfterNegotiate(uint fixpSessionId)
     {
         var oldIdentity = Identity;
         var newIdentity = new ContractsSessionId(fixpSessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         Identity = newIdentity;
         _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+        return oldIdentity;
+    }
+
+    /// <summary>
+    /// Issue #485: restores <see cref="Identity"/> to a previous value and
+    /// re-indexes the registry. Used when Negotiate rollback is needed
+    /// (e.g., persistence failure after identity update).
+    /// </summary>
+    private void RollbackIdentity(ContractsSessionId oldIdentity)
+    {
+        var current = Identity;
+        Identity = oldIdentity;
+        _onIdentityChanged?.Invoke(this, current, oldIdentity);
     }
 
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;

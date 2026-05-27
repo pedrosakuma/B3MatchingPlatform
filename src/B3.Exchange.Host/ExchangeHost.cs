@@ -610,13 +610,14 @@ public sealed class ExchangeHost : IAsyncDisposable
                 var connectionId = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
                 // Pre-Negotiate placeholder: firm/session are stamped from
                 // a default and rewritten by FixpSession on a successful
-                // Negotiate. SessionId here is just a unique pre-handshake
-                // tag for log correlation.
+                // Negotiate. Issue #485: SessionId=0 so Identity uses
+                // "pending-{connId}" format until Negotiate completes,
+                // avoiding collision with real FIXP SessionIds.
                 var enteringFirm = defaultSession.firmCode;
                 return new EntryPointListener.AcceptedConnection(
                     ConnectionId: connectionId,
                     EnteringFirm: enteringFirm,
-                    SessionId: (uint)(connectionId & 0xFFFFFFFFu));
+                    SessionId: 0);
             },
             sessionOptions: sessionOptions,
             onSessionClosed: (s, reason) => _logger.LogInformation("session {ConnectionId} closed: {Reason}", s.ConnectionId, reason),
