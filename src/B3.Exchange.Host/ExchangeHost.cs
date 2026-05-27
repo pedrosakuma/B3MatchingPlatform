@@ -305,7 +305,18 @@ public sealed class ExchangeHost : IAsyncDisposable
             // Resolve the policy here so the dispatcher can stay
             // host-agnostic (it just gets a predicate + enum).
             var orphanPolicy = ParseOrphanPolicy(ch.Persistence?.OrphanSessionPolicy);
-            Func<string, bool> sessionExists = sid => firmRegistry.FindSession(sid) is not null;
+            // Issue #485: sessionExists now checks if the sessionId is a known
+            // FIXP session credential (new format: numeric string like "12345").
+            // Legacy snapshots with "conn-*" format will always return false
+            // (treated as orphans per user's migration choice).
+            Func<string, bool> sessionExists = sid =>
+            {
+                // Legacy "conn-*" or "pending-*" format: always orphan
+                if (sid.StartsWith("conn-", StringComparison.Ordinal) ||
+                    sid.StartsWith("pending-", StringComparison.Ordinal))
+                    return false;
+                return firmRegistry.FindSession(sid) is not null;
+            };
             // ADR 0008 PR-2: rebuild the bust dedup index from on-disk
             // audit files within the retention window so a restart picks
             // up where the previous run left off. Only meaningful when

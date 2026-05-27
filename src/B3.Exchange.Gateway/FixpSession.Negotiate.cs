@@ -84,6 +84,8 @@ public sealed partial class FixpSession
                 return NegotiateStep.Rejected(rejectFrame,
                     $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
             }
+            // Issue #485: update Identity to stable FIXP SessionId (legacy path).
+            UpdateIdentityAfterNegotiate(req.SessionId);
             SessionId = req.SessionId;
             EnteringFirm = req.EnteringFirm;
             SessionVerId = req.SessionVerId;
@@ -143,6 +145,10 @@ public sealed partial class FixpSession
 
         _claimedSessionId = req.SessionId;
         _ = ApplyTransition(FixpEvent.Negotiate);
+        // Issue #485: update Identity to the stable FIXP SessionId and notify
+        // the registry to re-index. This must happen BEFORE TrySaveStateSnapshot
+        // so the persisted state uses the correct identity format.
+        UpdateIdentityAfterNegotiate(req.SessionId);
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
