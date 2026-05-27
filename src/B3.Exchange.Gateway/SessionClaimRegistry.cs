@@ -242,4 +242,29 @@ public sealed class SessionClaimRegistry
             }
         }
     }
+
+    /// <summary>
+    /// Rolls back a failed <see cref="TryForceTakeOver"/> by atomically
+    /// restoring the evicted session's claim and reverting
+    /// <c>_lastSessionVerId</c> to the pre-takeover value. Only acts
+    /// when <paramref name="newToken"/> still holds the active claim
+    /// (guards against a concurrent takeover winning the registry
+    /// between the failed persist and this restore call). Safe to call
+    /// multiple times; idempotent when the claim has already moved on.
+    /// </summary>
+    public void TryRestoreTakeOver(uint sessionId, object newToken,
+        object oldToken, ulong oldVerId)
+    {
+        ArgumentNullException.ThrowIfNull(newToken);
+        ArgumentNullException.ThrowIfNull(oldToken);
+        lock (_lock)
+        {
+            if (_activeClaims.TryGetValue(sessionId, out var current) &&
+                ReferenceEquals(current, newToken))
+            {
+                _activeClaims[sessionId] = oldToken;
+                _lastSessionVerId[sessionId] = oldVerId;
+            }
+        }
+    }
 }

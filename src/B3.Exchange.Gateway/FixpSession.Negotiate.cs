@@ -132,6 +132,7 @@ public sealed partial class FixpSession
         // no live session to own it — the old session's TCP will time out
         // naturally and call OnSessionClosed via the TransportError path.
         FixpSession? evictedByTakeOver = null;
+        ulong evictedVerId = 0UL;
         if (claim == SessionClaimRegistry.ClaimResult.DuplicateConnection)
         {
             // Session takeover — the peer crashed and reconnected before our
@@ -146,6 +147,7 @@ public sealed partial class FixpSession
                     "session {ConnectionId} taking over sessionId={SessionId} from {OldConnectionId} (new verId={NewVerId})",
                     ConnectionId, req.SessionId, oldSession.ConnectionId, req.SessionVerId);
                 evictedByTakeOver = oldSession;
+                evictedVerId = oldSession.SessionVerId;
             }
         }
         if (claim != SessionClaimRegistry.ClaimResult.Accepted)
@@ -186,6 +188,17 @@ public sealed partial class FixpSession
             // can be retried by the peer (same SessionVerID, same TCP
             // connection or a new one); without this the second attempt
             // would hit DUPLICATE_SESSION_CONNECTION.
+            //
+            // For a takeover, also restore the evicted session's claim so
+            // the old TCP (still alive) remains the authoritative owner
+            // rather than being left unclaimed. TryRestoreTakeOver is a
+            // no-op if a concurrent racing takeover has already won the
+            // registry in the window between TryForceTakeOver and here.
+            if (evictedByTakeOver is not null)
+            {
+                _claims.TryRestoreTakeOver(req.SessionId, this,
+                    evictedByTakeOver, evictedVerId);
+            }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
             SessionId = 0;

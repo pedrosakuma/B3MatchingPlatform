@@ -1,6 +1,7 @@
 using B3.Exchange.Contracts;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net;
@@ -56,7 +57,8 @@ public class FixpSessionTakeoverTests
 
     private static EntryPointListener BuildListener(
         FirmRegistry firms, SessionClaimRegistry claims,
-        NegotiationValidator negValidator, EstablishValidator estValidator)
+        NegotiationValidator negValidator, EstablishValidator estValidator,
+        IFixpSessionStatePersister? statePersister = null)
         => new(
             new IPEndPoint(IPAddress.Loopback, 0),
             new NoOpEngineSink(),
@@ -72,7 +74,30 @@ public class FixpSessionTakeoverTests
             },
             negotiationValidator: negValidator,
             sessionClaims: claims,
-            establishValidator: estValidator);
+            establishValidator: estValidator,
+            statePersister: statePersister);
+
+    private sealed class RecordingStatePersister : IFixpSessionStatePersister
+    {
+        private readonly object _lock = new();
+        private FixpSessionStateSnapshot? _last;
+
+        public FixpSessionStateSnapshot? LastSaved
+        {
+            get { lock (_lock) return _last; }
+        }
+
+        public void Save(in FixpSessionStateSnapshot snapshot)
+        {
+            lock (_lock) _last = snapshot;
+        }
+
+        public FixpSessionStateSnapshot? Load(uint sessionId) => null;
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
+            => Array.Empty<FixpSessionStateSnapshot>();
+        public void Remove(uint sessionId) { }
+        public void Dispose() { }
+    }
 
     /// <summary>
     /// Issue #492: trading-host crashes (old TCP still alive from exchange POV),
@@ -161,5 +186,74 @@ public class FixpSessionTakeoverTests
         // New session (verId=3) claim must be held in the registry.
         Assert.True(claims.TryGetActiveClaim(1u, out _, out var claimedVerId));
         Assert.Equal(3UL, claimedVerId);
+    }
+
+    /// <summary>
+    /// After a successful takeover, the persisted snapshot must reflect the
+    /// new session's verId (3), not the evicted session's verId (2).
+    /// Bug: before the fix, CloseLocked called SaveStateSnapshotSafe() for
+    /// the evicted session (kind=SessionTakeOver), overwriting the new
+    /// session's snapshot with the old verId.
+    /// </summary>
+    [Fact]
+    public async Task TakeOver_WithStatePersister_FinalSnapshotHasNewVerid()
+    {
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[] { new SessionCredential(SessionId: "1", FirmId: "F1", AccessKey: "",
+                AllowedSourceCidrs: null, Policy: SessionPolicy.Default) });
+        var claims = new SessionClaimRegistry();
+        var negValidator = new NegotiationValidator(firms, claims, devMode: true,
+            timestampSkewToleranceNs: 0);
+        var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
+        var persister = new RecordingStatePersister();
+
+        await using var listener = BuildListener(firms, claims, negValidator, estValidator,
+            statePersister: persister);
+        listener.Start();
+
+        var creds = Encoding.UTF8.GetBytes("{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
+        var buf = new byte[512];
+
+        // Establish old session (verId=2).
+        using var client1 = new TcpClient();
+        await client1.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var stream1 = client1.GetStream();
+        int len = EntryPointFixpFrameCodec.EncodeNegotiate(buf,
+            sessionId: 1, sessionVerId: 2UL, timestampNanos: 0UL, enteringFirm: 42u,
+            onBehalfFirm: null, credentials: creds,
+            clientIp: ReadOnlySpan<byte>.Empty,
+            clientAppName: ReadOnlySpan<byte>.Empty,
+            clientAppVersion: ReadOnlySpan<byte>.Empty);
+        await stream1.WriteAsync(buf.AsMemory(0, len));
+        using var cts1 = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var (tid1, _) = await ReadOneFrameAsync(stream1, cts1.Token);
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse, tid1);
+
+        // Take over with verId=3.
+        using var client2 = new TcpClient();
+        await client2.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var stream2 = client2.GetStream();
+        len = EntryPointFixpFrameCodec.EncodeNegotiate(buf,
+            sessionId: 1, sessionVerId: 3UL, timestampNanos: 0UL, enteringFirm: 42u,
+            onBehalfFirm: null, credentials: creds,
+            clientIp: ReadOnlySpan<byte>.Empty,
+            clientAppName: ReadOnlySpan<byte>.Empty,
+            clientAppVersion: ReadOnlySpan<byte>.Empty);
+        await stream2.WriteAsync(buf.AsMemory(0, len));
+        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var (tid2, _) = await ReadOneFrameAsync(stream2, cts2.Token);
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse, tid2);
+
+        // Wait for the old session to be evicted.
+        await TestUtil.WaitUntilAsync(
+            () => !listener.ActiveSessions.Any(s => s.SessionId == 1 && s.SessionVerId == 2UL),
+            TimeSpan.FromSeconds(5));
+
+        // The persisted snapshot MUST carry verId=3 (the new session), not
+        // verId=2 (the evicted session). Before the fix, the evicted session's
+        // CloseLocked called SaveStateSnapshotSafe() and overwrote the file.
+        Assert.NotNull(persister.LastSaved);
+        Assert.Equal(3UL, persister.LastSaved!.Value.SessionVerId);
     }
 }
