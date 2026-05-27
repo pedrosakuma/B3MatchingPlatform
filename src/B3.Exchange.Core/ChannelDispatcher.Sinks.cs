@@ -305,6 +305,14 @@ public sealed partial class ChannelDispatcher
         // triggered stop the engine rolled internally) — fall back to
         // the per-trade quantity rather than a misleading negative
         // leaves.
+        // Issue #484: IOC/FOK aggressors are always terminal — they never
+        // rest, so the LAST ER_Trade must carry leavesQty=0. We cannot
+        // determine which call is the last directly from OnTrade (the engine
+        // doesn't notify us when the IOC residual is dropped). Instead we
+        // buffer each IOC aggressor ER one step behind: the previous buffered
+        // ER is flushed with its natural leavesQty (intermediate fill), and
+        // the buffered ER from the final fill is emitted with leavesQty=0 in
+        // ProcessOne's finally block (FlushPendingIocAggressorER).
         if (_hasCurrentSession)
         {
             _aggressorCumQty += e.Quantity;
@@ -312,9 +320,36 @@ public sealed partial class ChannelDispatcher
             long aggLeaves = _aggressorOrigQty > 0
                 ? Math.Max(0, _aggressorOrigQty - aggCum)
                 : 0;
-            _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
-                ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
-                leavesQty: aggLeaves, cumQty: aggCum, durability: CurrentDurability);
+            if (_aggressorIsIoc)
+            {
+                if (_hasPendingIocER)
+                {
+                    // Flush previous (intermediate) fill with its natural leavesQty.
+                    _outbound.WriteExecutionReportTrade(_pendingIocER.Session, _pendingIocER.Event,
+                        isAggressor: true, ownerOrderId: _pendingIocER.OwnerOrderId,
+                        clOrdIdValue: _pendingIocER.ClOrdId,
+                        leavesQty: _pendingIocER.LeavesQty, cumQty: _pendingIocER.CumQty,
+                        durability: _pendingIocER.Durability);
+                }
+                // Buffer this fill; emit it in ProcessOne's finally with leavesQty=0.
+                _pendingIocER = new PendingIocTradeER
+                {
+                    Session = _currentSession,
+                    Event = e,
+                    OwnerOrderId = e.AggressorOrderId,
+                    ClOrdId = _currentClOrdId,
+                    LeavesQty = aggLeaves,
+                    CumQty = aggCum,
+                    Durability = CurrentDurability,
+                };
+                _hasPendingIocER = true;
+            }
+            else
+            {
+                _outbound.WriteExecutionReportTrade(_currentSession, e, isAggressor: true,
+                    ownerOrderId: e.AggressorOrderId, clOrdIdValue: _currentClOrdId,
+                    leavesQty: aggLeaves, cumQty: aggCum, durability: CurrentDurability);
+            }
             _metrics?.IncExecutionReport(ExecutionReportKind.Trade);
         }
         // ER_Trade for the resting side: resolve owner locally on the
