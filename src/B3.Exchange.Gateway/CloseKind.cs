@@ -74,4 +74,23 @@ public enum CloseKind
     /// removed.
     /// </summary>
     SuspendedTimeout,
+
+    /// <summary>
+    /// Issue #488: a new connection from the same firm arrived with a
+    /// strictly higher <c>sessionVerID</c> while this session still
+    /// held the active claim. The new connection atomically took over
+    /// the claim; this session is being torn down so the new one can
+    /// proceed. The underlying transport may already be dead (e.g. the
+    /// peer crashed), so this close has the same persistence semantics
+    /// as <see cref="TransportError"/>:
+    /// <list type="bullet">
+    ///   <item>Persisted state is kept (new session can resync).</item>
+    ///   <item>CancelOnDisconnect is NOT fired (orders remain alive
+    ///   and are now owned by the new connection's session).</item>
+    ///   <item><c>OnSessionClosed</c> is NOT invoked (order ownership
+    ///   entries in <c>HostRouter</c> are preserved for routing passive
+    ///   fills to the reconnected session).</item>
+    /// </list>
+    /// </summary>
+    SessionTakeOver,
 }

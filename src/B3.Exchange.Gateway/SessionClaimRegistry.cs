@@ -144,6 +144,49 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Issue #488: atomically evict an existing claim and register a new one
+    /// when the incoming <paramref name="sessionVerId"/> is strictly greater
+    /// than the last recorded version for <paramref name="sessionId"/>. This
+    /// enables the FIXP session-takeover path: a peer that crashed and
+    /// restarted fast (before the server's idle-timeout fired) can reclaim
+    /// its session without being blocked by <see cref="TryClaim"/> returning
+    /// <see cref="ClaimResult.DuplicateConnection"/>.
+    ///
+    /// <para>All state mutations occur under <see cref="_lock"/>, so no
+    /// intermediate state is visible to concurrent callers. The evicted token
+    /// is returned via <paramref name="evictedToken"/> so the caller can close
+    /// the old session AFTER the atomic swap; the old session's own
+    /// <see cref="Release"/> call will then be a no-op (the dictionary value
+    /// no longer matches its token).</para>
+    ///
+    /// <para>Returns <see cref="ClaimResult.Accepted"/> (with a non-null
+    /// <paramref name="evictedToken"/>) when the takeover succeeds, or
+    /// <see cref="ClaimResult.StaleVersion"/> when the version is not
+    /// strictly greater (reject: this is not a legitimate reconnect).</para>
+    /// </summary>
+    public ClaimResult TryForceTakeOver(uint sessionId, ulong sessionVerId,
+        object newToken, out object? evictedToken)
+    {
+        ArgumentNullException.ThrowIfNull(newToken);
+        evictedToken = null;
+        if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
+
+        lock (_lock)
+        {
+            // New verId must be strictly greater than the last recorded
+            // version — the FIXP monotonicity rule still applies.
+            if (_lastSessionVerId.TryGetValue(sessionId, out var last) && sessionVerId <= last)
+                return ClaimResult.StaleVersion;
+
+            // Evict old claim atomically (may or may not exist).
+            _activeClaims.TryGetValue(sessionId, out evictedToken);
+            _activeClaims[sessionId] = newToken;
+            _lastSessionVerId[sessionId] = sessionVerId;
+            return ClaimResult.Accepted;
+        }
+    }
+
+    /// <summary>
     /// Returns the live owner of <paramref name="sessionId"/>, if any,
     /// along with the recorded last-seen sessionVerID. Used by the
     /// rebind path (#69b-2): if the new transport's <c>Establish</c>

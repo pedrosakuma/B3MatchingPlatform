@@ -328,12 +328,18 @@ public sealed partial class FixpSession
         // session (see IInboundCommandSink.OnSessionClosed). Without this the
         // ChannelDispatcher's order-owners map keeps the session rooted for
         // the lifetime of every resting order it placed → unbounded memory.
-        try { _sink.OnSessionClosed(Identity); }
-        catch (Exception ex)
+        // Issue #488: skip for SessionTakeOver — the new session has the same
+        // Identity and has already taken over the claim; evicting ownership
+        // entries here would break routing of passive fills to the new session.
+        if (kind != CloseKind.SessionTakeOver)
         {
-            _logger.LogWarning(ex,
-                "fixp session {ConnectionId} OnSessionClosed callback threw",
-                ConnectionId);
+            try { _sink.OnSessionClosed(Identity); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp session {ConnectionId} OnSessionClosed callback threw",
+                    ConnectionId);
+            }
         }
         // Issue #289 / #405 / #416: terminal close ⇒ drop the persisted
         // retransmit ring file AND the unbounded outbound journal AND

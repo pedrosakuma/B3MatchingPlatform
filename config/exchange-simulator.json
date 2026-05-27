@@ -9,8 +9,8 @@
     // firms[]/sessions[] are empty. New deployments should declare
     // firms[] and sessions[] explicitly (see below).
     "enteringFirm": 1,
-    "heartbeatIntervalMs": 30000,
-    "idleTimeoutMs": 30000,
+    "heartbeatIntervalMs": 10000,
+    "idleTimeoutMs": 10000,
     "testRequestGraceMs": 5000,
     "sendingTimeSkewToleranceMs": 5000,
     // Decode-time fat-finger guardrails. Price is the EntryPoint /10000
