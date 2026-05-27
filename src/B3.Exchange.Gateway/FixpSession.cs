@@ -306,6 +306,14 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     public int SendQueueDepth => _transport.SendQueueDepth;
 
+    /// <summary>
+    /// Issue #487: waits until the session's outbound queue drains to empty
+    /// or the timeout expires. Call before closing to ensure pending frames
+    /// (e.g., ER_Cancel from option expiry sweep) reach the wire.
+    /// </summary>
+    public Task<bool> WaitForSendQueueDrainAsync(TimeSpan timeout) =>
+        _transport.WaitForSendQueueDrainAsync(timeout);
+
     /// <summary>Number of in-buffer business frames available to replay
     /// in response to a <c>RetransmitRequest</c>. Diagnostic only.</summary>
     public int RetxBufferDepth => _retxBuffer.Count;

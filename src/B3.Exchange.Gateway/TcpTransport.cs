@@ -77,6 +77,26 @@ public sealed class TcpTransport : IAsyncDisposable
     /// </summary>
     public long LastOutboundTickMs => Volatile.Read(ref _lastOutboundTickMs);
 
+    /// <summary>
+    /// Issue #487: waits until the send queue drains to empty (all queued
+    /// frames have been written to the socket) or the timeout expires.
+    /// Returns true if the queue drained within the timeout, false if
+    /// timed out or transport closed. Call before <see cref="Close"/> to
+    /// ensure pending frames reach the wire.
+    /// </summary>
+    public async Task<bool> WaitForSendQueueDrainAsync(TimeSpan timeout)
+    {
+        if (!IsOpen) return false;
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        while (SendQueueDepth > 0)
+        {
+            if (!IsOpen) return false;
+            if (Environment.TickCount64 >= deadline) return false;
+            await Task.Delay(5).ConfigureAwait(false);
+        }
+        return true;
+    }
+
     public TcpTransport(long connectionId, Stream stream, ILogger<TcpTransport> logger,
         int sendQueueCapacity, Action<string>? onClose = null,
         Action? onSendQueueFull = null)
