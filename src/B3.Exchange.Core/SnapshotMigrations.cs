@@ -86,6 +86,11 @@ public sealed class SnapshotMigrationSet
         // the new fields at their record defaults (0 / null / null) on
         // deserialise.
         set.Register(4, MigrateV4ToV5);
+        // Issue #499: v6 only adds an optional ExpireDate field on each
+        // RestingOrderRecord. v5 trees upgrade by stamping the version;
+        // STJ's missing-property tolerance leaves ExpireDate at its record
+        // default (0 == no GTD expiry) on deserialise.
+        set.Register(5, MigrateV5ToV6);
         return set;
     }
 
@@ -114,6 +119,13 @@ public sealed class SnapshotMigrationSet
     {
         if (previous is JsonObject obj)
             obj["Version"] = 5;
+        return previous;
+    }
+
+    private static JsonNode MigrateV5ToV6(JsonNode previous)
+    {
+        if (previous is JsonObject obj)
+            obj["Version"] = 6;
         return previous;
     }
 

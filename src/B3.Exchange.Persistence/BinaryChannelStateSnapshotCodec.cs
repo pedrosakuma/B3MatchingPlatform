@@ -346,7 +346,10 @@ public static class BinaryChannelStateSnapshotCodec
         // no per-resting-order OrdTagId/Asset/InvestorId trailer, and
         // ReadRestingOrder defaults them to 0/null/null for older
         // versions.
-        int effectiveVersion = (version == 1 || version == 2 || version == 3 || version == 4) ? ChannelStateSnapshot.CurrentVersion : version;
+        // Issue #499: v5 → v6 is also a clean migration — v5 files have
+        // no per-resting-order ExpireDate trailer, and ReadRestingOrder
+        // defaults it to 0 (no GTD expiry) for older versions.
+        int effectiveVersion = (version == 1 || version == 2 || version == 3 || version == 4 || version == 5) ? ChannelStateSnapshot.CurrentVersion : version;
         return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,
@@ -385,6 +388,13 @@ public static class BinaryChannelStateSnapshotCodec
                 w.WriteByte(0);
             }
         }
+        // Issue #499 (codec v6): GTD ExpireDate tail. Older versions wrote
+        // nothing here; ReadRestingOrder defaults to 0 (no GTD expiry) when
+        // the trailer is absent.
+        if (version >= 6)
+        {
+            w.WriteUInt16(o.ExpireDate);
+        }
     }
 
     private static RestingOrderRecord ReadRestingOrder(ref BinaryBufferReader r, int version)
@@ -415,8 +425,13 @@ public static class BinaryChannelStateSnapshotCodec
                 investor = new InvestorId(prefix, document);
             }
         }
+        ushort expireDate = 0;
+        if (version >= 6)
+        {
+            expireDate = r.ReadUInt16();
+        }
         return new RestingOrderRecord(orderId, clOrdId, (Side)side, price, qty, firm, ts,
-            (TimeInForce)tif, maxFloor, hidden, ordTagId, asset, investor);
+            (TimeInForce)tif, maxFloor, hidden, ordTagId, asset, investor, expireDate);
     }
 
     private static void WriteRestingStop(BinaryBufferWriter w, RestingStopRecord s, int version)

@@ -5,11 +5,10 @@ using static TestFactory;
 /// <summary>
 /// Issue #202 (gap-functional §9): the engine must accept the full
 /// B3 TimeInForce surface — Day, IOC, FOK, GTC, GTD, AtClose,
-/// GoodForAuction. GTC is currently identical to Day (no daily-reset
-/// operator command exists yet); GTD is rejected with
-/// <see cref="RejectReason.TimeInForceNotSupported"/> until ExpireDate is
-/// plumbed through <see cref="NewOrderCommand"/>; AtClose and
-/// GoodForAuction are gated on the instrument's
+/// GoodForAuction. GTC is currently identical to Day (the daily-reset
+/// operator command exists but GTC is not swept); GTD (GAP-23 / #499)
+/// rests with an <c>ExpireDate</c> and is swept at the end-of-day GTD
+/// boundary; AtClose and GoodForAuction are gated on the instrument's
 /// <see cref="TradingPhase"/> (FinalClosingCall and Reserved
 /// respectively).
 /// </summary>
@@ -28,14 +27,46 @@ public class ExtendedTimeInForceTests
     }
 
     [Fact]
-    public void Gtd_AlwaysRejected_UntilExpireDatePlumbed()
+    public void Gtd_WithExpireDate_RestsLikeDayOrder()
+    {
+        var eng = NewEngine(out var sink);
+
+        eng.Submit(new NewOrderCommand("o1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Gtd, Px(10m), 100, 11, 1000)
+        {
+            ExpireDate = 20_000,
+        });
+
+        Assert.Single(sink.Accepted);
+        Assert.Empty(sink.Rejects);
+        Assert.Equal(1, eng.OrderCount(PetrSecId));
+    }
+
+    [Fact]
+    public void Gtd_WithoutExpireDate_RejectedAsInvalidField()
     {
         var eng = NewEngine(out var sink);
 
         eng.Submit(new NewOrderCommand("o1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Gtd, Px(10m), 100, 11, 1000));
 
         var rej = Assert.Single(sink.Rejects);
-        Assert.Equal(RejectReason.TimeInForceNotSupported, rej.Reason);
+        Assert.Equal(RejectReason.InvalidField, rej.Reason);
+        Assert.Equal(0, eng.OrderCount(PetrSecId));
+    }
+
+    [Fact]
+    public void NonGtd_WithExpireDate_RejectedAsInvalidField()
+    {
+        // Defense for direct/WAL-replay commands: an ExpireDate is only
+        // meaningful on a GTD order.
+        var eng = NewEngine(out var sink);
+
+        eng.Submit(new NewOrderCommand("o1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 11, 1000)
+        {
+            ExpireDate = 20_000,
+        });
+
+        var rej = Assert.Single(sink.Rejects);
+        Assert.Equal(RejectReason.InvalidField, rej.Reason);
         Assert.Equal(0, eng.OrderCount(PetrSecId));
     }
 

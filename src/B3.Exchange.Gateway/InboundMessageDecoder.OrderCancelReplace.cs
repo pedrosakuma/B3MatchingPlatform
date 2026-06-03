@@ -161,12 +161,14 @@ internal static partial class InboundMessageDecoder
             cmd = UnsupportedCommand(ordType, newTif);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (expireDate != 0)
-        {
-            message = "ExpireDate not supported (only Day/IOC/FOK)";
-            cmd = UnsupportedCommand(ordType, newTif);
-            return InboundDecodeOutcome.UnsupportedFeature;
-        }
+        // GAP-23 / #499: ExpireDate is plumbed through as NewExpireDate.
+        // Unlike NewOrderSingle the decoder does NOT enforce the GTD<->
+        // ExpireDate pairing here: a replace may omit TimeInForce (preserve
+        // the resting order's TIF), so the engine — which knows the resting
+        // order's current TIF — is the single point that validates the
+        // resolved (effectiveTif, effectiveExpireDate) pair. A wire
+        // ExpireDate of 0 (SBE null) means "not supplied / preserve".
+        ushort? newExpireDate = expireDate == 0 ? null : expireDate;
         // #238: V6 trailer reject — see NewOrderSingle decoder.
         if (body.Length > OrderCancelReplaceV2BodySize)
         {
@@ -215,6 +217,7 @@ internal static partial class InboundMessageDecoder
             {
                 NewOrdType = ordType,
                 NewTif = newTif,
+                NewExpireDate = newExpireDate,
                 PreTradeRejectReason = preTradeRejectReason,
                 NewInvestorId = investorId,
             };
@@ -231,6 +234,7 @@ internal static partial class InboundMessageDecoder
         {
             NewOrdType = ordType,
             NewTif = newTif,
+            NewExpireDate = newExpireDate,
             NewInvestorId = investorId,
         };
         return InboundDecodeOutcome.Success;

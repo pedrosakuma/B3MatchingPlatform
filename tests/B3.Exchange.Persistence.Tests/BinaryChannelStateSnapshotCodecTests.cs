@@ -30,6 +30,13 @@ public class BinaryChannelStateSnapshotCodecTests
                 OrdTagId: 77,
                 Asset: "PETR",
                 InvestorId: new InvestorId(0xABCD, 1_234_567u)),
+            // GAP-23 / #499: exercise the v6 ExpireDate trailer so the
+            // round-trip catches any regression (record equality covers it).
+            new RestingOrderRecord(105, "gtd-1", Side.Buy,
+                PriceMantissa: 249900, RemainingQuantity: 200,
+                EnteringFirm: 7, InsertTimestampNanos: 555_000UL,
+                Tif: TimeInForce.Gtd, MaxFloor: 200, HiddenQuantity: 0,
+                ExpireDate: 20_000),
         };
         var stops = new[]
         {
@@ -128,6 +135,52 @@ public class BinaryChannelStateSnapshotCodecTests
         var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
         var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
         Assert.Null(decoded.Engine.Stops);
+    }
+
+    [Fact]
+    public void Encode_AtV5_OmitsExpireDateTrailer_AndV5DecodeFillsDefaults()
+    {
+        // GAP-23 / #499 backward-compat: a snapshot stamped at Version=5
+        // (the codec's pre-#499 schema) MUST round-trip without the
+        // per-resting-order ExpireDate trailer. Re-decoded ExpireDate
+        // defaults to 0 and the codec re-stamps the loaded snapshot at
+        // CurrentVersion so RestoreChannelState's strict version check
+        // accepts it.
+        var orders = new[]
+        {
+            new RestingOrderRecord(101, "CLI-A", Side.Buy,
+                PriceMantissa: 250000, RemainingQuantity: 100,
+                EnteringFirm: 7, InsertTimestampNanos: 123456789UL,
+                Tif: TimeInForce.Gtc, MaxFloor: 100, HiddenQuantity: 0,
+                OrdTagId: 77,
+                Asset: "PETR",
+                InvestorId: new InvestorId(0xABCD, 1_234_567u),
+                // Would be written under v6 but MUST NOT be on the wire
+                // when Version=5.
+                ExpireDate: 20_000),
+        };
+        var books = new[]
+        {
+            new EngineStateSnapshot.BookSnapshot(999_001, orders),
+        };
+        var engine = new EngineStateSnapshot(
+            NextOrderId: 102, NextTradeId: 1, RptSeq: 0,
+            Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
+            Books: books,
+            Stops: null);
+        var snap = new ChannelStateSnapshot(
+            Version: 5, ChannelNumber: 1, SequenceNumber: 0, SequenceVersion: 0,
+            Engine: engine, Owners: Array.Empty<OrderOwnerSnapshot>());
+
+        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+        var decoded = BinaryChannelStateSnapshotCodec.Decode(bytes);
+
+        Assert.Equal(ChannelStateSnapshot.CurrentVersion, decoded.Version);
+        var roundTripped = Assert.Single(decoded.Engine.Books[0].Orders);
+        Assert.Equal((ushort)0, roundTripped.ExpireDate);
+        // The v5 trailer fields (OrdTagId/Asset/InvestorId) still survive.
+        Assert.Equal((byte)77, roundTripped.OrdTagId);
+        Assert.Equal("PETR", roundTripped.Asset);
     }
 
     [Fact]
