@@ -17,9 +17,12 @@ should link back to a row in the table below by `#gap-NN`.
 
 Auditor: initial pass at commit `f36028a` (2026-04-30); re-audit at commit
 `edff9c8` (2026-05-24) after PR #405 (FIXP session resync persistence)
-landed — see issues #407..#416 for the resulting partial-status narrowings.
-Refresh this section when the table is re-validated against a newer spec
-revision.
+landed — see issues #407..#416 for the resulting partial-status narrowings;
+re-audit at commit `1ff9b15` (2026-06-03) after the #418..#427 wave closed all
+of #407..#416, plus STPC (#14), options work (#479 `SecurityDefinition_12`
+fields, #480 expiry-aware phase scheduling), and pre-trade fat-finger
+protections (#432/#436/#441). Refresh this section when the table is
+re-validated against a newer spec revision.
 
 ## How to read this document
 
@@ -54,9 +57,11 @@ out of the gap table and to make the rationale auditable.
   simulator maps 1:1 to a UMDF channel; spec allows both as long as the
   matching engine receives the message.
 - **Single `EnteringFirm` per host** (today) — multi-firm is tracked by #8.
-- **No order types beyond Limit / Market**, no GTC/GTD/MOC/MOA, no iceberg,
-  no stop. These are explicitly out of scope in the current roadmap (#19),
-  but each remains catalogued in the gap table for future re-scoping.
+- **Limited order-type / TIF surface.** Limit / Market plus Stop / StopLimit /
+  Market-with-leftover-as-Limit (`K`) are implemented; `GTC` / `MOC` (AtClose) /
+  `MOA` (GoodForAuction) TIF are end-to-end. `GTD` (pending #499), RLP (`W`),
+  Pegged Midpoint (`P`), and UDS remain out of scope / non-goals — each is
+  catalogued in the gap table for future re-scoping.
 
 ## Canonical session flows (for reference)
 
@@ -68,36 +73,39 @@ end-to-end today; `[GAP-NN]` points to the entry in the table that breaks it.
 ```
     Client                                Gateway
       |  ── TCP handshake ────────────►    |
-      |  ── Negotiate ───────────────►     |   [GAP-04]
-      |  ◄── NegotiateResponse ─────       |   [GAP-04]
-      |  ── Establish ───────────────►     |   [GAP-05]
-      |  ◄── EstablishAck ──────────       |   [GAP-05]
-      |  ── App messages ───────────►      |   (partial — see §4.6 gaps)
+      |  ── Negotiate ───────────────►     |   [OK]
+      |  ◄── NegotiateResponse ─────       |   [OK]
+      |  ── Establish ───────────────►     |   [OK]
+      |  ◄── EstablishAck ──────────       |   [OK]
+      |  ── App messages ───────────►      |   [OK]
       |  ◄── App messages ──────────       |
-      |  ── Terminate ──────────────►      |   [GAP-06]
-      |  ◄── Terminate ─────────────        |   [GAP-06]
+      |  ── Terminate ──────────────►      |   [OK]
+      |  ◄── Terminate ─────────────        |   [OK]
       |  ── TCP FIN ────────────────►       |
 ```
 
 ### §5.2 Invalid credentials in negotiation
 
-Requires `Negotiate` + `NegotiateReject(CREDENTIALS)` + `Terminate`. All three
-missing — see [GAP-04].
+Requires `Negotiate` + `NegotiateReject(CREDENTIALS)` + `Terminate`. Implemented
+([GAP-04] done; unknown `sessionID` now rejected as `INVALID_SESSIONID` per #413).
 
 ### §5.3 Loss of connectivity during the session
 
 Requires the client to re-`Establish` with the previously negotiated
-`sessionVerID`. Not supported today ([GAP-05], [GAP-07]).
+`sessionVerID`. Supported ([GAP-05], [GAP-07] done); session takeover on
+reconnect landed via #491/#497.
 
 ### §5.4 Client-side total failure
 
 Requires `NegotiateReject(ALREADY_NEGOTIATED, currentSessionVerID)` so the
-client can recover its `sessionVerID`. Missing ([GAP-04]).
+client can recover its `sessionVerID`. Implemented ([GAP-04] done).
 
 ### §5.5 Gateway failures
 
 Requires `Sequence` + retransmission + `BACKUP_TAKEOVER_IN_PROGRESS`
-termination code. Missing ([GAP-06], [GAP-08]).
+termination code. `Sequence`/retransmission implemented ([GAP-06], [GAP-08]
+done); the `BACKUP_TAKEOVER_IN_PROGRESS` termination code path remains a
+realism non-goal.
 
 ## Gap table
 
@@ -106,26 +114,26 @@ termination code. Missing ([GAP-06], [GAP-08]).
 | # | Spec § | Item | Status | Gap | Severity | Issue |
 | --- | --- | --- | --- | --- | --- | --- |
 | <a id="gap-01"></a>GAP-01 | 4.4 | **Simple Open Framing Header (SOFH)** — 4 bytes (`messageLength` LE + `encodingType=0xEB50`) prepended to every SBE frame; total wire header is **12 bytes**, not 8. | done | Implemented in `EntryPointFrameReader`; `messageLength ≤ 512` enforced. | critical | [#39](https://github.com/pedrosakuma/B3MatchingPlatform/issues/39) (closed) |
-| <a id="gap-02"></a>GAP-02 | 3.5, 4.6.5 | **Variable-length data trailing the fixed block** (`memo`, `credentials`, `clientIP`, `clientAppName`, `clientAppVersion`). Each is `length(uint8)` + `varData`. Total frame size is `SOFH.messageLength`, not `8 + BlockLength`. | partial | Inbound varData parsing done; **outbound ExecutionReport/BMR encoders do not emit varData trailer** (memo not echoed). | high | [#40](https://github.com/pedrosakuma/B3MatchingPlatform/issues/40) (closed), narrowed by [#411](https://github.com/pedrosakuma/B3MatchingPlatform/issues/411) |
-| <a id="gap-03"></a>GAP-03 | 4.5.7, 4.10 | **`Terminate` with `terminationCode`** on framing/decoding errors (`16=INVALID_SOFH`, `17=DECODING_ERROR`, `15=UNRECOGNIZED_MESSAGE`, `11=INVALID_SESSIONID`, `13=INVALID_TIMESTAMP`, …). Also enforce SOFH `messageLength ≤ 512` per spec. | partial | Decode errors emit Terminate with correct codes; **but all server Terminate frames encode `sessionVerID=0` regardless of session state** (spec §4.5.7 requires the active SessionVerId). | critical | [#41](https://github.com/pedrosakuma/B3MatchingPlatform/issues/41) (closed), narrowed by [#407](https://github.com/pedrosakuma/B3MatchingPlatform/issues/407) |
+| <a id="gap-02"></a>GAP-02 | 3.5, 4.6.5 | **Variable-length data trailing the fixed block** (`memo`, `credentials`, `clientIP`, `clientAppName`, `clientAppVersion`). Each is `length(uint8)` + `varData`. Total frame size is `SOFH.messageLength`, not `8 + BlockLength`. | done | Inbound varData parsing done; outbound ExecutionReport `memo` echo emitted (#427). | high | [#40](https://github.com/pedrosakuma/B3MatchingPlatform/issues/40), [#411](https://github.com/pedrosakuma/B3MatchingPlatform/issues/411) (closed via [#427](https://github.com/pedrosakuma/B3MatchingPlatform/pull/427)) |
+| <a id="gap-03"></a>GAP-03 | 4.5.7, 4.10 | **`Terminate` with `terminationCode`** on framing/decoding errors (`16=INVALID_SOFH`, `17=DECODING_ERROR`, `15=UNRECOGNIZED_MESSAGE`, `11=INVALID_SESSIONID`, `13=INVALID_TIMESTAMP`, …). Also enforce SOFH `messageLength ≤ 512` per spec. | done | Decode errors emit Terminate with correct codes; server Terminate frames now encode the live `sessionVerID` (#407 → [#418](https://github.com/pedrosakuma/B3MatchingPlatform/pull/418)). | critical | [#41](https://github.com/pedrosakuma/B3MatchingPlatform/issues/41), [#407](https://github.com/pedrosakuma/B3MatchingPlatform/issues/407) (closed) |
 
 ### FIXP session lifecycle
 
 | # | Spec § | Item | Status | Gap | Severity | Issue |
 | --- | --- | --- | --- | --- | --- | --- |
-| <a id="gap-04"></a>GAP-04 | 4.5.2 | **`Negotiate` / `NegotiateResponse` / `NegotiateReject`** — JSON `credentials` blob (`auth_type`, `username`, `access_key`), `sessionVerID`, daily reset, and the seven reject codes (incl. `ALREADY_NEGOTIATED` carrying `currentSessionVerID`). | partial | Full handshake + monotonicity persisted (#405). **Unknown sessionID is rejected as `CREDENTIALS` instead of `INVALID_SESSIONID`** (spec §4.5.2). | high | [#42](https://github.com/pedrosakuma/B3MatchingPlatform/issues/42) (closed), narrowed by [#413](https://github.com/pedrosakuma/B3MatchingPlatform/issues/413) |
-| <a id="gap-05"></a>GAP-05 | 4.5.3 | **`Establish` / `EstablishAck` / `EstablishReject`** with `keepAliveInterval`, `nextSeqNo`, `cancelOnDisconnect{Type,TimeoutWindow}` and the eight reject codes. | partial | Handshake/validation/EstablishmentAck.RECOVERABLE implemented. **`keepAliveInterval` lower bound is 1ms** in `EstablishValidator`; schema requires 1000–60000ms. | high | [#43](https://github.com/pedrosakuma/B3MatchingPlatform/issues/43) (closed), narrowed by [#408](https://github.com/pedrosakuma/B3MatchingPlatform/issues/408) |
-| <a id="gap-06"></a>GAP-06 | 4.5.4, 4.5.7 | **`Sequence` (heartbeat + reset)** + **`Terminate`** message (with codes from `TerminationCode` enum — see schema lines 384–404). Spec recommends terminating after 3× `keepAliveInterval` of silence. | partial | Heartbeat / Sequence / TestRequest implemented. **Idle-timeout closes silently (no `Terminate(KEEPALIVE_INTERVAL_LAPSED=10)`)** and threshold is `1.5×keepAlive + grace` instead of 3×. | high | [#44](https://github.com/pedrosakuma/B3MatchingPlatform/issues/44) (closed), narrowed by [#409](https://github.com/pedrosakuma/B3MatchingPlatform/issues/409) |
+| <a id="gap-04"></a>GAP-04 | 4.5.2 | **`Negotiate` / `NegotiateResponse` / `NegotiateReject`** — JSON `credentials` blob (`auth_type`, `username`, `access_key`), `sessionVerID`, daily reset, and the seven reject codes (incl. `ALREADY_NEGOTIATED` carrying `currentSessionVerID`). | done | Full handshake + monotonicity persisted (#405); unknown sessionID now rejected as `INVALID_SESSIONID` (#413 → [#421](https://github.com/pedrosakuma/B3MatchingPlatform/pull/421)). | high | [#42](https://github.com/pedrosakuma/B3MatchingPlatform/issues/42), [#413](https://github.com/pedrosakuma/B3MatchingPlatform/issues/413) (closed) |
+| <a id="gap-05"></a>GAP-05 | 4.5.3 | **`Establish` / `EstablishAck` / `EstablishReject`** with `keepAliveInterval`, `nextSeqNo`, `cancelOnDisconnect{Type,TimeoutWindow}` and the eight reject codes. | done | Handshake/validation/EstablishmentAck.RECOVERABLE implemented; `keepAliveInterval` lower bound now 1000ms per schema (#408 → [#419](https://github.com/pedrosakuma/B3MatchingPlatform/pull/419)). | high | [#43](https://github.com/pedrosakuma/B3MatchingPlatform/issues/43), [#408](https://github.com/pedrosakuma/B3MatchingPlatform/issues/408) (closed) |
+| <a id="gap-06"></a>GAP-06 | 4.5.4, 4.5.7 | **`Sequence` (heartbeat + reset)** + **`Terminate`** message (with codes from `TerminationCode` enum — see schema lines 384–404). Spec recommends terminating after 3× `keepAliveInterval` of silence. | done | Heartbeat / Sequence / TestRequest implemented; idle-timeout now emits `Terminate(KEEPALIVE_INTERVAL_LAPSED=10)` (#409 → [#420](https://github.com/pedrosakuma/B3MatchingPlatform/pull/420)). | high | [#44](https://github.com/pedrosakuma/B3MatchingPlatform/issues/44), [#409](https://github.com/pedrosakuma/B3MatchingPlatform/issues/409) (closed) |
 | <a id="gap-07"></a>GAP-07 | 4.5.5, 4.6.2 | **Inbound `MsgSeqNum` tracking + `NotApplied`** — gap detection emits `NotApplied(fromSeqNo, count)` and updates expected next seq. Outbound seq is per-`SessionID/SessionVerID`, reset daily. | done | Inbound seq tracking + `NotApplied` implemented; outbound seq per-session persisted (#405). Daily reset is its own gap (GAP-09). | high | [#45](https://github.com/pedrosakuma/B3MatchingPlatform/issues/45) (closed) |
 | <a id="gap-08"></a>GAP-08 | 4.5.6 | **`RetransmitRequest` / `Retransmission`** with `RetransmitRejectCode` enum (schema 406–416). Max 1000 messages per request, single in-flight. | done | Implemented (`FixpRetransmitController`); journal-backed cold-read after #405; 1000-cap, single-in-flight, all RetransmitRejectCodes covered. | high | [#46](https://github.com/pedrosakuma/B3MatchingPlatform/issues/46) (closed) |
-| <a id="gap-09"></a>GAP-09 | 4.5.1 | **Daily reset** — outbound + inbound seq reset to 1 at the start of each trading day. | partial | `DailyResetScheduler` runs at boundary, but **`TerminateAllSessions` closes with `CloseKind.HostShutdown` which preserves persisted seq state under #405** — next reconnect rehydrates yesterday's seqs. **Regression introduced by #405.** | medium | [#47](https://github.com/pedrosakuma/B3MatchingPlatform/issues/47) (closed), narrowed by [#416](https://github.com/pedrosakuma/B3MatchingPlatform/issues/416) |
+| <a id="gap-09"></a>GAP-09 | 4.5.1 | **Daily reset** — outbound + inbound seq reset to 1 at the start of each trading day. | done | `DailyResetScheduler` runs at boundary; daily-reset FIXP persistence cleanup so the next reconnect starts from seq 1 (#416 → [#424](https://github.com/pedrosakuma/B3MatchingPlatform/pull/424)). | medium | [#47](https://github.com/pedrosakuma/B3MatchingPlatform/issues/47), [#416](https://github.com/pedrosakuma/B3MatchingPlatform/issues/416) (closed) |
 
 ### Application-level header
 
 | # | Spec § | Item | Status | Gap | Severity | Issue |
 | --- | --- | --- | --- | --- | --- | --- |
-| <a id="gap-10"></a>GAP-10 | 4.6.3.1 | **Inbound `sessionID` validation** — spec §4.10 mandates `BusinessMessageReject(33003, "Wrong sessionID in businessHeader")` on mismatch. | partial | `sessionID` + `msgSeqNum` validated in `HeaderValidation`. **`sendingTime` (offset 8) is not read or validated** despite spec requirement. | high | [#48](https://github.com/pedrosakuma/B3MatchingPlatform/issues/48) (closed), narrowed by [#414](https://github.com/pedrosakuma/B3MatchingPlatform/issues/414) |
-| <a id="gap-11"></a>GAP-11 | 4.6.4 | **`receivedTime` (tag 35544)** optional field added in schema v3 to ER\_New / ER\_Modify / ER\_Cancel. Carries the gateway-reception timestamp. | partial | `receivedTime` emitted on ER\_New/Modify/Cancel. **Other declared varData trailing fields (`memo` echo, `deskID`, `text`) are not emitted** — see GAP-02. | medium | [#49](https://github.com/pedrosakuma/B3MatchingPlatform/issues/49) (closed), narrowed by [#411](https://github.com/pedrosakuma/B3MatchingPlatform/issues/411) |
+| <a id="gap-10"></a>GAP-10 | 4.6.3.1 | **Inbound `sessionID` validation** — spec §4.10 mandates `BusinessMessageReject(33003, "Wrong sessionID in businessHeader")` on mismatch. | done | `sessionID` + `msgSeqNum` validated in `HeaderValidation`; inbound `sendingTime` skew now validated (#414 → [#423](https://github.com/pedrosakuma/B3MatchingPlatform/pull/423)). | high | [#48](https://github.com/pedrosakuma/B3MatchingPlatform/issues/48), [#414](https://github.com/pedrosakuma/B3MatchingPlatform/issues/414) (closed) |
+| <a id="gap-11"></a>GAP-11 | 4.6.4 | **`receivedTime` (tag 35544)** optional field added in schema v3 to ER\_New / ER\_Modify / ER\_Cancel. Carries the gateway-reception timestamp. | done | `receivedTime` emitted on ER\_New/Modify/Cancel; `memo` echo on the outbound varData trailer landed via #427 (see GAP-02). | medium | [#49](https://github.com/pedrosakuma/B3MatchingPlatform/issues/49), [#411](https://github.com/pedrosakuma/B3MatchingPlatform/issues/411) (closed) |
 | <a id="gap-12"></a>GAP-12 | 4.6.3.1 | **`marketSegmentID` for routing** — spec says the gateway uses this header field to route to the matching engine. | deviation | Simulator routes by `SecurityID` (1:1 with channel in our config). Working, but a real B3 client that relies on cross-segment instrument codes will be surprised. | low | documented in "Conscious deviations" — keep here for traceability. |
 | <a id="gap-13"></a>GAP-13 | 4.6.3.2 | **`OutboundBusinessHeader.eventIndicator`** — bit flags (`PossResend`, `LowPriority`). | done | `PossResend` is now set on journal-replayed business frames by `FixpOutboundEncoder`; `LowPriority` not used by the simulator. | low | implicit via GAP-08 closure. |
 
@@ -134,15 +142,15 @@ termination code. Missing ([GAP-06], [GAP-08]).
 | # | Spec § | Item | Status | Gap | Severity | Issue |
 | --- | --- | --- | --- | --- | --- | --- |
 | <a id="gap-14"></a>GAP-14 | 4.6.1 | **`BusinessMessageReject` (template 206)** for application-level rejects (bad sessionID, throttle violations, varData too long, line breaks in deskID/senderLocation/enteringTrader/executingTrader). | done | BMR encoder + dispatch routing implemented. (Sub-issue: BMR's own varData trailer is not emitted — tracked under GAP-02/#411.) | high | [#50](https://github.com/pedrosakuma/B3MatchingPlatform/issues/50) (closed) |
-| <a id="gap-15"></a>GAP-15 | 4.6.1 | **`NewOrderSingle` (102)** and **`OrderCancelReplaceRequest` (104)** — the full templates with iceberg/stop/strategy fields. Spec lists these as the canonical messages; `Simple*` variants are explicitly the low-feature subset. | partial | Templates 102/104 decode + accept Limit/Market only. **Unsupported sub-features (stop, iceberg, GTC, …) surface as `BusinessMessageReject(33003)` instead of `ExecutionReport_Reject(OrdRejReason=11=UnsupportedOrderCharacteristic)`** per spec. | medium | [#51](https://github.com/pedrosakuma/B3MatchingPlatform/issues/51) (closed), narrowed by [#415](https://github.com/pedrosakuma/B3MatchingPlatform/issues/415) |
+| <a id="gap-15"></a>GAP-15 | 4.6.1 | **`NewOrderSingle` (102)** and **`OrderCancelReplaceRequest` (104)** — the full templates with iceberg/stop/strategy fields. Spec lists these as the canonical messages; `Simple*` variants are explicitly the low-feature subset. | done | Templates 102/104 decode + accept Limit/Market; unsupported sub-features (stop, iceberg, GTC, …) now surface as `ExecutionReport_Reject(OrdRejReason=11=UnsupportedOrderCharacteristic)` (#415 → [#425](https://github.com/pedrosakuma/B3MatchingPlatform/pull/425)). | medium | [#51](https://github.com/pedrosakuma/B3MatchingPlatform/issues/51), [#415](https://github.com/pedrosakuma/B3MatchingPlatform/issues/415) (closed) |
 | <a id="gap-16"></a>GAP-16 | 4.6.1 | **`NewOrderCross` (106)**. | done | Cross-order decode + matching implemented. | low | [#52](https://github.com/pedrosakuma/B3MatchingPlatform/issues/52) (closed) |
-| <a id="gap-17"></a>GAP-17 | 8.2 | **`OrdRejReason` mapping** — codes `1=UnknownSymbol`, `3=OrderExceedsLimit`, `5=UnknownOrder`, `6=DuplicateOrder`, `11=UnsupportedOrderCharacteristic`, etc. | partial | Engine→wire mapping table implemented in `FixpOutboundEncoder`. **`UnsupportedOrderCharacteristic (11)` path not wired** for unsupported sub-features (currently BMR'd — see GAP-15). | medium | [#53](https://github.com/pedrosakuma/B3MatchingPlatform/issues/53) (closed), narrowed by [#415](https://github.com/pedrosakuma/B3MatchingPlatform/issues/415) |
+| <a id="gap-17"></a>GAP-17 | 8.2 | **`OrdRejReason` mapping** — codes `1=UnknownSymbol`, `3=OrderExceedsLimit`, `5=UnknownOrder`, `6=DuplicateOrder`, `11=UnsupportedOrderCharacteristic`, etc. | done | Engine→wire mapping table in `FixpOutboundEncoder`; `UnsupportedOrderCharacteristic (11)` now wired for unsupported sub-features (#415 → [#425](https://github.com/pedrosakuma/B3MatchingPlatform/pull/425)). | medium | [#53](https://github.com/pedrosakuma/B3MatchingPlatform/issues/53), [#415](https://github.com/pedrosakuma/B3MatchingPlatform/issues/415) (closed) |
 
 ### Operational / risk features
 
 | # | Spec § | Item | Status | Gap | Severity | Issue |
 | --- | --- | --- | --- | --- | --- | --- |
-| <a id="gap-18"></a>GAP-18 | 4.7 | **Cancel-on-Disconnect (CoD)** — `CancelOnDisconnectType` (4 modes) + `CODTimeoutWindow` in `Establish`. Cancels non-GT working orders on triggering events; spec §4.7.3 enumerates gateway-forced disconnects that also fire CoD if enabled. | partial | On-disconnect half (modes 1+3) implemented with grace-window timer and per-channel filtering. **On-Terminate half (modes 2+3) still deferred** — peer-Terminate does not trigger CoD. Non-GT filter degenerate (TIF gap #GAP-23). | high | [#54](https://github.com/pedrosakuma/B3MatchingPlatform/issues/54) (closed), narrowed by [#410](https://github.com/pedrosakuma/B3MatchingPlatform/issues/410) |
+| <a id="gap-18"></a>GAP-18 | 4.7 | **Cancel-on-Disconnect (CoD)** — `CancelOnDisconnectType` (4 modes) + `CODTimeoutWindow` in `Establish`. Cancels non-GT working orders on triggering events; spec §4.7.3 enumerates gateway-forced disconnects that also fire CoD if enabled. | done | On-disconnect half (modes 1+3) and on-Terminate half (modes 2+3) implemented; peer-Terminate now triggers CoD (#410 → [#422](https://github.com/pedrosakuma/B3MatchingPlatform/pull/422)). | high | [#54](https://github.com/pedrosakuma/B3MatchingPlatform/issues/54), [#410](https://github.com/pedrosakuma/B3MatchingPlatform/issues/410) (closed) |
 | <a id="gap-19"></a>GAP-19 | 4.8 | **Mass Cancel (`OrderMassActionRequest` 701 / `OrderMassActionReport` 702)** with filters Side / SecurityID / OrdTagID / Asset, plus mass-cancel-on-behalf. | done | `MassCancelCommand` carries all five filters; `MatchingEngine.MatchesMassCancelFilter` (`src/B3.Exchange.Matching/MatchingEngine.cs:1072-1081`) applies them; the gateway rejects unsupported `MassActionType` values with spec `MassActionRejectReason`. Immediate order entry paths (`SimpleNewOrder` 100, `NewOrderSingle` 102) populate `OrdTagId` / `InvestorId` on the command. Triggered Stop/StopLimit orders propagate `OrdTagId` / `InvestorId` to the resulting resting limit (#453), and the snapshot codec round-trips `OrdTagId` / `Asset` / `InvestorId` on resting orders (#455) and `OrdTagId` / `InvestorId` on resting stops (#453) so restart and replay don't silently miss filters. `OrderCancelReplaceRequest` may also mutate `InvestorID` on the working order per spec §7.4 (#451); `OrdTagID` is preserved (absent from the spec mutation table) and `SimpleModifyOrder` is restricted to `orderQty` / `Price` per spec §7.3.2. | medium | [#412](https://github.com/pedrosakuma/B3MatchingPlatform/issues/412) (closed), [#449](https://github.com/pedrosakuma/B3MatchingPlatform/issues/449) (closed), [#451](https://github.com/pedrosakuma/B3MatchingPlatform/issues/451) (closed), [#453](https://github.com/pedrosakuma/B3MatchingPlatform/issues/453) (closed), [#455](https://github.com/pedrosakuma/B3MatchingPlatform/issues/455) (closed) |
 | <a id="gap-20"></a>GAP-20 | 4.9 | **Throttle** — sliding window of N messages / M ms, per session. Reject violations with `BusinessMessageReject "Throttle limit exceeded"`. | done | Sliding-window per-session throttle with BMR emission implemented. | medium | [#56](https://github.com/pedrosakuma/B3MatchingPlatform/issues/56) (closed) |
 | <a id="gap-21"></a>GAP-21 | 4.10 | **Other basic gateway validations** — `<CR>`/`<LF>` check on deskID/senderLocation/enteringTrader/executingTrader; varData length checks on `memo`/`deskID`. | done | CR/LF rejection + per-field length caps implemented in `HeaderValidation` / `EntryPointVarData`. | medium | [#57](https://github.com/pedrosakuma/B3MatchingPlatform/issues/57) (closed) |
@@ -165,16 +173,16 @@ contract supervision is a post-trade analytics concern.
 | # | Spec § | Item | Status | Severity | Issue |
 | --- | --- | --- | --- | --- | --- |
 | <a id="gap-22"></a>GAP-22 | 7.1.1–7.1.6 | Stop / StopLimit / Market-with-leftover-as-Limit (`K`) / RLP (`W`) / Pegged Midpoint (`P`) order types | partial | low (RLP+Pegged are non-goals) | Stop / StopLimit / `K` are implemented end-to-end (engine trigger book + retired ER + UMDF). RLP (`W`) and Pegged Midpoint (`P`) are decoded but rejected with `OrdRejReason=11 (UnsupportedOrderCharacteristic)`. |
-| <a id="gap-23"></a>GAP-23 | 7.1.7–7.1.14 | `GTC` / `GTD` / `MOC` (AtClose) / `MOA` (GoodForAuction) time-in-force | partial | medium | `GTC`, `MOC` (AtClose), `MOA` (GoodForAuction) are end-to-end (decoder + phase gating in `MatchingEngine.NewOrder`). **`GTD` is decoded but engine-rejected with `RejectReason.TimeInForceNotSupported`** because `ExpireDate` is not yet plumbed through `NewOrderCommand` (see `MatchingEngine.cs:813-818` and `ExtendedTimeInForceTests.Gtd_AlwaysRejected_UntilExpireDatePlumbed`). |
+| <a id="gap-23"></a>GAP-23 | 7.1.7–7.1.14 | `GTC` / `GTD` / `MOC` (AtClose) / `MOA` (GoodForAuction) time-in-force | partial | medium | `GTC`, `MOC` (AtClose), `MOA` (GoodForAuction) are end-to-end (decoder + phase gating in `MatchingEngine.NewOrder`). **`GTD` is decoded but engine-rejected with `RejectReason.TimeInForceNotSupported`** because `ExpireDate` is not yet plumbed through `NewOrderCommand` (see `MatchingEngine.cs:819-821`, `:1137-1138`). Tracked by [#499](https://github.com/pedrosakuma/B3MatchingPlatform/issues/499). |
 | <a id="gap-24"></a>GAP-24 | 7.1.16–7.1.17 | Iceberg / disclosed quantity (`MaxFloor`), `MinQty` | done | — | Both implemented with validation (`MaxFloor` in `(0, Quantity]`, multiple of `lotSize`; `MinQty` in `(0, Quantity]`) and rejection paths (`RejectReason.InvalidField` / `RejectReason.MinQtyNotMet`). |
 | <a id="gap-25"></a>GAP-25 | 7.1.20 | In-flight modification semantics (priority loss rules) | partial | medium | — |
-| <a id="gap-26"></a>GAP-26 | 8.3 | Daily GTC/GTD restatement at session boundary (carry-over + re-emit ER) | missing | medium | `DailyResetScheduler` exists but does not yet restate GTC/GTD orders. |
-| <a id="gap-27"></a>GAP-27 | 15.4 | Self-Trading Prevention (STPC) | missing | medium (in-scope per ADR 0012) | covered by [#14](https://github.com/pedrosakuma/B3MatchingPlatform/issues/14) |
-| <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections (price collars / fat-finger / max value) | missing | medium (in-scope per ADR 0012) | — |
+| <a id="gap-26"></a>GAP-26 | 8.3 | Daily GTC/GTD restatement at session boundary (carry-over + re-emit ER) | missing | medium | `DailyResetScheduler` exists but does not yet restate GTC/GTD orders. Tracked by [#498](https://github.com/pedrosakuma/B3MatchingPlatform/issues/498). |
+| <a id="gap-27"></a>GAP-27 | 15.4 | Self-Trading Prevention (STPC) | done | medium (in-scope per ADR 0012) | Per-`EnteringFirm` self-trade prevention implemented; covered by [#14](https://github.com/pedrosakuma/B3MatchingPlatform/issues/14) (closed). |
+| <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections (price collars / fat-finger / max value) | partial | medium (in-scope per ADR 0012) | Pre-trade fat-finger guardrails landed (#432/#436/#441): `InboundFatFingerOptions` enforces `MaxPriceMantissa`, max `OrderQty`, and a static `PriceBandPercent` at the wire edge. **Dynamic engine-side price collars and max-order-value remain.** Tracked by [#500](https://github.com/pedrosakuma/B3MatchingPlatform/issues/500). |
 | <a id="gap-29"></a>GAP-29 | 15.1 | User-Defined Spreads (UDS) — synthetic multi-leg instruments | missing | low (boundary case; borderline between exchange-side and broker-side) | — |
-| <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low (in-scope per ADR 0012) | — |
-| <a id="gap-31"></a>GAP-31 | 7.1.19 / UMDF v2.2.0 `SecurityDefinition_12` | `SecurityDefinition_12` does not emit option fields (`strikePrice`, `putOrCall`, `exerciseStyle`, `contractMultiplier`, `noUnderlyings`, `optPayoutType`, `maturityMonthYear`). | missing | high | tracked via [RFC 0002](rfc/0002-equity-options-support.md) issue OPT-02 |
-| <a id="gap-32"></a>GAP-32 | 8.3 / lifecycle | Expiring option series are not automatically moved to `Close` based on `ExpirationDate`. | missing | medium | tracked via [RFC 0002](rfc/0002-equity-options-support.md) issue OPT-03 |
+| <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low (in-scope per ADR 0012) | Tracked by [#501](https://github.com/pedrosakuma/B3MatchingPlatform/issues/501). |
+| <a id="gap-31"></a>GAP-31 | 7.1.19 / UMDF v2.2.0 `SecurityDefinition_12` | `SecurityDefinition_12` does not emit option fields (`strikePrice`, `putOrCall`, `exerciseStyle`, `contractMultiplier`, `noUnderlyings`, `optPayoutType`, `maturityMonthYear`). | done | high | Option fields emitted via `InstrumentDefinitionPublisher` (RFC 0002 OPT-02 → [#479](https://github.com/pedrosakuma/B3MatchingPlatform/pull/479)). |
+| <a id="gap-32"></a>GAP-32 | 8.3 / lifecycle | Expiring option series are not automatically moved to `Close` based on `ExpirationDate`. | done | medium | Expiry-aware phase scheduling moves expiring series to `Close` (RFC 0002 OPT-03 → [#480](https://github.com/pedrosakuma/B3MatchingPlatform/pull/480)). |
 
 ## Maintenance notes
 
