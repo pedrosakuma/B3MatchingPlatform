@@ -115,27 +115,77 @@ public class FixpSessionReattachTests
     }
 
     [Fact]
-    public async Task TryReattach_concurrent_calls_only_one_wins()
+    public async Task TryReattach_resets_suspend_guard_allowing_a_second_suspend_cycle()
     {
+        // Regression for the #496 follow-up: SuspendLocked's one-shot
+        // _suspendInProgress guard was never cleared on a successful
+        // suspend, and TryReattach did not reset it — so a SECOND
+        // disconnect after any reattach silently no-opped the suspend,
+        // wedging the session Established over a dead transport. Reattach
+        // must begin a fresh suspend cycle.
         var session = await NewSuspendedSessionAsync();
         try
         {
-            var (_, s1, c1) = await ConnectPairAsync();
-            var (_, s2, c2) = await ConnectPairAsync();
+            var (_, serverStream, client) = await ConnectPairAsync();
             try
             {
-                using var barrier = new ManualResetEventSlim(false);
-                var winners = 0;
-                var t1 = Task.Run(() => { barrier.Wait(); if (session.TryReattach(s1)) Interlocked.Increment(ref winners); });
-                var t2 = Task.Run(() => { barrier.Wait(); if (session.TryReattach(s2)) Interlocked.Increment(ref winners); });
-                barrier.Set();
-                await Task.WhenAll(t1, t2);
-                Assert.Equal(1, winners);
+                Assert.True(session.TryReattach(serverStream));
+                // Drive the state machine back to Established as a real
+                // Establish replay would, so the second Suspend has an
+                // Established → Suspended transition available.
+                session.ApplyTransition(FixpEvent.Establish);
+                Assert.Equal(FixpState.Established, session.State);
+
+                // Second suspend cycle must actually demote the session.
+                session.Suspend("second-cycle");
+                Assert.Equal(FixpState.Suspended, session.State);
             }
-            finally { c1.Close(); c2.Close(); }
+            finally { client.Close(); }
         }
         finally
         {
+            session.Close("test-cleanup");
+            await session.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task SuspendForTakeover_does_not_arm_cancel_on_disconnect()
+    {
+        // Issue #496: an Establish-path takeover demotes a still-Established
+        // session whose successor transport has already arrived, so CoD must
+        // NOT be armed (the disconnect is immediately superseded and resting
+        // orders must survive). A reattach must then succeed.
+        var (_, serverStream0, client0) = await ConnectPairAsync();
+        var session = new FixpSession(
+            connectionId: 1, enteringFirm: 7, sessionId: 100,
+            stream: serverStream0, sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance);
+        try
+        {
+            session.Start();
+            session.ApplyTransition(FixpEvent.Negotiate);
+            session.ApplyTransition(FixpEvent.Establish);
+            // Opt the session into cancel-on-disconnect with a zero window so
+            // the normal Suspend path would fire CoD essentially immediately.
+            session.SetCancelOnDisconnectForTest(
+                B3.Entrypoint.Fixp.Sbe.V6.CancelOnDisconnectType.CANCEL_ON_DISCONNECT_OR_TERMINATE,
+                codTimeoutWindowMs: 0);
+
+            session.SuspendForTakeover("establish-takeover:test");
+            Assert.Equal(FixpState.Suspended, session.State);
+
+            var (_, serverStream1, client1) = await ConnectPairAsync();
+            try
+            {
+                Assert.True(session.TryReattach(serverStream1));
+                Assert.True(session.IsAttached);
+            }
+            finally { client1.Close(); }
+        }
+        finally
+        {
+            client0.Close();
             session.Close("test-cleanup");
             await session.DisposeAsync();
         }

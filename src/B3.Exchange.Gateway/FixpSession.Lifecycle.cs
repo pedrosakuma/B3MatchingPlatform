@@ -87,6 +87,26 @@ public sealed partial class FixpSession
     }
 
     /// <summary>
+    /// Issue #496: demote a still-<see cref="FixpState.Established"/> stale
+    /// session for an Establish-path session takeover. Identical to
+    /// <see cref="Suspend(string)"/> except it does NOT arm the
+    /// cancel-on-disconnect timer: the successor transport has already
+    /// arrived (the listener parsed its resuming <c>Establish</c> with a
+    /// matching SessionId + SessionVerId), so the old transport's
+    /// disconnect is immediately superseded and the firm's resting orders
+    /// must be preserved — mirroring the <see cref="CloseKind.SessionTakeOver"/>
+    /// semantics on the Negotiate-path takeover (#488). The caller follows
+    /// this with <see cref="TryReattach"/> to bind the new transport.
+    /// </summary>
+    public void SuspendForTakeover(string reason)
+    {
+        lock (_attachLock)
+        {
+            SuspendLocked(reason, armCancelOnDisconnect: false);
+        }
+    }
+
+    /// <summary>
     /// <summary>
     /// Issue #405: writes the current FIXP envelope state to
     /// <see cref="_statePersister"/> if one is wired. Best-effort —
@@ -148,7 +168,7 @@ public sealed partial class FixpSession
     /// holds <see cref="_attachLock"/>. Idempotent — second caller is a
     /// no-op via the <see cref="_isAttached"/> CAS.
     /// </summary>
-    private void SuspendLocked(string reason)
+    private void SuspendLocked(string reason, bool armCancelOnDisconnect = true)
     {
         // Atomically claim the right to suspend; second caller is a no-op.
         // We use a separate CAS guard (not _isAttached) so the public
@@ -185,7 +205,11 @@ public sealed partial class FixpSession
             return;
         }
         Volatile.Write(ref _suspendedSinceMs, NowMs());
-        ScheduleCodTimerLocked();
+        // Issue #496: an Establish-path takeover suspends a still-Established
+        // session whose successor transport has already arrived, so CoD must
+        // be skipped (the disconnect is immediately superseded).
+        if (armCancelOnDisconnect)
+            ScheduleCodTimerLocked();
         // Issue #405: persist the envelope on suspend so a host crash
         // while the session is parked still produces an
         // EstablishmentAck.lastIncomingSeqNo matching reality.
@@ -482,6 +506,14 @@ public sealed partial class FixpSession
             Volatile.Write(ref _suspendedSinceMs, 0);
             Volatile.Write(ref _lastInboundMs, NowMs());
             Volatile.Write(ref _isAttached, 1);
+            // Installing a fresh attached generation begins a new suspend
+            // cycle: clear the one-shot SuspendLocked guard so a subsequent
+            // disconnect can demote this session again. Without this reset a
+            // second drop after any reattach would silently no-op the suspend
+            // (the guard is only otherwise cleared on the never-attached early
+            // return), leaving the session wedged Established over a dead
+            // transport.
+            Volatile.Write(ref _suspendInProgress, 0);
 
             // Spin up new send / recv / watchdog loops bound to the fresh
             // transport + cancellation source. The buffered Establish frame
