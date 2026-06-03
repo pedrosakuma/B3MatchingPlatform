@@ -389,6 +389,46 @@ public class ExecutionReportEncoderTests
     }
 
     [Fact]
+    public void EncodeRestate_GtcStopLimit_EchoesOrdTypeAndStopPx()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 7, orderId: 9,
+            securityId: 3, execId: 9UL, transactTimeNanos: 0UL,
+            openQty: 100, priceMantissa: 105_0000L,
+            tif: TimeInForce.Gtc, expireDate: 0,
+            ordType: OrderType.StopLimit, stopPxMantissa: 104_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'R', body[19]);                                       // OrdStatus=RESTATED
+        Assert.Equal((byte)'4', body[116]);                                      // OrdType=StopLimit
+        Assert.Equal((byte)'1', body[117]);                                      // TimeInForce=GTC
+        Assert.Equal(105_0000L, MemoryMarshal.Read<long>(body.Slice(128, 8)));   // limit Price echoed
+        Assert.Equal(104_0000L, MemoryMarshal.Read<long>(body.Slice(136, 8)));   // StopPx echoed
+        Assert.Equal((byte)1, body[179]);                                        // GT_RESTATEMENT
+    }
+
+    [Fact]
+    public void EncodeRestate_GtcStopLoss_NullsLimitPriceKeepsStopPx()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 7, orderId: 9,
+            securityId: 3, execId: 9UL, transactTimeNanos: 0UL,
+            openQty: 200, priceMantissa: 0L,
+            tif: TimeInForce.Gtc, expireDate: 0,
+            ordType: OrderType.StopLoss, stopPxMantissa: 96_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'3', body[116]);                                      // OrdType=StopLoss
+        // StopLoss carries no limit price → null sentinel.
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(128, 8)));
+        Assert.Equal(96_0000L, MemoryMarshal.Read<long>(body.Slice(136, 8)));    // StopPx echoed
+    }
+
+    [Fact]
     public void EncodeCancel_V6Header_VersionIs6()
     {
         Assert.Equal(182, ExecutionReportEncoder.ExecReportCancelBlock);

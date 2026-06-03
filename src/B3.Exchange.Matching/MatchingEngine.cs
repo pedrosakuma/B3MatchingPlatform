@@ -1136,16 +1136,18 @@ public sealed class MatchingEngine
     /// every surviving resting GTC order and every unexpired GTD order
     /// (<c>ExpireDate &gt; <paramref name="currentDate"/></c>, a B3
     /// <c>LocalMktDate</c> = days since the Unix epoch) across the channel's
-    /// books. Past-or-equal-date GTD orders are intentionally skipped here —
+    /// books, plus every parked GTC stop order (stops are off-book and only
+    /// accept Day or GTC, so an unexpired-GTD stop cannot exist). Past-or-equal
+    /// date GTD orders are intentionally skipped here —
     /// <see cref="ExpireGtdOrders"/> runs first at the boundary and cancels
     /// them, so restating one would contradict its <c>ER_Cancel</c>. The
     /// engine stays clockless (ADR 0009): the boundary date is an explicit
     /// argument.
     ///
-    /// <para>A restatement does <em>not</em> mutate the book: no order is
-    /// removed, no price level changes, and no <c>RptSeq</c> is consumed. It
-    /// is a private notification to the owning session only. Returns the
-    /// number of orders restated.</para>
+    /// <para>A restatement does <em>not</em> mutate the book or the stop
+    /// collections: no order is removed, no price level changes, and no
+    /// <c>RptSeq</c> is consumed. It is a private notification to the owning
+    /// session only. Returns the number of orders restated.</para>
     /// </summary>
     public int RestateGtOrders(ushort currentDate, ulong txnNanos)
     {
@@ -1181,8 +1183,38 @@ public sealed class MatchingEngine
                         Tif: resting.Tif,
                         ExpireDate: resting.ExpireDate,
                         TransactTimeNanos: txnNanos,
+                        OrdType: OrderType.Limit,
+                        StopPxMantissa: 0,
                         Memo: resting.Memo,
                         InvestorId: resting.InvestorId));
+                    restated++;
+                }
+            }
+
+            // Parked GTC stop / stop-limit orders survive the day off-book and
+            // must be restated too (#507 review). Iterating _stopsBySymbol is
+            // read-only — restatement never triggers, cancels, or re-parks.
+            foreach (var bucket in _stopsBySymbol.Values)
+            {
+                foreach (var stop in bucket)
+                {
+                    if (stop.Tif != TimeInForce.Gtc) continue;
+                    bool isStopLoss = stop.StopType == OrderType.StopLoss;
+                    _sink.OnOrderRestated(new OrderRestatedEvent(
+                        SecurityId: stop.SecurityId,
+                        OrderId: stop.OrderId,
+                        // StopLoss has no resting limit price (it becomes a
+                        // Market on trigger); StopLimit echoes its limit price.
+                        PriceMantissa: isStopLoss ? 0 : stop.LimitPriceMantissa,
+                        Side: stop.Side,
+                        OpenQuantity: stop.Quantity,
+                        Tif: stop.Tif,
+                        ExpireDate: 0,
+                        TransactTimeNanos: txnNanos,
+                        OrdType: stop.StopType,
+                        StopPxMantissa: stop.StopPxMantissa,
+                        Memo: stop.Memo,
+                        InvestorId: stop.InvestorId));
                     restated++;
                 }
             }

@@ -260,6 +260,7 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, long orderId,
         long securityId, ulong execId, ulong transactTimeNanos,
         long openQty, long priceMantissa, Matching.TimeInForce tif, ushort expireDate,
+        Matching.OrderType ordType = Matching.OrderType.Limit, long stopPxMantissa = 0,
         ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
         Matching.InvestorId? investorId = null)
     {
@@ -286,12 +287,15 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(96, 8), in clOrdIdValue);           // OrigClOrdID echoes the order's own ClOrdID
         long nullPx = PriceNullMantissa;
         MemoryMarshal.Write(body.Slice(104, 8), in nullPx);                 // ProtectionPrice
-        body[116] = OrdTypeLimit;
+        body[116] = EncodeOrdType(ordType);                                 // echo real OrdType (Limit / Stop / StopLimit)
         body[117] = EncodeTif(tif);                                         // echo real TIF (GTC / GTD)
         MemoryMarshal.Write(body.Slice(118, 2), in expireDate);            // ExpireDate (0 = null for GTC)
         MemoryMarshal.Write(body.Slice(120, 8), in openQty);               // OrderQty == LeavesQty on the new day
-        MemoryMarshal.Write(body.Slice(128, 8), in priceMantissa);
-        MemoryMarshal.Write(body.Slice(136, 8), in nullPx);                 // StopPx
+        // StopLoss carries no resting limit price (Market on trigger) → null.
+        long priceToWrite = ordType == Matching.OrderType.StopLoss ? nullPx : priceMantissa;
+        MemoryMarshal.Write(body.Slice(128, 8), in priceToWrite);
+        long stopToWrite = stopPxMantissa != 0 ? stopPxMantissa : nullPx;
+        MemoryMarshal.Write(body.Slice(136, 8), in stopToWrite);           // StopPx (null for non-stop orders)
         MemoryMarshal.Write(body.Slice(160, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
         if (investorId is { } iv)
         {

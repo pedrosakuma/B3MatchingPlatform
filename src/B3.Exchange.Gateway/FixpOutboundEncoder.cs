@@ -197,6 +197,7 @@ internal sealed class FixpOutboundEncoder
                     e.SecurityId, (ulong)e.OrderId, e.TransactTimeNanos,
                     openQty: e.OpenQuantity, priceMantissa: e.PriceMantissa,
                     tif: e.Tif, expireDate: e.ExpireDate,
+                    ordType: e.OrdType, stopPxMantissa: e.StopPxMantissa,
                     memo: memo.Span, investorId: e.InvestorId);
                 return AppendAndEnqueueLocked(exact, durability);
             }

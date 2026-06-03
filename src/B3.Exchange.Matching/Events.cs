@@ -346,6 +346,8 @@ public readonly record struct OrderRestatedEvent(
     TimeInForce Tif,
     ushort ExpireDate,
     ulong TransactTimeNanos,
+    OrderType OrdType = OrderType.Limit,
+    long StopPxMantissa = 0,
     byte[]? Memo = null,
     InvestorId? InvestorId = null);
 

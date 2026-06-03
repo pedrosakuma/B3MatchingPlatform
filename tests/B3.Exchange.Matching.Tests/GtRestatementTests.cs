@@ -62,6 +62,41 @@ public class GtRestatementTests
     }
 
     [Fact]
+    public void RestateGtOrders_RestatesParkedGtcStops_NotDayStops()
+    {
+        var eng = NewEngine(out var sink);
+        // GTC stop-limit and GTC stop-loss park off-book; a Day stop must not
+        // be restated. None trigger (no trades occur).
+        eng.Submit(new NewOrderCommand("stopLimitGtc", PetrSecId, Side.Buy, OrderType.StopLimit, TimeInForce.Gtc, Px(10.50m), 100, 11, 1000)
+        {
+            StopPxMantissa = Px(10.40m),
+        });
+        eng.Submit(new NewOrderCommand("stopLossGtc", PetrSecId, Side.Buy, OrderType.StopLoss, TimeInForce.Gtc, 0, 200, 11, 1100)
+        {
+            StopPxMantissa = Px(10.60m),
+        });
+        eng.Submit(new NewOrderCommand("stopLimitDay", PetrSecId, Side.Buy, OrderType.StopLimit, TimeInForce.Day, Px(10.50m), 100, 11, 1200)
+        {
+            StopPxMantissa = Px(10.45m),
+        });
+        sink.Clear();
+
+        int restated = eng.RestateGtOrders(currentDate: 20_000, txnNanos: Txn);
+
+        Assert.Equal(2, restated);
+        var stopLimit = Assert.Single(sink.Restated, r => r.OrdType == OrderType.StopLimit);
+        Assert.Equal(TimeInForce.Gtc, stopLimit.Tif);
+        Assert.Equal(Px(10.40m), stopLimit.StopPxMantissa);
+        Assert.Equal(Px(10.50m), stopLimit.PriceMantissa);
+        Assert.Equal(100, stopLimit.OpenQuantity);
+
+        var stopLoss = Assert.Single(sink.Restated, r => r.OrdType == OrderType.StopLoss);
+        Assert.Equal(Px(10.60m), stopLoss.StopPxMantissa);
+        Assert.Equal(0, stopLoss.PriceMantissa);      // StopLoss has no limit price
+        Assert.Equal(200, stopLoss.OpenQuantity);
+    }
+
+    [Fact]
     public void RestateGtOrders_NoGtOrders_ReturnsZero()
     {
         var eng = NewEngine(out var sink);
