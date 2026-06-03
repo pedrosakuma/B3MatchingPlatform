@@ -100,6 +100,14 @@ public sealed partial class ChannelDispatcher
             item.ExpireCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; ExpireSecurity rejected"));
+            // GAP-23 (#499) / GAP-26 (#498): GTD-expiry and GT-restatement
+            // sweeps await their completions too.
+            item.ExpireGtdCompletion?.TrySetException(
+                new InvalidOperationException(
+                    $"channel {ChannelNumber} WAL-halted; ExpireGtd rejected"));
+            item.RestateGtCompletion?.TrySetException(
+                new InvalidOperationException(
+                    $"channel {ChannelNumber} WAL-halted; RestateGt rejected"));
             return;
         }
 
@@ -186,6 +194,17 @@ public sealed partial class ChannelDispatcher
             // consumed by the per-order ER_Cancel frames survive a restart.
             // Operator commands are not WAL-logged; the forced snapshot is
             // the durability boundary — mirrors the ExpireSecurity path.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorRestateGt)
+        {
+            ProcessRestateGt(item.RestateGt!, item.RestateGtCompletion);
+            // GAP-26 (#498): a restatement does not mutate engine state (no
+            // book change, no RptSeq advance), so the forced snapshot is a
+            // no-op delta. We still force-persist to keep the operator-command
+            // durability contract uniform with the sibling sweeps above.
             OnAfterCommandFlushed(force: true);
             return;
         }

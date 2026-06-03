@@ -322,6 +322,34 @@ public readonly record struct OrderModifiedEvent(
     InvestorId? InvestorId = null);
 
 /// <summary>
+/// GAP-26 / issue #498: fired once per surviving Good-Till (GTC or
+/// unexpired GTD) resting order at the daily session boundary, so the
+/// owning client is told its order carries into the new trading day. The
+/// integration layer translates this into a private
+/// <c>ExecutionReport_Modify</c> with <c>OrdStatus=RESTATED</c> and
+/// <c>ExecRestatementReason=GT_RESTATEMENT</c> back to the originating
+/// session.
+///
+/// <para>The book is <em>unchanged</em> by a restatement — there is no
+/// UMDF frame, no <c>RptSeq</c> advance, and no registry eviction. On the
+/// new trading day the order's cumulative executed quantity resets, so the
+/// wire <c>CumQty</c> is 0 and <c>OrderQty == LeavesQty ==</c>
+/// <see cref="OpenQuantity"/> (the engine's remaining open quantity,
+/// iceberg-aware: displayed + hidden).</para>
+/// </summary>
+public readonly record struct OrderRestatedEvent(
+    long SecurityId,
+    long OrderId,
+    Side Side,
+    long PriceMantissa,
+    long OpenQuantity,
+    TimeInForce Tif,
+    ushort ExpireDate,
+    ulong TransactTimeNanos,
+    byte[]? Memo = null,
+    InvestorId? InvestorId = null);
+
+/// <summary>
 /// Fired when an instrument is placed into administrative halt via
 /// <see cref="MatchingEngine.HaltInstrument"/> (issue #322). The
 /// integration layer translates this to a UMDF
@@ -372,6 +400,16 @@ public interface IMatchingEventSink
     /// unchanged. Issue #251.
     /// </summary>
     void OnOrderModified(in OrderModifiedEvent e) { }
+
+    /// <summary>
+    /// Optional event emitted once per surviving Good-Till order at the daily
+    /// session boundary (GAP-26 / issue #498) to drive the private
+    /// restatement <c>ExecutionReport_Modify</c>. Default no-op so legacy
+    /// sinks compile; the production <c>ChannelDispatcher</c> overrides it to
+    /// route the restatement ER to the owning session without touching the
+    /// book or the UMDF feed.
+    /// </summary>
+    void OnOrderRestated(in OrderRestatedEvent e) { }
 
     /// <summary>
     /// Optional summary event emitted once per (SecurityId, Side) at the

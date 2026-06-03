@@ -1131,6 +1131,66 @@ public sealed class MatchingEngine
         finally { ExitDispatch(); }
     }
 
+    /// <summary>
+    /// GAP-26 / issue #498: emits a daily Good-Till restatement event for
+    /// every surviving resting GTC order and every unexpired GTD order
+    /// (<c>ExpireDate &gt; <paramref name="currentDate"/></c>, a B3
+    /// <c>LocalMktDate</c> = days since the Unix epoch) across the channel's
+    /// books. Past-or-equal-date GTD orders are intentionally skipped here —
+    /// <see cref="ExpireGtdOrders"/> runs first at the boundary and cancels
+    /// them, so restating one would contradict its <c>ER_Cancel</c>. The
+    /// engine stays clockless (ADR 0009): the boundary date is an explicit
+    /// argument.
+    ///
+    /// <para>A restatement does <em>not</em> mutate the book: no order is
+    /// removed, no price level changes, and no <c>RptSeq</c> is consumed. It
+    /// is a private notification to the owning session only. Returns the
+    /// number of orders restated.</para>
+    /// </summary>
+    public int RestateGtOrders(ushort currentDate, ulong txnNanos)
+    {
+        EnterDispatch();
+        try
+        {
+            int restated = 0;
+            foreach (var book in _booksById.Values)
+            {
+                // SnapshotOrders() copies into the book's scratch buffer.
+                // Restatement is read-only (no book mutation), so the
+                // snapshot is purely defensive — it mirrors ExpireGtdOrders
+                // and keeps the iteration robust if the sink ever grows a
+                // side-effect.
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    bool isGtc = resting.Tif == TimeInForce.Gtc;
+                    bool isUnexpiredGtd = resting.Tif == TimeInForce.Gtd
+                        && resting.ExpireDate != 0
+                        && resting.ExpireDate > currentDate;
+                    if (!isGtc && !isUnexpiredGtd) continue;
+
+                    // New trading day: cumulative executed qty resets, so the
+                    // open quantity (displayed + hidden for icebergs) is both
+                    // the leaves and the order quantity on the restatement.
+                    long open = resting.RemainingQuantity + resting.HiddenQuantity;
+                    _sink.OnOrderRestated(new OrderRestatedEvent(
+                        SecurityId: book.SecurityId,
+                        OrderId: resting.OrderId,
+                        Side: resting.Side,
+                        PriceMantissa: resting.PriceMantissa,
+                        OpenQuantity: open,
+                        Tif: resting.Tif,
+                        ExpireDate: resting.ExpireDate,
+                        TransactTimeNanos: txnNanos,
+                        Memo: resting.Memo,
+                        InvestorId: resting.InvestorId));
+                    restated++;
+                }
+            }
+            return restated;
+        }
+        finally { ExitDispatch(); }
+    }
+
     private static bool MatchesMassCancelFilter(LimitOrderBook book, RestingOrder resting, MassCancelCommand command)
     {
         if (command.SecurityId != 0 && book.SecurityId != command.SecurityId) return false;

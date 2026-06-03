@@ -85,6 +85,7 @@ internal static class ExecutionReportEncoder
     private const byte OrdStatusFilled = (byte)'2';
     private const byte OrdStatusCanceled = (byte)'4';
     private const byte OrdStatusReplaced = (byte)'5';
+    private const byte OrdStatusRestated = (byte)'R';
     private const byte OrdStatusRejected = (byte)'8';
     private const byte OrdTypeMarket = (byte)'1';
     private const byte OrdTypeLimit = (byte)'2';
@@ -99,6 +100,11 @@ internal static class ExecutionReportEncoder
     private const byte TifAtClose = (byte)'7';
     private const byte TifGoodForAuction = (byte)'A';
     private const byte ExecTypeTrade = (byte)'F';
+
+    /// <summary>GAP-26 / issue #498: ExecRestatementReason = GT_RESTATEMENT.
+    /// Carried at body offset 179 on the V6 ER_Modify block (where the null
+    /// sentinel is 255).</summary>
+    private const byte ExecRestatementReasonGtRestatement = 1;
 
     private static byte EncodeSide(Matching.Side s) => s == Matching.Side.Buy ? SideBuy : SideSell;
     private static byte EncodeOrdType(Matching.OrderType t) => t switch
@@ -231,6 +237,71 @@ internal static class ExecutionReportEncoder
         body[179] = 255;                                                    // ExecRestatementReason null
         // strategyID@180 (int, null=0) and tradingSubAccount@184 (uint,
         // null=0) covered by body.Clear() above.
+        return WriteMemoTrailer(dst, ExecReportModifyBlock, memo);
+    }
+
+    /// <summary>
+    /// GAP-26 / issue #498: encodes a daily Good-Till restatement
+    /// <c>ExecutionReport_Modify</c> (template 201) for a surviving GTC /
+    /// unexpired-GTD order at the session boundary. Distinct from
+    /// <see cref="EncodeExecReportModify"/> (which hard-codes
+    /// <c>OrdStatus=REPLACED</c> + <c>TimeInForce=Day</c>): a restatement sets
+    /// <c>OrdStatus=RESTATED('R')</c>, <c>ExecRestatementReason=GT_RESTATEMENT</c>
+    /// at body[179], echoes the order's real <c>TimeInForce</c> and (for GTD)
+    /// its <c>ExpireDate</c>, and reports the new-trading-day quantities
+    /// (<c>CumQty=0</c>, <c>LeavesQty == OrderQty == openQty</c>).
+    /// <c>OrigClOrdID</c> echoes the order's own <c>ClOrdID</c> (no client
+    /// request drives a restatement). <paramref name="execId"/> is the
+    /// engine <c>OrderID</c> — unique per instrument — because a restatement
+    /// consumes no <c>RptSeq</c>.
+    /// </summary>
+    public static int EncodeExecReportRestate(Span<byte> dst,
+        uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
+        Matching.Side side, ulong clOrdIdValue, long orderId,
+        long securityId, ulong execId, ulong transactTimeNanos,
+        long openQty, long priceMantissa, Matching.TimeInForce tif, ushort expireDate,
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
+        Matching.InvestorId? investorId = null)
+    {
+        int total = TotalSize(ExecReportModifyBlock, memo.Length);
+        if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Restate", nameof(dst));
+        EntryPointFrameReader.WriteHeader(dst, messageLength: (ushort)total,
+            ExecReportModifyBlock, EntryPointFrameReader.TidExecutionReportModify, version: 6);
+        var body = dst.Slice(HeaderSize, ExecReportModifyBlock);
+        body.Clear();
+        WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
+        body[18] = EncodeSide(side);
+        body[19] = OrdStatusRestated;
+        MemoryMarshal.Write(body.Slice(20, 8), in clOrdIdValue);
+        MemoryMarshal.Write(body.Slice(28, 8), in orderId);                 // SecondaryOrderID = engine OrderID
+        MemoryMarshal.Write(body.Slice(36, 8), in securityId);
+        MemoryMarshal.Write(body.Slice(44, 8), in openQty);                 // overlap SecExchange — LeavesQty
+        MemoryMarshal.Write(body.Slice(56, 8), in execId);
+        MemoryMarshal.Write(body.Slice(64, 8), in transactTimeNanos);
+        long cumQty = 0;                                                    // new trading day: nothing executed yet
+        MemoryMarshal.Write(body.Slice(72, 8), in cumQty);
+        ulong nullTs = UTCTimestampNullValue;
+        MemoryMarshal.Write(body.Slice(80, 8), in nullTs);                  // MarketSegmentReceivedTime
+        MemoryMarshal.Write(body.Slice(88, 8), in orderId);
+        MemoryMarshal.Write(body.Slice(96, 8), in clOrdIdValue);           // OrigClOrdID echoes the order's own ClOrdID
+        long nullPx = PriceNullMantissa;
+        MemoryMarshal.Write(body.Slice(104, 8), in nullPx);                 // ProtectionPrice
+        body[116] = OrdTypeLimit;
+        body[117] = EncodeTif(tif);                                         // echo real TIF (GTC / GTD)
+        MemoryMarshal.Write(body.Slice(118, 2), in expireDate);            // ExpireDate (0 = null for GTC)
+        MemoryMarshal.Write(body.Slice(120, 8), in openQty);               // OrderQty == LeavesQty on the new day
+        MemoryMarshal.Write(body.Slice(128, 8), in priceMantissa);
+        MemoryMarshal.Write(body.Slice(136, 8), in nullPx);                 // StopPx
+        MemoryMarshal.Write(body.Slice(160, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
+        if (investorId is { } iv)
+        {
+            ushort prefix = iv.Prefix;
+            uint document = iv.Document;
+            MemoryMarshal.Write(body.Slice(172, 2), in prefix);
+            MemoryMarshal.Write(body.Slice(174, 4), in document);
+        }
+        body[178] = 255;                                                    // MmProtectionReset null
+        body[179] = ExecRestatementReasonGtRestatement;                     // ExecRestatementReason = GT_RESTATEMENT
         return WriteMemoTrailer(dst, ExecReportModifyBlock, memo);
     }
 

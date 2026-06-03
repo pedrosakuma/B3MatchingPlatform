@@ -758,4 +758,58 @@ public sealed partial class ChannelDispatcher
             throw;
         }
     }
+
+    /// <summary>
+    /// GAP-26 / issue #498: enqueue a daily Good-Till restatement sweep for
+    /// the trading day being closed (<paramref name="currentDate"/>, a B3
+    /// <c>LocalMktDate</c> = days since the Unix epoch). On the dispatch
+    /// thread the engine emits a private restatement
+    /// <c>ExecutionReport_Modify</c> (OrdStatus=RESTATED,
+    /// ExecRestatementReason=GT_RESTATEMENT) for every surviving GTC order
+    /// and every GTD order whose <c>ExpireDate</c> is strictly after
+    /// <paramref name="currentDate"/>, routed back to the owning session via
+    /// the <c>OnOrderRestated</c> sink path. The book is unchanged: no UMDF
+    /// frame, no <c>RptSeq</c> advance, no phase change. Idempotent and safe
+    /// to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorRestateGt(ushort currentDate,
+        TaskCompletionSource<RestateGtOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorRestateGt))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; RestateGt rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorRestateGt, default, 0, false,
+            0, 0, null, null, null, null,
+            RestateGt: new OperatorRestateGt(currentDate),
+            RestateGtCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; RestateGt rejected"));
+        return false;
+    }
+
+    private void ProcessRestateGt(OperatorRestateGt op,
+        TaskCompletionSource<RestateGtOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _packetWritten = 0;
+        try
+        {
+            int restated = _engine.RestateGtOrders(op.CurrentDate, _timeSource.NowNanos());
+            // Restatement emits no UMDF frames (the book is unchanged), so
+            // _packetWritten stays 0; the guard mirrors the sibling sweeps.
+            if (_packetWritten > 0) FlushPacket();
+            completion?.TrySetResult(new RestateGtOutcome(restated));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
 }

@@ -177,6 +177,37 @@ internal sealed class FixpOutboundEncoder
     }
 
     /// <summary>
+    /// GAP-26 / issue #498: encodes and enqueues a private daily Good-Till
+    /// restatement <c>ExecutionReport_Modify</c> for a surviving order. The
+    /// engine <c>OrderID</c> doubles as the per-instrument <c>ExecID</c>
+    /// (a restatement consumes no <c>RptSeq</c>).
+    /// </summary>
+    public bool WriteExecutionReportRestate(in OrderRestatedEvent e, ulong ownerClOrdId,
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+    {
+        if (!_isOpen()) return false;
+        var exact = PooledOutboundFrame.Rent(ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportModifyBlock, memo.Length));
+        try
+        {
+            lock (_outboundLock)
+            {
+                ExecutionReportEncoder.EncodeExecReportRestate(exact.Span,
+                    _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
+                    e.Side, ownerClOrdId, e.OrderId,
+                    e.SecurityId, (ulong)e.OrderId, e.TransactTimeNanos,
+                    openQty: e.OpenQuantity, priceMantissa: e.PriceMantissa,
+                    tif: e.Tif, expireDate: e.ExpireDate,
+                    memo: memo.Span, investorId: e.InvestorId);
+                return AppendAndEnqueueLocked(exact, durability);
+            }
+        }
+        finally
+        {
+            exact.Release();
+        }
+    }
+
+    /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
     /// <c>OrderMassActionRequest</c>.
