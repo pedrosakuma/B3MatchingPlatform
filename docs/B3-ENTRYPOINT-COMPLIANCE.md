@@ -40,8 +40,13 @@ re-validated against a newer spec revision.
 These are **intentional** simplifications. They are listed here to keep them
 out of the gap table and to make the rationale auditable.
 
-- **Continuous trading only.** No auction phases / TradingSessionStatus
-  cycle. (See [#19](https://github.com/pedrosakuma/B3MatchingPlatform/issues/19).)
+- **No automatic intraday session schedule.** Auction phases *are* modeled —
+  the `TradingPhase` enum carries `Reserved` (pre-open), `Open`,
+  `FinalClosingCall` and `Close`, the engine uncrosses auctions and gates
+  `MOC`/`MOA` orders by phase, and option series are swept to `Close` on
+  expiry — but there is no autonomous time-of-day `TradingSessionStatus` cycle:
+  phase transitions are operator/scheduler-driven, not wall-clock-scheduled.
+  (See [#19](https://github.com/pedrosakuma/B3MatchingPlatform/issues/19).)
 - **FIXP session resync persistence** ([#405](https://github.com/pedrosakuma/B3MatchingPlatform/issues/405)).
   Outbound business frames are appended to an unbounded per-session
   journal and the FIXP envelope state (SessionVerId, LastIncomingSeqNo,
@@ -181,8 +186,8 @@ contract supervision is a post-trade analytics concern.
 | <a id="gap-28"></a>GAP-28 | 15.5 | Market Protections (price collars / fat-finger / max value) | partial | medium (in-scope per ADR 0012) | Pre-trade fat-finger guardrails landed (#432/#436/#441): `InboundFatFingerOptions` enforces `MaxPriceMantissa`, max `OrderQty`, and a static `PriceBandPercent` at the wire edge. **Dynamic engine-side price collars and max-order-value remain.** Tracked by [#500](https://github.com/pedrosakuma/B3MatchingPlatform/issues/500). |
 | <a id="gap-29"></a>GAP-29 | 15.1 | User-Defined Spreads (UDS) — synthetic multi-leg instruments | missing | low (boundary case; borderline between exchange-side and broker-side) | — |
 | <a id="gap-30"></a>GAP-30 | 16.6 | Sweep & Cross | missing | low (in-scope per ADR 0012) | Tracked by [#501](https://github.com/pedrosakuma/B3MatchingPlatform/issues/501). |
-| <a id="gap-31"></a>GAP-31 | 7.1.19 / UMDF v2.2.0 `SecurityDefinition_12` | `SecurityDefinition_12` does not emit option fields (`strikePrice`, `putOrCall`, `exerciseStyle`, `contractMultiplier`, `noUnderlyings`, `optPayoutType`, `maturityMonthYear`). | done | high | Option fields emitted via `InstrumentDefinitionPublisher` (RFC 0002 OPT-02 → [#479](https://github.com/pedrosakuma/B3MatchingPlatform/pull/479)). |
-| <a id="gap-32"></a>GAP-32 | 8.3 / lifecycle | Expiring option series are not automatically moved to `Close` based on `ExpirationDate`. | done | medium | Expiry-aware phase scheduling moves expiring series to `Close` (RFC 0002 OPT-03 → [#480](https://github.com/pedrosakuma/B3MatchingPlatform/pull/480)). |
+| <a id="gap-31"></a>GAP-31 | 7.1.19 / UMDF v2.2.0 `SecurityDefinition_12` | **Option fields in `SecurityDefinition_12`** (`strikePrice`, `putOrCall`, `exerciseStyle`, `contractMultiplier`, `noUnderlyings`, `optPayoutType`, `maturityMonthYear`). | done | high | Option fields emitted via `InstrumentDefinitionPublisher` → `UmdfWireEncoder.WriteSecurityDefinitionFrame` (RFC 0002 OPT-02 → [#479](https://github.com/pedrosakuma/B3MatchingPlatform/pull/479)). |
+| <a id="gap-32"></a>GAP-32 | 8.3 / lifecycle | **Expiry-driven `SecurityStatus` close** — option series moved to `Close` based on `ExpirationDate`. | done | medium | `OptionExpirySweeper` enqueues expired series and `EnqueueOperatorExpireSecurity` transitions them to `TradingPhase.Close` (RFC 0002 OPT-03 → [#480](https://github.com/pedrosakuma/B3MatchingPlatform/pull/480)). |
 
 ## Maintenance notes
 
