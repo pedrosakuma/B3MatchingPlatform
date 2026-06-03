@@ -159,9 +159,15 @@ public class GtdExpiryE2ETests
 
             host.TriggerDailyReset(reason: "test-gtd-keep");
 
-            // No ER_Cancel should arrive for this order within the window.
-            await Assert.ThrowsAnyAsync<Exception>(async () =>
-                await ReadFrameAsync(stream, TimeSpan.FromMilliseconds(750)));
+            // The future-dated GTD survives the sweep — and as of GAP-26 (#498)
+            // it is restated for the new trading day: a private ER_Modify with
+            // OrdStatus=RESTATED('R') and ExecRestatementReason=GT_RESTATEMENT(1).
+            var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            Assert.Equal(EntryPointFrameReader.TidExecutionReportModify, er2.TemplateId);
+            Assert.Equal((byte)'R', er2.Body[19]);
+            Assert.Equal((byte)1, er2.Body[179]);
+            Assert.Equal((byte)'6', er2.Body[117]);   // TimeInForce echoed = GTD
+            Assert.Equal(expireDate, BinaryPrimitives.ReadUInt16LittleEndian(er2.Body.AsSpan(118, 2)));
         }
         finally
         {

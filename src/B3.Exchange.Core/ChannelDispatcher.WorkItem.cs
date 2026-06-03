@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity, OperatorExpireGtd }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity, OperatorExpireGtd, OperatorRestateGt }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -43,6 +43,7 @@ public sealed partial class ChannelDispatcher
         "ShutdownBarrier",
         "OperatorExpireSecurity",
         "OperatorExpireGtd",
+        "OperatorRestateGt",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -78,6 +79,8 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<ExpireSecurityOutcome>? ExpireCompletion = null,
         OperatorExpireGtd? ExpireGtd = null,
         TaskCompletionSource<ExpireGtdOutcome>? ExpireGtdCompletion = null,
+        OperatorRestateGt? RestateGt = null,
+        TaskCompletionSource<RestateGtOutcome>? RestateGtCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -164,6 +167,21 @@ public sealed partial class ChannelDispatcher
     /// ExpireDate).
     /// </summary>
     public readonly record struct ExpireGtdOutcome(int CancelledOrderCount);
+
+    /// <summary>
+    /// GAP-26 / issue #498: payload for the daily Good-Till restatement sweep.
+    /// On the dispatch thread the engine emits a private restatement ER for
+    /// every surviving GTC order and every GTD order whose <c>ExpireDate</c>
+    /// is strictly after <see cref="CurrentDate"/> (a B3 <c>LocalMktDate</c>).
+    /// The book is not mutated; no trading phase changes.
+    /// </summary>
+    internal sealed record OperatorRestateGt(ushort CurrentDate);
+
+    /// <summary>
+    /// GAP-26 / issue #498: outcome of a Good-Till restatement sweep — how
+    /// many surviving GTC / unexpired-GTD orders were restated.
+    /// </summary>
+    public readonly record struct RestateGtOutcome(int RestatedOrderCount);
 
     /// <summary>
     /// ADR 0008 PR-2: operator bust request payload (post-trade audit

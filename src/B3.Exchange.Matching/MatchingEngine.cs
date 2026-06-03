@@ -1131,6 +1131,98 @@ public sealed class MatchingEngine
         finally { ExitDispatch(); }
     }
 
+    /// <summary>
+    /// GAP-26 / issue #498: emits a daily Good-Till restatement event for
+    /// every surviving resting GTC order and every unexpired GTD order
+    /// (<c>ExpireDate &gt; <paramref name="currentDate"/></c>, a B3
+    /// <c>LocalMktDate</c> = days since the Unix epoch) across the channel's
+    /// books, plus every parked GTC stop order (stops are off-book and only
+    /// accept Day or GTC, so an unexpired-GTD stop cannot exist). Past-or-equal
+    /// date GTD orders are intentionally skipped here —
+    /// <see cref="ExpireGtdOrders"/> runs first at the boundary and cancels
+    /// them, so restating one would contradict its <c>ER_Cancel</c>. The
+    /// engine stays clockless (ADR 0009): the boundary date is an explicit
+    /// argument.
+    ///
+    /// <para>A restatement does <em>not</em> mutate the book or the stop
+    /// collections: no order is removed, no price level changes, and no
+    /// <c>RptSeq</c> is consumed. It is a private notification to the owning
+    /// session only. Returns the number of orders restated.</para>
+    /// </summary>
+    public int RestateGtOrders(ushort currentDate, ulong txnNanos)
+    {
+        EnterDispatch();
+        try
+        {
+            int restated = 0;
+            foreach (var book in _booksById.Values)
+            {
+                // SnapshotOrders() copies into the book's scratch buffer.
+                // Restatement is read-only (no book mutation), so the
+                // snapshot is purely defensive — it mirrors ExpireGtdOrders
+                // and keeps the iteration robust if the sink ever grows a
+                // side-effect.
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    bool isGtc = resting.Tif == TimeInForce.Gtc;
+                    bool isUnexpiredGtd = resting.Tif == TimeInForce.Gtd
+                        && resting.ExpireDate != 0
+                        && resting.ExpireDate > currentDate;
+                    if (!isGtc && !isUnexpiredGtd) continue;
+
+                    // New trading day: cumulative executed qty resets, so the
+                    // open quantity (displayed + hidden for icebergs) is both
+                    // the leaves and the order quantity on the restatement.
+                    long open = resting.RemainingQuantity + resting.HiddenQuantity;
+                    _sink.OnOrderRestated(new OrderRestatedEvent(
+                        SecurityId: book.SecurityId,
+                        OrderId: resting.OrderId,
+                        Side: resting.Side,
+                        PriceMantissa: resting.PriceMantissa,
+                        OpenQuantity: open,
+                        Tif: resting.Tif,
+                        ExpireDate: resting.ExpireDate,
+                        TransactTimeNanos: txnNanos,
+                        OrdType: OrderType.Limit,
+                        StopPxMantissa: 0,
+                        Memo: resting.Memo,
+                        InvestorId: resting.InvestorId));
+                    restated++;
+                }
+            }
+
+            // Parked GTC stop / stop-limit orders survive the day off-book and
+            // must be restated too (#507 review). Iterating _stopsBySymbol is
+            // read-only — restatement never triggers, cancels, or re-parks.
+            foreach (var bucket in _stopsBySymbol.Values)
+            {
+                foreach (var stop in bucket)
+                {
+                    if (stop.Tif != TimeInForce.Gtc) continue;
+                    bool isStopLoss = stop.StopType == OrderType.StopLoss;
+                    _sink.OnOrderRestated(new OrderRestatedEvent(
+                        SecurityId: stop.SecurityId,
+                        OrderId: stop.OrderId,
+                        // StopLoss has no resting limit price (it becomes a
+                        // Market on trigger); StopLimit echoes its limit price.
+                        PriceMantissa: isStopLoss ? 0 : stop.LimitPriceMantissa,
+                        Side: stop.Side,
+                        OpenQuantity: stop.Quantity,
+                        Tif: stop.Tif,
+                        ExpireDate: 0,
+                        TransactTimeNanos: txnNanos,
+                        OrdType: stop.StopType,
+                        StopPxMantissa: stop.StopPxMantissa,
+                        Memo: stop.Memo,
+                        InvestorId: stop.InvestorId));
+                    restated++;
+                }
+            }
+            return restated;
+        }
+        finally { ExitDispatch(); }
+    }
+
     private static bool MatchesMassCancelFilter(LimitOrderBook book, RestingOrder resting, MassCancelCommand command)
     {
         if (command.SecurityId != 0 && book.SecurityId != command.SecurityId) return false;

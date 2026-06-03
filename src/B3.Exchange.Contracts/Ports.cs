@@ -74,6 +74,22 @@ public interface ICoreOutbound
 
     bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default);
+
+    /// <summary>
+    /// GAP-26 / issue #498: routes a private daily Good-Till restatement
+    /// <c>ExecutionReport_Modify</c> (OrdStatus=RESTATED,
+    /// ExecRestatementReason=GT_RESTATEMENT) for the owner of the surviving
+    /// GTC / unexpired-GTD order to <paramref name="ownerSession"/>. The Core
+    /// resolves the owner on the dispatch thread (read-only — the order stays
+    /// on the book) and passes <paramref name="ownerClOrdId"/> as the wire
+    /// ClOrdID. No UMDF frame, RptSeq advance, or registry mutation
+    /// accompanies a restatement.
+    ///
+    /// <para>Default no-op (returns <c>false</c>) so legacy fakes compile
+    /// unchanged; the Gateway overrides it.</para>
+    /// </summary>
+    bool WriteExecutionReportRestate(SessionId ownerSession, ulong ownerClOrdId,
+        in OrderRestatedEvent e, DurabilityHandle durability = default) => false;
 }
 
 /// <summary>

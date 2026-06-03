@@ -261,6 +261,21 @@ public sealed partial class ChannelDispatcher
         }
     }
 
+    public void OnOrderRestated(in OrderRestatedEvent e)
+    {
+        AssertOnLoopThread();
+        // GAP-26 / issue #498: a daily Good-Till restatement is a private
+        // notification to the owning session only. The order stays on the
+        // book unchanged, so we emit NO UMDF frame, consume NO RptSeq, and
+        // do NOT evict the registry entry or decrement the firm's open-order
+        // count (TryResolve is read-only, unlike OnOrderCanceled's TryEvict).
+        if (_orders.TryResolve(e.OrderId, out var owner))
+        {
+            _outbound.WriteExecutionReportRestate(owner.Session, owner.ClOrdId, e, CurrentDurability);
+            _metrics?.IncExecutionReport(ExecutionReportKind.Replace);
+        }
+    }
+
     public void OnOrderFilled(in OrderFilledEvent e)
     {
         AssertOnLoopThread();

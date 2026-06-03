@@ -52,6 +52,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private PhaseScheduler? _phaseScheduler;
     private OptionExpirySweeper? _optionExpirySweeper;
     private GtdExpirySweeper? _gtdExpirySweeper;
+    private GtRestatementSweeper? _gtRestatementSweeper;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
     private B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal? _outboundJournal;
     private B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister? _statePersister;
@@ -107,6 +108,15 @@ public sealed class ExchangeHost : IAsyncDisposable
         // here); waits on per-channel completions so the cancels reach the
         // outbound encoder before DrainAllSessionsOutbound + TerminateAllSessions.
         _gtdExpirySweeper?.Sweep(reason, waitTimeout: TimeSpan.FromSeconds(15));
+        // GAP-26 / #498: restate every surviving GTC / unexpired-GTD order
+        // BEFORE the listener tears down, so the private restatement
+        // ER_Modify (OrdStatus=RESTATED, ExecRestatementReason=GT_RESTATEMENT)
+        // reaches its originating session. Runs AFTER the GTD-expiry sweep so
+        // past-date GTD orders are already cancelled and not restated. The
+        // book is unchanged, so this never emits UMDF; waits on per-channel
+        // completions so the ERs reach the outbound encoder before
+        // DrainAllSessionsOutbound + TerminateAllSessions.
+        _gtRestatementSweeper?.Sweep(reason, waitTimeout: TimeSpan.FromSeconds(15));
         // Issue #487: drain outbound queues BEFORE closing sockets.
         // ER_Cancel frames from the sweep are enqueued to the session's
         // send queue but may not have been written to the socket yet.
@@ -563,6 +573,13 @@ public sealed class ExchangeHost : IAsyncDisposable
             _gtdExpirySweeper = new GtdExpirySweeper(
                 _dispatchers,
                 _loggerFactory.CreateLogger<GtdExpirySweeper>(),
+                todayProvider);
+            // GAP-26 / #498: the restatement sweeper shares the same
+            // timezone-aware "today" provider — both interpret the B3 local
+            // market date in the configured daily-reset timezone.
+            _gtRestatementSweeper = new GtRestatementSweeper(
+                _dispatchers,
+                _loggerFactory.CreateLogger<GtRestatementSweeper>(),
                 todayProvider);
         }
         var listenEp = ParseEndpoint(_config.Tcp.Listen);

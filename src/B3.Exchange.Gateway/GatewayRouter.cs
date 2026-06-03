@@ -100,6 +100,14 @@ public sealed class GatewayRouter : ICoreOutbound
         return s.WriteExecutionReportReject(e, clOrdIdValue, durability, e.Memo ?? ReadOnlyMemory<byte>.Empty);
     }
 
+    public bool WriteExecutionReportRestate(ContractsSessionId ownerSession, ulong ownerClOrdId,
+        in OrderRestatedEvent e, DurabilityHandle durability = default)
+    {
+        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportRestate"); return false; }
+        return s.WriteExecutionReportRestate(e, ownerClOrdId, durability,
+            e.Memo ?? ReadOnlyMemory<byte>.Empty);
+    }
+
     private void LogMiss(ContractsSessionId session, string kind)
     {
         // Common at session-close races; keep at trace so /metrics doesn't

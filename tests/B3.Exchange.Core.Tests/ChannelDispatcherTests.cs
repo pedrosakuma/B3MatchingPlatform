@@ -51,6 +51,7 @@ public partial class ChannelDispatcherTests
         public List<ulong> RejectClOrdIds { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
         public List<(long LeavesQty, long CumQty)> TradeQty { get; } = new();
+        public List<OrderRestatedEvent> Restates { get; } = new();
         public bool CaptureCancelIds { get; set; }
         public List<(ulong ClOrdId, ulong OrigClOrdId)> CancelIds { get; } = new();
         public ulong LastReceivedTime { get; set; } = ulong.MaxValue;
@@ -85,6 +86,8 @@ public partial class ChannelDispatcherTests
         { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; } return true; }
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default)
         { if (Find(session) is { } s) { s.Rejects.Add(e); s.RejectClOrdIds.Add(clOrdIdValue); s.Calls.Add("Reject"); } return true; }
+        public bool WriteExecutionReportRestate(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, in OrderRestatedEvent e, DurabilityHandle d = default)
+        { if (Find(ownerSession) is { } s) { s.Restates.Add(e); s.Calls.Add("Restate"); } return true; }
     }
 
     private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound) NewDispatcher(
@@ -920,6 +923,40 @@ public partial class ChannelDispatcherTests
     }
 
     private static void DrainInbound(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();
+
+    [Fact]
+    public void OperatorRestateGt_RoutesRestateToOwner_NoUmdfFrame_NoEviction()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        // Resting GTC order owned by `reply`.
+        disp.EnqueueNewOrder(new NewOrderCommand("g1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Gtc, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long orderId = Assert.Single(reply.News).OrderId;
+        int packetsAfterRest = pkt.Packets.Count;
+        uint seqAfterRest = disp.SequenceNumber;
+
+        disp.EnqueueOperatorRestateGt(currentDate: 20_000);
+        DrainInbound(disp);
+
+        // Routed to the owning session as a restatement.
+        var restate = Assert.Single(reply.Restates);
+        Assert.Equal(orderId, restate.OrderId);
+        Assert.Equal(TimeInForce.Gtc, restate.Tif);
+        Assert.Equal(100L, restate.OpenQuantity);
+        // Private ER only: no new UMDF packet, no RptSeq advance.
+        Assert.Equal(packetsAfterRest, pkt.Packets.Count);
+        Assert.Equal(seqAfterRest, disp.SequenceNumber);
+
+        // Registry NOT evicted: a subsequent cancel still resolves the owner.
+        disp.EnqueueCancel(new CancelOrderCommand("c1", Petr, orderId, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+        Assert.Single(reply.Cancels);
+    }
+
 
     [Fact]
     public void OperatorSetTradingPhase_EmitsSecurityStatusFrameAndGatesNewOrders()

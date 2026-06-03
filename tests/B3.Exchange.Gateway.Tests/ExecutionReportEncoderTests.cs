@@ -322,6 +322,112 @@ public class ExecutionReportEncoderTests
         Assert.Equal(0u, MemoryMarshal.Read<uint>(body.Slice(174, 4)));
     }
 
+    // ====== GAP-26 / issue #498: daily Good-Till restatement ======
+    //
+    // A restatement reuses the ER_Modify template (201) but flips
+    // OrdStatus to RESTATED('R') and sets ExecRestatementReason at body[179]
+    // to GT_RESTATEMENT(1). It echoes the real TIF + (for GTD) ExpireDate and
+    // reports new-trading-day quantities (cum=0, leaves==orderQty==open).
+
+    [Fact]
+    public void EncodeRestate_Gtc_SetsRestatedStatusAndGtReason()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        int n = ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 5, msgSeqNum: 9, sendingTimeNanos: 1_234UL,
+            side: Side.Buy, clOrdIdValue: 42, orderId: 7777,
+            securityId: 11, execId: 7777UL, transactTimeNanos: 1_234UL,
+            openQty: 300, priceMantissa: 100_0000L,
+            tif: TimeInForce.Gtc, expireDate: 0);
+
+        Assert.Equal(ExecutionReportEncoder.ExecReportModifyTotal, n);
+        // Template id is ER_Modify (201) on the V6 schema.
+        var hdr = buf.AsSpan(EntryPointFrameReader.SofhSize, EntryPointFrameReader.SbeHeaderSize);
+        Assert.Equal((ushort)ExecutionReportEncoder.ExecReportModifyBlock, MemoryMarshal.Read<ushort>(hdr.Slice(0, 2)));
+        Assert.Equal((ushort)EntryPointFrameReader.TidExecutionReportModify, MemoryMarshal.Read<ushort>(hdr.Slice(2, 2)));
+        Assert.Equal((ushort)6, MemoryMarshal.Read<ushort>(hdr.Slice(6, 2)));
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'1', body[18]);                                       // Side=Buy
+        Assert.Equal((byte)'R', body[19]);                                       // OrdStatus=RESTATED
+        Assert.Equal(42UL, MemoryMarshal.Read<ulong>(body.Slice(20, 8)));        // ClOrdID
+        Assert.Equal(7777L, MemoryMarshal.Read<long>(body.Slice(28, 8)));        // SecondaryOrderID = OrderID
+        Assert.Equal(300L, MemoryMarshal.Read<long>(body.Slice(44, 8)));         // LeavesQty = open (overlap)
+        Assert.Equal(7777UL, MemoryMarshal.Read<ulong>(body.Slice(56, 8)));      // ExecID = OrderID
+        Assert.Equal(0L, MemoryMarshal.Read<long>(body.Slice(72, 8)));           // CumQty = 0 (new day)
+        Assert.Equal(7777L, MemoryMarshal.Read<long>(body.Slice(88, 8)));        // OrderID
+        Assert.Equal(42UL, MemoryMarshal.Read<ulong>(body.Slice(96, 8)));        // OrigClOrdID echoes ClOrdID
+        Assert.Equal((byte)'2', body[116]);                                      // OrdType=Limit
+        Assert.Equal((byte)'1', body[117]);                                      // TimeInForce=GTC
+        Assert.Equal((ushort)0, MemoryMarshal.Read<ushort>(body.Slice(118, 2))); // ExpireDate null for GTC
+        Assert.Equal(300L, MemoryMarshal.Read<long>(body.Slice(120, 8)));        // OrderQty = open
+        Assert.Equal(100_0000L, MemoryMarshal.Read<long>(body.Slice(128, 8)));   // Price
+        Assert.Equal((byte)255, body[178]);                                      // MmProtectionReset null
+        Assert.Equal((byte)1, body[179]);                                        // ExecRestatementReason=GT_RESTATEMENT
+    }
+
+    [Fact]
+    public void EncodeRestate_Gtd_EchoesTifAndExpireDate()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 7, orderId: 9,
+            securityId: 3, execId: 9UL, transactTimeNanos: 0UL,
+            openQty: 150, priceMantissa: 50_0000L,
+            tif: TimeInForce.Gtd, expireDate: 20_001,
+            investorId: new B3.Exchange.Matching.InvestorId(Prefix: 9, Document: 987_654));
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'2', body[18]);                                       // Side=Sell
+        Assert.Equal((byte)'R', body[19]);                                       // OrdStatus=RESTATED
+        Assert.Equal((byte)'6', body[117]);                                      // TimeInForce=GTD
+        Assert.Equal((ushort)20_001, MemoryMarshal.Read<ushort>(body.Slice(118, 2))); // ExpireDate echoed
+        Assert.Equal((byte)1, body[179]);                                        // GT_RESTATEMENT
+        Assert.Equal((ushort)9, MemoryMarshal.Read<ushort>(body.Slice(172, 2))); // InvestorID prefix
+        Assert.Equal(987_654u, MemoryMarshal.Read<uint>(body.Slice(174, 4)));    // InvestorID document
+    }
+
+    [Fact]
+    public void EncodeRestate_GtcStopLimit_EchoesOrdTypeAndStopPx()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 7, orderId: 9,
+            securityId: 3, execId: 9UL, transactTimeNanos: 0UL,
+            openQty: 100, priceMantissa: 105_0000L,
+            tif: TimeInForce.Gtc, expireDate: 0,
+            ordType: OrderType.StopLimit, stopPxMantissa: 104_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'R', body[19]);                                       // OrdStatus=RESTATED
+        Assert.Equal((byte)'4', body[116]);                                      // OrdType=StopLimit
+        Assert.Equal((byte)'1', body[117]);                                      // TimeInForce=GTC
+        Assert.Equal(105_0000L, MemoryMarshal.Read<long>(body.Slice(128, 8)));   // limit Price echoed
+        Assert.Equal(104_0000L, MemoryMarshal.Read<long>(body.Slice(136, 8)));   // StopPx echoed
+        Assert.Equal((byte)1, body[179]);                                        // GT_RESTATEMENT
+    }
+
+    [Fact]
+    public void EncodeRestate_GtcStopLoss_NullsLimitPriceKeepsStopPx()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportRestate(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 7, orderId: 9,
+            securityId: 3, execId: 9UL, transactTimeNanos: 0UL,
+            openQty: 200, priceMantissa: 0L,
+            tif: TimeInForce.Gtc, expireDate: 0,
+            ordType: OrderType.StopLoss, stopPxMantissa: 96_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'3', body[116]);                                      // OrdType=StopLoss
+        // StopLoss carries no limit price → null sentinel.
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(128, 8)));
+        Assert.Equal(96_0000L, MemoryMarshal.Read<long>(body.Slice(136, 8)));    // StopPx echoed
+    }
+
     [Fact]
     public void EncodeCancel_V6Header_VersionIs6()
     {

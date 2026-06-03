@@ -620,6 +620,10 @@ public sealed partial class FixpSession : IAsyncDisposable
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
             side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId);
 
+    public bool WriteExecutionReportRestate(in B3.Exchange.Matching.OrderRestatedEvent e, ulong ownerClOrdId,
+        DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
+        => _outboundEncoder.WriteExecutionReportRestate(e, ownerClOrdId, durability, memo);
+
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
