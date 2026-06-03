@@ -445,7 +445,8 @@ public sealed class EntryPointListener : IAsyncDisposable
 
         // Re-attach decision: only meaningful when the first message is
         // an Establish targeting an already-claimed sessionId currently
-        // held by a Suspended FixpSession with matching SessionVerId.
+        // held by a FixpSession (Suspended, or still-Established and taken
+        // over per #496) with matching SessionVerId.
         if (templateId == EntryPointFrameReader.TidEstablish
             && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize + EstablishDecoder.BlockLength
             && EstablishDecoder.TryDecode(
@@ -455,22 +456,54 @@ public sealed class EntryPointListener : IAsyncDisposable
             if (_sessionClaims.TryGetActiveClaim(req.SessionId, out var holder, out var lastVerId)
                 && holder is FixpSession existing
                 && existing.SessionVerId == req.SessionVerId
-                && req.SessionVerId == lastVerId
-                && existing.State == FixpState.Suspended)
+                && req.SessionVerId == lastVerId)
             {
-                var prepended = new PrependedStream(firstFrame, stream);
-                if (existing.TryReattach(prepended))
+                // Snapshot State ONCE so the takeover decision is consistent: a
+                // connection that matched a Suspended session must never later
+                // re-read State and escalate to SuspendForTakeover — by then a
+                // concurrent reconnect may have legitimately reattached and
+                // moved the session back to Established, and tearing that fresh
+                // transport down would steal a live successor. Only a connection
+                // that matched an Established session performs the takeover.
+                var matchedState = existing.State;
+                if (matchedState == FixpState.Suspended
+                    || matchedState == FixpState.Established)
                 {
+                    // Issue #496: a still-Established stale claim means the
+                    // prior TCP death has not been reaped yet (hard kill / no
+                    // FIN, before the idle-timeout watchdog fired). A resuming
+                    // Establish with a matching SessionId + SessionVerId is a
+                    // cold-resume reconnect (spec §5.3), not a fresh session —
+                    // the peer that holds the session demonstrably reconnected.
+                    // Force-suspend the stale session (preserving order
+                    // ownership + persistence, skipping Cancel-on-Disconnect) so
+                    // the proven re-attach path can take over deterministically,
+                    // instead of falling through to a fresh Idle session that
+                    // rejects UNNEGOTIATED. Mirrors the Negotiate-path takeover
+                    // added in #488.
+                    if (matchedState == FixpState.Established)
+                    {
+                        _logger.LogInformation(
+                            "establish-takeover: force-suspending still-Established session {ConnectionId} for resuming Establish (sessionId={SessionId} sessionVerId={SessionVerId} from {Remote})",
+                            existing.ConnectionId, req.SessionId, req.SessionVerId, SafeRemote(sock));
+                        existing.SuspendForTakeover(
+                            $"establish-takeover:sessionId={req.SessionId}");
+                    }
+
+                    var prepended = new PrependedStream(firstFrame, stream);
+                    if (existing.TryReattach(prepended))
+                    {
+                        _logger.LogInformation(
+                            "re-attached transport to existing session {ConnectionId} (sessionId={SessionId} from {Remote})",
+                            existing.ConnectionId, existing.SessionId, SafeRemote(sock));
+                        return;
+                    }
                     _logger.LogInformation(
-                        "re-attached transport to existing session {ConnectionId} (sessionId={SessionId} from {Remote})",
-                        existing.ConnectionId, existing.SessionId, SafeRemote(sock));
+                        "re-attach raced and lost for sessionId={SessionId} from {Remote}; closing new socket",
+                        req.SessionId, SafeRemote(sock));
+                    try { prepended.Dispose(); } catch { }
                     return;
                 }
-                _logger.LogInformation(
-                    "re-attach raced and lost for sessionId={SessionId} from {Remote}; closing new socket",
-                    req.SessionId, SafeRemote(sock));
-                try { prepended.Dispose(); } catch { }
-                return;
             }
         }
 
