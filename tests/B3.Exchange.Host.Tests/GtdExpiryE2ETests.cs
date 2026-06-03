@@ -84,12 +84,13 @@ public class GtdExpiryE2ETests
             await client.ConnectAsync(ep.Address, ep.Port);
             var stream = client.GetStream();
 
-            // GTD ExpireDate = today's B3 LocalMktDate (days since epoch).
-            // The host's daily-reset sweep computes the same boundary (UTC,
-            // since cfg.DailyReset is unset) and cancels ExpireDate <= today.
+            // GTD ExpireDate a few days in the past: unambiguously elapsed
+            // regardless of the UTC-vs-local-market-date boundary, so the
+            // daily-reset sweep must cancel it. (A past-dated GTD order is
+            // accepted at entry — the engine is clockless — and swept here.)
             int epochDay = DateOnly.FromDateTime(DateTime.UtcNow).DayNumber
                 - new DateOnly(1970, 1, 1).DayNumber;
-            ushort expireDate = (ushort)epochDay;
+            ushort expireDate = (ushort)(epochDay - 5);
 
             var newOrder = BuildNewOrderSingleGtd(clOrdId: 12_001, secId: SecId,
                 side: '1', qty: 100, priceMantissa: 123_400, expireDate: expireDate);

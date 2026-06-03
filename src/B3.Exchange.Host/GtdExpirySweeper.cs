@@ -47,25 +47,35 @@ public sealed class GtdExpirySweeper
         _todayLocal = todayLocal;
     }
 
+    /// <summary>The B3 venue timezone the local market date is interpreted
+    /// in; matches <c>DailyResetConfig.Timezone</c>'s default. Used when the
+    /// daily-reset section is absent so the GTD boundary still follows the
+    /// B3 local market date rather than UTC.</summary>
+    private const string DefaultMarketTimezone = "America/Sao_Paulo";
+
     /// <summary>
     /// Builds the timezone-aware "today" provider for the sweeper from the
-    /// configured daily-reset timezone. Falls back to UTC when the timezone
-    /// id is unknown so the host never fails to start over a bad config.
+    /// configured daily-reset timezone. A null/blank id (daily-reset section
+    /// absent) defaults to the B3 market timezone (<c>America/Sao_Paulo</c>)
+    /// so the GTD <c>LocalMktDate</c> boundary is the B3 local market date,
+    /// not UTC. An explicitly configured but unknown timezone id falls back
+    /// to UTC so the host never fails to start over a bad config.
     /// </summary>
     public static Func<DateOnly> BuildTodayProvider(string? timezoneId, ILogger logger)
     {
+        string resolvedId = string.IsNullOrWhiteSpace(timezoneId)
+            ? DefaultMarketTimezone
+            : timezoneId;
         TimeZoneInfo tz;
         try
         {
-            tz = string.IsNullOrWhiteSpace(timezoneId)
-                ? TimeZoneInfo.Utc
-                : TimeZoneInfo.FindSystemTimeZoneById(timezoneId);
+            tz = TimeZoneInfo.FindSystemTimeZoneById(resolvedId);
         }
         catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
         {
             logger.LogWarning(ex,
                 "GTD expiry: unknown timezone '{Timezone}', falling back to UTC for the local market date",
-                timezoneId);
+                resolvedId);
             tz = TimeZoneInfo.Utc;
         }
         return () => DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz));
