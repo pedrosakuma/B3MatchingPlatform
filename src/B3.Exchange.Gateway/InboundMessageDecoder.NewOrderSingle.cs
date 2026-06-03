@@ -172,9 +172,19 @@ internal static partial class InboundMessageDecoder
             cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
-        if (expireDate != 0)
+        // GAP-23 / #499: GTD requires a non-zero ExpireDate; ExpireDate is
+        // only meaningful for GTD. Reject the contradictory pairings as an
+        // ER_Reject (UnsupportedFeature keeps the session open) rather than
+        // terminating. Valid GTD+ExpireDate is plumbed into the command.
+        if (tif == TimeInForce.Gtd && expireDate == 0)
         {
-            message = "ExpireDate not supported (only Day/IOC/FOK)";
+            message = "GTD requires ExpireDate";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
+        if (tif != TimeInForce.Gtd && expireDate != 0)
+        {
+            message = "ExpireDate only valid with GTD time-in-force";
             cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
@@ -227,6 +237,7 @@ internal static partial class InboundMessageDecoder
                 StopPxMantissa = engineStopPx,
                 OrdTagId = ordTagId,
                 InvestorId = investorId,
+                ExpireDate = expireDate,
                 PreTradeRejectReason = preTradeRejectReason,
             };
             return InboundDecodeOutcome.UnsupportedFeature;
@@ -248,6 +259,7 @@ internal static partial class InboundMessageDecoder
             StopPxMantissa = engineStopPx,
             OrdTagId = ordTagId,
             InvestorId = investorId,
+            ExpireDate = expireDate,
         };
         return InboundDecodeOutcome.Success;
     }

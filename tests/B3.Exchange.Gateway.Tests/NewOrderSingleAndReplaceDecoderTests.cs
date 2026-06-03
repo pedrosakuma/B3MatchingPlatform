@@ -31,7 +31,8 @@ public class NewOrderSingleAndReplaceDecoderTests
         long price = 12_3400L,
         long stopPx = PriceNull,
         ulong minQty = 0UL,
-        ulong maxFloor = 0UL)
+        ulong maxFloor = 0UL,
+        ushort expireDate = 0)
     {
         var body = new byte[125];
         Span<byte> s = body;
@@ -46,6 +47,7 @@ public class NewOrderSingleAndReplaceDecoderTests
         MemoryMarshal.Write(s.Slice(76, 8), in stopPx);
         MemoryMarshal.Write(s.Slice(84, 8), in minQty);
         MemoryMarshal.Write(s.Slice(92, 8), in maxFloor);
+        MemoryMarshal.Write(s.Slice(105, 2), in expireDate);
         return body;
     }
 
@@ -64,7 +66,8 @@ public class NewOrderSingleAndReplaceDecoderTests
         ulong minQty = 0UL,
         ulong maxFloor = 0UL,
         ushort investorPrefix = 0,
-        uint investorDocument = 0)
+        uint investorDocument = 0,
+        ushort expireDate = 0)
     {
         var body = new byte[142];
         Span<byte> s = body;
@@ -81,6 +84,7 @@ public class NewOrderSingleAndReplaceDecoderTests
         MemoryMarshal.Write(s.Slice(92, 8), in stopPx);
         MemoryMarshal.Write(s.Slice(100, 8), in minQty);
         MemoryMarshal.Write(s.Slice(108, 8), in maxFloor);
+        MemoryMarshal.Write(s.Slice(122, 2), in expireDate);
         MemoryMarshal.Write(s.Slice(136, 2), in investorPrefix);
         MemoryMarshal.Write(s.Slice(138, 4), in investorDocument);
         return body;
@@ -113,7 +117,6 @@ public class NewOrderSingleAndReplaceDecoderTests
     [InlineData((byte)'3', TimeInForce.IOC)]
     [InlineData((byte)'4', TimeInForce.FOK)]
     [InlineData((byte)'1', TimeInForce.Gtc)]
-    [InlineData((byte)'6', TimeInForce.Gtd)]
     [InlineData((byte)'7', TimeInForce.AtClose)]
     [InlineData((byte)'A', TimeInForce.GoodForAuction)]
     public void NewOrderSingle_AcceptsSupportedTif(byte tifByte, TimeInForce expected)
@@ -125,6 +128,36 @@ public class NewOrderSingleAndReplaceDecoderTests
 
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
         Assert.Equal(expected, cmd.Tif);
+    }
+
+    // GAP-23 / #499: GTD with a non-zero ExpireDate is now accepted and the
+    // ExpireDate is plumbed through to the command.
+    [Fact]
+    public void NewOrderSingle_GtdWithExpireDate_AcceptedAndPlumbed()
+    {
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 0x1234);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal(TimeInForce.Gtd, cmd.Tif);
+        Assert.Equal((ushort)0x1234, cmd.ExpireDate);
+    }
+
+    // GAP-23 / #499: GTD without an ExpireDate is rejected as unsupported
+    // (BMR-eligible) rather than terminating the session.
+    [Fact]
+    public void NewOrderSingle_GtdWithoutExpireDate_RejectsAsUnsupported()
+    {
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 0);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out _, out _, out var msg);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.Contains("ExpireDate", msg);
     }
 
     [Fact]
@@ -493,12 +526,12 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Contains("SelfTradePrevention", msg);
     }
 
+    // GAP-23 / #499: an ExpireDate on a non-GTD order is rejected as
+    // unsupported (the field is only meaningful with GTD time-in-force).
     [Fact]
-    public void NewOrderSingle_ExpireDateRejectsAsUnsupported()
+    public void NewOrderSingle_ExpireDateWithoutGtd_RejectsAsUnsupported()
     {
-        var body = BuildNewOrderSingleV2();
-        ushort expire = 0x1234;
-        MemoryMarshal.Write(((Span<byte>)body).Slice(105, 2), in expire);
+        var body = BuildNewOrderSingleV2(expireDate: 0x1234);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
             body, 1, 0, out _, out _, out var msg);
@@ -717,18 +750,34 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Contains("SelfTradePrevention", msg);
     }
 
+    // GAP-23 / #499: a replace now plumbs ExpireDate through as
+    // NewExpireDate and defers GTD pairing validation to the engine (the
+    // wire TimeInForce may be omitted/preserved on a replace).
     [Fact]
-    public void OrderCancelReplace_ExpireDateRejectsAsUnsupported()
+    public void OrderCancelReplace_ExpireDate_PopulatesNewExpireDate()
     {
-        var body = BuildOrderCancelReplaceV2();
-        ushort expire = 0x1234;
-        MemoryMarshal.Write(((Span<byte>)body).Slice(122, 2), in expire);
+        var body = BuildOrderCancelReplaceV2(expireDate: 0x1234);
 
         var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
-            body, 0UL, out _, out _, out _, out var msg);
+            body, 0UL, out var cmd, out _, out _, out var msg);
 
-        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
-        Assert.Contains("ExpireDate", msg);
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal((ushort)0x1234, cmd.NewExpireDate);
+    }
+
+    // A replace with no ExpireDate on the wire leaves NewExpireDate null
+    // (preserve the resting order's existing expiry).
+    [Fact]
+    public void OrderCancelReplace_NoExpireDate_LeavesNewExpireDateNull()
+    {
+        var body = BuildOrderCancelReplaceV2(expireDate: 0);
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out var cmd, out _, out _, out _);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(cmd.NewExpireDate);
     }
 
     // ---------------- #238: V6 trailer (StrategyID + TradingSubAccount) ----------------

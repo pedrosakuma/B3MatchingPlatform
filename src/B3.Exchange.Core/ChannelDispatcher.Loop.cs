@@ -178,6 +178,18 @@ public sealed partial class ChannelDispatcher
             return;
         }
 
+        if (item.Kind == WorkKind.OperatorExpireGtd)
+        {
+            ProcessExpireGtd(item.ExpireGtd!, item.ExpireGtdCompletion);
+            // GAP-23 (#499): force-persist after the sweep so the cancelled
+            // GTD orders are gone from the engine snapshot and any RptSeq
+            // consumed by the per-order ER_Cancel frames survive a restart.
+            // Operator commands are not WAL-logged; the forced snapshot is
+            // the durability boundary — mirrors the ExpireSecurity path.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
         _currentSession = item.Session;
         _currentFirm = item.Firm;
         _hasCurrentSession = item.HasSession;

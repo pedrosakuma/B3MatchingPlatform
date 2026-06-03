@@ -61,7 +61,8 @@ public sealed record RestingOrderRecord(
     long HiddenQuantity,
     byte OrdTagId = 0,
     string? Asset = null,
-    InvestorId? InvestorId = null)
+    InvestorId? InvestorId = null,
+    ushort ExpireDate = 0)
 {
     public byte[] Memo { get; init; } = [];
 }

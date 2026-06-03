@@ -26,13 +26,22 @@ internal sealed class RestingOrder
     public ulong InsertTimestampNanos;
 
     /// <summary>
-    /// TIF the order was originally accepted with (Day or Gtc — the only
+    /// TIF the order was originally accepted with (Day, Gtc or Gtd — the
     /// TIFs that can rest). Tracked so a subsequent
     /// <see cref="ReplaceOrderCommand"/> that omits TIF on the wire
     /// preserves the resting order's original TIF instead of silently
-    /// downgrading to <see cref="TimeInForce.Day"/>. Issue #204.
+    /// downgrading to <see cref="TimeInForce.Day"/>. Issue #204 / #499.
     /// </summary>
     public TimeInForce Tif { get; init; } = TimeInForce.Day;
+
+    /// <summary>
+    /// Good-Till-Date expiry for <see cref="TimeInForce.Gtd"/> orders: the
+    /// last local-market date (days since Unix epoch) the order may trade.
+    /// 0 for every non-GTD resting order. Mutable so a priority-preserving
+    /// <see cref="ReplaceOrderCommand"/> can amend the expiry in place
+    /// without rebuilding the order. GAP-23 / issue #499.
+    /// </summary>
+    public ushort ExpireDate { get; set; }
 
     /// <summary>
     /// Iceberg visible-slice size (FIX MaxFloor). 0 means "not an iceberg"
@@ -309,7 +318,8 @@ internal sealed class LimitOrderBook
                         HiddenQuantity: o.HiddenQuantity,
                         OrdTagId: o.OrdTagId,
                         Asset: o.Asset,
-                        InvestorId: o.InvestorId)
+                        InvestorId: o.InvestorId,
+                        ExpireDate: o.ExpireDate)
                     { Memo = o.Memo };
                 }
             }
@@ -342,6 +352,7 @@ internal sealed class LimitOrderBook
             MaxFloor = record.MaxFloor,
             HiddenQuantity = record.HiddenQuantity,
             RemainingQuantity = record.RemainingQuantity,
+            ExpireDate = record.ExpireDate,
             Memo = record.Memo,
         };
         Insert(order);

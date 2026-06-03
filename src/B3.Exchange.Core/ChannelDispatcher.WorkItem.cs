@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity, OperatorExpireGtd }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -42,6 +42,7 @@ public sealed partial class ChannelDispatcher
         "AuditCheckpoint",
         "ShutdownBarrier",
         "OperatorExpireSecurity",
+        "OperatorExpireGtd",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -75,6 +76,8 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<bool>? ShutdownBarrier = null,
         OperatorExpireSecurity? ExpireSecurity = null,
         TaskCompletionSource<ExpireSecurityOutcome>? ExpireCompletion = null,
+        OperatorExpireGtd? ExpireGtd = null,
+        TaskCompletionSource<ExpireGtdOutcome>? ExpireGtdCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -142,6 +145,25 @@ public sealed partial class ChannelDispatcher
     /// phase actually changed (false if it was already <c>Close</c>).
     /// </summary>
     public readonly record struct ExpireSecurityOutcome(int CancelledOrderCount, bool PhaseChanged);
+
+    /// <summary>
+    /// GAP-23 / issue #499: end-of-trading-day Good-Till-Date expiry sweep
+    /// payload. Carries the trading day being closed as a B3
+    /// <c>LocalMktDate</c> (days since Unix epoch). The dispatcher cancels
+    /// every resting GTD order across the channel's books whose
+    /// <c>ExpireDate</c> is on or before this date (per-order
+    /// <c>ER_Cancel</c> + UMDF <c>OrderDelete</c>), in one dispatch-thread
+    /// step. Unlike <see cref="OperatorExpireSecurity"/> it never changes a
+    /// trading phase.
+    /// </summary>
+    internal sealed record OperatorExpireGtd(ushort CurrentDate);
+
+    /// <summary>
+    /// GAP-23 / issue #499: outcome of a GTD expiry sweep — how many
+    /// resting GTD orders were cancelled (0 when none had reached their
+    /// ExpireDate).
+    /// </summary>
+    public readonly record struct ExpireGtdOutcome(int CancelledOrderCount);
 
     /// <summary>
     /// ADR 0008 PR-2: operator bust request payload (post-trade audit

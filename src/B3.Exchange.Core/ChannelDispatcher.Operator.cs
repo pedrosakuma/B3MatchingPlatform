@@ -708,4 +708,54 @@ public sealed partial class ChannelDispatcher
             throw;
         }
     }
+
+    /// <summary>
+    /// GAP-23 / issue #499: enqueue an end-of-trading-day Good-Till-Date
+    /// expiry sweep for the trading day being closed
+    /// (<paramref name="currentDate"/>, a B3 <c>LocalMktDate</c> = days
+    /// since Unix epoch). On the dispatch thread the dispatcher cancels
+    /// every resting GTD order across the channel's books whose
+    /// <c>ExpireDate</c> is on or before that date, driving per-order
+    /// <c>ER_Cancel</c> + UMDF <c>OrderDelete</c> frames via the existing
+    /// <c>OnOrderCanceled</c> sink path, packed into one packet. No trading
+    /// phase changes. Idempotent and safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorExpireGtd(ushort currentDate,
+        TaskCompletionSource<ExpireGtdOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorExpireGtd))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; ExpireGtd rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorExpireGtd, default, 0, false,
+            0, 0, null, null, null, null,
+            ExpireGtd: new OperatorExpireGtd(currentDate),
+            ExpireGtdCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; ExpireGtd rejected"));
+        return false;
+    }
+
+    private void ProcessExpireGtd(OperatorExpireGtd op,
+        TaskCompletionSource<ExpireGtdOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _packetWritten = 0;
+        try
+        {
+            int cancelled = _engine.ExpireGtdOrders(op.CurrentDate, _timeSource.NowNanos());
+            if (_packetWritten > 0) FlushPacket();
+            completion?.TrySetResult(new ExpireGtdOutcome(cancelled));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
 }

@@ -51,6 +51,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private DailyResetScheduler? _dailyReset;
     private PhaseScheduler? _phaseScheduler;
     private OptionExpirySweeper? _optionExpirySweeper;
+    private GtdExpirySweeper? _gtdExpirySweeper;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
     private B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal? _outboundJournal;
     private B3.Exchange.Gateway.Persistence.FileFixpSessionStatePersister? _statePersister;
@@ -98,6 +99,14 @@ public sealed class ExchangeHost : IAsyncDisposable
         // guarantees the resting orders' cancels reach the wire
         // before TerminateAllSessions closes the sockets.
         _optionExpirySweeper?.SweepExpiredSeries(reason, waitTimeout: TimeSpan.FromSeconds(15));
+        // GAP-23 / #499: sweep expired GTD orders BEFORE the listener tears
+        // down, for the same routing reason as the option sweep above — each
+        // per-order ER_Cancel must reach its originating TCP session while
+        // the gateway is still attached. Runs after the option sweep so any
+        // GTD order on an expiring option series is already gone (no-op
+        // here); waits on per-channel completions so the cancels reach the
+        // outbound encoder before DrainAllSessionsOutbound + TerminateAllSessions.
+        _gtdExpirySweeper?.Sweep(reason, waitTimeout: TimeSpan.FromSeconds(15));
         // Issue #487: drain outbound queues BEFORE closing sockets.
         // ER_Cancel frames from the sweep are enqueued to the session's
         // send queue but may not have been written to the socket yet.
@@ -542,6 +551,19 @@ public sealed class ExchangeHost : IAsyncDisposable
                     "option-expiry sweeper armed for {SeriesCount} option series across {ChannelCount} channels",
                     sinks.Count, _dispatchers.Count);
             }
+        }
+        // GAP-23 / #499: stand up the GTD expiry sweeper. It fans out one
+        // expiry command per channel at daily reset; "today" is the B3 local
+        // market date in the configured daily-reset timezone (the engine
+        // stays clockless and receives the date as a command argument).
+        {
+            var todayProvider = GtdExpirySweeper.BuildTodayProvider(
+                _config.DailyReset?.Timezone,
+                _loggerFactory.CreateLogger<GtdExpirySweeper>());
+            _gtdExpirySweeper = new GtdExpirySweeper(
+                _dispatchers,
+                _loggerFactory.CreateLogger<GtdExpirySweeper>(),
+                todayProvider);
         }
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions

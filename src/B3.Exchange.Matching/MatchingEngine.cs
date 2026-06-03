@@ -812,13 +812,27 @@ public sealed class MatchingEngine
 
             // #201: trading-phase gating combined with #202 TIF semantics.
             // Day/IOC/FOK/GTC require Open. AtClose requires FinalClosingCall.
-            // GoodForAuction requires Reserved (pre-open auction). GTD is
-            // wire-accepted but not yet implementable in the engine — the
-            // ExpireDate is not plumbed through NewOrderCommand yet.
+            // GoodForAuction requires Reserved (pre-open auction). GTD
+            // (#499) rests like Day/Gtc (requires Open) but carries an
+            // ExpireDate driving the end-of-day expiry sweep.
             var phase = _phaseById[cmd.SecurityId];
+            // GAP-23 / #499: GTD requires a non-zero ExpireDate; a non-zero
+            // ExpireDate is meaningless on any other TIF. The gateway
+            // decoder enforces the same pairing for NewOrderSingle, but
+            // re-validate here so direct-API and WAL-replay paths stay
+            // consistent. (The engine is clockless, so a date already in
+            // the past is accepted and removed by the next daily sweep.)
             if (cmd.Tif == TimeInForce.Gtd)
             {
-                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.TimeInForceNotSupported, cmd.EnteredAtNanos);
+                if (cmd.ExpireDate == 0)
+                {
+                    Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos);
+                    return;
+                }
+            }
+            else if (cmd.ExpireDate != 0)
+            {
+                Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.InvalidField, cmd.EnteredAtNanos);
                 return;
             }
             var requiredPhase = cmd.Tif switch
@@ -1073,6 +1087,50 @@ public sealed class MatchingEngine
         finally { ExitDispatch(); }
     }
 
+    /// <summary>
+    /// GAP-23 / issue #499: end-of-trading-day Good-Till-Date expiry sweep.
+    /// Cancels every resting <see cref="TimeInForce.Gtd"/> order across all
+    /// books owned by this engine whose <c>ExpireDate</c> (last tradeable
+    /// local-market date, days since Unix epoch) is on or before
+    /// <paramref name="currentDate"/> — the trading day being closed. Each
+    /// cancellation flows through the standard
+    /// <see cref="IMatchingEventSink.OnOrderCanceled"/> path with
+    /// <see cref="CancelReason.GtdExpired"/>, so the dispatcher emits a
+    /// per-order <c>ER_Cancel</c> back to the originating session and a UMDF
+    /// <c>OrderDelete</c> frame exactly like a client cancel.
+    /// <para>The engine is clockless by design (ADR 0009): the caller
+    /// supplies the boundary date. Idempotent — a second sweep with the same
+    /// date is a no-op once the matching orders are gone. Returns the number
+    /// of orders cancelled.</para>
+    /// </summary>
+    public int ExpireGtdOrders(ushort currentDate, ulong txnNanos)
+    {
+        EnterDispatch();
+        try
+        {
+            int cancelled = 0;
+            foreach (var book in _booksById.Values)
+            {
+                // SnapshotOrders() copies into the book's scratch buffer, so
+                // EmitCanceled (which mutates the book's index) is safe to
+                // call while iterating the snapshot. The buffer is consumed
+                // fully before the next book's SnapshotOrders() overwrites it.
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    if (resting.Tif == TimeInForce.Gtd
+                        && resting.ExpireDate != 0
+                        && resting.ExpireDate <= currentDate)
+                    {
+                        EmitCanceled(book, resting, txnNanos, CancelReason.GtdExpired);
+                        cancelled++;
+                    }
+                }
+            }
+            return cancelled;
+        }
+        finally { ExitDispatch(); }
+    }
+
     private static bool MatchesMassCancelFilter(LimitOrderBook book, RestingOrder resting, MassCancelCommand command)
     {
         if (command.SecurityId != 0 && book.SecurityId != command.SecurityId) return false;
@@ -1129,13 +1187,36 @@ public sealed class MatchingEngine
             var effectiveType = cmd.NewOrdType ?? OrderType.Limit;
             var effectiveTif = cmd.NewTif ?? resting.Tif;
 
+            // GAP-23 / #499: resolve the effective GTD ExpireDate from the
+            // replace and the resting order. A wire ExpireDate (NewExpireDate
+            // non-null) overrides; otherwise an order that stays GTD keeps
+            // its current ExpireDate. A transition away from GTD clears it.
+            ushort effectiveExpireDate;
+            if (effectiveTif == TimeInForce.Gtd)
+            {
+                effectiveExpireDate = cmd.NewExpireDate
+                    ?? (resting.Tif == TimeInForce.Gtd ? resting.ExpireDate : (ushort)0);
+            }
+            else
+            {
+                effectiveExpireDate = 0;
+            }
+
             // Phase gating — same rules as a brand-new order. A replace that
             // lands during a trading halt must be rejected before mutating
             // the resting order; if the new TIF is incompatible with the
             // current phase the replace is treated like a new order would be.
             var phase = _phaseById[cmd.SecurityId];
+            // GTD validation mirrors the new-order path: a GTD result needs a
+            // non-zero ExpireDate; an explicit non-zero ExpireDate on a
+            // non-GTD result is contradictory.
             if (effectiveTif == TimeInForce.Gtd)
-            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.TimeInForceNotSupported, cmd.EnteredAtNanos); return; }
+            {
+                if (effectiveExpireDate == 0)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+            }
+            else if (cmd.NewExpireDate is { } suppliedExpire && suppliedExpire != 0)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
             var requiredPhase = effectiveTif switch
             {
                 TimeInForce.AtClose => TradingPhase.FinalClosingCall,
@@ -1184,6 +1265,11 @@ public sealed class MatchingEngine
                 {
                     resting.InvestorId = newInvestorKept;
                 }
+                // GAP-23 / #499: a priority-preserving replace may amend the
+                // GTD ExpireDate in place (effectiveTif == resting.Tif here,
+                // so this only changes the date, never the TIF). For non-GTD
+                // orders effectiveExpireDate is 0, leaving the field untouched.
+                resting.ExpireDate = effectiveExpireDate;
                 uint rptSeq = NextRptSeq();
                 _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
                     SecurityId: book.SecurityId,
@@ -1245,6 +1331,7 @@ public sealed class MatchingEngine
                 OrdTagId = resting.OrdTagId,
                 Asset = resting.Asset,
                 InvestorId = cmd.NewInvestorId ?? resting.InvestorId,
+                ExpireDate = effectiveExpireDate,
                 Memo = cmd.Memo,
             };
 
@@ -1301,6 +1388,7 @@ public sealed class MatchingEngine
             Tif = cmd.Tif,
             MaxFloor = (long)cmd.MaxFloor,
             HiddenQuantity = hidden,
+            ExpireDate = cmd.ExpireDate,
         };
         book.Insert(resting);
         _sink.OnOrderAccepted(new OrderAcceptedEvent(
@@ -1757,6 +1845,7 @@ public sealed class MatchingEngine
                 Tif = cmd.Tif,
                 MaxFloor = (long)cmd.MaxFloor,
                 HiddenQuantity = hidden,
+                ExpireDate = cmd.ExpireDate,
                 Memo = cmd.Memo,
             };
             book.Insert(resting);

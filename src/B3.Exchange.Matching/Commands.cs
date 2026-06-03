@@ -183,6 +183,13 @@ public enum CancelReason : byte
     /// to the originating session — no MBO frame, since the order was
     /// never visible on the public book.</summary>
     IocUnmatched,
+    /// <summary>Resting <see cref="TimeInForce.Gtd"/> order whose
+    /// <c>ExpireDate</c> (last tradeable local-market date) has passed.
+    /// Cancelled by the end-of-trading-day GTD expiry sweep
+    /// (GAP-23 / issue #499) — drives an <c>ER_Cancel</c> back to the
+    /// originating session and a UMDF <c>OrderDelete</c>, exactly like a
+    /// client cancel.</summary>
+    GtdExpired,
 }
 
 /// <summary>
@@ -206,7 +213,17 @@ public sealed record NewOrderCommand(
     public InvestorId? InvestorId { get; init; }
 
     /// <summary>
-    /// Optional minimum-fill (FIX MinQty). When non-zero, the engine
+    /// Good-Till-Date expiry as a B3 <c>LocalMktDateOptional</c>: the
+    /// number of days since the Unix epoch of the LAST local-market date
+    /// the order may trade (0 == not supplied / SBE null). Required and
+    /// must be non-zero when <see cref="Tif"/> is
+    /// <see cref="TimeInForce.Gtd"/> (else
+    /// <see cref="RejectReason.InvalidField"/>); must be 0 for every other
+    /// TIF. The order rests until cancelled, filled, or swept by the
+    /// end-of-trading-day GTD expiry when the trading day being closed is
+    /// on or after this date. GAP-23 / issue #499.
+    /// </summary>
+    public ushort ExpireDate { get; init; }
     /// requires that at submission time the immediately fillable quantity
     /// against the opposite side at this order's limit (or any price for
     /// market orders) is at least <c>MinQty</c>; otherwise the order is
@@ -310,6 +327,18 @@ public sealed record ReplaceOrderCommand(
     /// clearing is intentionally not supported. Issue #451.
     /// </summary>
     public InvestorId? NewInvestorId { get; init; }
+
+    /// <summary>
+    /// New Good-Till-Date expiry (B3 <c>LocalMktDateOptional</c>, days
+    /// since Unix epoch). <c>null</c> means "not supplied on the wire" —
+    /// preserve the resting order's existing <c>ExpireDate</c> when the
+    /// effective TIF stays <see cref="TimeInForce.Gtd"/>. When the
+    /// effective TIF is GTD the resolved expiry must be non-zero (else
+    /// <see cref="RejectReason.InvalidField"/>); when the effective TIF is
+    /// not GTD an explicitly-supplied non-zero value is rejected. GAP-23 /
+    /// issue #499.
+    /// </summary>
+    public ushort? NewExpireDate { get; init; }
 
     public bool UnsupportedOrderCharacteristic { get; init; }
 
