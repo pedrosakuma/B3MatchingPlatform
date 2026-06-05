@@ -564,7 +564,7 @@ public sealed partial class ChannelDispatcher
                 PriceMantissa: e.StopPxMantissa,
                 RemainingQuantityAtCancel: e.RemainingQuantityAtCancel,
                 TransactTimeNanos: e.TransactTimeNanos,
-                Reason: CancelReason.Client,
+                Reason: e.Reason,
                 RptSeq: e.RptSeq);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);

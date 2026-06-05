@@ -108,6 +108,10 @@ public sealed partial class ChannelDispatcher
             item.RestateGtCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; RestateGt rejected"));
+            // Issue #506: the Day-expiry sweep awaits its completion too.
+            item.ExpireDayCompletion?.TrySetException(
+                new InvalidOperationException(
+                    $"channel {ChannelNumber} WAL-halted; ExpireDay rejected"));
             return;
         }
 
@@ -205,6 +209,18 @@ public sealed partial class ChannelDispatcher
             // book change, no RptSeq advance), so the forced snapshot is a
             // no-op delta. We still force-persist to keep the operator-command
             // durability contract uniform with the sibling sweeps above.
+            OnAfterCommandFlushed(force: true);
+            return;
+        }
+
+        if (item.Kind == WorkKind.OperatorExpireDay)
+        {
+            ProcessExpireDay(item.ExpireDay!, item.ExpireDayCompletion);
+            // Issue #506: force-persist after the sweep so the cancelled Day
+            // orders are gone from the engine snapshot and any RptSeq consumed
+            // by the per-order ER + UMDF OrderDelete frames survive a restart.
+            // Operator commands are not WAL-logged; the forced snapshot is the
+            // durability boundary — mirrors the GTD-expiry path.
             OnAfterCommandFlushed(force: true);
             return;
         }

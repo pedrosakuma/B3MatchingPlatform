@@ -122,6 +122,32 @@ public class ExecutionReportEncoderTests
     }
 
     [Fact]
+    public void EncodeCancel_WithExpiredOrdStatus_WritesC()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 11, origClOrdIdValue: 10, secondaryOrderId: 0,
+            securityId: 1, orderId: 9999,
+            execId: 0UL, transactTimeNanos: 0UL,
+            cumQty: 0, orderQty: 100, priceMantissa: 12_3450L,
+            ordStatus: ExecutionReportEncoder.CancelOrdStatus(Matching.CancelReason.DayExpired));
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'C', body[19]);                                          // OrdStatus=Expired
+    }
+
+    [Theory]
+    [InlineData(Matching.CancelReason.DayExpired, (byte)'C')]
+    [InlineData(Matching.CancelReason.GtdExpired, (byte)'4')]
+    [InlineData(Matching.CancelReason.AuctionExpired, (byte)'4')]
+    [InlineData(Matching.CancelReason.Client, (byte)'4')]
+    public void CancelOrdStatus_MapsDayExpiredToExpired_OthersCanceled(Matching.CancelReason reason, byte expected)
+    {
+        Assert.Equal(expected, ExecutionReportEncoder.CancelOrdStatus(reason));
+    }
+
+    [Fact]
     public void EncodeReject_WritesRejReasonOverlapWithSecExchange()
     {
         var buf = new byte[ExecutionReportEncoder.ExecReportRejectTotal];

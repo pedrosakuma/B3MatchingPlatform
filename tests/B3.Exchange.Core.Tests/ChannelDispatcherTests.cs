@@ -959,6 +959,39 @@ public partial class ChannelDispatcherTests
 
 
     [Fact]
+    public void OperatorExpireDay_CancelsDayOrder_RoutesExpiredToOwner_EmitsUmdfFrame_Evicts()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        // Resting Day order owned by `reply`.
+        disp.EnqueueNewOrder(new NewOrderCommand("d1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long orderId = Assert.Single(reply.News).OrderId;
+        int packetsAfterRest = pkt.Packets.Count;
+        uint seqAfterRest = disp.SequenceNumber;
+
+        disp.EnqueueOperatorExpireDay();
+        DrainInbound(disp);
+
+        // Terminal EXPIRED cancel routed to the owning session.
+        var cancel = Assert.Single(reply.Cancels);
+        Assert.Equal(orderId, cancel.OrderId);
+        Assert.Equal(B3.Exchange.Matching.CancelReason.DayExpired, cancel.Reason);
+        // Public event: a new UMDF packet (OrderDelete) and an RptSeq advance.
+        Assert.True(pkt.Packets.Count > packetsAfterRest);
+        Assert.True(disp.SequenceNumber > seqAfterRest);
+
+        // Registry evicted: a follow-up cancel for the same order no longer resolves an owner.
+        reply.Cancels.Clear();
+        disp.EnqueueCancel(new CancelOrderCommand("c1", Petr, orderId, 3_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+        Assert.Empty(reply.Cancels);
+    }
+
+    [Fact]
     public void OperatorSetTradingPhase_EmitsSecurityStatusFrameAndGatesNewOrders()
     {
         var (disp, pkt, outbound) = NewDispatcher();

@@ -295,7 +295,8 @@ public readonly record struct StopOrderCanceledEvent(
     long RemainingQuantityAtCancel,
     ulong TransactTimeNanos,
     uint RptSeq,
-    byte[]? Memo = null);
+    byte[]? Memo = null,
+    CancelReason Reason = CancelReason.Client);
 
 /// <summary>
 /// Fired when a resting order has been successfully replaced by a client

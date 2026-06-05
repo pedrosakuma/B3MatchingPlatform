@@ -87,6 +87,7 @@ internal static class ExecutionReportEncoder
     private const byte OrdStatusReplaced = (byte)'5';
     private const byte OrdStatusRestated = (byte)'R';
     private const byte OrdStatusRejected = (byte)'8';
+    private const byte OrdStatusExpired = (byte)'C';
     private const byte OrdTypeMarket = (byte)'1';
     private const byte OrdTypeLimit = (byte)'2';
     private const byte OrdTypeStopLoss = (byte)'3';
@@ -314,7 +315,8 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, ulong origClOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long cumQty, long orderQty, long? priceMantissa,
-        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
+        ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
+        byte ordStatus = OrdStatusCanceled)
     {
         int total = TotalSize(ExecReportCancelBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
@@ -324,7 +326,7 @@ internal static class ExecutionReportEncoder
         body.Clear();
         WriteBusinessHeader(body, sessionId, msgSeqNum, sendingTimeNanos);
         body[18] = EncodeSide(side);
-        body[19] = OrdStatusCanceled;
+        body[19] = ordStatus;
         MemoryMarshal.Write(body.Slice(20, 8), in clOrdIdValue);
         MemoryMarshal.Write(body.Slice(28, 8), in secondaryOrderId);
         MemoryMarshal.Write(body.Slice(36, 8), in securityId);
@@ -348,6 +350,18 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(156, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
         return WriteMemoTrailer(dst, ExecReportCancelBlock, memo);
     }
+
+    /// <summary>
+    /// Maps a cancel reason to the FIX <c>OrdStatus</c> byte for the terminal
+    /// cancel ExecutionReport. A time-in-force expiry (issue #506 — a resting
+    /// Day order or parked Day stop swept at the session boundary) reports
+    /// <c>EXPIRED('C')</c>; every other cancel reason reports
+    /// <c>CANCELED('4')</c>. GTD expiry and auction expiry intentionally keep
+    /// reporting <c>CANCELED</c> for now (their EXPIRED-status alignment is a
+    /// separate FIX-consistency refinement).
+    /// </summary>
+    public static byte CancelOrdStatus(Matching.CancelReason reason) =>
+        reason == Matching.CancelReason.DayExpired ? OrdStatusExpired : OrdStatusCanceled;
 
     public static int EncodeExecReportTrade(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
