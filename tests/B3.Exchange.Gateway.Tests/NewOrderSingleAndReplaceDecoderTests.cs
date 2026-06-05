@@ -148,16 +148,96 @@ public class NewOrderSingleAndReplaceDecoderTests
 
     // GAP-23 / #499: GTD without an ExpireDate is rejected as unsupported
     // (BMR-eligible) rather than terminating the session.
-    [Fact]
-    public void NewOrderSingle_GtdWithoutExpireDate_RejectsAsUnsupported()
+    // #504: a GTD whose ExpireDate is strictly before the current trading
+    // day is rejected at entry as an unsupported (BMR-eligible) feature,
+    // using the host-supplied market-date provider.
+    private static InboundFatFingerOptions MarketDate(ushort today) => new()
     {
-        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 0);
+        CurrentMarketDateProvider = () => today,
+    };
+
+    [Fact]
+    public void NewOrderSingle_GtdWithPastExpireDate_RejectsAsUnsupported()
+    {
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 19_999);
 
         var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
-            body, 1, 0, out _, out _, out var msg);
+            body, 1, 0, out var cmd, out _, out var msg, MarketDate(20_000));
 
         Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.UnsupportedFeature, outcome);
+        Assert.NotNull(cmd);
+        Assert.True(cmd.UnsupportedOrderCharacteristic);
         Assert.Contains("ExpireDate", msg);
+    }
+
+    [Fact]
+    public void NewOrderSingle_GtdExpiringToday_Accepted()
+    {
+        // ExpireDate == today: valid *through* today, rests until tonight's
+        // close (the EOD sweep cancels it then). Not rejected at entry.
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 20_000);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out var msg, MarketDate(20_000));
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal((ushort)20_000, cmd.ExpireDate);
+    }
+
+    [Fact]
+    public void NewOrderSingle_GtdFutureExpireDate_Accepted()
+    {
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 20_001);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out _, MarketDate(20_000));
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal((ushort)20_001, cmd.ExpireDate);
+    }
+
+    [Fact]
+    public void NewOrderSingle_GtdPastExpireDate_ProviderReturnsNull_Accepted()
+    {
+        // A null provider result (e.g. date out of LocalMktDate range) skips
+        // the check: legacy "accept, swept next day" behavior is preserved.
+        var opts = new InboundFatFingerOptions { CurrentMarketDateProvider = () => null };
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 19_999);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out _, opts);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal((ushort)19_999, cmd.ExpireDate);
+    }
+
+    [Fact]
+    public void NewOrderSingle_GtdPastExpireDate_NoProvider_Accepted()
+    {
+        // No options / no provider wired: the guard is inert (the engine is
+        // clockless and the daily sweep removes the order).
+        var body = BuildNewOrderSingleV2(tif: (byte)'6', expireDate: 19_999);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out _);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal((ushort)19_999, cmd.ExpireDate);
+    }
+
+    [Fact]
+    public void NewOrderSingle_NonGtd_MarketDateProvider_NotConsulted()
+    {
+        // A Day order carries no ExpireDate and must be unaffected by the
+        // market-date guard even when a provider is present.
+        var body = BuildNewOrderSingleV2(tif: (byte)'0', expireDate: 0);
+
+        var outcome = InboundMessageDecoder.TryDecodeNewOrderSingle(
+            body, 1, 0, out var cmd, out _, out _, MarketDate(20_000));
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Equal(TimeInForce.Day, cmd.Tif);
     }
 
     [Fact]

@@ -820,8 +820,10 @@ public sealed class MatchingEngine
             // ExpireDate is meaningless on any other TIF. The gateway
             // decoder enforces the same pairing for NewOrderSingle, but
             // re-validate here so direct-API and WAL-replay paths stay
-            // consistent. (The engine is clockless, so a date already in
-            // the past is accepted and removed by the next daily sweep.)
+            // consistent. (The engine is clockless: a past-dated ExpireDate
+            // is accepted here and removed by the next daily sweep. #504 adds
+            // an entry-time reject for stale GTD in the gateway decoder, which
+            // holds the clock — the engine itself stays date-agnostic.)
             if (cmd.Tif == TimeInForce.Gtd)
             {
                 if (cmd.ExpireDate == 0)

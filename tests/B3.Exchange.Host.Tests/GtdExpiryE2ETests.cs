@@ -63,6 +63,10 @@ public class GtdExpiryE2ETests
             {
                 Auth = new AuthConfig { RequireFixpHandshake = false },
                 Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
+                // #504: pin the local market date to UTC so the entry-time
+                // stale-GTD guard and the boundary sweep both agree with the
+                // UTC epoch-day this test computes — no SP/UTC midnight skew.
+                DailyReset = new DailyResetConfig { Timezone = "UTC" },
                 Channels =
                 {
                     new ChannelConfig
@@ -84,13 +88,12 @@ public class GtdExpiryE2ETests
             await client.ConnectAsync(ep.Address, ep.Port);
             var stream = client.GetStream();
 
-            // GTD ExpireDate a few days in the past: unambiguously elapsed
-            // regardless of the UTC-vs-local-market-date boundary, so the
-            // daily-reset sweep must cancel it. (A past-dated GTD order is
-            // accepted at entry — the engine is clockless — and swept here.)
+            // GTD ExpireDate == today: valid *through* today, so it is accepted
+            // at entry (#504 rejects only strictly-past dates) and the
+            // daily-reset sweep cancels it at the close (ExpireDate <= today).
             int epochDay = DateOnly.FromDateTime(DateTime.UtcNow).DayNumber
                 - new DateOnly(1970, 1, 1).DayNumber;
-            ushort expireDate = (ushort)(epochDay - 5);
+            ushort expireDate = (ushort)epochDay;
 
             var newOrder = BuildNewOrderSingleGtd(clOrdId: 12_001, secId: SecId,
                 side: '1', qty: 100, priceMantissa: 123_400, expireDate: expireDate);
@@ -168,6 +171,62 @@ public class GtdExpiryE2ETests
             Assert.Equal((byte)1, er2.Body[179]);
             Assert.Equal((byte)'6', er2.Body[117]);   // TimeInForce echoed = GTD
             Assert.Equal(expireDate, BinaryPrimitives.ReadUInt16LittleEndian(er2.Body.AsSpan(118, 2)));
+        }
+        finally
+        {
+            if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task NewGtdOrder_WithPastExpireDate_RejectedAtEntry()
+    {
+        var scratch = Path.Combine(AppContext.BaseDirectory,
+            "gtd-e2e-reject-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var instrumentsPath = WriteEquityInstrumentsJson(scratch);
+            var sink = new RecordingPacketSink();
+            var cfg = new HostConfig
+            {
+                Auth = new AuthConfig { RequireFixpHandshake = false },
+                Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
+                // #504: UTC market date so the entry guard matches this test's
+                // UTC epoch-day computation deterministically.
+                DailyReset = new DailyResetConfig { Timezone = "UTC" },
+                Channels =
+                {
+                    new ChannelConfig
+                    {
+                        ChannelNumber = 98,
+                        IncrementalGroup = "239.255.42.98",
+                        IncrementalPort = 30198,
+                        Ttl = 0,
+                        InstrumentsFile = instrumentsPath,
+                    },
+                },
+            };
+
+            await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+            await host.StartAsync();
+            var ep = host.TcpEndpoint!;
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(ep.Address, ep.Port);
+            var stream = client.GetStream();
+
+            // ExpireDate strictly in the past: #504 rejects it at entry rather
+            // than resting it until the next daily-reset sweep.
+            int epochDay = DateOnly.FromDateTime(DateTime.UtcNow).DayNumber
+                - new DateOnly(1970, 1, 1).DayNumber;
+            ushort expireDate = (ushort)(epochDay - 5);
+
+            var newOrder = BuildNewOrderSingleGtd(clOrdId: 12_201, secId: SecId,
+                side: '1', qty: 100, priceMantissa: 123_400, expireDate: expireDate);
+            await stream.WriteAsync(newOrder);
+
+            var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, er.TemplateId);
         }
         finally
         {
