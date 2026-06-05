@@ -63,6 +63,13 @@ public sealed partial class FixpSession
                 // restarting the loop. (#161)
                 hbiMs = EffectiveHeartbeatIntervalMs();
                 idleMs = EffectiveIdleTimeoutMs();
+                // Recompute the tick cadence from the freshly-resolved
+                // intervals so a small client-negotiated keepAlive shrinks
+                // the loop delay too. Without this the next Task.Delay would
+                // keep using the coarse pre-negotiation cadence and could
+                // sleep past the (now ~3×keepAlive) terminate threshold when
+                // a large static grace was configured.
+                tickMs = Math.Max(1, Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4);
 
                 // Idle teardown: if a probe is outstanding and the peer has
                 // stayed silent past the terminate threshold, close. Per spec
