@@ -40,7 +40,14 @@ public sealed partial class FixpSession
         int hbiMs = EffectiveHeartbeatIntervalMs();
         int idleMs = EffectiveIdleTimeoutMs();
         int graceMs = _options.TestRequestGraceMs;
-        int tickMs = Math.Max(1, Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4);
+        // The watchdog may start in the Negotiated state, before Establish
+        // commits a (much smaller) keepAlive. Bound the very first sleep so it
+        // cannot oversleep the smallest negotiable terminate threshold
+        // (3×MinKeepAliveInterval = 3000ms); the loop re-resolves tickMs from
+        // the actual negotiated intervals on every subsequent iteration.
+        const int preNegotiationMaxTickMs = 1000;
+        int tickMs = Math.Max(1, Math.Min(preNegotiationMaxTickMs,
+            Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4));
         try
         {
             while (!ct.IsCancellationRequested)
