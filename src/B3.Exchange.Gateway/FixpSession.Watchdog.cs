@@ -40,7 +40,14 @@ public sealed partial class FixpSession
         int hbiMs = EffectiveHeartbeatIntervalMs();
         int idleMs = EffectiveIdleTimeoutMs();
         int graceMs = _options.TestRequestGraceMs;
-        int tickMs = Math.Max(1, Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4);
+        // The watchdog may start in the Negotiated state, before Establish
+        // commits a (much smaller) keepAlive. Bound the very first sleep so it
+        // cannot oversleep the smallest negotiable terminate threshold
+        // (3×MinKeepAliveInterval = 3000ms); the loop re-resolves tickMs from
+        // the actual negotiated intervals on every subsequent iteration.
+        const int preNegotiationMaxTickMs = 1000;
+        int tickMs = Math.Max(1, Math.Min(preNegotiationMaxTickMs,
+            Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4));
         try
         {
             while (!ct.IsCancellationRequested)
@@ -63,13 +70,23 @@ public sealed partial class FixpSession
                 // restarting the loop. (#161)
                 hbiMs = EffectiveHeartbeatIntervalMs();
                 idleMs = EffectiveIdleTimeoutMs();
+                // Recompute the tick cadence from the freshly-resolved
+                // intervals so a small client-negotiated keepAlive shrinks
+                // the loop delay too. Without this the next Task.Delay would
+                // keep using the coarse pre-negotiation cadence and could
+                // sleep past the (now ~3×keepAlive) terminate threshold when
+                // a large static grace was configured.
+                tickMs = Math.Max(1, Math.Min(hbiMs, Math.Min(idleMs, graceMs)) / 4);
 
-                // Idle teardown: if a probe is outstanding and grace elapsed
-                // without any inbound, close. The grace clock starts from the
-                // moment the probe was sent (i.e. last outbound tick was
-                // bumped), so we measure the additional silence beyond
-                // idleTimeoutMs.
-                if (sinceIn >= (long)idleMs + graceMs &&
+                // Idle teardown: if a probe is outstanding and the peer has
+                // stayed silent past the terminate threshold, close. Per spec
+                // §4.5.4 the server SHOULD tolerate ~3×keepAlive of inbound
+                // silence (three missed heartbeats) before tearing the session
+                // down. The probe is sent earlier (at EffectiveIdleTimeoutMs,
+                // ~1.5×keepAlive) so a live-but-slow peer has a full keepAlive
+                // window to answer before the 3× terminate fires.
+                int terminateMs = EffectiveTerminateTimeoutMs();
+                if (sinceIn >= terminateMs &&
                     Volatile.Read(ref _probeOutstanding) == 1)
                 {
                     // Generation-aware close: another reattach could have
@@ -143,6 +160,26 @@ public sealed partial class FixpSession
         if (negotiated > 0)
             return (int)Math.Min(int.MaxValue, negotiated + (negotiated / 2));
         return _options.IdleTimeoutMs;
+    }
+
+    /// <summary>
+    /// Resolves the effective inbound-silence threshold at which the
+    /// watchdog tears the session down with
+    /// <c>Terminate(KEEPALIVE_INTERVAL_LAPSED)</c>. When the client
+    /// negotiated a keepAlive interval we honor the FIXP §4.5.4
+    /// recommendation of tolerating ~3×keepAlive (three missed
+    /// heartbeats) of silence before terminating, giving a live-but-slow
+    /// peer a full keepAlive window to answer the probe sent at
+    /// <see cref="EffectiveIdleTimeoutMs"/> (~1.5×keepAlive). Without a
+    /// negotiated value (static-config / mid-handshake) we preserve the
+    /// historical <c>IdleTimeoutMs + TestRequestGraceMs</c> threshold.
+    /// </summary>
+    private int EffectiveTerminateTimeoutMs()
+    {
+        long negotiated = KeepAliveIntervalMs;
+        if (negotiated > 0)
+            return (int)Math.Min(int.MaxValue, negotiated * 3);
+        return (int)Math.Min((long)int.MaxValue, (long)_options.IdleTimeoutMs + _options.TestRequestGraceMs);
     }
 
     private void EnqueueSequence() => _retransmitController.EnqueueSequence();
