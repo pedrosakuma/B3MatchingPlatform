@@ -1132,6 +1132,83 @@ public sealed class MatchingEngine
     }
 
     /// <summary>
+    /// Issue #506: cancels every resting <see cref="TimeInForce.Day"/> order
+    /// — and every parked Day stop / stop-limit order — across the books
+    /// owned by this engine at the end of the trading session. Each
+    /// cancellation flows through the standard cancel path with
+    /// <see cref="CancelReason.DayExpired"/>, so the dispatcher emits a
+    /// terminal <c>ExecutionReport</c> (<c>OrdStatus=EXPIRED 'C'</c>) back to
+    /// the originating session and a UMDF <c>OrderDelete</c> frame.
+    /// <para>Unlike <see cref="ExpireGtdOrders"/> the sweep is
+    /// <em>unconditional</em> — every Day order expires at the session
+    /// boundary regardless of date — so the engine needs no boundary date
+    /// argument and stays fully deterministic for replay (ADR 0009).
+    /// Idempotent: a second sweep is a no-op once the Day orders are gone.
+    /// Returns the number of orders cancelled.</para>
+    /// </summary>
+    public int ExpireDayOrders(ulong txnNanos)
+    {
+        EnterDispatch();
+        try
+        {
+            int cancelled = 0;
+            foreach (var book in _booksById.Values)
+            {
+                // SnapshotOrders() copies into the book's scratch buffer, so
+                // EmitCanceled (which mutates the book's index) is safe to
+                // call while iterating the snapshot — mirrors ExpireGtdOrders.
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    if (resting.Tif == TimeInForce.Day)
+                    {
+                        EmitCanceled(book, resting, txnNanos, CancelReason.DayExpired);
+                        cancelled++;
+                    }
+                }
+            }
+
+            // Parked Day stop / stop-limit orders sit off-book and would
+            // otherwise survive to the next trading day. Collect the Day
+            // stops first (read-only) so we don't mutate the per-symbol
+            // bucket lists while iterating them, then remove + emit.
+            List<RestingStop>? expiringStops = null;
+            foreach (var bucket in _stopsBySymbol.Values)
+            {
+                foreach (var stop in bucket)
+                {
+                    if (stop.Tif == TimeInForce.Day)
+                        (expiringStops ??= new List<RestingStop>()).Add(stop);
+                }
+            }
+            if (expiringStops != null)
+            {
+                foreach (var stop in expiringStops)
+                {
+                    _stopById.Remove(stop.OrderId);
+                    _stopsBySymbol[stop.SecurityId].Remove(stop);
+                    // The downstream cancel encoding inherits the existing
+                    // parked-stop simplification (stop price carried as the
+                    // cancel price; OrdType reported as Limit) shared with the
+                    // client-cancel path — only OrdStatus differs (EXPIRED).
+                    _sink.OnStopOrderCanceled(new StopOrderCanceledEvent(
+                        SecurityId: stop.SecurityId,
+                        OrderId: stop.OrderId,
+                        Side: stop.Side,
+                        StopPxMantissa: stop.StopPxMantissa,
+                        RemainingQuantityAtCancel: stop.Quantity,
+                        TransactTimeNanos: txnNanos,
+                        RptSeq: NextRptSeq(),
+                        Memo: stop.Memo,
+                        Reason: CancelReason.DayExpired));
+                    cancelled++;
+                }
+            }
+            return cancelled;
+        }
+        finally { ExitDispatch(); }
+    }
+
+    /// <summary>
     /// GAP-26 / issue #498: emits a daily Good-Till restatement event for
     /// every surviving resting GTC order and every unexpired GTD order
     /// (<c>ExpireDate &gt; <paramref name="currentDate"/></c>, a B3

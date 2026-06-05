@@ -812,4 +812,54 @@ public sealed partial class ChannelDispatcher
             throw;
         }
     }
+
+    /// <summary>
+    /// Issue #506: enqueue an end-of-trading-day Day-order expiry sweep. On
+    /// the dispatch thread the engine cancels every resting
+    /// <c>TimeInForce.Day</c> order — and every parked Day stop — across the
+    /// channel's books, driving a terminal <c>ExecutionReport</c>
+    /// (OrdStatus=EXPIRED) + UMDF <c>OrderDelete</c> per order via the
+    /// <c>OnOrderCanceled</c> / <c>OnStopOrderCanceled</c> sink paths, packed
+    /// into one packet. The sweep is unconditional (no boundary date) and
+    /// changes no trading phase. Idempotent and safe to call from any thread.
+    /// </summary>
+    public bool EnqueueOperatorExpireDay(
+        TaskCompletionSource<ExpireDayOutcome>? completion = null)
+    {
+        if (RejectIfWalHalted(WorkKind.OperatorExpireDay))
+        {
+            completion?.TrySetException(new InvalidOperationException(
+                $"channel {ChannelNumber} WAL-halted; ExpireDay rejected"));
+            return false;
+        }
+        if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.OperatorExpireDay, default, 0, false,
+            0, 0, null, null, null, null,
+            ExpireDay: new OperatorExpireDay(),
+            ExpireDayCompletion: completion)))
+        {
+            return true;
+        }
+        completion?.TrySetException(new InvalidOperationException(
+            $"channel {ChannelNumber} inbound queue full; ExpireDay rejected"));
+        return false;
+    }
+
+    private void ProcessExpireDay(OperatorExpireDay op,
+        TaskCompletionSource<ExpireDayOutcome>? completion)
+    {
+        AssertOnLoopThread();
+        _ = op;
+        _packetWritten = 0;
+        try
+        {
+            int cancelled = _engine.ExpireDayOrders(_timeSource.NowNanos());
+            if (_packetWritten > 0) FlushPacket();
+            completion?.TrySetResult(new ExpireDayOutcome(cancelled));
+        }
+        catch (Exception ex)
+        {
+            completion?.TrySetException(ex);
+            throw;
+        }
+    }
 }

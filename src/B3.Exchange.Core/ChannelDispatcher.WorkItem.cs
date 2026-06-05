@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
-    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity, OperatorExpireGtd, OperatorRestateGt }
+    internal enum WorkKind : byte { New, Cancel, Replace, Cross, MassCancel, DecodeError, SnapshotRotation, PriceBandPublish, OperatorSnapshotNow, OperatorBumpVersion, OperatorTradeBust, OperatorSetTradingPhase, OperatorPersistSnapshot, OperatorUncrossAuction, OperatorHaltInstrument, OperatorResumeInstrument, OperatorBustV2, AuditCheckpoint, ShutdownBarrier, OperatorExpireSecurity, OperatorExpireGtd, OperatorRestateGt, OperatorExpireDay }
 
     /// <summary>
     /// Pre-allocated string names for <see cref="WorkKind"/> used as
@@ -44,6 +44,7 @@ public sealed partial class ChannelDispatcher
         "OperatorExpireSecurity",
         "OperatorExpireGtd",
         "OperatorRestateGt",
+        "OperatorExpireDay",
     };
 
     private static string WorkKindName(WorkKind kind)
@@ -81,6 +82,8 @@ public sealed partial class ChannelDispatcher
         TaskCompletionSource<ExpireGtdOutcome>? ExpireGtdCompletion = null,
         OperatorRestateGt? RestateGt = null,
         TaskCompletionSource<RestateGtOutcome>? RestateGtCompletion = null,
+        OperatorExpireDay? ExpireDay = null,
+        TaskCompletionSource<ExpireDayOutcome>? ExpireDayCompletion = null,
         long EnqueueTicks = 0,
         System.Diagnostics.ActivityContext ParentContext = default);
 
@@ -182,6 +185,22 @@ public sealed partial class ChannelDispatcher
     /// many surviving GTC / unexpired-GTD orders were restated.
     /// </summary>
     public readonly record struct RestateGtOutcome(int RestatedOrderCount);
+
+    /// <summary>
+    /// Issue #506: end-of-trading-day Day-order expiry sweep payload. On the
+    /// dispatch thread the engine cancels every resting <c>TimeInForce.Day</c>
+    /// order and every parked Day stop across the channel's books, driving a
+    /// terminal ExecutionReport (<c>OrdStatus=EXPIRED 'C'</c>) + UMDF
+    /// <c>OrderDelete</c> per order. The sweep is unconditional, so unlike
+    /// <see cref="OperatorExpireGtd"/> it carries no boundary date.
+    /// </summary>
+    internal sealed record OperatorExpireDay();
+
+    /// <summary>
+    /// Issue #506: outcome of a Day-order expiry sweep — how many resting Day
+    /// orders / parked Day stops were cancelled (0 when none were resting).
+    /// </summary>
+    public readonly record struct ExpireDayOutcome(int CancelledOrderCount);
 
     /// <summary>
     /// ADR 0008 PR-2: operator bust request payload (post-trade audit

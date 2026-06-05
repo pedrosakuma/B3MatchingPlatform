@@ -52,6 +52,7 @@ public sealed class ExchangeHost : IAsyncDisposable
     private PhaseScheduler? _phaseScheduler;
     private OptionExpirySweeper? _optionExpirySweeper;
     private GtdExpirySweeper? _gtdExpirySweeper;
+    private DayExpirySweeper? _dayExpirySweeper;
     private GtRestatementSweeper? _gtRestatementSweeper;
     private readonly List<B3.Exchange.Persistence.DataDirLock> _dataDirLocks = new();
     private B3.Exchange.Gateway.Persistence.FileFixpOutboundJournal? _outboundJournal;
@@ -108,6 +109,16 @@ public sealed class ExchangeHost : IAsyncDisposable
         // here); waits on per-channel completions so the cancels reach the
         // outbound encoder before DrainAllSessionsOutbound + TerminateAllSessions.
         _gtdExpirySweeper?.Sweep(reason, waitTimeout: TimeSpan.FromSeconds(15));
+        // Issue #506: expire resting Day orders (and parked Day stops) at the
+        // session boundary BEFORE the listener tears down, so the terminal
+        // ExecutionReport (OrdStatus=EXPIRED) + UMDF OrderDelete reach the
+        // originating session. Runs after the GTD-expiry sweep and BEFORE the
+        // GT restatement below: Day orders are never restated (only GTC /
+        // unexpired-GTD survive), so emitting their terminal EXPIRED before the
+        // survivors' carry-forward ER keeps the boundary event order clean.
+        // Waits on per-channel completions so the ERs reach the outbound
+        // encoder before DrainAllSessionsOutbound + TerminateAllSessions.
+        _dayExpirySweeper?.Sweep(reason, waitTimeout: TimeSpan.FromSeconds(15));
         // GAP-26 / #498: restate every surviving GTC / unexpired-GTD order
         // BEFORE the listener tears down, so the private restatement
         // ER_Modify (OrdStatus=RESTATED, ExecRestatementReason=GT_RESTATEMENT)
@@ -582,6 +593,11 @@ public sealed class ExchangeHost : IAsyncDisposable
                 _loggerFactory.CreateLogger<GtRestatementSweeper>(),
                 todayProvider);
         }
+        // Issue #506: the Day-expiry sweeper needs no date/timezone — Day
+        // orders expire unconditionally at the session boundary.
+        _dayExpirySweeper = new DayExpirySweeper(
+            _dispatchers,
+            _loggerFactory.CreateLogger<DayExpirySweeper>());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions
         {

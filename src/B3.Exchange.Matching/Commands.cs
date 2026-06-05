@@ -190,6 +190,12 @@ public enum CancelReason : byte
     /// originating session and a UMDF <c>OrderDelete</c>, exactly like a
     /// client cancel.</summary>
     GtdExpired,
+    /// <summary>Resting <see cref="TimeInForce.Day"/> order (or parked Day
+    /// stop) that did not fill during its trading session. Cancelled by the
+    /// end-of-trading-day Day expiry sweep (issue #506) — drives a terminal
+    /// <c>ExecutionReport</c> (<c>OrdStatus=EXPIRED 'C'</c>) back to the
+    /// originating session and a UMDF <c>OrderDelete</c>.</summary>
+    DayExpired,
 }
 
 /// <summary>
