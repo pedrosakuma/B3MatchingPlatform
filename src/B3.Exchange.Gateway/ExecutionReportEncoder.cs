@@ -353,15 +353,20 @@ internal static class ExecutionReportEncoder
 
     /// <summary>
     /// Maps a cancel reason to the FIX <c>OrdStatus</c> byte for the terminal
-    /// cancel ExecutionReport. A time-in-force expiry (issue #506 — a resting
-    /// Day order or parked Day stop swept at the session boundary) reports
-    /// <c>EXPIRED('C')</c>; every other cancel reason reports
-    /// <c>CANCELED('4')</c>. GTD expiry and auction expiry intentionally keep
-    /// reporting <c>CANCELED</c> for now (their EXPIRED-status alignment is a
-    /// separate FIX-consistency refinement).
+    /// cancel ExecutionReport. An order removed because its time-in-force
+    /// elapsed — a Day order or parked Day stop swept at the session boundary
+    /// (issue #506), a GTD order whose ExpireDate has passed, or a
+    /// GoodForAuction/AtClose order removed at the auction uncross (issue #513)
+    /// — reports <c>EXPIRED('C')</c>; every other (solicited) cancel reason
+    /// reports <c>CANCELED('4')</c>.
     /// </summary>
-    public static byte CancelOrdStatus(Matching.CancelReason reason) =>
-        reason == Matching.CancelReason.DayExpired ? OrdStatusExpired : OrdStatusCanceled;
+    public static byte CancelOrdStatus(Matching.CancelReason reason) => reason switch
+    {
+        Matching.CancelReason.DayExpired
+            or Matching.CancelReason.GtdExpired
+            or Matching.CancelReason.AuctionExpired => OrdStatusExpired,
+        _ => OrdStatusCanceled,
+    };
 
     public static int EncodeExecReportTrade(Span<byte> dst,
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,

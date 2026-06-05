@@ -139,10 +139,10 @@ public class ExecutionReportEncoderTests
 
     [Theory]
     [InlineData(Matching.CancelReason.DayExpired, (byte)'C')]
-    [InlineData(Matching.CancelReason.GtdExpired, (byte)'4')]
-    [InlineData(Matching.CancelReason.AuctionExpired, (byte)'4')]
+    [InlineData(Matching.CancelReason.GtdExpired, (byte)'C')]
+    [InlineData(Matching.CancelReason.AuctionExpired, (byte)'C')]
     [InlineData(Matching.CancelReason.Client, (byte)'4')]
-    public void CancelOrdStatus_MapsDayExpiredToExpired_OthersCanceled(Matching.CancelReason reason, byte expected)
+    public void CancelOrdStatus_MapsExpiriesToExpired_OthersCanceled(Matching.CancelReason reason, byte expected)
     {
         Assert.Equal(expected, ExecutionReportEncoder.CancelOrdStatus(reason));
     }

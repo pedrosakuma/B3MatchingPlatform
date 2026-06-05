@@ -108,6 +108,8 @@ public class GtdExpiryE2ETests
             Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, er2.TemplateId);
             // ER_Cancel body[18] carries Side; the resting order was Buy.
             Assert.Equal((byte)'1', er2.Body[18]);
+            // GTD expiry reports OrdStatus=EXPIRED('C') (issue #513).
+            Assert.Equal((byte)'C', er2.Body[19]);
         }
         finally
         {
