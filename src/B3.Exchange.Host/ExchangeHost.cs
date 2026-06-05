@@ -577,10 +577,10 @@ public sealed class ExchangeHost : IAsyncDisposable
         // expiry command per channel at daily reset; "today" is the B3 local
         // market date in the configured daily-reset timezone (the engine
         // stays clockless and receives the date as a command argument).
+        var todayProvider = GtdExpirySweeper.BuildTodayProvider(
+            _config.DailyReset?.Timezone,
+            _loggerFactory.CreateLogger<GtdExpirySweeper>());
         {
-            var todayProvider = GtdExpirySweeper.BuildTodayProvider(
-                _config.DailyReset?.Timezone,
-                _loggerFactory.CreateLogger<GtdExpirySweeper>());
             _gtdExpirySweeper = new GtdExpirySweeper(
                 _dispatchers,
                 _loggerFactory.CreateLogger<GtdExpirySweeper>(),
@@ -598,6 +598,11 @@ public sealed class ExchangeHost : IAsyncDisposable
         _dayExpirySweeper = new DayExpirySweeper(
             _dispatchers,
             _loggerFactory.CreateLogger<DayExpirySweeper>());
+        // #504: the decoder rejects a GTD NewOrderSingle whose ExpireDate is
+        // already in the past using the same timezone-aware local market date
+        // the GTD sweep uses, converted to the wire LocalMktDate. Read only on
+        // the live decode path; the engine stays clockless.
+        Func<ushort?> marketDateProvider = () => GtdExpirySweeper.ToLocalMktDate(todayProvider());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
         var sessionOptions = new FixpSessionOptions
         {
@@ -617,6 +622,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 MaxPriceMantissa = _config.Tcp.MaxPrice,
                 PriceBandPercent = _config.Tcp.PriceBandPercent,
                 LastTradePriceProvider = _router.LastTradePriceMantissa,
+                CurrentMarketDateProvider = marketDateProvider,
             },
         };
         // Phase 2 (#42): real Negotiate handshake. The validator is pure

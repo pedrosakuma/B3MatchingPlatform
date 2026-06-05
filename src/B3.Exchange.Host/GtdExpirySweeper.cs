@@ -31,6 +31,21 @@ public sealed class GtdExpirySweeper
     /// <c>LocalMktDate</c>.</summary>
     private static readonly int UnixEpochDayNumber = new DateOnly(1970, 1, 1).DayNumber;
 
+    /// <summary>
+    /// Converts a calendar date to the B3 wire <c>LocalMktDate</c>
+    /// (days since the Unix epoch, a <see cref="ushort"/>). Returns
+    /// <c>null</c> when the date falls outside the representable
+    /// <see cref="ushort"/> range. Shared by the boundary sweep and by the
+    /// decode-time stale-GTD guard (#504) so both interpret "today" the same
+    /// way.
+    /// </summary>
+    public static ushort? ToLocalMktDate(DateOnly date)
+    {
+        int dayNumber = date.DayNumber - UnixEpochDayNumber;
+        if (dayNumber < 0 || dayNumber > ushort.MaxValue) return null;
+        return (ushort)dayNumber;
+    }
+
     private readonly IReadOnlyList<ChannelDispatcher> _dispatchers;
     private readonly ILogger<GtdExpirySweeper> _logger;
     private readonly Func<DateOnly> _todayLocal;
@@ -101,15 +116,13 @@ public sealed class GtdExpirySweeper
     {
         if (_dispatchers.Count == 0) return 0;
         var today = _todayLocal();
-        int dayNumber = today.DayNumber - UnixEpochDayNumber;
-        if (dayNumber < 0 || dayNumber > ushort.MaxValue)
+        if (ToLocalMktDate(today) is not { } currentDate)
         {
             _logger.LogError(
                 "GTD expiry sweep ({Trigger}): local market date {Today} is outside the LocalMktDate range; skipping",
                 trigger, today);
             return 0;
         }
-        ushort currentDate = (ushort)dayNumber;
 
         var pending = waitTimeout is { } t && t > TimeSpan.Zero
             ? new List<Task<ChannelDispatcher.ExpireGtdOutcome>>()

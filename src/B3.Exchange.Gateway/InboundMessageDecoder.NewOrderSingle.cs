@@ -188,6 +188,24 @@ internal static partial class InboundMessageDecoder
             cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
             return InboundDecodeOutcome.UnsupportedFeature;
         }
+        // #504: reject a GTD whose ExpireDate is already in the past at entry,
+        // rather than letting it rest until the next daily-reset sweep cancels
+        // it one trading day late. The host supplies the current B3 local
+        // market date (LocalMktDate = days since epoch); a null result skips
+        // the check. The comparison is strict (< today): an order dated for
+        // today is valid *through* today and rests until tonight's close — the
+        // end-of-day sweep cancels it then (it expires on ExpireDate <= today).
+        // Reading the date here (the live decode path) keeps the engine
+        // clockless: the reject decision is frozen into the command via
+        // UnsupportedOrderCharacteristic, so WAL replay stays deterministic.
+        if (tif == TimeInForce.Gtd
+            && guardrails.CurrentMarketDateProvider?.Invoke() is { } currentMarketDate
+            && expireDate < currentMarketDate)
+        {
+            message = $"GTD ExpireDate {expireDate} is before the current trading day {currentMarketDate}";
+            cmd = UnsupportedCommand(ordType, tif, isStop ? stopPx : 0L);
+            return InboundDecodeOutcome.UnsupportedFeature;
+        }
 
         // #238: V6 root carries +strategyID@125 (int32, 0=null) and
         // +tradingSubAccount@129 (uint32, 0=null). The body span has

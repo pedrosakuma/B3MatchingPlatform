@@ -21,6 +21,20 @@ public sealed record InboundFatFingerOptions
     public decimal? PriceBandPercent { get; init; }
     public Func<long, long?>? LastTradePriceProvider { get; init; }
 
+    /// <summary>
+    /// #504: supplies the current B3 local market date as a wire
+    /// <c>LocalMktDate</c> (days since the Unix epoch) so the decoder can
+    /// reject a GTD <c>NewOrderSingle</c> whose <c>ExpireDate</c> is already
+    /// in the past at entry time, rather than letting it rest until the next
+    /// daily-reset sweep. Host-supplied and read only on the live decode
+    /// path — never during WAL replay (replay rebuilds commands from WAL
+    /// records, bypassing the decoder), so the engine stays clockless
+    /// (ADR 0009) and replay stays deterministic. Must not throw; return
+    /// <c>null</c> to skip the check (e.g. the date is outside the
+    /// <see cref="ushort"/> LocalMktDate range or unconfigured).
+    /// </summary>
+    public Func<ushort?>? CurrentMarketDateProvider { get; init; }
+
     public static InboundFatFingerOptions Default { get; } = new();
 
     public void Validate()
