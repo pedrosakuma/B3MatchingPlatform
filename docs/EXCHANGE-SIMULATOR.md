@@ -77,6 +77,7 @@ Exposes:
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
     "testRequestGraceMs": 5000,
+    "suspendedTimeoutMs": 300000,
     "sendingTimeSkewToleranceMs": 5000,
     "maxOrderQty": 1000000000,
     "maxPrice": 1000000000000000,
@@ -147,6 +148,10 @@ Exposes:
   the session is closed; a `BusinessReject` (templateId=206) framing the
   reason is the responsibility of issue #11 — `EntryPointSession.Close(reason)`
   exposes the seam.
+* `tcp.suspendedTimeoutMs` — how long a Suspended FIXP session remains
+  re-attachable after its transport drops before the listener reaper fully
+  closes it. Default `300000`; set `0` to disable the suspended-session
+  reaper.
 * `tcp.sendingTimeSkewToleranceMs` — maximum absolute skew tolerated between
   the server clock and an inbound application message's
   `InboundBusinessHeader.sendingTime`. Default `5000`; set `0` to disable.
