@@ -561,11 +561,14 @@ public sealed partial class ChannelDispatcher
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,
                 Side: e.Side,
-                PriceMantissa: e.StopPxMantissa,
+                PriceMantissa: e.StopType == OrderType.StopLoss ? 0 : e.LimitPriceMantissa,
                 RemainingQuantityAtCancel: e.RemainingQuantityAtCancel,
                 TransactTimeNanos: e.TransactTimeNanos,
                 Reason: e.Reason,
-                RptSeq: e.RptSeq);
+                RptSeq: e.RptSeq,
+                Memo: e.Memo,
+                OrdType: e.StopType,
+                StopPxMantissa: e.StopPxMantissa);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);

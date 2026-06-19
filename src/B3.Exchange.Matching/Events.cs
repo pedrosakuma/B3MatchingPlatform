@@ -52,7 +52,9 @@ public readonly record struct OrderCanceledEvent(
     ulong TransactTimeNanos,
     CancelReason Reason,
     uint RptSeq,
-    byte[]? Memo = null);
+    byte[]? Memo = null,
+    OrderType OrdType = OrderType.Limit,
+    long StopPxMantissa = 0);
 
 /// <summary>
 /// Fired when a resting order is fully consumed by trades. The integration layer
@@ -281,8 +283,7 @@ public readonly record struct StopOrderTriggeredEvent(
     uint RptSeq);
 
 /// <summary>
-/// Fired when a parked stop order is cancelled by the client (the only
-/// reason for a stop cancel — stops do not auto-expire in this engine).
+/// Fired when a parked stop order is cancelled before triggering.
 /// Issue #214. The integration layer translates this to ER_Cancel back
 /// to the owning session; no MBO frame is emitted because the stop was
 /// never on the book.
@@ -291,7 +292,9 @@ public readonly record struct StopOrderCanceledEvent(
     long SecurityId,
     long OrderId,
     Side Side,
+    OrderType StopType,
     long StopPxMantissa,
+    long LimitPriceMantissa,
     long RemainingQuantityAtCancel,
     ulong TransactTimeNanos,
     uint RptSeq,

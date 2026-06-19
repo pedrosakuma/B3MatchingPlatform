@@ -316,7 +316,8 @@ internal static class ExecutionReportEncoder
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long cumQty, long orderQty, long? priceMantissa,
         ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
-        byte ordStatus = OrdStatusCanceled)
+        byte ordStatus = OrdStatusCanceled,
+        Matching.OrderType ordType = Matching.OrderType.Limit, long stopPxMantissa = 0)
     {
         int total = TotalSize(ExecReportCancelBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Cancel", nameof(dst));
@@ -338,13 +339,13 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(80, 8), in orderId);
         MemoryMarshal.Write(body.Slice(88, 8), in origClOrdIdValue);
         body[99] = 255;                                                     // ExecRestatementReason null
-        body[112] = OrdTypeLimit;
+        body[112] = EncodeOrdType(ordType);
         body[113] = TifDay;
         MemoryMarshal.Write(body.Slice(116, 8), in orderQty);
-        long px = priceMantissa ?? PriceNullMantissa;
+        long px = ordType == Matching.OrderType.StopLoss ? PriceNullMantissa : priceMantissa ?? PriceNullMantissa;
         MemoryMarshal.Write(body.Slice(124, 8), in px);                     // Price
-        long nullPx = PriceNullMantissa;
-        MemoryMarshal.Write(body.Slice(132, 8), in nullPx);                 // StopPx
+        long stopPx = stopPxMantissa != 0 ? stopPxMantissa : PriceNullMantissa;
+        MemoryMarshal.Write(body.Slice(132, 8), in stopPx);                 // StopPx
         // V3 trailing fields: receivedTime@156 + ordTagID/investorID/strategyID/actionRequestedFromSessionID
         // null sentinels are all zero (handled by body.Clear() above).
         MemoryMarshal.Write(body.Slice(156, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)

@@ -67,6 +67,9 @@ public class DayExpiryTests
         Assert.Equal(1, eng.StopOrderCount);
         var stop = Assert.Single(sink.StopCanceled);
         Assert.Equal(CancelReason.DayExpired, stop.Reason);
+        Assert.Equal(OrderType.StopLimit, stop.StopType);
+        Assert.Equal(Px(10.45m), stop.StopPxMantissa);
+        Assert.Equal(Px(10.50m), stop.LimitPriceMantissa);
     }
 
     [Fact]

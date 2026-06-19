@@ -139,7 +139,8 @@ internal sealed class FixpOutboundEncoder
                     (ulong)e.RptSeq, e.TransactTimeNanos,
                     cumQty: 0, orderQty: e.RemainingQuantityAtCancel, priceMantissa: e.PriceMantissa,
                     memo: memo.Span, receivedTimeNanos: receivedTimeNanos,
-                    ordStatus: ExecutionReportEncoder.CancelOrdStatus(e.Reason));
+                    ordStatus: ExecutionReportEncoder.CancelOrdStatus(e.Reason),
+                    ordType: e.OrdType, stopPxMantissa: e.StopPxMantissa);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }
