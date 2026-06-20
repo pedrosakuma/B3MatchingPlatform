@@ -50,6 +50,7 @@ internal static partial class InboundMessageDecoder
         InboundFatFingerOptions? fatFingerOptions = null)
     {
         var guardrails = NormalizeFatFingerOptions(fatFingerOptions);
+        ushort? currentMarketDate = guardrails.CurrentMarketDateProvider?.Invoke();
         cmd = null!;
         clOrdIdValue = 0;
         origClOrdIdValue = 0;
@@ -235,6 +236,7 @@ internal static partial class InboundMessageDecoder
             NewOrdType = ordType,
             NewTif = newTif,
             NewExpireDate = newExpireDate,
+            CurrentMarketDate = currentMarketDate,
             NewInvestorId = investorId,
         };
         return InboundDecodeOutcome.Success;

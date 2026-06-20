@@ -1385,6 +1385,10 @@ public sealed class MatchingEngine
             {
                 if (effectiveExpireDate == 0)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
+                // #516: decode freezes the host's market date into the command
+                // so WAL replay preserves the same stale-GTD replace decision.
+                if (cmd.CurrentMarketDate is { } today && effectiveExpireDate < today)
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnsupportedOrderCharacteristic, cmd.EnteredAtNanos); return; }
             }
             else if (cmd.NewExpireDate is { } suppliedExpire && suppliedExpire != 0)
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.InvalidField, cmd.EnteredAtNanos); return; }
