@@ -236,6 +236,68 @@ public class GtdExpiryE2ETests
         }
     }
 
+    [Fact]
+    public async Task ReplaceGtdOrder_WithPastNewExpireDate_RejectedAtEntry()
+    {
+        var scratch = Path.Combine(AppContext.BaseDirectory,
+            "gtd-replace-e2e-reject-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var instrumentsPath = WriteEquityInstrumentsJson(scratch);
+            var sink = new RecordingPacketSink();
+            var cfg = new HostConfig
+            {
+                Auth = new AuthConfig { RequireFixpHandshake = false },
+                Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
+                DailyReset = new DailyResetConfig { Timezone = "UTC" },
+                Channels =
+                {
+                    new ChannelConfig
+                    {
+                        ChannelNumber = 99,
+                        IncrementalGroup = "239.255.42.99",
+                        IncrementalPort = 30199,
+                        Ttl = 0,
+                        InstrumentsFile = instrumentsPath,
+                    },
+                },
+            };
+
+            await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+            await host.StartAsync();
+            var ep = host.TcpEndpoint!;
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(ep.Address, ep.Port);
+            var stream = client.GetStream();
+
+            int epochDay = DateOnly.FromDateTime(DateTime.UtcNow).DayNumber
+                - new DateOnly(1970, 1, 1).DayNumber;
+            ushort futureExpireDate = (ushort)(epochDay + 30);
+            ushort pastExpireDate = (ushort)(epochDay - 5);
+
+            var newOrder = BuildNewOrderSingleGtd(clOrdId: 12_301, secId: SecId,
+                side: '1', qty: 100, priceMantissa: 123_400, expireDate: futureExpireDate);
+            await stream.WriteAsync(newOrder);
+            var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
+
+            var replace = BuildOrderCancelReplaceGtd(clOrdId: 12_302, origClOrdId: 12_301,
+                secId: SecId, side: '1', qty: 100, priceMantissa: 123_400,
+                expireDate: pastExpireDate);
+            await stream.WriteAsync(replace);
+
+            var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, er2.TemplateId);
+            Assert.Equal(12_302UL, BinaryPrimitives.ReadUInt64LittleEndian(er2.Body.AsSpan(20, 8)));
+            Assert.Equal(11u, BinaryPrimitives.ReadUInt32LittleEndian(er2.Body.AsSpan(44, 4)));
+        }
+        finally
+        {
+            if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true);
+        }
+    }
+
     /// <summary>
     /// Builds a full NewOrderSingle_102 (V2) frame with a GTD
     /// TimeInForce and the given ExpireDate. BlockLength = 125; no
@@ -261,6 +323,31 @@ public class GtdExpiryE2ETests
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(76, 8), long.MinValue); // StopPx null
         BinaryPrimitives.WriteUInt16LittleEndian(body.Slice(105, 2), expireDate);
+        return frame;
+    }
+
+    private static byte[] BuildOrderCancelReplaceGtd(ulong clOrdId, ulong origClOrdId,
+        long secId, char side, long qty, long priceMantissa, ushort expireDate)
+    {
+        const int BlockLength = 142;
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + BlockLength];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, EntryPointFrameReader.WireHeaderSize),
+            messageLength: (ushort)frame.Length,
+            blockLength: BlockLength, templateId: EntryPointFrameReader.TidOrderCancelReplaceRequest, version: 2);
+
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
+        body[56] = (byte)side;
+        body[57] = (byte)'2';
+        body[58] = 0;
+        body[59] = 255;
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(60, 8), qty);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(76, 8), 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(84, 8), origClOrdId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(92, 8), long.MinValue);
+        BinaryPrimitives.WriteUInt16LittleEndian(body.Slice(122, 2), expireDate);
         return frame;
     }
 

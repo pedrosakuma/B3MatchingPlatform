@@ -346,6 +346,17 @@ public sealed record ReplaceOrderCommand(
     /// </summary>
     public ushort? NewExpireDate { get; init; }
 
+    /// <summary>
+    /// Current B3 local market date (days since the Unix epoch) frozen at
+    /// decode time from the host's CurrentMarketDateProvider, or null when
+    /// the host supplied no provider. The engine is clockless (ADR 0009);
+    /// freezing the date into the command keeps WAL replay deterministic.
+    /// Used only to reject a replace that resolves to a GTD whose effective
+    /// ExpireDate is already in the past (#516, follow-up to #504). Strict
+    /// comparison: ExpireDate &lt; CurrentMarketDate is stale; same-day is valid.
+    /// </summary>
+    public ushort? CurrentMarketDate { get; init; }
+
     public bool UnsupportedOrderCharacteristic { get; init; }
 
     public RejectReason? PreTradeRejectReason { get; init; }

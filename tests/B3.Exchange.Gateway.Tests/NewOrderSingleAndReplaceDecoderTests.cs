@@ -860,6 +860,29 @@ public class NewOrderSingleAndReplaceDecoderTests
         Assert.Null(cmd.NewExpireDate);
     }
 
+    [Fact]
+    public void OrderCancelReplace_PopulatesCurrentMarketDateFromProvider()
+    {
+        var body = BuildOrderCancelReplaceV2(expireDate: 19_999);
+        int calls = 0;
+        var opts = new InboundFatFingerOptions
+        {
+            CurrentMarketDateProvider = () =>
+            {
+                calls++;
+                return 20_000;
+            },
+        };
+
+        var outcome = InboundMessageDecoder.TryDecodeOrderCancelReplace(
+            body, 0UL, out var cmd, out _, out _, out var msg, opts);
+
+        Assert.Equal(InboundMessageDecoder.InboundDecodeOutcome.Success, outcome);
+        Assert.Null(msg);
+        Assert.Equal((ushort)20_000, cmd.CurrentMarketDate);
+        Assert.Equal(1, calls);
+    }
+
     // ---------------- #238: V6 trailer (StrategyID + TradingSubAccount) ----------------
 
     private static byte[] BuildNewOrderSingleV6(

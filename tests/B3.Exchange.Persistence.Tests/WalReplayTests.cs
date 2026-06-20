@@ -1,5 +1,6 @@
 using System.Text;
 using B3.Exchange.Core;
+using B3.Exchange.Matching;
 using B3.Exchange.Persistence;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -155,6 +156,29 @@ public sealed class WalReplayTests
         Assert.Equal(3, result.Records.Count);
         Assert.Equal(2, result.LegacyCount);
         Assert.Equal(0, result.CorruptCount);
+    }
+
+    [Fact]
+    public void ReplaceOrderCommand_CurrentMarketDate_RoundTripsThroughWalJson()
+    {
+        var replace = new ReplaceOrderCommand("r1", 900_000_000_001L, 123L, 100_000L, 100L, 2_000UL)
+        {
+            NewTif = TimeInForce.Gtd,
+            NewExpireDate = 19_999,
+            CurrentMarketDate = 20_000,
+        };
+        var rec = new WalRecord(1, WalRecordKind.Replace, "S", 1u, 2u, 1u, null, null, replace);
+
+        var json = SerializeRecord(rec);
+        var roundTrip = System.Text.Json.JsonSerializer.Deserialize(json, WalJsonContext.Default.WalRecord);
+
+        Assert.NotNull(roundTrip);
+        Assert.Equal((ushort)20_000, roundTrip.Replace!.CurrentMarketDate);
+
+        var legacyJson = Encoding.UTF8.GetString(json).Replace(",\"CurrentMarketDate\":20000", "", StringComparison.Ordinal);
+        var legacy = System.Text.Json.JsonSerializer.Deserialize(legacyJson, WalJsonContext.Default.WalRecord);
+        Assert.NotNull(legacy);
+        Assert.Null(legacy.Replace!.CurrentMarketDate);
     }
 
     [Fact]
