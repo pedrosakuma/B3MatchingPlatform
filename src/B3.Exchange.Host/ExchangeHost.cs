@@ -604,27 +604,11 @@ public sealed class ExchangeHost : IAsyncDisposable
         // the live decode path; the engine stays clockless.
         Func<ushort?> marketDateProvider = () => GtdExpirySweeper.ToLocalMktDate(todayProvider());
         var listenEp = ParseEndpoint(_config.Tcp.Listen);
-        var sessionOptions = new FixpSessionOptions
-        {
-            HeartbeatIntervalMs = _config.Tcp.HeartbeatIntervalMs,
-            IdleTimeoutMs = _config.Tcp.IdleTimeoutMs,
-            TestRequestGraceMs = _config.Tcp.TestRequestGraceMs,
-            SendingTimeSkewToleranceNs = (ulong)Math.Max(_config.Tcp.SendingTimeSkewToleranceMs, 0) * 1_000_000UL,
-            LifecycleMetrics = _metrics.Sessions,
-            ThrottleTimeWindowMs = _config.Tcp.Throttle?.TimeWindowMs ?? 0,
-            ThrottleMaxMessages = _config.Tcp.Throttle?.MaxMessages ?? 0,
-            MaxOrderRatePerSecond = 200,
-            ThrottleMetrics = _metrics.Throttle,
-            OnTransportSendQueueFull = _metrics.Transport.IncSendQueueFull,
-            FatFinger = new InboundFatFingerOptions
-            {
-                MaxOrderQty = _config.Tcp.MaxOrderQty,
-                MaxPriceMantissa = _config.Tcp.MaxPrice,
-                PriceBandPercent = _config.Tcp.PriceBandPercent,
-                LastTradePriceProvider = _router.LastTradePriceMantissa,
-                CurrentMarketDateProvider = marketDateProvider,
-            },
-        };
+        var sessionOptions = BuildSessionOptions(
+            _config.Tcp,
+            _metrics,
+            _router.LastTradePriceMantissa,
+            marketDateProvider);
         // Phase 2 (#42): real Negotiate handshake. The validator is pure
         // (no IO); the claim ledger lives for the host process lifetime
         // so duplicate-connection detection works across reconnects.
@@ -1162,6 +1146,36 @@ public sealed class ExchangeHost : IAsyncDisposable
             "Update your config to declare firms[] and sessions[] per docs/B3-ENTRYPOINT-ARCHITECTURE.md §8.",
             _config.Tcp.EnteringFirm);
         return ("legacy", _config.Tcp.EnteringFirm);
+    }
+
+    internal static FixpSessionOptions BuildSessionOptions(
+        TcpConfig tcp,
+        MetricsRegistry metrics,
+        Func<long, long?> lastTradePriceProvider,
+        Func<ushort?> marketDateProvider)
+    {
+        return new FixpSessionOptions
+        {
+            HeartbeatIntervalMs = tcp.HeartbeatIntervalMs,
+            IdleTimeoutMs = tcp.IdleTimeoutMs,
+            TestRequestGraceMs = tcp.TestRequestGraceMs,
+            SuspendedTimeoutMs = tcp.SuspendedTimeoutMs,
+            SendingTimeSkewToleranceNs = (ulong)Math.Max(tcp.SendingTimeSkewToleranceMs, 0) * 1_000_000UL,
+            LifecycleMetrics = metrics.Sessions,
+            ThrottleTimeWindowMs = tcp.Throttle?.TimeWindowMs ?? 0,
+            ThrottleMaxMessages = tcp.Throttle?.MaxMessages ?? 0,
+            MaxOrderRatePerSecond = 200,
+            ThrottleMetrics = metrics.Throttle,
+            OnTransportSendQueueFull = metrics.Transport.IncSendQueueFull,
+            FatFinger = new InboundFatFingerOptions
+            {
+                MaxOrderQty = tcp.MaxOrderQty,
+                MaxPriceMantissa = tcp.MaxPrice,
+                PriceBandPercent = tcp.PriceBandPercent,
+                LastTradePriceProvider = lastTradePriceProvider,
+                CurrentMarketDateProvider = marketDateProvider,
+            },
+        };
     }
 
     private static IPEndPoint ParseEndpoint(string s)

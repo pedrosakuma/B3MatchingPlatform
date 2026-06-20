@@ -88,6 +88,9 @@ public sealed class TcpConfig
     /// <summary>Additional grace window after the probe before the session is
     /// closed for inactivity. Default: 5 s.</summary>
     [JsonPropertyName("testRequestGraceMs")] public int TestRequestGraceMs { get; set; } = 5_000;
+    /// <summary>Suspended-session lifetime in milliseconds before the listener
+    /// reaper fully closes the session. Set to 0 to disable. Default: 5 min.</summary>
+    [JsonPropertyName("suspendedTimeoutMs")] public int SuspendedTimeoutMs { get; set; } = 5 * 60_000;
 
     /// <summary>
     /// Maximum absolute skew tolerated for inbound application

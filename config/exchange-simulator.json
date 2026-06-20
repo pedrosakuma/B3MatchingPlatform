@@ -12,6 +12,7 @@
     "heartbeatIntervalMs": 10000,
     "idleTimeoutMs": 10000,
     "testRequestGraceMs": 5000,
+    "suspendedTimeoutMs": 300000,
     "sendingTimeSkewToleranceMs": 5000,
     // Decode-time fat-finger guardrails. Price is the EntryPoint /10000
     // mantissa; priceBandPercent null disables the last-trade-relative band.
