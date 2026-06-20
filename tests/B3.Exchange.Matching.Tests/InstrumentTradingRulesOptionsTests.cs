@@ -53,4 +53,21 @@ public class InstrumentTradingRulesOptionsTests
 
         Assert.Throws<ArgumentException>(() => _ = new InstrumentTradingRules(instrument));
     }
+
+    [Fact]
+    public void Constructor_MarketProtectionFields_ConvertsToEngineScales()
+    {
+        var instrument = TestFactory.Petr4 with
+        {
+            AuctionCollarPercent = 2.50m,
+            MaxOrderQty = 1_000_000,
+            MaxOrderValue = 250_000.25m,
+        };
+
+        var rules = new InstrumentTradingRules(instrument);
+
+        Assert.Equal(2_500_000L, rules.AuctionCollarPercentUnits);
+        Assert.Equal(1_000_000L, rules.MaxOrderQty);
+        Assert.Equal(2_500_002_500L, rules.MaxOrderValueMantissa);
+    }
 }

@@ -11,6 +11,7 @@ public sealed class InstrumentTradingRules
     /// <summary>Multiplier from a decimal price to a long mantissa
     /// (10^4 = 10_000 for the V16 MBO Price/PriceOptional encoding).</summary>
     public const long PriceScale = 10_000L;
+    private const long PercentScale = 1_000_000L;
 
     public Instrument Instrument { get; }
     public long TickSizeMantissa { get; }
@@ -22,6 +23,9 @@ public sealed class InstrumentTradingRules
     public long? LowerPriceBandMantissa { get; }
     public long? UpperPriceBandMantissa { get; }
     public bool HasPriceBand => LowerPriceBandMantissa.HasValue && UpperPriceBandMantissa.HasValue;
+    public long? AuctionCollarPercentUnits { get; }
+    public long? MaxOrderQty { get; }
+    public long? MaxOrderValueMantissa { get; }
 
     public InstrumentTradingRules(Instrument instrument)
     {
@@ -35,6 +39,13 @@ public sealed class InstrumentTradingRules
             : null;
         UpperPriceBandMantissa = instrument.UpperPriceBand.HasValue
             ? ToMantissaChecked(instrument.UpperPriceBand.Value, nameof(instrument.UpperPriceBand))
+            : null;
+        AuctionCollarPercentUnits = instrument.AuctionCollarPercent.HasValue
+            ? ToScaledLongChecked(instrument.AuctionCollarPercent.Value, PercentScale, nameof(instrument.AuctionCollarPercent))
+            : null;
+        MaxOrderQty = instrument.MaxOrderQty;
+        MaxOrderValueMantissa = instrument.MaxOrderValue.HasValue
+            ? ToMantissaChecked(instrument.MaxOrderValue.Value, nameof(instrument.MaxOrderValue))
             : null;
         LotSize = instrument.LotSize;
         ContractMultiplier = instrument.ContractMultiplier;
@@ -69,16 +80,25 @@ public sealed class InstrumentTradingRules
         }
         if (LowerPriceBandMantissa is { } low && UpperPriceBandMantissa is { } high && high < low)
             throw new ArgumentException("UpperPriceBand < LowerPriceBand", nameof(instrument));
+        if (AuctionCollarPercentUnits is <= 0)
+            throw new ArgumentException("AuctionCollarPercent must be > 0", nameof(instrument));
+        if (MaxOrderQty is <= 0)
+            throw new ArgumentException("MaxOrderQty must be > 0", nameof(instrument));
+        if (MaxOrderValueMantissa is <= 0)
+            throw new ArgumentException("MaxOrderValue must be > 0 after scale", nameof(instrument));
     }
 
     private static long ToMantissaChecked(decimal value, string name)
+        => ToScaledLongChecked(value, PriceScale, name);
+
+    private static long ToScaledLongChecked(decimal value, long scale, string name)
     {
-        decimal scaled = value * PriceScale;
+        decimal scaled = value * scale;
         decimal rounded = Math.Truncate(scaled);
         if (rounded != scaled)
-            throw new ArgumentException($"{name}={value} has more than 4 decimal places", name);
+            throw new ArgumentException($"{name}={value} has too many decimal places for scale {scale}", name);
         if (scaled > long.MaxValue || scaled < long.MinValue)
-            throw new ArgumentException($"{name}={value} overflows mantissa range", name);
+            throw new ArgumentException($"{name}={value} overflows scaled range", name);
         return (long)scaled;
     }
 }

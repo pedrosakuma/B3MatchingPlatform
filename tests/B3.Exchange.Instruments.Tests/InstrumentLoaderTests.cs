@@ -30,6 +30,9 @@ public class InstrumentLoaderTests
         Assert.Equal("CS", i.SecurityType);
         Assert.Null(i.LowerPriceBand);
         Assert.Null(i.UpperPriceBand);
+        Assert.Null(i.AuctionCollarPercent);
+        Assert.Null(i.MaxOrderQty);
+        Assert.Null(i.MaxOrderValue);
     }
 
     [Fact]
@@ -147,6 +150,9 @@ public class InstrumentLoaderTests
                 "maxPx": "99.99",
                 "lowerPriceBand": "11.50",
                 "upperPriceBand": "18.25",
+                "auctionCollarPercent": "5.50",
+                "maxOrderQty": 1000000,
+                "maxOrderValue": "250000.00",
                 "currency": "BRL",
                 "isin": "BRPETRACNPR6",
                 "securityType": "CS"
@@ -157,6 +163,37 @@ public class InstrumentLoaderTests
         var inst = Assert.Single(InstrumentLoader.LoadFromString(json));
         Assert.Equal(11.50m, inst.LowerPriceBand);
         Assert.Equal(18.25m, inst.UpperPriceBand);
+        Assert.Equal(5.50m, inst.AuctionCollarPercent);
+        Assert.Equal(1_000_000L, inst.MaxOrderQty);
+        Assert.Equal(250_000.00m, inst.MaxOrderValue);
+    }
+
+    [Theory]
+    [InlineData("auctionCollarPercent", "\"0\"")]
+    [InlineData("maxOrderQty", "0")]
+    [InlineData("maxOrderValue", "\"0\"")]
+    public void Load_InvalidOptionalMarketProtection_Throws(string field, string badValue)
+    {
+        var json = """
+            [
+              {
+                "symbol": "PETR4",
+                "securityId": 1,
+                "tickSize": "0.01",
+                "lotSize": 100,
+                "minPx": "10.00",
+                "maxPx": "99.99",
+                "currency": "BRL",
+                "isin": "BRPETRACNPR6",
+                "securityType": "CS",
+                "__FIELD__": __VALUE__
+              }
+            ]
+            """.Replace("__FIELD__", field, StringComparison.Ordinal)
+                .Replace("__VALUE__", badValue, StringComparison.Ordinal);
+
+        var ex = Assert.Throws<InstrumentConfigException>(() => InstrumentLoader.LoadFromString(json));
+        Assert.Contains(field, ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

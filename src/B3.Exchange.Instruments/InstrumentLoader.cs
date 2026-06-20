@@ -124,6 +124,12 @@ public static class InstrumentLoader
             throw new InstrumentConfigException(Where("upperPriceBand must be > 0"));
         if (r.LowerPriceBand is { } bandLow && r.UpperPriceBand is { } bandHigh && bandHigh < bandLow)
             throw new InstrumentConfigException(Where($"upperPriceBand ({bandHigh}) must be >= lowerPriceBand ({bandLow})"));
+        if (r.AuctionCollarPercent is <= 0)
+            throw new InstrumentConfigException(Where("auctionCollarPercent must be > 0"));
+        if (r.MaxOrderQty is <= 0)
+            throw new InstrumentConfigException(Where("maxOrderQty must be > 0"));
+        if (r.MaxOrderValue is <= 0)
+            throw new InstrumentConfigException(Where("maxOrderValue must be > 0"));
         if (string.IsNullOrWhiteSpace(r.Currency))
             throw new InstrumentConfigException(Where("currency is required"));
         if (string.IsNullOrWhiteSpace(r.Isin))
@@ -207,6 +213,9 @@ public static class InstrumentLoader
             MaxPrice = r.MaxPrice.Value,
             LowerPriceBand = r.LowerPriceBand,
             UpperPriceBand = r.UpperPriceBand,
+            AuctionCollarPercent = r.AuctionCollarPercent,
+            MaxOrderQty = r.MaxOrderQty,
+            MaxOrderValue = r.MaxOrderValue,
             Currency = r.Currency!,
             Isin = r.Isin!,
             SecurityType = r.SecurityType!,
@@ -231,6 +240,9 @@ public static class InstrumentLoader
         [JsonPropertyName("maxPx")] public decimal? MaxPrice { get; set; }
         [JsonPropertyName("lowerPriceBand")] public decimal? LowerPriceBand { get; set; }
         [JsonPropertyName("upperPriceBand")] public decimal? UpperPriceBand { get; set; }
+        [JsonPropertyName("auctionCollarPercent")] public decimal? AuctionCollarPercent { get; set; }
+        [JsonPropertyName("maxOrderQty")] public long? MaxOrderQty { get; set; }
+        [JsonPropertyName("maxOrderValue")] public decimal? MaxOrderValue { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("isin")] public string? Isin { get; set; }
         [JsonPropertyName("securityType")] public string? SecurityType { get; set; }
