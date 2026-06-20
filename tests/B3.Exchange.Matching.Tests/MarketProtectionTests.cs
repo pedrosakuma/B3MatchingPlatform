@@ -104,6 +104,24 @@ public class MarketProtectionTests
     }
 
     [Fact]
+    public void Submit_AuctionCollar_FinalClosingCall_RejectsOutsideTopPercentAndAcceptsInside()
+    {
+        var eng = NewEngine(WithMarketProtections(auctionCollarPercent: 5.00m), out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.FinalClosingCall, 5000);
+        sink.Clear();
+        eng.Submit(new NewOrderCommand("bid", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10.00m), 100, 11, 6000));
+        eng.Submit(new NewOrderCommand("ask", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.AtClose, Px(10.00m), 100, 12, 6001));
+        Assert.True(sink.AuctionTops[^1].HasTop);
+        sink.Clear();
+
+        eng.Submit(new NewOrderCommand("outside", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10.51m), 100, 11, 6002));
+        eng.Submit(new NewOrderCommand("inside", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.AtClose, Px(10.50m), 100, 11, 6003));
+
+        Assert.Equal(RejectReason.PriceExceedsCurrentPriceBand, Assert.Single(sink.Rejects).Reason);
+        Assert.Single(sink.Accepted);
+    }
+
+    [Fact]
     public void Submit_AuctionCollar_DoesNotApplyOutsideAuctionPhases()
     {
         var eng = NewEngine(WithMarketProtections(auctionCollarPercent: 5.00m), out var sink);
@@ -168,11 +186,70 @@ public class MarketProtectionTests
     {
         var eng = NewEngine(WithMarketProtections(maxOrderValue: 1_000.00m), out var sink);
 
-        eng.Submit(new NewOrderCommand("at", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10.00m), 100, 11, 1000));
         eng.Submit(new NewOrderCommand("over", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10.01m), 100, 11, 1001));
 
-        Assert.Single(sink.Accepted);
         Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(sink.Rejects).Reason);
+        Assert.Empty(sink.Accepted);
+    }
+
+    [Fact]
+    public void Submit_PerInstrumentMaxOrderValue_AcceptsAtLimit()
+    {
+        var eng = NewEngine(WithMarketProtections(maxOrderValue: 1_000.00m), out var sink);
+
+        eng.Submit(new NewOrderCommand("at", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10.00m), 100, 11, 1000));
+
+        Assert.Single(sink.Accepted);
+        Assert.Empty(sink.Rejects);
+    }
+
+    [Fact]
+    public void Submit_PerInstrumentMaxOrderValue_AcceptsUnderLimit()
+    {
+        var eng = NewEngine(WithMarketProtections(maxOrderValue: 1_000.00m), out var sink);
+
+        eng.Submit(new NewOrderCommand("under", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 11, 1000));
+
+        Assert.Single(sink.Accepted);
+        Assert.Empty(sink.Rejects);
+    }
+
+    [Fact]
+    public void Submit_WithoutMaxOrderValue_AcceptsLargeOrder()
+    {
+        var eng = NewEngine(WithMarketProtections(), out var sink);
+
+        eng.Submit(new NewOrderCommand("no-value-limit", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(100.00m), 1_000_000_000, 11, 1000));
+
+        Assert.Single(sink.Accepted);
+        Assert.Empty(sink.Rejects);
+    }
+
+    [Fact]
+    public void Replace_PerInstrumentMaxOrderValue_RejectsOverLimitWithoutMutatingBook()
+    {
+        var eng = NewEngine(WithMarketProtections(maxOrderValue: 1_000.00m), out var sink);
+        eng.Submit(new NewOrderCommand("orig", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10.00m), 100, 11, 1000));
+        var orderId = sink.Accepted[0].OrderId;
+        sink.Clear();
+
+        eng.Replace(new ReplaceOrderCommand("repl", PetrSecId, orderId, Px(10.01m), 100, 1001));
+
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(sink.Rejects).Reason);
+        Assert.Equal(1, eng.OrderCount(PetrSecId));
+        Assert.Empty(sink.Canceled);
+        Assert.Empty(sink.Accepted);
+    }
+
+    [Fact]
+    public void Submit_PerInstrumentMaxOrderValue_RejectsInt32OverflowSizedValue()
+    {
+        var eng = NewEngine(WithMarketProtections(maxOrderValue: 100_000.00m), out var sink);
+
+        eng.Submit(new NewOrderCommand("overflow-sized", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(100.00m), 3_000, 11, 1000));
+
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(sink.Rejects).Reason);
+        Assert.Empty(sink.Accepted);
     }
 
     private static MatchingEngine NewEngine(Instrument instrument, out RecordingSink sink)
