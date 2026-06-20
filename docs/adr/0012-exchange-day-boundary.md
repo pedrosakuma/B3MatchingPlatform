@@ -44,10 +44,14 @@ closing auction (`FinalClosingCall` / `Close`). Concretely, in scope:
   Prevention (STPC, GAP-27), market protections (price collars / fat
   finger / max value, GAP-28), inbound throttling.
 - **Market-making protocols** — *future scope, not yet implemented.*
-  `MassQuote` / `QuoteRequest` are necessary for any non-trivial options
-  or futures venue simulation; they live inside this boundary even though
-  no concrete consumer has driven implementation yet (tracked separately
-  as a gap in `docs/B3-ENTRYPOINT-COMPLIANCE.md`).
+  `MassQuote` / an options-side `QuoteRequest` (distinct from the existing
+  Termo/Forward `QuoteRequest`, template id=401) are necessary for any
+  non-trivial options or futures venue simulation; they live inside this
+  boundary even though no concrete consumer has driven implementation yet.
+  Tracked as **OPT-08** in `docs/rfc/0002-equity-options-support.md`;
+  blocked until B3 publishes a `MassQuote` template in a future EntryPoint
+  schema release (the vendored v8.4.2 carries none — its `Quote*` templates
+  are Termo/Forward only).
 - **Operational surface needed to run the venue 24/7** — phase
   scheduling, daily reset, halt/resume, durable WAL+snapshot, EOD fills
   drop, per-trade audit log (ADRs 0001/0002).
