@@ -7,7 +7,9 @@ using B3.Exchange.Instruments;
 using B3.Exchange.Core;
 using B3.Exchange.TestSupport;
 using B3.Exchange.Matching;
+using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Buffers.Binary;
 
 namespace B3.Exchange.Core.Tests;
 
@@ -114,6 +116,52 @@ public class CrossOrderSemanticsTests
 
     private static void DrainInbound(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();
 
+    private static List<byte> TradeSubTypes(byte[] packet)
+    {
+        var values = new List<byte>();
+        int offset = WireOffsets.PacketHeaderSize;
+        while (offset < packet.Length)
+        {
+            ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderMessageLengthOffset, 2));
+            ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderSize + 2, 2));
+            if (templateId == 53)
+            {
+                int bodyOffset = offset + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+                values.Add(packet[bodyOffset + WireOffsets.TradeBodyTrdSubTypeOffset]);
+            }
+            offset += messageLength;
+        }
+        return values;
+    }
+
+    private readonly record struct TradeFrame(long PriceMantissa, long Quantity, byte TrdSubType);
+
+    private static List<TradeFrame> TradeFrames(byte[] packet)
+    {
+        var values = new List<TradeFrame>();
+        int offset = WireOffsets.PacketHeaderSize;
+        while (offset < packet.Length)
+        {
+            ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderMessageLengthOffset, 2));
+            ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderSize + 2, 2));
+            if (templateId == 53)
+            {
+                int bodyOffset = offset + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+                var body = packet.AsSpan(bodyOffset);
+                values.Add(new TradeFrame(
+                    BinaryPrimitives.ReadInt64LittleEndian(body.Slice(WireOffsets.TradeBodyMdEntryPxOffset, 8)),
+                    BinaryPrimitives.ReadInt64LittleEndian(body.Slice(WireOffsets.TradeBodyMdEntrySizeOffset, 8)),
+                    body[WireOffsets.TradeBodyTrdSubTypeOffset]));
+            }
+            offset += messageLength;
+        }
+        return values;
+    }
+
     private static NewOrderCommand Buy(long qty, decimal price, ulong clOrdId = 1UL)
         => new("B" + clOrdId, Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(price), qty, 7, 1_000UL);
     private static NewOrderCommand Sell(long qty, decimal price, ulong clOrdId = 2UL)
@@ -192,7 +240,7 @@ public class CrossOrderSemanticsTests
     public void AgainstBook_WithExternalLiquidity_SweepsBookThenPrintsResidual()
     {
         // External seller resting at a better price than the cross.
-        var (disp, _, outbound) = NewDispatcher();
+        var (disp, pkt, outbound) = NewDispatcher();
         var external = new FakeSession(outbound);
         var crosser = new FakeSession(outbound);
 
@@ -235,6 +283,101 @@ public class CrossOrderSemanticsTests
         // (buy resting) on the same FakeSession (crosser owns both legs).
         Assert.NotEmpty(crosserInternalFills);
         Assert.Contains(crosserInternalFills, t => t.Quantity == 100);
+
+        var tradeSubTypes = TradeSubTypes(pkt.Packets.Last());
+        Assert.Equal(new[] { UmdfWireEncoder.TrdSubTypeSweepTrade, UmdfWireEncoder.TrdSubTypeNull }, tradeSubTypes);
+    }
+
+    [Fact]
+    public void AgainstBook_SweepTradeTriggeringStop_DoesNotTagOrAccumulateStopTrade()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var external = new FakeSession(outbound);
+        var stopOwner = new FakeSession(outbound);
+        var crosser = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-999", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, external.EnteringFirm, 1_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-1000", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, external.EnteringFirm, 2_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("STOP", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, stopOwner.EnteringFirm, 3_000UL)
+            { StopPxMantissa = Px(9.99m) },
+            stopOwner.Id, stopOwner.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        var cross = new CrossOrderCommand(Buy(300, 10m, 10UL), Sell(300, 10m, 11UL), 10UL, 11UL, 999UL)
+        {
+            CrossType = CrossType.AgainstBook,
+            CrossPrioritization = CrossPrioritization.BuyPrioritized,
+            MaxSweepQty = 100,
+        };
+        disp.EnqueueCross(cross, crosser.Id, crosser.EnteringFirm);
+        DrainInbound(disp);
+
+        var frames = TradeFrames(pkt.Packets.Last());
+        Assert.Equal(
+            new[]
+            {
+                new TradeFrame(Px(9.99m), 100, UmdfWireEncoder.TrdSubTypeSweepTrade),
+                new TradeFrame(Px(10m), 100, UmdfWireEncoder.TrdSubTypeNull),
+                new TradeFrame(Px(10m), 200, UmdfWireEncoder.TrdSubTypeNull),
+            },
+            frames);
+
+        Assert.Contains(crosser.Trades, t => t.PriceMantissa == Px(10m) && t.Quantity == 200);
+    }
+
+    [Fact]
+    public void AgainstBook_SweepTradeTriggeredStopSameFirmClOrdId_DoesNotTagOrAccumulateStopTrade()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var external = new FakeSession(outbound);
+        var stopOwner = new FakeSession(outbound);
+        var crosser = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-999", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, external.EnteringFirm, 1_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-1000", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, external.EnteringFirm, 2_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("B10", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, crosser.EnteringFirm, 3_000UL)
+            { StopPxMantissa = Px(9.99m) },
+            stopOwner.Id, crosser.EnteringFirm, clOrdIdValue: 10UL);
+        DrainInbound(disp);
+
+        var cross = new CrossOrderCommand(Buy(300, 10m, 10UL), Sell(300, 10m, 11UL), 10UL, 11UL, 999UL)
+        {
+            CrossType = CrossType.AgainstBook,
+            CrossPrioritization = CrossPrioritization.BuyPrioritized,
+            MaxSweepQty = 100,
+        };
+        disp.EnqueueCross(cross, crosser.Id, crosser.EnteringFirm);
+        DrainInbound(disp);
+
+        var frames = TradeFrames(pkt.Packets.Last());
+        Assert.Equal(
+            new[]
+            {
+                new TradeFrame(Px(9.99m), 100, UmdfWireEncoder.TrdSubTypeSweepTrade),
+                new TradeFrame(Px(10m), 100, UmdfWireEncoder.TrdSubTypeNull),
+                new TradeFrame(Px(10m), 200, UmdfWireEncoder.TrdSubTypeNull),
+            },
+            frames);
+
+        Assert.Contains(crosser.Trades, t => t.PriceMantissa == Px(10m) && t.Quantity == 200);
     }
 
     [Fact]

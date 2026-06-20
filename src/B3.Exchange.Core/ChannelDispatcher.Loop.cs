@@ -401,11 +401,20 @@ public sealed partial class ChannelDispatcher
                             };
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = prioClOrd;
+                            long swept = 0;
                             _crossSweepFilledQty = 0;
-                            BeginAggressor(sweepLeg.Quantity);
-                            _engine.SubmitCrossSweep(sweepLeg);
-                            long swept = _crossSweepFilledQty.GetValueOrDefault();
-                            _crossSweepFilledQty = null;
+                            _crossSweepAggressorOrderId = _engine.PeekNextOrderId;
+                            try
+                            {
+                                BeginAggressor(sweepLeg.Quantity);
+                                _engine.SubmitCrossSweep(sweepLeg);
+                                swept = _crossSweepFilledQty.GetValueOrDefault();
+                            }
+                            finally
+                            {
+                                _crossSweepFilledQty = null;
+                                _crossSweepAggressorOrderId = 0;
+                            }
 
                             // Phase 2: residual prioritized leg as the
                             // original Limit Day at cross price; rests on

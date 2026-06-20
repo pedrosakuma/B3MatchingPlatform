@@ -28,6 +28,8 @@ public static class UmdfWireEncoder
     public const byte MdEntryTypeBid = (byte)MDEntryType.BID;
     public const byte MdEntryTypeOffer = (byte)MDEntryType.OFFER;
     public const byte MdEntryTypeTrade = (byte)MDEntryType.TRADE;
+    public const byte TrdSubTypeNull = 255;
+    public const byte TrdSubTypeSweepTrade = 109;
 
     /// <summary>
     /// Writes the 16-byte UMDF PacketHeader at the start of <paramref name="dst"/>.
@@ -153,7 +155,8 @@ public static class UmdfWireEncoder
         ulong transactTimeNanos,
         uint rptSeq,
         uint? buyerFirm = null,
-        uint? sellerFirm = null)
+        uint? sellerFirm = null,
+        bool isSweepTrade = false)
     {
         const int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.TradeBlockLength;
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
@@ -176,7 +179,7 @@ public static class UmdfWireEncoder
         MemoryMarshal.Write(body.Slice(WireOffsets.TradeBodyMdEntryBuyerOffset, 4), in buyer);
         MemoryMarshal.Write(body.Slice(WireOffsets.TradeBodyMdEntrySellerOffset, 4), in seller);
         MemoryMarshal.Write(body.Slice(WireOffsets.TradeBodyTradeDateOffset, 2), in tradeDate);
-        body[WireOffsets.TradeBodyTrdSubTypeOffset] = 255; // NULL sentinel
+        body[WireOffsets.TradeBodyTrdSubTypeOffset] = isSweepTrade ? TrdSubTypeSweepTrade : TrdSubTypeNull;
         MemoryMarshal.Write(body.Slice(WireOffsets.TradeBodyTransactTimeOffset, 8), in transactTimeNanos);
         MemoryMarshal.Write(body.Slice(WireOffsets.TradeBodyRptSeqOffset, 4), in rptSeq);
 

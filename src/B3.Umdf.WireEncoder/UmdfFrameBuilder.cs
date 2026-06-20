@@ -354,7 +354,8 @@ public static class UmdfFrameBuilder
         ulong transactTimeNanos,
         uint rptSeq,
         uint? buyerFirm,
-        uint? sellerFirm)
+        uint? sellerFirm,
+        bool isSweepTrade = false)
     {
         const int size = WireOffsets.FramingHeaderSize
             + WireOffsets.SbeMessageHeaderSize
@@ -362,7 +363,7 @@ public static class UmdfFrameBuilder
         var dst = sink.Reserve(size);
         int n = UmdfWireEncoder.WriteTradeFrame(
             dst, securityId, priceMantissa, quantity, tradeId, tradeDate, transactTimeNanos, rptSeq,
-            buyerFirm, sellerFirm);
+            buyerFirm, sellerFirm, isSweepTrade);
         sink.Commit(n);
     }
 }
