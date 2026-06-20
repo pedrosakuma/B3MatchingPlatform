@@ -1013,7 +1013,9 @@ public sealed class MatchingEngine
                     SecurityId: cmd.SecurityId,
                     OrderId: stop.OrderId,
                     Side: stop.Side,
+                    StopType: stop.StopType,
                     StopPxMantissa: stop.StopPxMantissa,
+                    LimitPriceMantissa: stop.LimitPriceMantissa,
                     RemainingQuantityAtCancel: stop.Quantity,
                     TransactTimeNanos: cmd.EnteredAtNanos,
                     RptSeq: NextRptSeq(),
@@ -1196,15 +1198,13 @@ public sealed class MatchingEngine
                 {
                     _stopById.Remove(stop.OrderId);
                     _stopsBySymbol[stop.SecurityId].Remove(stop);
-                    // The downstream cancel encoding inherits the existing
-                    // parked-stop simplification (stop price carried as the
-                    // cancel price; OrdType reported as Limit) shared with the
-                    // client-cancel path — only OrdStatus differs (EXPIRED).
                     _sink.OnStopOrderCanceled(new StopOrderCanceledEvent(
                         SecurityId: stop.SecurityId,
                         OrderId: stop.OrderId,
                         Side: stop.Side,
+                        StopType: stop.StopType,
                         StopPxMantissa: stop.StopPxMantissa,
+                        LimitPriceMantissa: stop.LimitPriceMantissa,
                         RemainingQuantityAtCancel: stop.Quantity,
                         TransactTimeNanos: txnNanos,
                         RptSeq: NextRptSeq(),

@@ -117,8 +117,47 @@ public class ExecutionReportEncoderTests
         Assert.Equal(9999L, MemoryMarshal.Read<long>(body.Slice(80, 8)));           // OrderID
         Assert.Equal(10UL, MemoryMarshal.Read<ulong>(body.Slice(88, 8)));           // OrigClOrdID
         Assert.Equal((byte)255, body[99]);                                          // ExecRestatementReason null
+        Assert.Equal((byte)'2', body[112]);                                         // OrdType=Limit
+        Assert.Equal((byte)'0', body[113]);                                         // TIF=Day
         Assert.Equal(100L, MemoryMarshal.Read<long>(body.Slice(116, 8)));           // OrderQty
         Assert.Equal(12_3450L, MemoryMarshal.Read<long>(body.Slice(124, 8)));       // Price
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(132, 8)));  // StopPx null
+    }
+
+    [Fact]
+    public void EncodeCancel_StopLimit_EchoesOrdTypeStopPxAndLimitPrice()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 11, origClOrdIdValue: 10, secondaryOrderId: 0,
+            securityId: 1, orderId: 9999,
+            execId: 0UL, transactTimeNanos: 0UL,
+            cumQty: 0, orderQty: 100, priceMantissa: 10_5000L,
+            ordType: OrderType.StopLimit, stopPxMantissa: 10_4500L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'4', body[112]);                                         // OrdType=StopLimit
+        Assert.Equal(10_5000L, MemoryMarshal.Read<long>(body.Slice(124, 8)));       // Price=limit
+        Assert.Equal(10_4500L, MemoryMarshal.Read<long>(body.Slice(132, 8)));       // StopPx=trigger
+    }
+
+    [Fact]
+    public void EncodeCancel_StopLoss_EchoesOrdTypeStopPxAndNullsLimitPrice()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportCancelTotal];
+        ExecutionReportEncoder.EncodeExecReportCancel(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 11, origClOrdIdValue: 10, secondaryOrderId: 0,
+            securityId: 1, orderId: 9999,
+            execId: 0UL, transactTimeNanos: 0UL,
+            cumQty: 0, orderQty: 100, priceMantissa: 0L,
+            ordType: OrderType.StopLoss, stopPxMantissa: 10_4500L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)'3', body[112]);                                         // OrdType=StopLoss
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(124, 8)));  // Price null
+        Assert.Equal(10_4500L, MemoryMarshal.Read<long>(body.Slice(132, 8)));       // StopPx=trigger
     }
 
     [Fact]

@@ -151,6 +151,9 @@ public class StopOrderTests
 
         var c = Assert.Single(sink.StopCanceled);
         Assert.Equal(stopId, c.OrderId);
+        Assert.Equal(OrderType.StopLoss, c.StopType);
+        Assert.Equal(TestFactory.Px(11m), c.StopPxMantissa);
+        Assert.Equal(0L, c.LimitPriceMantissa);
         Assert.Equal(100, c.RemainingQuantityAtCancel);
     }
 

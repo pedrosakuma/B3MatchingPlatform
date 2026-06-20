@@ -333,6 +333,49 @@ public partial class ChannelDispatcherTests
     }
 
     [Fact]
+    public void StopLossClientCancel_RoutesCancelWithStopTypeAndStopPx_NoLimitPrice()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(11m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long stopOrderId = Assert.Single(reply.News).OrderId;
+
+        disp.EnqueueCancel(new CancelOrderCommand("C1", Petr, stopOrderId, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var cancel = Assert.Single(reply.Cancels);
+        Assert.Equal(OrderType.StopLoss, cancel.OrdType);
+        Assert.Equal(Px(11m), cancel.StopPxMantissa);
+        Assert.Equal(0L, cancel.PriceMantissa);
+        Assert.Equal(B3.Exchange.Matching.CancelReason.Client, cancel.Reason);
+    }
+
+    [Fact]
+    public void StopLimitClientCancel_RoutesCancelWithStopTypeStopPxAndLimitPrice()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, OrderType.StopLimit, TimeInForce.Day, Px(10.50m), 100, 7, 1_000UL)
+        { StopPxMantissa = Px(10.45m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long stopOrderId = Assert.Single(reply.News).OrderId;
+
+        disp.EnqueueCancel(new CancelOrderCommand("C1", Petr, stopOrderId, 2_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var cancel = Assert.Single(reply.Cancels);
+        Assert.Equal(OrderType.StopLimit, cancel.OrdType);
+        Assert.Equal(Px(10.45m), cancel.StopPxMantissa);
+        Assert.Equal(Px(10.50m), cancel.PriceMantissa);
+    }
+
+    [Fact]
     public void MaxOpenOrdersPerFirm_TriggeredStopThatRestsKeepsSingleCount()
     {
         var metrics = new MetricsRegistry();
@@ -989,6 +1032,30 @@ public partial class ChannelDispatcherTests
             reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
         DrainInbound(disp);
         Assert.Empty(reply.Cancels);
+    }
+
+    [Fact]
+    public void OperatorExpireDay_CancelsParkedDayStop_RoutesExpiredWithStopFields_NoUmdf()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("s1", Petr, Side.Buy, OrderType.StopLimit, TimeInForce.Day, Px(10.50m), 100, 7, 1_000UL)
+        { StopPxMantissa = Px(10.45m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+        long orderId = Assert.Single(reply.News).OrderId;
+        int packetsAfterPark = pkt.Packets.Count;
+
+        disp.EnqueueOperatorExpireDay();
+        DrainInbound(disp);
+
+        var cancel = Assert.Single(reply.Cancels);
+        Assert.Equal(orderId, cancel.OrderId);
+        Assert.Equal(B3.Exchange.Matching.CancelReason.DayExpired, cancel.Reason);
+        Assert.Equal(OrderType.StopLimit, cancel.OrdType);
+        Assert.Equal(Px(10.45m), cancel.StopPxMantissa);
+        Assert.Equal(Px(10.50m), cancel.PriceMantissa);
+        Assert.Equal(packetsAfterPark, pkt.Packets.Count);
     }
 
     [Fact]
