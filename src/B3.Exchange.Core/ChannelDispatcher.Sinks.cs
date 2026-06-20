@@ -299,9 +299,14 @@ public sealed partial class ChannelDispatcher
         AssertOnLoopThread();
         _lastTradePriceBySecurity[e.SecurityId] = e.PriceMantissa;
         // Issue #218 (Onda L · L5): when a cross sweep phase is active,
-        // accumulate the aggressor's filled qty so the loop can decide how
-        // much of the prioritized leg remains for the internal print.
-        bool isSweepTrade = _crossSweepFilledQty.HasValue;
+        // accumulate only the direct sweep aggressor's filled qty so the loop
+        // can decide how much of the prioritized leg remains for the internal
+        // print. Engine-internal cascades (for example triggered stops) can
+        // emit trades before SubmitCrossSweep returns; those are not sweep
+        // prints and must not shrink the residual.
+        bool isSweepTrade = _crossSweepFilledQty.HasValue
+            && e.AggressorFirm == _crossSweepAggressorFirm
+            && string.Equals(e.AggressorClOrdId, _crossSweepAggressorClOrdId, StringComparison.Ordinal);
         if (isSweepTrade)
             _crossSweepFilledQty = _crossSweepFilledQty.GetValueOrDefault() + e.Quantity;
         bool aggressorIsBuy = e.AggressorSide == Side.Buy;
