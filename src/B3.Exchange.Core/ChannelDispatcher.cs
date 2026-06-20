@@ -289,14 +289,14 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// <summary>
     /// When non-null, the dispatcher is processing the sweep phase of a
     /// <see cref="WorkKind.Cross"/> with <c>CrossType=AgainstBook</c>. Only
-    /// trades whose aggressor identity matches the sweep order accrue into
-    /// the captured value so engine-internal cascades (for example triggered
-    /// stops) do not shrink the cross residual or receive the sweep trade tag.
+    /// trades whose engine-side aggressor order id matches the sweep order
+    /// accrue into the captured value so engine-internal cascades (for example
+    /// triggered stops) do not shrink the cross residual or receive the sweep
+    /// trade tag.
     /// Issue #218 (Onda L · L5).
     /// </summary>
     private long? _crossSweepFilledQty;
-    private string? _crossSweepAggressorClOrdId;
-    private uint _crossSweepAggressorFirm;
+    private long _crossSweepAggressorOrderId;
 
     private SnapshotRotator? _snapshotRotator;
     private PriceBandPublisher? _priceBandPublisher;

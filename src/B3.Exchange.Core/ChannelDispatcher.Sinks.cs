@@ -305,8 +305,7 @@ public sealed partial class ChannelDispatcher
         // emit trades before SubmitCrossSweep returns; those are not sweep
         // prints and must not shrink the residual.
         bool isSweepTrade = _crossSweepFilledQty.HasValue
-            && e.AggressorFirm == _crossSweepAggressorFirm
-            && string.Equals(e.AggressorClOrdId, _crossSweepAggressorClOrdId, StringComparison.Ordinal);
+            && e.AggressorOrderId == _crossSweepAggressorOrderId;
         if (isSweepTrade)
             _crossSweepFilledQty = _crossSweepFilledQty.GetValueOrDefault() + e.Quantity;
         bool aggressorIsBuy = e.AggressorSide == Side.Buy;

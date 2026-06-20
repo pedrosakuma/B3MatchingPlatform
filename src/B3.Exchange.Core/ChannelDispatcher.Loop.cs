@@ -403,8 +403,7 @@ public sealed partial class ChannelDispatcher
                             _currentClOrdId = prioClOrd;
                             long swept = 0;
                             _crossSweepFilledQty = 0;
-                            _crossSweepAggressorClOrdId = sweepLeg.ClOrdId;
-                            _crossSweepAggressorFirm = sweepLeg.EnteringFirm;
+                            _crossSweepAggressorOrderId = _engine.PeekNextOrderId;
                             try
                             {
                                 BeginAggressor(sweepLeg.Quantity);
@@ -414,8 +413,7 @@ public sealed partial class ChannelDispatcher
                             finally
                             {
                                 _crossSweepFilledQty = null;
-                                _crossSweepAggressorClOrdId = null;
-                                _crossSweepAggressorFirm = 0;
+                                _crossSweepAggressorOrderId = 0;
                             }
 
                             // Phase 2: residual prioritized leg as the

@@ -335,6 +335,52 @@ public class CrossOrderSemanticsTests
     }
 
     [Fact]
+    public void AgainstBook_SweepTradeTriggeredStopSameFirmClOrdId_DoesNotTagOrAccumulateStopTrade()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var external = new FakeSession(outbound);
+        var stopOwner = new FakeSession(outbound);
+        var crosser = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-999", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, external.EnteringFirm, 1_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT-1000", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, external.EnteringFirm, 2_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("B10", Petr, Side.Buy, OrderType.StopLoss, TimeInForce.Day, 0, 100, crosser.EnteringFirm, 3_000UL)
+            { StopPxMantissa = Px(9.99m) },
+            stopOwner.Id, crosser.EnteringFirm, clOrdIdValue: 10UL);
+        DrainInbound(disp);
+
+        var cross = new CrossOrderCommand(Buy(300, 10m, 10UL), Sell(300, 10m, 11UL), 10UL, 11UL, 999UL)
+        {
+            CrossType = CrossType.AgainstBook,
+            CrossPrioritization = CrossPrioritization.BuyPrioritized,
+            MaxSweepQty = 100,
+        };
+        disp.EnqueueCross(cross, crosser.Id, crosser.EnteringFirm);
+        DrainInbound(disp);
+
+        var frames = TradeFrames(pkt.Packets.Last());
+        Assert.Equal(
+            new[]
+            {
+                new TradeFrame(Px(9.99m), 100, UmdfWireEncoder.TrdSubTypeSweepTrade),
+                new TradeFrame(Px(10m), 100, UmdfWireEncoder.TrdSubTypeNull),
+                new TradeFrame(Px(10m), 200, UmdfWireEncoder.TrdSubTypeNull),
+            },
+            frames);
+
+        Assert.Contains(crosser.Trades, t => t.PriceMantissa == Px(10m) && t.Quantity == 200);
+    }
+
+    [Fact]
     public void AgainstBook_MaxSweepQtyZero_StillBehavesLikeAon()
     {
         // Defensive: AgainstBook with MaxSweepQty=0 falls through to the
