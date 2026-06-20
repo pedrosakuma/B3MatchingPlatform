@@ -852,6 +852,8 @@ public sealed class MatchingEngine
             // Quantity rules apply to all order types.
             if (cmd.Quantity <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.QuantityNonPositive, cmd.EnteredAtNanos); return; }
             if (cmd.Quantity % rules.LotSize != 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.QuantityNotMultipleOfLot, cmd.EnteredAtNanos); return; }
+            if (rules.MaxOrderQty is { } maxOrderQty && cmd.Quantity > maxOrderQty)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.QuantityExceedsLimit, cmd.EnteredAtNanos); return; }
 
             // #203 (MinQty subset): MinQty must be in (0, Quantity]. Zero
             // means "no minimum-fill constraint" and is the legacy path.
@@ -889,8 +891,14 @@ public sealed class MatchingEngine
                 if (cmd.PriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
                 if (cmd.PriceMantissa < rules.MinPriceMantissa || cmd.PriceMantissa > rules.MaxPriceMantissa)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
+                if (OutsideStaticPriceBand(cmd.PriceMantissa, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceExceedsCurrentPriceBand, cmd.EnteredAtNanos); return; }
                 if (cmd.PriceMantissa % rules.TickSizeMantissa != 0)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
+                if (OutsideAuctionCollar(cmd.SecurityId, cmd.PriceMantissa, phase, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.PriceExceedsCurrentPriceBand, cmd.EnteredAtNanos); return; }
+                if (ExceedsMaxOrderValue(cmd.PriceMantissa, cmd.Quantity, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.OrderExceedsLimit, cmd.EnteredAtNanos); return; }
             }
             else if (cmd.Type == OrderType.Market)
             {
@@ -1325,6 +1333,39 @@ public sealed class MatchingEngine
     private static string OrderAsset(NewOrderCommand cmd, InstrumentTradingRules rules)
         => string.IsNullOrWhiteSpace(cmd.Asset) ? DeriveAsset(rules.Instrument.Symbol) : cmd.Asset.Trim().ToUpperInvariant();
 
+    private static bool OutsideStaticPriceBand(long priceMantissa, InstrumentTradingRules rules)
+        => rules.HasPriceBand
+           && (priceMantissa < rules.LowerPriceBandMantissa!.Value
+               || priceMantissa > rules.UpperPriceBandMantissa!.Value);
+
+    private static bool ExceedsMaxOrderValue(long priceMantissa, long quantity, InstrumentTradingRules rules)
+        => rules.MaxOrderValueMantissa is { } maxValue
+           && (Int128)priceMantissa * quantity > maxValue;
+
+    private static long FloorMulDiv(long value, long numerator, long denominator)
+        => (long)(((Int128)value * numerator) / denominator);
+
+    private static long CeilMulDiv(long value, long numerator, long denominator)
+        => (long)((((Int128)value * numerator) + denominator - 1) / denominator);
+
+    private bool OutsideAuctionCollar(long securityId, long priceMantissa, TradingPhase phase, InstrumentTradingRules rules)
+    {
+        if (phase != TradingPhase.Reserved && phase != TradingPhase.FinalClosingCall)
+            return false;
+        if (rules.AuctionCollarPercentUnits is not { } percentUnits)
+            return false;
+        if (!_auctionTopById.TryGetValue(securityId, out var top) || !top.HasTop)
+            return false;
+
+        const long hundredPercentUnits = 100L * 1_000_000L;
+        long lowerNumerator = percentUnits >= hundredPercentUnits ? 0 : hundredPercentUnits - percentUnits;
+        long upperNumerator = hundredPercentUnits + percentUnits;
+        long lower = lowerNumerator == 0 ? 0 : CeilMulDiv(top.TopPriceMantissa, lowerNumerator, hundredPercentUnits);
+        long upper = FloorMulDiv(top.TopPriceMantissa, upperNumerator, hundredPercentUnits);
+
+        return priceMantissa < lower || priceMantissa > upper;
+    }
+
     public void Replace(ReplaceOrderCommand cmd)
     {
         _currentMemo = cmd.Memo;
@@ -1350,6 +1391,8 @@ public sealed class MatchingEngine
             // Validate new params *before* mutating.
             if (cmd.NewQuantity <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.QuantityNonPositive, cmd.EnteredAtNanos); return; }
             if (cmd.NewQuantity % rules.LotSize != 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.QuantityNotMultipleOfLot, cmd.EnteredAtNanos); return; }
+            if (rules.MaxOrderQty is { } maxOrderQty && cmd.NewQuantity > maxOrderQty)
+            { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.QuantityExceedsLimit, cmd.EnteredAtNanos); return; }
 
             // #204: effective Type/TIF — null means "preserve original".
             // The resting order is by construction Limit (Market never rests),
@@ -1413,8 +1456,14 @@ public sealed class MatchingEngine
                 if (cmd.NewPriceMantissa <= 0) { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNonPositive, cmd.EnteredAtNanos); return; }
                 if (cmd.NewPriceMantissa < rules.MinPriceMantissa || cmd.NewPriceMantissa > rules.MaxPriceMantissa)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceOutOfBand, cmd.EnteredAtNanos); return; }
+                if (OutsideStaticPriceBand(cmd.NewPriceMantissa, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceExceedsCurrentPriceBand, cmd.EnteredAtNanos); return; }
                 if (cmd.NewPriceMantissa % rules.TickSizeMantissa != 0)
                 { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceNotOnTick, cmd.EnteredAtNanos); return; }
+                if (OutsideAuctionCollar(cmd.SecurityId, cmd.NewPriceMantissa, phase, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.PriceExceedsCurrentPriceBand, cmd.EnteredAtNanos); return; }
+                if (ExceedsMaxOrderValue(cmd.NewPriceMantissa, cmd.NewQuantity, rules))
+                { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.OrderExceedsLimit, cmd.EnteredAtNanos); return; }
             }
 
             // Priority-keep is only possible if Type/TIF are unchanged: a Type

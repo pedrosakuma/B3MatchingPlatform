@@ -4,6 +4,12 @@
   // don't collide with anything from PCAPs.
   { "symbol": "PETR4", "securityId": 900000000001, "tickSize": "0.01",
     "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    // Optional engine-side market protections; omit any of these to disable
+    // that per-instrument guardrail. lowerPriceBand/upperPriceBand are also
+    // optional but left unset here so PriceBand_22 sample tests keep the
+    // "no configured bands" path.
+    "auctionCollarPercent": "10.0", "maxOrderQty": 1000000000,
+    "maxOrderValue": "100000000000000.00",
     "currency": "BRL", "isin": "BRPETRACNPR6", "securityType": "CS" },
   { "symbol": "VALE3", "securityId": 900000000002, "tickSize": "0.01",
     "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",

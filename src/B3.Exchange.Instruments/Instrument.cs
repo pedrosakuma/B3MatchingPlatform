@@ -21,15 +21,36 @@ public sealed record Instrument
 
     /// <summary>
     /// Optional static lower price-band limit in human price units. When null,
-    /// the host does not emit <c>PriceBand_22</c> for this instrument.
+    /// the host does not emit <c>PriceBand_22</c> for this instrument and the
+    /// matching engine does not apply a static band.
     /// </summary>
     public decimal? LowerPriceBand { get; init; }
 
     /// <summary>
     /// Optional static upper price-band limit in human price units. When null,
-    /// the host does not emit <c>PriceBand_22</c> for this instrument.
+    /// the host does not emit <c>PriceBand_22</c> for this instrument and the
+    /// matching engine does not apply a static band.
     /// </summary>
     public decimal? UpperPriceBand { get; init; }
+
+    /// <summary>
+    /// Optional auction collar percentage around the current theoretical
+    /// opening price. When null, the matching engine does not apply an
+    /// auction-phase TOP collar for this instrument.
+    /// </summary>
+    public decimal? AuctionCollarPercent { get; init; }
+
+    /// <summary>
+    /// Optional per-order quantity ceiling. When null, only the gateway-level
+    /// fat-finger ceiling applies.
+    /// </summary>
+    public long? MaxOrderQty { get; init; }
+
+    /// <summary>
+    /// Optional per-order value ceiling in human price units. The matching
+    /// engine compares price × quantity in mantissa space.
+    /// </summary>
+    public decimal? MaxOrderValue { get; init; }
 
     public required string Currency { get; init; }
     public required string Isin { get; init; }

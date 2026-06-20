@@ -196,6 +196,13 @@ Exposes:
     aggressor's residual; stop further matching.
 * `instruments` — path to the instrument list (re-uses the format already
   consumed by `B3.Exchange.Instruments.InstrumentLoader`).
+  Per-instrument market-protection fields are optional and default to off:
+  `lowerPriceBand` + `upperPriceBand` define the inclusive static price band
+  enforced by the engine for Limit submits/replaces
+  (`OrdRejReason=16` on breach); `auctionCollarPercent` defines an auction-only
+  percent collar around the current TOP when one exists; `maxOrderQty` rejects
+  larger order quantities with `OrdRejReason=99`; and `maxOrderValue` rejects
+  larger `price × quantity` Limit order values with `OrdRejReason=3`.
 * `instrumentDefinition` *(optional)* — enables a dedicated
   `SecurityDefinition_12` publisher on its own multicast group so
   late-joining consumers can resolve every SecurityID seen on MBO/Trade
