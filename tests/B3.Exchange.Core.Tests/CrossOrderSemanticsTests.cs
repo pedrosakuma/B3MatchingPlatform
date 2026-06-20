@@ -7,7 +7,9 @@ using B3.Exchange.Instruments;
 using B3.Exchange.Core;
 using B3.Exchange.TestSupport;
 using B3.Exchange.Matching;
+using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Buffers.Binary;
 
 namespace B3.Exchange.Core.Tests;
 
@@ -114,6 +116,26 @@ public class CrossOrderSemanticsTests
 
     private static void DrainInbound(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();
 
+    private static List<byte> TradeSubTypes(byte[] packet)
+    {
+        var values = new List<byte>();
+        int offset = WireOffsets.PacketHeaderSize;
+        while (offset < packet.Length)
+        {
+            ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderMessageLengthOffset, 2));
+            ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(offset + WireOffsets.FramingHeaderSize + 2, 2));
+            if (templateId == 53)
+            {
+                int bodyOffset = offset + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+                values.Add(packet[bodyOffset + WireOffsets.TradeBodyTrdSubTypeOffset]);
+            }
+            offset += messageLength;
+        }
+        return values;
+    }
+
     private static NewOrderCommand Buy(long qty, decimal price, ulong clOrdId = 1UL)
         => new("B" + clOrdId, Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(price), qty, 7, 1_000UL);
     private static NewOrderCommand Sell(long qty, decimal price, ulong clOrdId = 2UL)
@@ -192,7 +214,7 @@ public class CrossOrderSemanticsTests
     public void AgainstBook_WithExternalLiquidity_SweepsBookThenPrintsResidual()
     {
         // External seller resting at a better price than the cross.
-        var (disp, _, outbound) = NewDispatcher();
+        var (disp, pkt, outbound) = NewDispatcher();
         var external = new FakeSession(outbound);
         var crosser = new FakeSession(outbound);
 
@@ -235,6 +257,9 @@ public class CrossOrderSemanticsTests
         // (buy resting) on the same FakeSession (crosser owns both legs).
         Assert.NotEmpty(crosserInternalFills);
         Assert.Contains(crosserInternalFills, t => t.Quantity == 100);
+
+        var tradeSubTypes = TradeSubTypes(pkt.Packets.Last());
+        Assert.Equal(new[] { UmdfWireEncoder.TrdSubTypeSweepTrade, UmdfWireEncoder.TrdSubTypeNull }, tradeSubTypes);
     }
 
     [Fact]

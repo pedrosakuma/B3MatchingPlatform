@@ -301,14 +301,15 @@ public sealed partial class ChannelDispatcher
         // Issue #218 (Onda L · L5): when a cross sweep phase is active,
         // accumulate the aggressor's filled qty so the loop can decide how
         // much of the prioritized leg remains for the internal print.
-        if (_crossSweepFilledQty.HasValue)
-            _crossSweepFilledQty = _crossSweepFilledQty.Value + e.Quantity;
+        bool isSweepTrade = _crossSweepFilledQty.HasValue;
+        if (isSweepTrade)
+            _crossSweepFilledQty = _crossSweepFilledQty.GetValueOrDefault() + e.Quantity;
         bool aggressorIsBuy = e.AggressorSide == Side.Buy;
         uint buyer = aggressorIsBuy ? e.AggressorFirm : e.RestingFirm;
         uint seller = aggressorIsBuy ? e.RestingFirm : e.AggressorFirm;
         UmdfFrameBuilder.WriteTrade(FrameSink,
             e.SecurityId, e.PriceMantissa, e.Quantity, e.TradeId, _tradeDate, e.TransactTimeNanos, e.RptSeq,
-            buyerFirm: buyer, sellerFirm: seller);
+            buyerFirm: buyer, sellerFirm: seller, isSweepTrade: isSweepTrade);
 
         // ER_Trade for the aggressor side: routed to the active session by
         // SessionId. Issue #319: cumQty/leavesQty are accumulated across

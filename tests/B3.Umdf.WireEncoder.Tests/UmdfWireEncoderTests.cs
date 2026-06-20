@@ -121,6 +121,19 @@ public class UmdfWireEncoderTests
     }
 
     [Fact]
+    public void Trade_SweepTrade_WritesTrdSubType()
+    {
+        var buf = new byte[80];
+        UmdfWireEncoder.WriteTradeFrame(buf, securityId: 5L,
+            priceMantissa: 250_5000L, size: 100L, tradeId: 7,
+            tradeDate: 9000, transactTimeNanos: 12345UL, rptSeq: 17,
+            buyerFirm: 100u, sellerFirm: 200u, isSweepTrade: true);
+
+        Assert.True(Trade_53Data.TryParse(buf.AsSpan(FrameOffset, WireOffsets.TradeBlockLength), out var rdr));
+        Assert.Equal(UmdfWireEncoder.TrdSubTypeSweepTrade, (byte)rdr.Data.TrdSubType!.Value);
+    }
+
+    [Fact]
     public void TradeBust_Roundtrip()
     {
         var buf = new byte[80];
