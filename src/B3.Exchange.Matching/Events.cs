@@ -22,7 +22,9 @@ public readonly record struct OrderAcceptedEvent(
     uint RptSeq,
     byte[]? Memo = null,
     OrderType OrdType = OrderType.Limit,
-    long? ProtectionPriceMantissa = null);
+    long? ProtectionPriceMantissa = null,
+    CrossType? CrossType = null,
+    CrossPrioritization? CrossPrioritization = null);
 
 /// <summary>
 /// Fired when a resting order's remaining quantity is reduced as a passive maker
@@ -91,7 +93,9 @@ public readonly record struct TradeEvent(
     ulong TransactTimeNanos,
     uint RptSeq,
     byte[]? AggressorMemo = null,
-    byte[]? RestingMemo = null);
+    byte[]? RestingMemo = null,
+    CrossType? CrossType = null,
+    CrossPrioritization? CrossPrioritization = null);
 
 public readonly record struct RejectEvent(
     string ClOrdId,

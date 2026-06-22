@@ -378,11 +378,11 @@ public sealed partial class ChannelDispatcher
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = prioClOrd;
                             BeginAggressor(prioLeg.Quantity);
-                            _engine.Submit(prioLeg);
+                            _engine.SubmitCrossLeg(prioLeg, cross.CrossType, cross.CrossPrioritization);
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = otherClOrd;
                             BeginAggressor(otherLeg.Quantity);
-                            _engine.Submit(otherLeg);
+                            _engine.SubmitCrossLeg(otherLeg, cross.CrossType, cross.CrossPrioritization);
                             break;
                         }
 
@@ -407,7 +407,7 @@ public sealed partial class ChannelDispatcher
                             try
                             {
                                 BeginAggressor(sweepLeg.Quantity);
-                                _engine.SubmitCrossSweep(sweepLeg);
+                                _engine.SubmitCrossSweep(sweepLeg, cross.CrossType, cross.CrossPrioritization);
                                 swept = _crossSweepFilledQty.GetValueOrDefault();
                             }
                             finally
@@ -425,7 +425,7 @@ public sealed partial class ChannelDispatcher
                                 _metrics?.IncOrdersIn();
                                 _currentClOrdId = prioClOrd;
                                 BeginAggressor(residual);
-                                _engine.Submit(prioLeg with { Quantity = residual });
+                                _engine.SubmitCrossLeg(prioLeg with { Quantity = residual }, cross.CrossType, cross.CrossPrioritization);
                             }
 
                             // Phase 3: the other leg at full OrderQty —
@@ -435,7 +435,7 @@ public sealed partial class ChannelDispatcher
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = otherClOrd;
                             BeginAggressor(otherLeg.Quantity);
-                            _engine.Submit(otherLeg);
+                            _engine.SubmitCrossLeg(otherLeg, cross.CrossType, cross.CrossPrioritization);
                         }
                         else
                         {
@@ -446,11 +446,11 @@ public sealed partial class ChannelDispatcher
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = prioClOrd;
                             BeginAggressor(prioLeg.Quantity);
-                            _engine.Submit(prioLeg);
+                            _engine.SubmitCrossLeg(prioLeg, cross.CrossType, cross.CrossPrioritization);
                             _metrics?.IncOrdersIn();
                             _currentClOrdId = otherClOrd;
                             BeginAggressor(otherLeg.Quantity);
-                            _engine.Submit(otherLeg);
+                            _engine.SubmitCrossLeg(otherLeg, cross.CrossType, cross.CrossPrioritization);
                         }
                         break;
                     }

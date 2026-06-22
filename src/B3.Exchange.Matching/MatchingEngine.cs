@@ -777,7 +777,14 @@ public sealed class MatchingEngine
     /// </summary>
     public void SubmitCrossSweep(NewOrderCommand cmd) => SubmitImpl(cmd, emitUnmatchedIocClose: false);
 
-    private void SubmitImpl(NewOrderCommand cmd, bool emitUnmatchedIocClose)
+    public void SubmitCrossSweep(NewOrderCommand cmd, CrossType crossType, CrossPrioritization crossPrioritization)
+        => SubmitImpl(cmd, emitUnmatchedIocClose: false, crossType, crossPrioritization);
+
+    public void SubmitCrossLeg(NewOrderCommand cmd, CrossType crossType, CrossPrioritization crossPrioritization)
+        => SubmitImpl(cmd, emitUnmatchedIocClose: true, crossType, crossPrioritization);
+
+    private void SubmitImpl(NewOrderCommand cmd, bool emitUnmatchedIocClose,
+        CrossType? crossType = null, CrossPrioritization? crossPrioritization = null)
     {
         _currentMemo = cmd.Memo;
         EnterDispatch();
@@ -985,10 +992,10 @@ public sealed class MatchingEngine
             // rest cmd directly with cmd.PriceMantissa.
             if (phase == TradingPhase.Reserved || phase == TradingPhase.FinalClosingCall)
             {
-                RestForAuction(cmd, rules, book);
+                RestForAuction(cmd, rules, book, crossType, crossPrioritization);
                 return;
             }
-            ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose);
+            ExecuteAggressor(cmd, rules, book, emitUnmatchedIocClose, crossType, crossPrioritization);
         }
         finally { ExitDispatch(); }
     }
@@ -1581,8 +1588,9 @@ public sealed class MatchingEngine
     }
 
     private void ExecuteAggressor(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book,
-        bool emitUnmatchedIocClose)
-        => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++, emitUnmatchedIocClose);
+        bool emitUnmatchedIocClose, CrossType? crossType = null, CrossPrioritization? crossPrioritization = null)
+        => ExecuteAggressorWithOrderId(cmd, rules, book, _nextOrderId++, emitUnmatchedIocClose,
+            crossType, crossPrioritization);
 
     /// <summary>
     /// Issue #228 (Onda M · M1): rest the order on the book without any
@@ -1595,7 +1603,8 @@ public sealed class MatchingEngine
     /// (<see cref="NewOrderCommand.MaxFloor"/>) is honored so the visible
     /// slice on the book matches the continuous-Open semantics from #211.
     /// </summary>
-    private void RestForAuction(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book)
+    private void RestForAuction(NewOrderCommand cmd, InstrumentTradingRules rules, LimitOrderBook book,
+        CrossType? crossType = null, CrossPrioritization? crossPrioritization = null)
     {
         long visible = cmd.Quantity;
         long hidden = 0;
@@ -1633,7 +1642,9 @@ public sealed class MatchingEngine
             InsertTimestampNanos: resting.InsertTimestampNanos,
             RptSeq: NextRptSeq(),
             OrdType: cmd.Type,
-            ProtectionPriceMantissa: cmd.Type == OrderType.MarketWithLeftover ? resting.PriceMantissa : null));
+            ProtectionPriceMantissa: cmd.Type == OrderType.MarketWithLeftover ? resting.PriceMantissa : null,
+            CrossType: crossType,
+            CrossPrioritization: crossPrioritization));
 
         RecomputeAuctionTopIfApplicable(book.SecurityId, cmd.EnteredAtNanos);
     }
@@ -1822,7 +1833,8 @@ public sealed class MatchingEngine
         => t == OrderType.Market || t == OrderType.MarketWithLeftover;
 
     private void ExecuteAggressorWithOrderId(NewOrderCommand cmd, InstrumentTradingRules rules,
-        LimitOrderBook book, long aggressorOrderIdForTrades, bool emitUnmatchedIocClose)
+        LimitOrderBook book, long aggressorOrderIdForTrades, bool emitUnmatchedIocClose,
+        CrossType? crossType = null, CrossPrioritization? crossPrioritization = null)
     {
         long aggressorRemaining = cmd.Quantity;
         bool isMarket = IsMarketLike(cmd.Type);
@@ -1892,7 +1904,9 @@ public sealed class MatchingEngine
                         TransactTimeNanos: cmd.EnteredAtNanos,
                         RptSeq: NextRptSeq(),
                         AggressorMemo: cmd.Memo,
-                        RestingMemo: maker.Memo));
+                        RestingMemo: maker.Memo,
+                        CrossType: crossType,
+                        CrossPrioritization: crossPrioritization));
 
                     aggressorRemaining -= tradeQty;
                     maker.RemainingQuantity -= tradeQty;
@@ -2094,7 +2108,9 @@ public sealed class MatchingEngine
                 RptSeq: NextRptSeq(),
                 Memo: resting.Memo,
                 OrdType: cmd.Type,
-                ProtectionPriceMantissa: isMwl ? limitPx : null));
+                ProtectionPriceMantissa: isMwl ? limitPx : null,
+                CrossType: crossType,
+                CrossPrioritization: crossPrioritization));
         }
         finally
         {
