@@ -401,6 +401,59 @@ public class CrossOrderSemanticsTests
     }
 
     [Fact]
+    public void AgainstBook_ExecutionReportsEchoSubmittedCrossAttributes()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var external = new FakeSession(outbound);
+        var crosser = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("EXT", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, external.EnteringFirm, 1_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Single(external.News);
+        Assert.Null(external.News[0].CrossType);
+        Assert.Null(external.News[0].CrossPrioritization);
+
+        var cross = new CrossOrderCommand(Buy(200, 10m, 10UL), Sell(200, 10m, 11UL), 10UL, 11UL, 999UL)
+        {
+            CrossType = CrossType.AgainstBook,
+            CrossPrioritization = CrossPrioritization.BuyPrioritized,
+            MaxSweepQty = 100,
+        };
+        disp.EnqueueCross(cross, crosser.Id, crosser.EnteringFirm);
+        DrainInbound(disp);
+
+        Assert.NotEmpty(crosser.News);
+        Assert.All(crosser.News, e =>
+        {
+            Assert.Equal(CrossType.AgainstBook, e.CrossType);
+            Assert.Equal(CrossPrioritization.BuyPrioritized, e.CrossPrioritization);
+        });
+        Assert.NotEmpty(crosser.Trades);
+        Assert.All(crosser.Trades, e =>
+        {
+            Assert.Equal(CrossType.AgainstBook, e.CrossType);
+            Assert.Equal(CrossPrioritization.BuyPrioritized, e.CrossPrioritization);
+        });
+    }
+
+    [Fact]
+    public void LimitOrder_ExecutionReportNewLeavesCrossAttributesNull()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var session = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(Buy(100, 10m, 1UL), session.Id, session.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        Assert.Single(session.News);
+        Assert.Null(session.News[0].CrossType);
+        Assert.Null(session.News[0].CrossPrioritization);
+    }
+
+    [Fact]
     public void MaxOpenOrdersPerFirm_CrossAtCapMinusOneIsRejectedForWorstCaseResidual()
     {
         var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 2);

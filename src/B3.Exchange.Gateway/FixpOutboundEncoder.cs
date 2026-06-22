@@ -84,7 +84,7 @@ internal sealed class FixpOutboundEncoder
                     (ulong)e.RptSeq, e.InsertTimestampNanos,
                     OrderType.Limit, TimeInForce.Day,
                     e.RemainingQuantity, e.PriceMantissa,
-                    memo.Span, receivedTimeNanos);
+                    memo.Span, receivedTimeNanos, e.CrossType, e.CrossPrioritization);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }
@@ -112,7 +112,7 @@ internal sealed class FixpOutboundEncoder
                     isAggressor, e.TradeId,
                     isAggressor ? e.RestingFirm : e.AggressorFirm,
                     tradeDate: 0,
-                    orderQty: leavesQty + cumQty, memo.Span);
+                    orderQty: leavesQty + cumQty, memo.Span, e.CrossType, e.CrossPrioritization);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }

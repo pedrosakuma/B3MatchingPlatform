@@ -45,8 +45,27 @@ public class ExecutionReportEncoderTests
         Assert.Equal(10L, MemoryMarshal.Read<long>(body.Slice(96, 8)));            // OrderQty
         Assert.Equal(12_3450L, MemoryMarshal.Read<long>(body.Slice(104, 8)));      // Price
         Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(112, 8))); // StopPx null
+        Assert.Equal((byte)255, body[162]);                                        // CrossType null
+        Assert.Equal((byte)255, body[163]);                                        // CrossPrioritization null
     }
 
+    [Fact]
+    public void EncodeNew_CrossEchoesCrossTypeAndPrioritization()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777, execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 12_3450L,
+            crossType: CrossType.AgainstBook, crossPrioritization: CrossPrioritization.BuyPrioritized);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)CrossType.AgainstBook, body[162]);
+        Assert.Equal((byte)CrossPrioritization.BuyPrioritized, body[163]);
+    }
 
     [Fact]
     public void EncodeNew_WritesMemoVarData()
@@ -96,6 +115,29 @@ public class ExecutionReportEncoderTests
         Assert.Equal((ushort)19000, MemoryMarshal.Read<ushort>(body.Slice(116, 2))); // TradeDate
         Assert.Equal((ushort)65535, MemoryMarshal.Read<ushort>(body.Slice(144, 2))); // CrossedIndicator null
         Assert.Equal(5L, MemoryMarshal.Read<long>(body.Slice(146, 8)));  // OrderQty
+        Assert.Equal((byte)255, body[157]);                              // CrossType null
+        Assert.Equal((byte)255, body[158]);                              // CrossPrioritization null
+    }
+
+    [Fact]
+    public void EncodeTrade_CrossEchoesCrossTypeAndPrioritization()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportTradeTotal];
+
+        ExecutionReportEncoder.EncodeExecReportTrade(buf,
+            sessionId: 1, msgSeqNum: 2, sendingTimeNanos: 0UL,
+            side: Side.Sell, clOrdIdValue: 77, secondaryOrderId: 0,
+            securityId: 999, orderId: 1234,
+            lastQty: 5, lastPxMantissa: 50_0000L,
+            execId: 10UL, transactTimeNanos: 0UL,
+            leavesQty: 0, cumQty: 5,
+            aggressor: true, tradeId: 4242, contraBroker: 8,
+            tradeDate: 19000, orderQty: 5,
+            crossType: CrossType.AgainstBook, crossPrioritization: CrossPrioritization.SellPrioritized);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal((byte)CrossType.AgainstBook, body[157]);
+        Assert.Equal((byte)CrossPrioritization.SellPrioritized, body[158]);
     }
 
     [Fact]
