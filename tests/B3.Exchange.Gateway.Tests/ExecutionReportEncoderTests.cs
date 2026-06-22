@@ -50,6 +50,80 @@ public class ExecutionReportEncoderTests
     }
 
     [Fact]
+    public void EncodeNew_Mwl_WritesProtectionPriceAndOrdTypeK()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777,
+            execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: OrderType.MarketWithLeftover, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 12_3450L,
+            protectionPriceMantissa: 12_3450L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(12_3450L, MemoryMarshal.Read<long>(body.Slice(80, 8)));       // ProtectionPrice
+        Assert.Equal((byte)'K', body[92]);                                         // OrdType=MWL
+    }
+
+    [Fact]
+    public void EncodeNew_Limit_WritesNullProtectionPriceAndLimitOrdType()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777,
+            execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: OrderType.Limit, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: 12_3450L,
+            protectionPriceMantissa: 12_3450L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(80, 8)));  // ProtectionPrice null
+        Assert.Equal((byte)'2', body[92]);                                         // OrdType=Limit
+    }
+
+    [Fact]
+    public void EncodeNew_Market_WritesNullProtectionPriceAndMarketOrdType()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777,
+            execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: OrderType.Market, tif: TimeInForce.IOC,
+            orderQty: 10, priceMantissa: null,
+            protectionPriceMantissa: 12_3450L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(80, 8)));  // ProtectionPrice null
+        Assert.Equal((byte)'1', body[92]);                                         // OrdType=Market
+    }
+
+    [Theory]
+    [InlineData(OrderType.StopLoss, (byte)'3', 0L, 10_4500L)]
+    [InlineData(OrderType.StopLimit, (byte)'4', 10_5000L, 10_4500L)]
+    public void EncodeNew_StopOrders_WriteStopOrdTypeByte(OrderType ordType, byte expectedOrdTypeByte, long priceMantissa, long stopPxMantissa)
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777,
+            execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: ordType, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: priceMantissa,
+            protectionPriceMantissa: stopPxMantissa);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(80, 8)));   // ProtectionPrice null
+        Assert.Equal(expectedOrdTypeByte, body[92]);
+    }
+
+    [Fact]
     public void EncodeNew_CrossEchoesCrossTypeAndPrioritization()
     {
         var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
@@ -263,6 +337,39 @@ public class ExecutionReportEncoderTests
         Assert.Equal(21UL, MemoryMarshal.Read<ulong>(body.Slice(96, 8)));           // OrigClOrdID
         Assert.Equal(75L, MemoryMarshal.Read<long>(body.Slice(120, 8)));            // OrderQty
         Assert.Equal(99_0000L, MemoryMarshal.Read<long>(body.Slice(128, 8)));       // Price
+    }
+
+    [Fact]
+    public void EncodeModify_Mwl_WritesProtectionPriceAndOrdTypeK()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L,
+            ordType: OrderType.MarketWithLeftover,
+            protectionPriceMantissa: 99_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(99_0000L, MemoryMarshal.Read<long>(body.Slice(104, 8)));       // ProtectionPrice
+        Assert.Equal((byte)'K', body[116]);                                         // OrdType=MWL
+    }
+
+    [Fact]
+    public void EncodeModify_Limit_WritesNullProtectionPriceAndLimitOrdType()
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportModifyTotal];
+        ExecutionReportEncoder.EncodeExecReportModify(buf,
+            sessionId: 1, msgSeqNum: 1, sendingTimeNanos: 0UL,
+            side: Side.Buy, clOrdIdValue: 22, origClOrdIdValue: 21, secondaryOrderId: 0,
+            securityId: 7, orderId: 1234, execId: 0UL, transactTimeNanos: 0UL,
+            leavesQty: 50, cumQty: 25, orderQty: 75, priceMantissa: 99_0000L,
+            protectionPriceMantissa: 99_0000L);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(104, 8)));  // ProtectionPrice null
+        Assert.Equal((byte)'2', body[116]);                                         // OrdType=Limit
     }
 
     // ====== #49 / #GAP-11: receivedTime (tag 35544) round-trip ======

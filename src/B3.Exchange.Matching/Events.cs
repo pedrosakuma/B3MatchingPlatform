@@ -21,6 +21,8 @@ public readonly record struct OrderAcceptedEvent(
     ulong InsertTimestampNanos,
     uint RptSeq,
     byte[]? Memo = null,
+    OrderType OrdType = OrderType.Limit,
+    long? ProtectionPriceMantissa = null,
     CrossType? CrossType = null,
     CrossPrioritization? CrossPrioritization = null);
 
@@ -327,7 +329,9 @@ public readonly record struct OrderModifiedEvent(
     ulong TransactTimeNanos,
     uint RptSeq,
     byte[]? Memo = null,
-    InvestorId? InvestorId = null);
+    InvestorId? InvestorId = null,
+    OrderType OrdType = OrderType.Limit,
+    long? ProtectionPriceMantissa = null);
 
 /// <summary>
 /// GAP-26 / issue #498: fired once per surviving Good-Till (GTC or

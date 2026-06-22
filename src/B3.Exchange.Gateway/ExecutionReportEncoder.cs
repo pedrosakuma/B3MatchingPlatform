@@ -151,6 +151,7 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId, long securityId, long orderId,
         ulong execId, ulong transactTimeNanos, Matching.OrderType ordType, Matching.TimeInForce tif,
         long orderQty, long? priceMantissa, ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
+        long? protectionPriceMantissa = null,
         Matching.CrossType? crossType = null, Matching.CrossPrioritization? crossPrioritization = null)
     {
         int total = TotalSize(ExecReportNewBlock, memo.Length);
@@ -171,7 +172,10 @@ internal static class ExecutionReportEncoder
         ulong nullTs = UTCTimestampNullValue;
         MemoryMarshal.Write(body.Slice(72, 8), in nullTs);                  // MarketSegmentReceivedTime
         long nullPx = PriceNullMantissa;
-        MemoryMarshal.Write(body.Slice(80, 8), in nullPx);                  // ProtectionPrice
+        long protectionPx = ordType == Matching.OrderType.MarketWithLeftover
+            ? protectionPriceMantissa ?? PriceNullMantissa
+            : PriceNullMantissa;
+        MemoryMarshal.Write(body.Slice(80, 8), in protectionPx);            // ProtectionPrice
         body[92] = EncodeOrdType(ordType);
         body[93] = EncodeTif(tif);
         MemoryMarshal.Write(body.Slice(96, 8), in orderQty);
@@ -195,7 +199,9 @@ internal static class ExecutionReportEncoder
         long securityId, long orderId, ulong execId, ulong transactTimeNanos,
         long leavesQty, long cumQty, long orderQty, long priceMantissa,
         ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
-        Matching.InvestorId? investorId = null)
+        Matching.InvestorId? investorId = null,
+        Matching.OrderType ordType = Matching.OrderType.Limit,
+        long? protectionPriceMantissa = null)
     {
         int total = TotalSize(ExecReportModifyBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Modify", nameof(dst));
@@ -218,8 +224,11 @@ internal static class ExecutionReportEncoder
         MemoryMarshal.Write(body.Slice(88, 8), in orderId);
         MemoryMarshal.Write(body.Slice(96, 8), in origClOrdIdValue);
         long nullPx = PriceNullMantissa;
-        MemoryMarshal.Write(body.Slice(104, 8), in nullPx);                 // ProtectionPrice
-        body[116] = OrdTypeLimit;                                           // OrdType - replace can only be on limit
+        long protectionPx = ordType == Matching.OrderType.MarketWithLeftover
+            ? protectionPriceMantissa ?? PriceNullMantissa
+            : PriceNullMantissa;
+        MemoryMarshal.Write(body.Slice(104, 8), in protectionPx);           // ProtectionPrice
+        body[116] = EncodeOrdType(ordType);                                 // OrdType
         body[117] = TifDay;                                                 // TimeInForce - replace inherits original; default Day
         MemoryMarshal.Write(body.Slice(120, 8), in orderQty);
         MemoryMarshal.Write(body.Slice(128, 8), in priceMantissa);

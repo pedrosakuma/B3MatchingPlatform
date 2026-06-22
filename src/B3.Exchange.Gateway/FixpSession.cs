@@ -616,9 +616,12 @@ public sealed partial class FixpSession : IAsyncDisposable
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         ReadOnlyMemory<byte> memo = default,
-        B3.Exchange.Matching.InvestorId? investorId = null)
+        B3.Exchange.Matching.InvestorId? investorId = null,
+        B3.Exchange.Matching.OrderType ordType = B3.Exchange.Matching.OrderType.Limit,
+        long? protectionPriceMantissa = null)
         => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId);
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId,
+            ordType, protectionPriceMantissa);
 
     public bool WriteExecutionReportRestate(in B3.Exchange.Matching.OrderRestatedEvent e, ulong ownerClOrdId,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)

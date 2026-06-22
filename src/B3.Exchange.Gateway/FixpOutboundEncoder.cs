@@ -82,9 +82,9 @@ internal sealed class FixpOutboundEncoder
                     _sessionId(), _nextMsgSeqNum(), e.InsertTimestampNanos,
                     e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
                     (ulong)e.RptSeq, e.InsertTimestampNanos,
-                    OrderType.Limit, TimeInForce.Day,
+                    e.OrdType, TimeInForce.Day,
                     e.RemainingQuantity, e.PriceMantissa,
-                    memo.Span, receivedTimeNanos, e.CrossType, e.CrossPrioritization);
+                    memo.Span, receivedTimeNanos, e.ProtectionPriceMantissa, e.CrossType, e.CrossPrioritization);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }
@@ -154,7 +154,9 @@ internal sealed class FixpOutboundEncoder
         Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default,
-        Matching.InvestorId? investorId = null)
+        Matching.InvestorId? investorId = null,
+        OrderType ordType = OrderType.Limit,
+        long? protectionPriceMantissa = null)
     {
         if (!_isOpen()) return false;
         var exact = PooledOutboundFrame.Rent(ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportModifyBlock, memo.Length));
@@ -168,7 +170,9 @@ internal sealed class FixpOutboundEncoder
                     securityId, orderId, (ulong)rptSeq, transactTimeNanos,
                     leavesQty: newRemainingQty, cumQty: 0, orderQty: newRemainingQty, priceMantissa: newPriceMantissa,
                     memo: memo.Span, receivedTimeNanos: receivedTimeNanos,
-                    investorId: investorId);
+                    investorId: investorId,
+                    ordType: ordType,
+                    protectionPriceMantissa: protectionPriceMantissa);
                 return AppendAndEnqueueLocked(exact, durability);
             }
         }

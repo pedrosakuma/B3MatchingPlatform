@@ -51,6 +51,7 @@ public partial class ChannelDispatcherTests
         public List<ulong> RejectClOrdIds { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
         public List<(long LeavesQty, long CumQty)> TradeQty { get; } = new();
+        public List<(OrderType OrdType, long? ProtectionPriceMantissa, long PriceMantissa, long RemainingQty)> Modifies { get; } = new();
         public List<OrderRestatedEvent> Restates { get; } = new();
         public bool CaptureCancelIds { get; set; }
         public List<(ulong ClOrdId, ulong OrigClOrdId)> CancelIds { get; } = new();
@@ -84,6 +85,8 @@ public partial class ChannelDispatcherTests
         }
         public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null)
         { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; } return true; }
+        public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, OrderType ordType, long? protectionPriceMantissa, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null)
+        { if (Find(session) is { } s) { s.Calls.Add("Modify"); s.LastReceivedTime = receivedTimeNanos; s.Modifies.Add((ordType, protectionPriceMantissa, newPriceMantissa, newRemainingQty)); } return true; }
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle d = default)
         { if (Find(session) is { } s) { s.Rejects.Add(e); s.RejectClOrdIds.Add(clOrdIdValue); s.Calls.Add("Reject"); } return true; }
         public bool WriteExecutionReportRestate(B3.Exchange.Contracts.SessionId ownerSession, ulong ownerClOrdId, in OrderRestatedEvent e, DurabilityHandle d = default)
@@ -139,6 +142,72 @@ public partial class ChannelDispatcherTests
         // SecurityId in body (after PacketHeader+Framing+SbeHeader)
         int bodyStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.Equal(Petr, MemoryMarshal.Read<long>(packet.AsSpan(bodyStart + WireOffsets.OrderBodySecurityIdOffset, 8)));
+    }
+
+    [Fact]
+    public void MwlPartialFillThenRest_ExecReportNewCarriesMwlOrdTypeAndProtectionPrice()
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var seller = new FakeSession(outbound) { EnteringFirm = 7 };
+        var mwlBuyer = new FakeSession(outbound) { EnteringFirm = 8 };
+        var plainLimit = new FakeSession(outbound) { EnteringFirm = 9 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, seller.EnteringFirm, 1_000UL),
+            seller.Id, seller.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var limitNew = Assert.Single(seller.News);
+        Assert.Equal(OrderType.Limit, limitNew.OrdType);
+        Assert.Null(limitNew.ProtectionPriceMantissa);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("MWL", Petr, Side.Buy, OrderType.MarketWithLeftover, TimeInForce.Day, 0L, 300, mwlBuyer.EnteringFirm, 2_000UL),
+            mwlBuyer.Id, mwlBuyer.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        var mwlNew = Assert.Single(mwlBuyer.News);
+        Assert.Equal(OrderType.MarketWithLeftover, mwlNew.OrdType);
+        Assert.Equal(Px(10m), mwlNew.PriceMantissa);
+        Assert.Equal(Px(10m), mwlNew.ProtectionPriceMantissa);
+        Assert.Equal(200, mwlNew.RemainingQuantity);
+
+        disp.EnqueueReplace(new ReplaceOrderCommand("MWL-2", Petr, mwlNew.OrderId, Px(10m), 100, 2_500UL)
+        {
+            NewOrdType = OrderType.MarketWithLeftover,
+        },
+            mwlBuyer.Id, mwlBuyer.EnteringFirm, clOrdIdValue: 22UL, origClOrdIdValue: 2UL);
+        DrainInbound(disp);
+
+        var mwlModify = Assert.Single(mwlBuyer.Modifies);
+        Assert.Equal(OrderType.MarketWithLeftover, mwlModify.OrdType);
+        Assert.Equal(Px(10m), mwlModify.ProtectionPriceMantissa);
+        Assert.Equal(Px(10m), mwlModify.PriceMantissa);
+        Assert.Equal(100, mwlModify.RemainingQty);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("B1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, plainLimit.EnteringFirm, 3_000UL),
+            plainLimit.Id, plainLimit.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        var plainNew = Assert.Single(plainLimit.News);
+        Assert.Equal(OrderType.Limit, plainNew.OrdType);
+        Assert.Null(plainNew.ProtectionPriceMantissa);
+    }
+
+    [Theory]
+    [InlineData(OrderType.StopLoss)]
+    [InlineData(OrderType.StopLimit)]
+    public void StopAccepted_ExecReportNewCarriesStopOrdType(OrderType stopType)
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        long limitPrice = stopType == OrderType.StopLimit ? Px(10.50m) : 0L;
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, stopType, TimeInForce.Day, limitPrice, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(10.45m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var accepted = Assert.Single(reply.News);
+        Assert.Equal(stopType, accepted.OrdType);
+        Assert.Null(accepted.ProtectionPriceMantissa);
     }
 
     [Fact]

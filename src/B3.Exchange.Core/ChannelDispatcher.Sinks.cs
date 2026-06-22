@@ -84,6 +84,8 @@ public sealed partial class ChannelDispatcher
             side: e.Side, newPriceMantissa: e.NewPriceMantissa,
             newRemainingQty: e.NewRemainingQuantity,
             transactTimeNanos: e.TransactTimeNanos, rptSeq: e.RptSeq,
+            ordType: e.OrdType,
+            protectionPriceMantissa: e.ProtectionPriceMantissa,
             receivedTimeNanos: _currentReceivedTimeNanos,
             durability: CurrentDurability,
             investorId: e.InvestorId);
@@ -524,8 +526,8 @@ public sealed partial class ChannelDispatcher
     /// can resolve the owner) and emit ER_New back to the active session.
     /// No MBO frame is emitted because stops are not on the public book
     /// until they trigger. The wire ER reuses the regular OrderAccepted
-    /// shape and therefore does not carry StopPx/OrdType=Stop on the
-    /// wire — an MVP limitation tracked in the issue body.
+    /// shape and carries the stop OrdType so ER_New echoes the accepted
+    /// stop semantics. StopPx is still not present on ER_New.
     /// </summary>
     public void OnStopOrderAccepted(in StopOrderAcceptedEvent e)
     {
@@ -544,7 +546,8 @@ public sealed partial class ChannelDispatcher
                 RemainingQuantity: e.Quantity,
                 EnteringFirm: e.EnteringFirm,
                 InsertTimestampNanos: e.InsertTimestampNanos,
-                RptSeq: e.RptSeq);
+                RptSeq: e.RptSeq,
+                OrdType: e.StopType);
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, accepted, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
         }

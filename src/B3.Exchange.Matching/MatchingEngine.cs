@@ -1404,7 +1404,10 @@ public sealed class MatchingEngine
             // #204: effective Type/TIF — null means "preserve original".
             // The resting order is by construction Limit (Market never rests),
             // so the only meaningful Type override is Limit -> Market, which
-            // turns the priority-loss path into a market aggressor.
+            // turns the priority-loss path into a market aggressor. A MWL
+            // replace may keep priority when it is otherwise equivalent to a
+            // resting limit amend; its ER_Modify echoes the replace request's
+            // OrdType and uses the post-replace resting price as ProtectionPrice.
             var effectiveType = cmd.NewOrdType ?? OrderType.Limit;
             var effectiveTif = cmd.NewTif ?? resting.Tif;
 
@@ -1473,10 +1476,12 @@ public sealed class MatchingEngine
                 { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.OrderExceedsLimit, cmd.EnteredAtNanos); return; }
             }
 
-            // Priority-keep is only possible if Type/TIF are unchanged: a Type
-            // or TIF transition is by definition a logical re-entry (the order
-            // semantics differ), so we must DEL+NEW.
-            bool priorityKept = effectiveType == OrderType.Limit
+            // Priority-keep is only possible when the replacement still has
+            // resting-limit semantics (Limit, or MWL after it has already
+            // become a resting leftover) and leaves TIF/price priority intact.
+            bool effectiveTypeCanRestInPlace = effectiveType == OrderType.Limit
+                                               || effectiveType == OrderType.MarketWithLeftover;
+            bool priorityKept = effectiveTypeCanRestInPlace
                                 && effectiveTif == resting.Tif
                                 && cmd.NewPriceMantissa == resting.PriceMantissa
                                 && cmd.NewQuantity <= resting.RemainingQuantity;
@@ -1533,7 +1538,9 @@ public sealed class MatchingEngine
                     // order's identity. resting.InvestorId has already
                     // been mutated above when cmd.NewInvestorId was set,
                     // so this is the canonical post-replace value.
-                    InvestorId: resting.InvestorId));
+                    InvestorId: resting.InvestorId,
+                    OrdType: effectiveType,
+                    ProtectionPriceMantissa: effectiveType == OrderType.MarketWithLeftover ? resting.PriceMantissa : null));
                 RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }
@@ -1634,6 +1641,8 @@ public sealed class MatchingEngine
             EnteringFirm: resting.EnteringFirm,
             InsertTimestampNanos: resting.InsertTimestampNanos,
             RptSeq: NextRptSeq(),
+            OrdType: cmd.Type,
+            ProtectionPriceMantissa: cmd.Type == OrderType.MarketWithLeftover ? resting.PriceMantissa : null,
             CrossType: crossType,
             CrossPrioritization: crossPrioritization));
 
@@ -2098,6 +2107,8 @@ public sealed class MatchingEngine
                 InsertTimestampNanos: resting.InsertTimestampNanos,
                 RptSeq: NextRptSeq(),
                 Memo: resting.Memo,
+                OrdType: cmd.Type,
+                ProtectionPriceMantissa: isMwl ? limitPx : null,
                 CrossType: crossType,
                 CrossPrioritization: crossPrioritization));
         }

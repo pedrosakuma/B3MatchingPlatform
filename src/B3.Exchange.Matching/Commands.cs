@@ -291,10 +291,12 @@ public sealed record CancelOrderCommand(
 /// <summary>
 /// Replace command. <see cref="NewQuantity"/> is interpreted as the new
 /// <em>remaining open quantity</em> (not the original total). Replace cannot
-/// change Side, SecurityId, Type or TIF — those would be a new order.
-/// Priority is preserved iff (PriceMantissa unchanged AND NewQuantity &lt;= current
-/// remaining qty); otherwise the engine emits a <see cref="OrderCanceledEvent"/>
-/// with <see cref="CancelReason.ReplaceLostPriority"/> followed by an
+/// change Side or SecurityId; Type/TIF overrides are carried by
+/// <see cref="NewOrdType"/> and <see cref="NewTif"/>. Priority is preserved iff
+/// the effective type can rest in place, TIF and price priority are unchanged,
+/// and NewQuantity &lt;= current remaining qty; otherwise the engine emits a
+/// <see cref="OrderCanceledEvent"/> with
+/// <see cref="CancelReason.ReplaceLostPriority"/> followed by an
 /// <see cref="OrderAcceptedEvent"/> for the replacement (which may then cross
 /// or rest like a brand-new order, including emitting trades).
 /// </summary>
@@ -307,12 +309,11 @@ public sealed record ReplaceOrderCommand(
     ulong EnteredAtNanos)
 {
     /// <summary>
-    /// New order type for the replacement. <c>null</c> means "preserve
-    /// the resting order's type" (always <see cref="OrderType.Limit"/>
-    /// for an order that is on the book). Setting <c>OrderType.Market</c>
-    /// turns the priority-loss path into a market aggressor that consumes
-    /// liquidity and never rests; <see cref="NewTif"/> must then be
-    /// IOC or FOK. Issue #204.
+    /// New order type for the replacement. <c>null</c> means "preserve as
+    /// resting-limit semantics" for an order that is on the book. Setting
+    /// <c>OrderType.Market</c> turns the priority-loss path into a market
+    /// aggressor that consumes liquidity and never rests; <see cref="NewTif"/>
+    /// must then be IOC or FOK. Issue #204.
     /// </summary>
     public OrderType? NewOrdType { get; init; }
 

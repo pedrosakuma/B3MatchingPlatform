@@ -1,6 +1,7 @@
 using B3.Exchange.Matching;
 using MatchingRejectEvent = B3.Exchange.Matching.RejectEvent;
 using MatchingSide = B3.Exchange.Matching.Side;
+using MatchingOrderType = B3.Exchange.Matching.OrderType;
 
 namespace B3.Exchange.Contracts;
 
@@ -71,6 +72,17 @@ public interface ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         InvestorId? investorId = null);
+
+    bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
+        ulong clOrdIdValue, ulong origClOrdIdValue,
+        MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        MatchingOrderType ordType, long? protectionPriceMantissa,
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default,
+        InvestorId? investorId = null)
+        => WriteExecutionReportModify(session, securityId, orderId, clOrdIdValue, origClOrdIdValue,
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq,
+            receivedTimeNanos, durability, investorId);
 
     bool WriteExecutionReportReject(SessionId session, in MatchingRejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default);
