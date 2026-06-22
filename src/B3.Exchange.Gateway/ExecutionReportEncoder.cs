@@ -129,6 +129,11 @@ internal static class ExecutionReportEncoder
         _ => 0,
     };
 
+    private static byte EncodeCrossType(Matching.CrossType? value) => value.HasValue ? (byte)value.Value : (byte)255;
+
+    private static byte EncodeCrossPrioritization(Matching.CrossPrioritization? value)
+        => value.HasValue ? (byte)value.Value : (byte)255;
+
     private static void WriteBusinessHeader(Span<byte> body, uint sessionId, uint msgSeqNum, ulong sendingTimeNanos)
     {
         // OutboundBusinessHeader (sequential, Pack=1):
@@ -145,7 +150,8 @@ internal static class ExecutionReportEncoder
         uint sessionId, uint msgSeqNum, ulong sendingTimeNanos,
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId, long securityId, long orderId,
         ulong execId, ulong transactTimeNanos, Matching.OrderType ordType, Matching.TimeInForce tif,
-        long orderQty, long? priceMantissa, ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue)
+        long orderQty, long? priceMantissa, ReadOnlySpan<byte> memo = default, ulong receivedTimeNanos = UTCTimestampNullValue,
+        Matching.CrossType? crossType = null, Matching.CrossPrioritization? crossPrioritization = null)
     {
         int total = TotalSize(ExecReportNewBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_New", nameof(dst));
@@ -175,8 +181,8 @@ internal static class ExecutionReportEncoder
         // V3 trailing fields: receivedTime + non-zero null sentinels.
         MemoryMarshal.Write(body.Slice(144, 8), in receivedTimeNanos);      // ReceivedTime (tag 35544)
         // ordTagID@155 null=0 already, investorID@156 null=zeros already, strategyID@168 null=0 already.
-        body[162] = 255;                                                    // CrossType null
-        body[163] = 255;                                                    // CrossPrioritization null
+        body[162] = EncodeCrossType(crossType);                             // CrossType
+        body[163] = EncodeCrossPrioritization(crossPrioritization);          // CrossPrioritization
         body[164] = 255;                                                    // MmProtectionReset null
         // V6 trailing field: tradingSubAccount@172 (uint, null=0) — covered
         // by body.Clear() above. strategyID@168 (int, null=0) ditto.
@@ -374,7 +380,8 @@ internal static class ExecutionReportEncoder
         Matching.Side side, ulong clOrdIdValue, long secondaryOrderId,
         long securityId, long orderId, long lastQty, long lastPxMantissa,
         ulong execId, ulong transactTimeNanos, long leavesQty, long cumQty,
-        bool aggressor, uint tradeId, uint contraBroker, ushort tradeDate, long orderQty, ReadOnlySpan<byte> memo = default)
+        bool aggressor, uint tradeId, uint contraBroker, ushort tradeDate, long orderQty, ReadOnlySpan<byte> memo = default,
+        Matching.CrossType? crossType = null, Matching.CrossPrioritization? crossPrioritization = null)
     {
         int total = TotalSize(ExecReportTradeBlock, memo.Length);
         if (dst.Length < total) throw new ArgumentException("buffer too small for ER_Trade", nameof(dst));
@@ -408,8 +415,8 @@ internal static class ExecutionReportEncoder
         body[154] = 255;                                                    // TradingSessionID null
         body[155] = 255;                                                    // TradingSessionSubID null
         body[156] = 255;                                                    // SecurityTradingStatus null
-        body[157] = 255;                                                    // CrossType null
-        body[158] = 255;                                                    // CrossPrioritization null
+        body[157] = EncodeCrossType(crossType);                             // CrossType
+        body[158] = EncodeCrossPrioritization(crossPrioritization);          // CrossPrioritization
         // strategyID@160 (int, null=0), impliedEventID@164 (6 bytes; eventID
         // and noRelatedTrades both null=0) and tradingSubAccount@170 (uint,
         // null=0) are covered by body.Clear() above.
