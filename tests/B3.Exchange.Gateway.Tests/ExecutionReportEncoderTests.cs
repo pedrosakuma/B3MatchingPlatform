@@ -101,6 +101,26 @@ public class ExecutionReportEncoderTests
         Assert.Equal((byte)'1', body[92]);                                         // OrdType=Market
     }
 
+    [Theory]
+    [InlineData(OrderType.StopLoss, (byte)'3', 0L, 10_4500L)]
+    [InlineData(OrderType.StopLimit, (byte)'4', 10_5000L, 10_4500L)]
+    public void EncodeNew_StopOrders_WriteStopOrdTypeByte(OrderType ordType, byte expectedOrdTypeByte, long priceMantissa, long stopPxMantissa)
+    {
+        var buf = new byte[ExecutionReportEncoder.ExecReportNewTotal];
+        ExecutionReportEncoder.EncodeExecReportNew(buf,
+            sessionId: 42, msgSeqNum: 1, sendingTimeNanos: 1_000_000_000UL,
+            side: Side.Buy, clOrdIdValue: 99, secondaryOrderId: 555,
+            securityId: 1122, orderId: 7777,
+            execId: 100UL, transactTimeNanos: 1_000_000_001UL,
+            ordType: ordType, tif: TimeInForce.Day,
+            orderQty: 10, priceMantissa: priceMantissa,
+            protectionPriceMantissa: stopPxMantissa);
+
+        var body = buf.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        Assert.Equal(long.MinValue, MemoryMarshal.Read<long>(body.Slice(80, 8)));   // ProtectionPrice null
+        Assert.Equal(expectedOrdTypeByte, body[92]);
+    }
+
 
     [Fact]
     public void EncodeNew_WritesMemoVarData()

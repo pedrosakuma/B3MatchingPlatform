@@ -170,7 +170,10 @@ public partial class ChannelDispatcherTests
         Assert.Equal(Px(10m), mwlNew.ProtectionPriceMantissa);
         Assert.Equal(200, mwlNew.RemainingQuantity);
 
-        disp.EnqueueReplace(new ReplaceOrderCommand("MWL-2", Petr, mwlNew.OrderId, Px(10m), 100, 2_500UL),
+        disp.EnqueueReplace(new ReplaceOrderCommand("MWL-2", Petr, mwlNew.OrderId, Px(10m), 100, 2_500UL)
+        {
+            NewOrdType = OrderType.MarketWithLeftover,
+        },
             mwlBuyer.Id, mwlBuyer.EnteringFirm, clOrdIdValue: 22UL, origClOrdIdValue: 2UL);
         DrainInbound(disp);
 
@@ -187,6 +190,24 @@ public partial class ChannelDispatcherTests
         var plainNew = Assert.Single(plainLimit.News);
         Assert.Equal(OrderType.Limit, plainNew.OrdType);
         Assert.Null(plainNew.ProtectionPriceMantissa);
+    }
+
+    [Theory]
+    [InlineData(OrderType.StopLoss)]
+    [InlineData(OrderType.StopLimit)]
+    public void StopAccepted_ExecReportNewCarriesStopOrdType(OrderType stopType)
+    {
+        var (disp, _, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        long limitPrice = stopType == OrderType.StopLimit ? Px(10.50m) : 0L;
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S1", Petr, Side.Buy, stopType, TimeInForce.Day, limitPrice, 100, 7, 1_000UL)
+        { StopPxMantissa = Px(10.45m) }, reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var accepted = Assert.Single(reply.News);
+        Assert.Equal(stopType, accepted.OrdType);
+        Assert.Null(accepted.ProtectionPriceMantissa);
     }
 
     [Fact]

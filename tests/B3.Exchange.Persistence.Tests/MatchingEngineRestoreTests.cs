@@ -31,9 +31,10 @@ public class MatchingEngineRestoreTests
     {
         public List<long> AcceptedOrderIds { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
+        public List<OrderModifiedEvent> Modified { get; } = new();
         public void OnOrderAccepted(in OrderAcceptedEvent e) => AcceptedOrderIds.Add(e.OrderId);
         public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e) { }
-        public void OnOrderModified(in OrderModifiedEvent e) { }
+        public void OnOrderModified(in OrderModifiedEvent e) => Modified.Add(e);
         public void OnOrderCanceled(in OrderCanceledEvent e) { }
         public void OnOrderFilled(in OrderFilledEvent e) { }
         public void OnTrade(in TradeEvent e) => Trades.Add(e);
@@ -142,5 +143,30 @@ public class MatchingEngineRestoreTests
         // Restored book exposes only the visible slice.
         var view = dst.EnumerateBook(Sec, Side.Buy).Single();
         Assert.Equal(100L, view.RemainingQuantity);
+    }
+
+    [Fact]
+    public void Restore_MwlLeftoverModifyEchoesReplaceOrdTypeAndRestingProtectionPrice()
+    {
+        var src = NewEngine(out var srcSink);
+        src.Submit(new NewOrderCommand("S", Sec, Side.Sell, OrderType.Limit,
+            TimeInForce.Day, Px(10.00m), 100, 100, 1_000UL));
+        src.Submit(new NewOrderCommand("MWL", Sec, Side.Buy, OrderType.MarketWithLeftover,
+            TimeInForce.Day, 0, 300, 200, 2_000UL));
+        long mwlOrderId = srcSink.AcceptedOrderIds.Last();
+
+        var dst = NewEngine(out var dstSink);
+        dst.RestoreState(src.CaptureState());
+
+        dst.Replace(new ReplaceOrderCommand("MWL-R", Sec, mwlOrderId, Px(10.00m), 100, 3_000UL)
+        {
+            NewOrdType = OrderType.MarketWithLeftover,
+        });
+
+        var modified = Assert.Single(dstSink.Modified);
+        Assert.Equal(OrderType.MarketWithLeftover, modified.OrdType);
+        Assert.Equal(Px(10.00m), modified.ProtectionPriceMantissa);
+        Assert.Equal(Px(10.00m), modified.NewPriceMantissa);
+        Assert.Equal(100, modified.NewRemainingQuantity);
     }
 }
