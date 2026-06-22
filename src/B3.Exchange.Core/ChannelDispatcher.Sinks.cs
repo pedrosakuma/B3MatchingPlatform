@@ -84,6 +84,8 @@ public sealed partial class ChannelDispatcher
             side: e.Side, newPriceMantissa: e.NewPriceMantissa,
             newRemainingQty: e.NewRemainingQuantity,
             transactTimeNanos: e.TransactTimeNanos, rptSeq: e.RptSeq,
+            ordType: e.OrdType,
+            protectionPriceMantissa: e.ProtectionPriceMantissa,
             receivedTimeNanos: _currentReceivedTimeNanos,
             durability: CurrentDurability,
             investorId: e.InvestorId);

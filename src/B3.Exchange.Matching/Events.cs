@@ -20,7 +20,9 @@ public readonly record struct OrderAcceptedEvent(
     uint EnteringFirm,
     ulong InsertTimestampNanos,
     uint RptSeq,
-    byte[]? Memo = null);
+    byte[]? Memo = null,
+    OrderType OrdType = OrderType.Limit,
+    long? ProtectionPriceMantissa = null);
 
 /// <summary>
 /// Fired when a resting order's remaining quantity is reduced as a passive maker
@@ -323,7 +325,9 @@ public readonly record struct OrderModifiedEvent(
     ulong TransactTimeNanos,
     uint RptSeq,
     byte[]? Memo = null,
-    InvestorId? InvestorId = null);
+    InvestorId? InvestorId = null,
+    OrderType OrdType = OrderType.Limit,
+    long? ProtectionPriceMantissa = null);
 
 /// <summary>
 /// GAP-26 / issue #498: fired once per surviving Good-Till (GTC or

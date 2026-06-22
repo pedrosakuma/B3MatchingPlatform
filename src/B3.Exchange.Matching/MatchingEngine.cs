@@ -1526,7 +1526,9 @@ public sealed class MatchingEngine
                     // order's identity. resting.InvestorId has already
                     // been mutated above when cmd.NewInvestorId was set,
                     // so this is the canonical post-replace value.
-                    InvestorId: resting.InvestorId));
+                    InvestorId: resting.InvestorId,
+                    OrdType: resting.OrdType,
+                    ProtectionPriceMantissa: resting.ProtectionPriceMantissa));
                 RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
                 return;
             }
@@ -1613,6 +1615,7 @@ public sealed class MatchingEngine
             MaxFloor = (long)cmd.MaxFloor,
             HiddenQuantity = hidden,
             ExpireDate = cmd.ExpireDate,
+            OrdType = cmd.Type,
         };
         book.Insert(resting);
         _sink.OnOrderAccepted(new OrderAcceptedEvent(
@@ -1624,7 +1627,9 @@ public sealed class MatchingEngine
             RemainingQuantity: resting.RemainingQuantity,
             EnteringFirm: resting.EnteringFirm,
             InsertTimestampNanos: resting.InsertTimestampNanos,
-            RptSeq: NextRptSeq()));
+            RptSeq: NextRptSeq(),
+            OrdType: resting.OrdType,
+            ProtectionPriceMantissa: resting.ProtectionPriceMantissa));
 
         RecomputeAuctionTopIfApplicable(book.SecurityId, cmd.EnteredAtNanos);
     }
@@ -2071,6 +2076,8 @@ public sealed class MatchingEngine
                 HiddenQuantity = hidden,
                 ExpireDate = cmd.ExpireDate,
                 Memo = cmd.Memo,
+                OrdType = cmd.Type,
+                ProtectionPriceMantissa = isMwl ? limitPx : null,
             };
             book.Insert(resting);
             _sink.OnOrderAccepted(new OrderAcceptedEvent(
@@ -2083,7 +2090,9 @@ public sealed class MatchingEngine
                 EnteringFirm: resting.EnteringFirm,
                 InsertTimestampNanos: resting.InsertTimestampNanos,
                 RptSeq: NextRptSeq(),
-                Memo: resting.Memo));
+                Memo: resting.Memo,
+                OrdType: resting.OrdType,
+                ProtectionPriceMantissa: resting.ProtectionPriceMantissa));
         }
         finally
         {

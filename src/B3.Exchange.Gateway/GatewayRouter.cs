@@ -93,6 +93,20 @@ public sealed class GatewayRouter : ICoreOutbound
             memo: default, investorId: investorId);
     }
 
+    public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
+        ulong clOrdIdValue, ulong origClOrdIdValue,
+        Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
+        OrderType ordType, long? protectionPriceMantissa,
+        ulong receivedTimeNanos = ulong.MaxValue,
+        DurabilityHandle durability = default,
+        Matching.InvestorId? investorId = null)
+    {
+        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportModify"); return false; }
+        return s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
+            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability,
+            memo: default, investorId: investorId, ordType: ordType, protectionPriceMantissa: protectionPriceMantissa);
+    }
+
     public bool WriteExecutionReportReject(ContractsSessionId session, in RejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default)
     {

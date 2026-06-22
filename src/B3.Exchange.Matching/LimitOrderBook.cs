@@ -16,6 +16,8 @@ internal sealed class RestingOrder
     public string? Asset { get; init; }
     public InvestorId? InvestorId { get; set; }
     public byte[] Memo { get; init; } = [];
+    public OrderType OrdType { get; init; } = OrderType.Limit;
+    public long? ProtectionPriceMantissa { get; init; }
 
     /// <summary>
     /// Wall-clock timestamp at which the order entered (or last re-entered)
