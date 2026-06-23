@@ -192,12 +192,14 @@ public sealed partial class FixpSession
             // For a takeover, also restore the evicted session's claim so
             // the old TCP (still alive) remains the authoritative owner
             // rather than being left unclaimed. TryRestoreTakeOver is a
-            // no-op if a concurrent racing takeover has already won the
-            // registry in the window between TryForceTakeOver and here.
+            // no-op (returns false) if a concurrent racing takeover has
+            // already won the registry in the window between
+            // TryForceTakeOver and here.
+            var takeOverRolledBack = false;
             if (evictedByTakeOver is not null)
             {
-                _claims.TryRestoreTakeOver(req.SessionId, this,
-                    evictedByTakeOver, evictedVerId);
+                takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
+                    this, evictedByTakeOver, evictedVerId);
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
@@ -207,6 +209,17 @@ public sealed partial class FixpSession
             // Issue #485: roll back Identity to the pending format so
             // OnSessionClosed doesn't evict ownership for a real session.
             RollbackIdentity(pendingIdentity);
+            // Issue #492: UpdateIdentityAfterNegotiate above overwrote the
+            // evicted session's SessionRegistry entry with this (failed) new
+            // session; RollbackIdentity then removed it, leaving the old
+            // owner unroutable. Re-register the evicted session AFTER the
+            // rollback so routing is restored — but only when the claim was
+            // actually handed back (takeOverRolledBack), to stay in lock-step
+            // with the claim registry and avoid clobbering a racing takeover.
+            if (takeOverRolledBack && evictedByTakeOver is not null)
+            {
+                _onTakeOverRollback?.Invoke(evictedByTakeOver);
+            }
             // No spec-defined "internal error" reject code; UNSPECIFIED
             // (0) is the closest match. The peer will retry.
             var rejectFrame = new byte[NegotiateRejectEncoder.Total];

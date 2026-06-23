@@ -251,8 +251,13 @@ public sealed class SessionClaimRegistry
     /// (guards against a concurrent takeover winning the registry
     /// between the failed persist and this restore call). Safe to call
     /// multiple times; idempotent when the claim has already moved on.
+    /// Returns <c>true</c> when the claim was actually restored to
+    /// <paramref name="oldToken"/>, so the caller can keep the
+    /// <see cref="SessionRegistry"/> entry in lock-step; returns
+    /// <c>false</c> when a concurrent takeover already moved the claim on
+    /// (in which case the caller must not roll the registry back either).
     /// </summary>
-    public void TryRestoreTakeOver(uint sessionId, object newToken,
+    public bool TryRestoreTakeOver(uint sessionId, object newToken,
         object oldToken, ulong oldVerId)
     {
         ArgumentNullException.ThrowIfNull(newToken);
@@ -264,7 +269,9 @@ public sealed class SessionClaimRegistry
             {
                 _activeClaims[sessionId] = oldToken;
                 _lastSessionVerId[sessionId] = oldVerId;
+                return true;
             }
         }
+        return false;
     }
 }

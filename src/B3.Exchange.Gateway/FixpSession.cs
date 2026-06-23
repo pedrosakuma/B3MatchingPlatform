@@ -142,6 +142,17 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     private readonly Action<FixpSession, ContractsSessionId, ContractsSessionId>? _onIdentityChanged;
 
+    /// <summary>
+    /// Issue #492: re-registers an evicted-by-takeover session in the
+    /// <see cref="SessionRegistry"/> when a takeover is rolled back after
+    /// the new session already overwrote the old session's registry entry
+    /// (e.g. snapshot persistence failed mid-Negotiate). Wired to
+    /// <c>SessionRegistry.Register</c> so the old, still-live owner keeps
+    /// receiving routed execution reports. Invoked only in lock-step with a
+    /// successful <see cref="SessionClaimRegistry.TryRestoreTakeOver"/>.
+    /// </summary>
+    private readonly Action<FixpSession>? _onTakeOverRollback;
+
     public long ConnectionId { get; }
 
     /// <summary>
@@ -369,7 +380,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
         bool resumeAsNegotiated = false,
         int? persistedMaxOrderRatePerSecond = null,
-        Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null)
+        Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null,
+        Action<FixpSession>? onTakeOverRollback = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -392,6 +404,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         _options = options ?? FixpSessionOptions.Default;
         _options.Validate();
         _onIdentityChanged = onIdentityChanged;
+        _onTakeOverRollback = onTakeOverRollback;
         if (persistedMaxOrderRatePerSecond is < 0)
             throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;

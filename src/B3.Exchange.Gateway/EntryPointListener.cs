@@ -620,7 +620,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             persistedState: persistedState,
             resumeAsNegotiated: resumeAsNegotiated,
             persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond,
-            onIdentityChanged: onIdentityChanged);
+            onIdentityChanged: onIdentityChanged,
+            onTakeOverRollback: s => _registry.Register(s));
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);
         session.Start();
