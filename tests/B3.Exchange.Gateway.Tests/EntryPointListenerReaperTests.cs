@@ -89,10 +89,28 @@ public class EntryPointListenerReaperTests
         {
             // Background reaper polls every ~50ms (floor) at 200ms timeout,
             // so it should observe the session past timeout within ~250ms.
+            //
+            // Synchronize on the *terminal* effect of the close, not an
+            // intermediate one: CloseLocked flips IsOpen/SuspendedSinceMs and
+            // fires sink.OnSessionClosed early, but only invokes the
+            // listener's onSessionClosed reason callback (which populates
+            // `closures` and removes the session from ActiveSessions) as its
+            // very last step, after per-session persistence cleanup. Under
+            // full-suite parallel load that cleanup window is wide enough for
+            // a test that waits on the earlier state to observe an empty
+            // `closures` and flake (issue #539). Waiting for `closures` to be
+            // populated guarantees every prior step has completed.
             var reaped = await TestUtil.WaitUntilAsync(
-                () => !session.IsOpen && session.SuspendedSinceMs is null,
+                () =>
+                {
+                    lock (closures)
+                        return !session.IsOpen
+                            && session.SuspendedSinceMs is null
+                            && Volatile.Read(ref sink.SessionClosedCalls) == 1
+                            && closures.Count == 1;
+                },
                 TimeSpan.FromSeconds(2));
-            Assert.True(reaped, "reaper did not close the suspended session within 2s");
+            Assert.True(reaped, "reaper did not fully close the suspended session within 2s");
             Assert.Equal(1, Volatile.Read(ref sink.SessionClosedCalls));
             lock (closures)
             {
