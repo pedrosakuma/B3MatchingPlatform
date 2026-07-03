@@ -402,11 +402,16 @@ public sealed partial class FixpSession
                 }
             }
         }
-        else
+        else if (kind != CloseKind.SessionTakeOver)
         {
             // Host shutdown / transport error: keep journal + ring;
             // persist final snapshot so the reconnecting peer sees the
             // correct LastIncomingSeqNo / OutboundMsgSeqNum.
+            // SessionTakeOver is intentionally excluded: the new session
+            // already persisted its snapshot (with the higher SessionVerID)
+            // before calling Close on this evicted session. Saving here
+            // would overwrite the new snapshot with this session's older
+            // SessionVerID, rolling durable state backwards.
             SaveStateSnapshotSafe();
         }
         try { _onClosed?.Invoke(this, reason); }

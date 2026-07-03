@@ -236,4 +236,52 @@ public class SessionClaimRegistryTests
         Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
         Assert.Same(newToken, holder);
     }
+
+    // ===== TryRestoreTakeOver (issue #492) =====
+
+    [Fact]
+    public void TryRestoreTakeOver_WhenNewTokenStillActive_RestoresOldClaimAndVerId()
+    {
+        // A takeover was force-applied, then its Negotiate persist failed.
+        // Rolling it back must hand the claim (and verId) back to the
+        // evicted old session and report success.
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _);
+        Assert.Equal(6UL, r.CurrentSessionVerId(42));
+
+        var restored = r.TryRestoreTakeOver(42, newToken, oldToken, oldVerId: 5);
+
+        Assert.True(restored);
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
+        Assert.Same(oldToken, holder);
+        Assert.Equal(5UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void TryRestoreTakeOver_WhenRacingTakeoverWon_DoesNotClobberAndReturnsFalse()
+    {
+        // While the failed takeover was rolling back, a second takeover won
+        // the registry. Restore must be a no-op (return false) so the caller
+        // does not roll the SessionRegistry back over the racing winner.
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _);
+
+        var racingToken = new object();
+        r.TryForceTakeOver(42, 7, racingToken, out _);
+
+        var restored = r.TryRestoreTakeOver(42, newToken, oldToken, oldVerId: 5);
+
+        Assert.False(restored);
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
+        Assert.Same(racingToken, holder);
+        Assert.Equal(7UL, r.CurrentSessionVerId(42));
+    }
 }
