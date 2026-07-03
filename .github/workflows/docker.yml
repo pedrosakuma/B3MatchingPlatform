@@ -52,7 +52,7 @@ jobs:
       # image manifest. The .NET SDK stage stays native (see Dockerfile
       # $BUILDPLATFORM), so QEMU only covers the lightweight runtime layer.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
