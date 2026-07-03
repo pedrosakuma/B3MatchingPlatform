@@ -1,4 +1,11 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+# $BUILDPLATFORM keeps the SDK stage on the runner's native architecture so
+# the (slow) build never runs under QEMU emulation. Only the runtime layer is
+# emitted for $TARGETARCH via `dotnet publish -a`.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+# TARGETARCH is injected by buildx (amd64 / arm64); `dotnet publish -a`
+# accepts these Docker arch names directly.
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -6,9 +13,9 @@ COPY Directory.Build.props Directory.Packages.props global.json SbeB3Exchange.sl
 COPY schemas/ schemas/
 COPY src/ src/
 
-RUN dotnet restore src/B3.Exchange.Host/B3.Exchange.Host.csproj
+RUN dotnet restore src/B3.Exchange.Host/B3.Exchange.Host.csproj -a $TARGETARCH
 RUN dotnet publish src/B3.Exchange.Host/B3.Exchange.Host.csproj \
-    -c Release -o /app --no-restore
+    -a $TARGETARCH -c Release -o /app --no-restore
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
