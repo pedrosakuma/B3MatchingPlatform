@@ -129,6 +129,16 @@ public class ChannelDispatcherWalTests
                 TimeInForce.Day, Px(10.00m), 100, 100, nanos),
             session, enteringFirm: 700, clOrdIdValue: clOrdIdValue);
 
+    // Readiness waits below poll a background dispatcher thread that must
+    // be scheduled + finish WAL replay/snapshot work. The operations are
+    // bounded and synchronous once the LongRunning loop thread runs, but
+    // under the Release CI lane (whole solution's tests in parallel +
+    // coverage instrumentation) CPU oversubscription can delay thread
+    // scheduling well past a few seconds — a 5s budget flaked here
+    // (issue #543). 30s is pure headroom: the happy path still returns in
+    // milliseconds, we only wait longer when the box is saturated.
+    private static readonly TimeSpan ReadyTimeout = TimeSpan.FromSeconds(30);
+
     private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -260,7 +270,7 @@ public class ChannelDispatcherWalTests
         // starting the dispatcher and waiting for the replayed registry state.
         dispB.Start();
         Assert.True(await WaitForAsync(() => dispB.OrderRegistryCount >= 3,
-            TimeSpan.FromSeconds(5)), "dispatcher did not replay WAL tail before timeout");
+            ReadyTimeout), "dispatcher did not replay WAL tail before timeout");
 
         Assert.Equal(3, dispB.OrderRegistryCount);
         // Replay must NOT publish on the wire or send ERs.
@@ -314,7 +324,7 @@ public class ChannelDispatcherWalTests
                 probe.DrainInbound();
                 return persister.SaveCount >= 1 && metrics.WalTruncations >= 1;
             },
-            TimeSpan.FromSeconds(5)), "async snapshot writer did not save and truncate before timeout");
+            ReadyTimeout), "async snapshot writer did not save and truncate before timeout");
 
         Assert.True(persister.SaveCount >= 1);
         Assert.True(metrics.WalTruncations >= 1);
@@ -374,7 +384,7 @@ public class ChannelDispatcherWalTests
         dispB.Start();
 
         Assert.True(await WaitForAsync(() => !dispB.IsWalHealthy,
-            TimeSpan.FromSeconds(5)), "dispatcher did not halt on the snapshot/WAL boundary gap before timeout");
+            ReadyTimeout), "dispatcher did not halt on the snapshot/WAL boundary gap before timeout");
 
         Assert.False(dispB.IsWalHealthy);
         // Engine must remain at the snapshot baseline (2 resting orders);
