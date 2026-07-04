@@ -1,0 +1,130 @@
+name: Helm
+
+# Lints the b3-matching Layer-1 chart on every PR, and publishes it as an OCI
+# artifact next to the GHCR image on pushes to main / tags — gated on a
+# Chart.yaml `version` bump (the publish step is skipped when that version is
+# already present in the registry, so it is idempotent).
+#
+#   oci://ghcr.io/<owner>/charts/b3-matching:<version>
+#
+# Versioning contract (docs/HELM-CHART.md): chart `version` is SemVer, released
+# in lockstep with the image; `appVersion` is the image version it was
+# validated against. b3deploy pins `chart@version` next to `image@sha256:`.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'deploy/charts/**'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    paths:
+      - 'deploy/charts/**'
+      - '.github/workflows/helm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: helm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHART_DIR: deploy/charts/b3-matching
+  CHART_NAME: b3-matching
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint
+        run: helm lint "$CHART_DIR"
+
+      # Render with defaults and with an override set so both the digest-pinned
+      # and the tag path (plus the toggles) stay green.
+      - name: helm template (defaults)
+        run: helm template ci "$CHART_DIR" > /tmp/default.yaml
+
+      - name: helm template (overrides)
+        run: |
+          helm template ci "$CHART_DIR" \
+            --set marketData.host=md.b3-prod.svc.cluster.local \
+            --set image.digest="" --set image.tag=9.9.9 \
+            --set colocation.enabled=false \
+            --set persistence.enabled=false \
+            --set networkPolicy.enabled=false > /tmp/override.yaml
+
+      - name: Validate rendered manifests (kubeconform)
+        run: |
+          KUBECONFORM_VERSION=v0.8.0
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp kubeconform
+          /tmp/kubeconform -strict -summary -ignore-missing-schemas /tmp/default.yaml /tmp/override.yaml
+
+  publish:
+    name: Package & push (OCI)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Read chart version
+        id: chart
+        run: |
+          version="$(helm show chart "$CHART_DIR" | awk '/^version:/ {print $2}')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $version"
+
+      - name: Log in to GHCR (Helm OCI)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Gate on a version bump: if the version is already in the registry, skip.
+      - name: Check if version already published
+        id: exists
+        run: |
+          owner="${{ github.repository_owner }}"
+          if helm show chart "oci://ghcr.io/${owner}/charts/${CHART_NAME}" \
+               --version "${{ steps.chart.outputs.version }}" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Chart ${CHART_NAME} ${{ steps.chart.outputs.version }} already published — skipping push."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: helm package
+        if: steps.exists.outputs.published == 'false'
+        run: helm package "$CHART_DIR" --destination /tmp/pkg
+
+      - name: helm push (OCI)
+        if: steps.exists.outputs.published == 'false'
+        run: |
+          owner="${{ github.repository_owner }}"
+          helm push \
+            "/tmp/pkg/${CHART_NAME}-${{ steps.chart.outputs.version }}.tgz" \
+            "oci://ghcr.io/${owner}/charts"

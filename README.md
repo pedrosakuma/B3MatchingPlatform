@@ -103,6 +103,19 @@ docker pull ghcr.io/pedrosakuma/b3-matching-synthtrader:latest
 
 Tags available: `:latest`, `:sha-<short>`, `:<branch>`, `:vX.Y.Z`, `:X.Y`.
 
+### Kubernetes (Helm chart, OCI)
+
+A Layer-1 Helm chart ships alongside the image for AKS/Kubernetes deploys:
+
+```bash
+helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching --version <version>
+```
+
+Chart source is [`deploy/charts/b3-matching`](deploy/charts/b3-matching); see
+[`docs/HELM-CHART.md`](docs/HELM-CHART.md) for the versioning contract and
+publish flow. `b3deploy` consumes it as `chart@version` + per-env values.
+
+
 ### Bridge-network mode (issue #88, preview)
 
 The default mode publishes UMDF over UDP **multicast** and so requires

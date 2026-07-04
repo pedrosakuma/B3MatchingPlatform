@@ -1,0 +1,29 @@
+apiVersion: v2
+name: b3-matching
+description: >-
+  The B3 exchange-core matching platform (FIXP EntryPoint venue + UMDF unicast
+  emitter). Layer-1 component chart, published as an OCI artifact next to the
+  ghcr.io/pedrosakuma/b3-matching image and consumed by b3deploy as
+  chart@version + per-env values.
+type: application
+
+# Chart version follows SemVer and is released in lockstep with the image
+# (see docs/HELM-CHART.md § Versioning contract). appVersion tracks the
+# b3-matching image version this chart was validated against.
+version: 0.1.0
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.27.0-0"
+
+home: https://github.com/pedrosakuma/B3MatchingPlatform
+sources:
+  - https://github.com/pedrosakuma/B3MatchingPlatform
+keywords:
+  - b3
+  - exchange
+  - matching-engine
+  - fixp
+  - umdf
+maintainers:
+  - name: pedrosakuma
+    url: https://github.com/pedrosakuma

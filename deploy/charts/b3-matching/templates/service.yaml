@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "b3-matching.labels" . | nindent 4 }}
+spec:
+  # Headless: governs the StatefulSet and lets trading-host resolve
+  # {{ .Values.service.name }}:{{ .Values.service.fixpPort }} straight to the
+  # pod IP (no LB in the FIXP path).
+  clusterIP: None
+  selector:
+    {{- include "b3-matching.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: fixp
+      port: {{ .Values.service.fixpPort }}
+      protocol: TCP
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      protocol: TCP

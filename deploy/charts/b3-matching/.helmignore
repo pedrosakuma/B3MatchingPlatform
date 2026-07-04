@@ -1,0 +1,10 @@
+# Patterns to ignore when building the chart package.
+.git/
+.gitignore
+*.tmp
+*.bak
+*.orig
+.DS_Store
+# CI / dev artifacts
+ci/
+*.tgz

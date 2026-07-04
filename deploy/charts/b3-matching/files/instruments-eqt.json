@@ -1,0 +1,26 @@
+[
+  // Pinned copy of upstream B3MatchingPlatform's config/instruments-eqt.json
+  // (https://github.com/pedrosakuma/B3MatchingPlatform/blob/main/config/instruments-eqt.json).
+  //
+  // Mounted into the matching-platform container next to
+  // exchange-simulator.bridge.json so the simulator can resolve symbol
+  // → securityId at startup. Ships under docker/real/ for the same
+  // reason as the bridge config: pin at our PR boundary; an upstream
+  // schema change becomes a CI failure on the next PR.
+  //
+  // The trading-host overlay (docker-compose.real.yml) does NOT need to
+  // know these securityIds — conformance specs that submit to /orders or
+  // /algo either get rejected by the risk pipeline before reaching the
+  // gateway (RiskRejectionShape) or skip when the simulator endpoint is
+  // absent (Algo, Simulator). v2 follow-ups that submit through-and-back
+  // would map Trading__SymbolDirectory__SecurityIds__* to these ids.
+  { "symbol": "PETR4", "securityId": 900000000001, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRPETRACNPR6", "securityType": "CS" },
+  { "symbol": "VALE3", "securityId": 900000000002, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRVALEACNOR0", "securityType": "CS" },
+  { "symbol": "ITUB4", "securityId": 900000000003, "tickSize": "0.01",
+    "lotSize": 100, "minPx": "0.01", "maxPx": "999999.99",
+    "currency": "BRL", "isin": "BRITUBACNPR1", "securityType": "CS" }
+]

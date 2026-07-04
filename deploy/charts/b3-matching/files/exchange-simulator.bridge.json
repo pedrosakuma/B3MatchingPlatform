@@ -1,0 +1,120 @@
+{
+  // Layer-1 Helm chart default for b3-matching, ported verbatim from the
+  // validated-on-AKS manifest b3deploy@3b4c1d9 (envs/prod/config/). The three
+  // UMDF unicast host values are templated to {{ .Values.marketData.host }} and
+  // rendered by the ConfigMap via `tpl`; everything else is unchanged. Override
+  // wholesale with .Values.config.bridgeJson if an env needs a different shape.
+  //
+  // Bridge-network friendly variant of upstream's exchange-simulator.json,
+  // pinned to the shape B3TradingPlatform's family compose exercises.
+  // Ships under docker/real/ and is mounted into the matching-platform
+  // service by docker-compose.real.yml.
+  //
+  // Why we commit our own copy instead of mounting the upstream config:
+  // pinning at our PR boundary keeps an upstream config refactor from
+  // silently changing what our CI exercises. When upstream changes shape
+  // and ":latest" stops parsing this file, the next CI run fails — which
+  // is exactly the signal we want.
+  //
+  // Differences from upstream config/exchange-simulator.bridge.json
+  // (https://github.com/pedrosakuma/B3MatchingPlatform):
+  //
+  // 1. UMDF unicast targets point at "marketdata" (the docker compose
+  //    service alias on b3-net). Resolved at startup by
+  //    B3.Exchange.Core.UnicastUdpPacketSink via DNS. The matching ports
+  //    here MUST match docker/real/marketdata-transport.json EQT group
+  //    verbatim (incremental 30084, instrument-def 31084, snapshot 30184).
+  //    Closes RFC integration-real-stack-v0 §4.4 R1.b after upstream
+  //    B3MarketDataPlatform#10 (PR #11) shipped the unicast transport.
+  //
+  // 2. firms[0] / sessions[0] pinned to FIRM01 / 10101 / dev-key-1 so
+  //    docker-compose.real.yml's trading-host overlay can hard-code
+  //    Trading__Exchange__Firms__0__SessionId/AccessKey to match.
+  "tcp": {
+    "listen": "0.0.0.0:9876",
+    "enteringFirm": 1,
+    "heartbeatIntervalMs": 30000,
+    "idleTimeoutMs": 30000,
+    "testRequestGraceMs": 5000
+  },
+  "auth": {
+    "devMode": true
+  },
+  "firms": [
+    { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 },
+    // Q4.2 (#302). FIRM02 / FIRM03 added so the compose default can wire
+    // three independent firm gateways out of trading-host and prove the
+    // multi-firm isolation surface end-to-end (no order/position/PnL/WAL
+    // leakage across the firm boundary). Distinct enteringFirmCodes so
+    // each appears under its own clearing identity on outbound orders.
+    { "id": "FIRM02", "name": "Beta Corretora", "enteringFirmCode": 200 },
+    { "id": "FIRM03", "name": "Gamma Corretora", "enteringFirmCode": 300 }
+  ],
+  "sessions": [
+    { "sessionId": "10101", "firmId": "FIRM01", "accessKey": "dev-key-1" },
+    // Reserved for the external simulator bot (issue #134). Lets the
+    // bot connect to matching-platform on its own FIXP session without
+    // colliding with trading-host's 10101.
+    { "sessionId": "10102", "firmId": "FIRM01", "accessKey": "dev-key-2" },
+    // Q4.2 (#302). One trading-host FIXP session per additional firm.
+    // SessionIds are picked from the 1010x range so they stay grouped
+    // with FIRM01's sessions in matching's session table.
+    { "sessionId": "10103", "firmId": "FIRM02", "accessKey": "dev-key-3" },
+    { "sessionId": "10104", "firmId": "FIRM03", "accessKey": "dev-key-4" }
+  ],
+  "http": {
+    "listen": "0.0.0.0:8080",
+    "livenessStaleMs": 5000
+  },
+  "channels": [
+    {
+      "channelNumber": 84,
+      // transport=unicast: each "*.group" below is the docker compose
+      // service alias of the marketdata consumer on b3-net. matching's
+      // B3.Exchange.Core.UnicastUdpPacketSink resolves the alias via DNS
+      // at startup, so it MUST match the service name in
+      // docker-compose.real.yml (`marketdata`).
+      "transport": "unicast",
+      "incrementalGroup": "{{ .Values.marketData.host }}",
+      "incrementalPort": 30084,
+      "selfTradePrevention": "none",
+      "instruments": "config/instruments-eqt.json",
+      "snapshot": {
+        "group": "{{ .Values.marketData.host }}",
+        "port": 30184,
+        "cadenceMs": 1000,
+        "maxEntriesPerChunk": 30
+      },
+      "instrumentDefinition": {
+        "channelNumber": 184,
+        "group": "{{ .Values.marketData.host }}",
+        "port": 31084,
+        "cadenceMs": 5000
+      },
+      // Persistence (upstream PRs #261/#269/#262/#274 etc, closes part of
+      // pedrosakuma/B3MatchingPlatform#260). dataDir is mounted from the
+      // named volume `b3-matching-data` in docker-compose.real.yml so
+      // restarts preserve the order book + per-channel WAL.
+      //
+      // IMPORTANT — what is NOT preserved (pedrosakuma/B3MatchingPlatform#405):
+      // FIXP session state (SessionId, SessionVerId, inbound/outbound seq
+      // numbers, SessionClaimRegistry, CoD timers) lives in process memory
+      // only. A graceful `docker compose restart matching-platform` will
+      // force every connected client to fully re-Negotiate with a fresh
+      // SessionVerId — even though the book itself is intact. The host
+      // compensates via ReconcileFirmSessionVerIds (#420) which stales
+      // surviving working orders so the UI never silently lies about
+      // venue state, but the proper fix is server-side persistence.
+      //
+      // WAL closes the RPO gap between snapshots; fsyncPerWrite trades
+      // throughput for at-most-one-cmd loss on unclean shutdown.
+      "persistence": {
+        "dataDir": "/var/lib/b3matching",
+        "wal": {
+          "enabled": true,
+          "fsyncPerWrite": true
+        }
+      }
+    }
+  ]
+}
