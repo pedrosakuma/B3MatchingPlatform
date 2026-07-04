@@ -1,0 +1,116 @@
+# Default values for the b3-matching Layer-1 chart.
+#
+# These are the "component defaults" validated on AKS (b3deploy@3b4c1d9 →
+# envs/prod/matching.yaml). b3deploy overrides the env-specific surface
+# (image digest, resources, storage class, marketdata host, colocation) per
+# environment; everything here is a safe standalone default.
+
+# -- Container image. b3deploy pins `digest` (@sha256:) per env; when `digest`
+#    is set it wins over `tag`. `tag` falls back to the chart appVersion.
+image:
+  repository: ghcr.io/pedrosakuma/b3-matching
+  # Validated-on-AKS digest (b3deploy@3b4c1d9). Leave empty to use `tag`.
+  digest: "sha256:d7dc4e9390a7334bcfc9030ecf98b39aabb3844afed0698a93383c95c2a661d7"
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Active-passive disk-reattach only. NEVER set >1: two writers would
+#    double-write the single-writer WAL under /var/lib/b3matching.
+replicas: 1
+
+# -- Config file the ExchangeHost boots from (mounted from the ConfigMap).
+configFileName: exchange-simulator.bridge.json
+
+# -- Unicast UMDF target. matching resolves this DNS name at startup and
+#    ABORTS if it misses; it emits unicast UDP here (no multicast, no LB in
+#    the UDP path). Injected into the bridge config's channel groups.
+marketData:
+  host: marketdata
+  # UDP ports matching emits to this host. Must match the channel ports in
+  # the bridge config; used to render the matching->marketdata egress
+  # NetworkPolicy. Defaults match the shipped EQT channel (incremental 30084,
+  # snapshot 30184, instrument-definition 31084).
+  udpPorts:
+    - 30084
+    - 30184
+    - 31084
+
+# -- Co-location affinity to marketdata (RFC: matching<->marketdata same
+#    node/AZ, UDP never crosses a LB). Load-bearing once the pool scales.
+colocation:
+  enabled: true
+  # podAffinity requiredDuringScheduling target on
+  # topologyKey: kubernetes.io/hostname.
+  matchTargetLabels:
+    app.kubernetes.io/name: marketdata
+
+# -- Persistent volume for the per-channel WAL + snapshots (RWO, single-writer).
+persistence:
+  enabled: true
+  storageClassName: managed-csi-premium
+  size: 4Gi
+  accessModes:
+    - ReadWriteOnce
+  mountPath: /var/lib/b3matching
+
+# -- Pod resources. Kept a value: the lean single 2-vCPU ARM node only fits the
+#    whole family with trimmed requests — do not hard-code fat requests.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+service:
+  # Headless so trading-host resolves matching straight to the pod IP
+  # (no LB in the FIXP path) and to govern the StatefulSet.
+  name: matching-platform
+  fixpPort: 9876
+  httpPort: 8080
+
+# -- NetworkPolicy for the legitimate hops this Layer-1 component owns:
+#    ingress trading-host -> matching:9876 (metrics 8080 stays cluster-internal,
+#    it is simply not admitted) and egress matching -> marketData UDP.
+networkPolicy:
+  enabled: true
+  # Pod selector of the allowed FIXP client (trading-host).
+  fixpClientSelector:
+    app.kubernetes.io/name: trading-host
+  # Pod selector of the marketdata consumer for the UDP egress allow.
+  marketDataSelector:
+    app.kubernetes.io/name: marketdata
+
+# -- Probes hit /metrics, which only binds after the channel dispatcher + FIXP
+#    listener are up (ExchangeHost startup order).
+readinessProbe:
+  httpGet:
+    path: /metrics
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 12
+livenessProbe:
+  httpGet:
+    path: /metrics
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 15
+
+# -- Extra labels applied to every rendered object.
+commonLabels: {}
+
+nodeSelector: {}
+tolerations: []
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+# -- Escape hatch: full override of the bridge config / instruments JSON.
+#    When set, the string wins over the shipped Layer-1 default file (the
+#    marketData.host templating still applies via `tpl` for bridgeJson).
+config:
+  bridgeJson: ""
+  instrumentsJson: ""

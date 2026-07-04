@@ -1,0 +1,63 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicy for the legitimate hops this Layer-1 component owns:
+#
+#   trading-host ──9876(FIXP)──► matching ──UDP(30084/30184/31084)──► marketdata
+#
+# Metrics (8080) is deliberately NOT admitted, so it stays cluster-internal.
+# Egress is restricted to the marketdata UDP feed + DNS — the latter is
+# load-bearing: matching resolves marketData.host at startup and ABORTS if it
+# misses, so kube-dns must stay reachable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "b3-matching.fullname" . }}-ingress
+  labels:
+    {{- include "b3-matching.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "b3-matching.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # admit only trading-host FIXP (9876); /metrics (8080) stays internal.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.fixpClientSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.fixpPort }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "b3-matching.fullname" . }}-egress
+  labels:
+    {{- include "b3-matching.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "b3-matching.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # UMDF unicast UDP to marketdata.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.marketDataSelector | nindent 14 }}
+      ports:
+        {{- range .Values.marketData.udpPorts }}
+        - protocol: UDP
+          port: {{ . }}
+        {{- end }}
+    # DNS — load-bearing: startup name resolution of marketData.host.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}

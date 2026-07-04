@@ -1,0 +1,17 @@
+b3-matching (chart {{ .Chart.Version }}, appVersion {{ .Chart.AppVersion }}) is installed as release "{{ .Release.Name }}".
+
+Image:            {{ include "b3-matching.image" . }}
+Replicas:         {{ .Values.replicas }}  {{ if gt (int .Values.replicas) 1 }}⚠️  >1 will double-write the single-writer WAL — set replicas: 1{{ end }}
+Headless service: {{ .Values.service.name }}  (FIXP {{ .Values.service.fixpPort }}/TCP, metrics {{ .Values.service.httpPort }}/TCP)
+Marketdata host:  {{ .Values.marketData.host }}  (unicast UDP {{ .Values.marketData.udpPorts | join ", " }})
+Persistence:      {{ if .Values.persistence.enabled }}{{ .Values.persistence.size }} on {{ .Values.persistence.storageClassName | default "(default StorageClass)" }} at {{ .Values.persistence.mountPath }}{{ else }}DISABLED (emptyDir — WAL is not durable!){{ end }}
+
+Trading-host reaches matching at:
+    {{ .Values.service.name }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.fixpPort }}
+
+Load-bearing invariants (see docs/HELM-CHART.md):
+  * matching resolves "{{ .Values.marketData.host }}" at startup and ABORTS if it misses.
+  * Keep replicas at 1 (active-passive disk-reattach; never active-active).
+{{- if not .Values.colocation.enabled }}
+  * colocation.enabled is false — matching may schedule off-node from marketdata; the UDP feed could cross a node boundary.
+{{- end }}
