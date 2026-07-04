@@ -36,10 +36,18 @@ public sealed class TcpTransport : IAsyncDisposable
     private long _lastOutboundTickMs;
     private Task? _sendTask;
     /// <summary>
-    /// Issue #487: tracks frames that have been dequeued but not yet fully
-    /// written to the socket. WaitForSendQueueDrainAsync must wait for both
-    /// SendQueueDepth == 0 AND this counter == 0 to guarantee all frames
-    /// have reached the wire.
+    /// Issue #487: tracks frames that have been accepted into the send
+    /// queue but not yet fully written to (or dropped from) the socket.
+    /// Incremented by the producer (<see cref="TryEnqueueFrame(byte[], DurabilityHandle)"/>)
+    /// the instant a frame is admitted — before it becomes visible in the
+    /// bounded channel — and decremented by the single consumer once the
+    /// frame has been written, errored, or released. Counting from the
+    /// producer side (rather than after the send loop dequeues) closes the
+    /// race window between the channel dequeue and the consumer's
+    /// bookkeeping: without it a frame could be invisible to
+    /// <see cref="WaitForSendQueueDrainAsync"/> (out of the queue but not
+    /// yet counted in-flight) and be dropped by a concurrent
+    /// <see cref="Close"/> before reaching the wire.
     /// </summary>
     private int _inFlightFrames;
 
@@ -95,9 +103,12 @@ public sealed class TcpTransport : IAsyncDisposable
     {
         if (!IsOpen) return false;
         var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
-        // Must wait for both: queued frames AND in-flight frame (dequeued but
-        // not yet written). The send loop increments _inFlightFrames before
-        // dequeue and decrements after WriteAsync completes.
+        // Must wait for both: queued frames AND in-flight frames (admitted to
+        // the queue but not yet written). _inFlightFrames is incremented by the
+        // producer before the frame becomes visible in the channel and
+        // decremented by the consumer after WriteAsync completes / the frame is
+        // released, so there is no window where an outstanding frame is
+        // invisible to this check.
         while (SendQueueDepth > 0 || Volatile.Read(ref _inFlightFrames) > 0)
         {
             if (!IsOpen) return false;
@@ -153,7 +164,12 @@ public sealed class TcpTransport : IAsyncDisposable
     public bool TryEnqueueFrame(byte[] frame, DurabilityHandle durability = default)
     {
         if (!IsOpen) return false;
+        // Count the frame as in-flight BEFORE it becomes visible in the queue
+        // so a concurrent drain never observes it as fully drained while it is
+        // still pending (see _inFlightFrames docs / issue #487).
+        Interlocked.Increment(ref _inFlightFrames);
         if (_sendQueue.Writer.TryWrite(new OutboundFrame(frame, null, durability))) return true;
+        Interlocked.Decrement(ref _inFlightFrames);
         try { _onSendQueueFull?.Invoke(); } catch { }
         Close("send-queue-full");
         return false;
@@ -164,7 +180,9 @@ public sealed class TcpTransport : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(frame);
         if (!IsOpen) return false;
         frame.AddRef();
+        Interlocked.Increment(ref _inFlightFrames);
         if (_sendQueue.Writer.TryWrite(new OutboundFrame(null, frame, durability))) return true;
+        Interlocked.Decrement(ref _inFlightFrames);
         frame.Release();
         try { _onSendQueueFull?.Invoke(); } catch { }
         Close("send-queue-full");
@@ -199,9 +217,9 @@ public sealed class TcpTransport : IAsyncDisposable
         {
             await foreach (var frame in _sendQueue.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                // Issue #487: track in-flight frame for drain synchronization.
-                // Increment immediately after dequeue, decrement after write.
-                Interlocked.Increment(ref _inFlightFrames);
+                // Issue #487: _inFlightFrames was incremented by the producer
+                // when this frame was admitted to the queue; decrement it once
+                // the frame has been written or released (finally below).
                 try
                 {
                     try
@@ -257,6 +275,9 @@ public sealed class TcpTransport : IAsyncDisposable
     {
         while (_sendQueue.Reader.TryRead(out var frame))
         {
+            // Frames still queued at close were counted in-flight by the
+            // producer but never written; balance the counter as we drop them.
+            Interlocked.Decrement(ref _inFlightFrames);
             frame.Release();
         }
     }
