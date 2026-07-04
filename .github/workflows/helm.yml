@@ -66,11 +66,13 @@ jobs:
             --set persistence.enabled=false \
             --set networkPolicy.enabled=false > /tmp/override.yaml
 
-      - name: Validate rendered manifests
-        uses: yannh/kubeconform-action@v1
-        with:
-          args: -strict -summary -ignore-missing-schemas
-          files: /tmp/default.yaml
+      - name: Validate rendered manifests (kubeconform)
+        run: |
+          KUBECONFORM_VERSION=v0.8.0
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp kubeconform
+          /tmp/kubeconform -strict -summary -ignore-missing-schemas /tmp/default.yaml /tmp/override.yaml
 
   publish:
     name: Package & push (OCI)
