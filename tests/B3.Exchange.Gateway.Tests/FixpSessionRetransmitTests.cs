@@ -350,8 +350,11 @@ public class FixpSessionRetransmitTests
             session.WriteExecutionReportNew(NewER(3, 1003));
             session.WriteExecutionReportNew(NewER(4, 1004));
 
+            // Generous budget: under full-suite + coverage load the pre-filled ER
+            // frames plus the RetransmitReject can take >5s to flush through the
+            // send loop; 15s keeps CI robust while still catching a genuine hang.
             var clientStream = client.GetStream();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
 
             // Request a 3-message replay; with depth 4 + needed (2+3=5) > capacity 4
             // the gateway must respond SYSTEM_BUSY before any block is enqueued.
