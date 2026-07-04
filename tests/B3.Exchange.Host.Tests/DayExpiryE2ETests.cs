@@ -19,6 +19,14 @@ public class DayExpiryE2ETests
 {
     private const long SecId = 900000000001L;
 
+    // Generous read budget for the wire round-trips: these E2E tests run in the
+    // full suite under coverage instrumentation, which adds enough overhead that
+    // a 5s budget is occasionally too tight (the frames DO arrive — the
+    // TcpTransport drain-race that could drop them was fixed in #548 — but under
+    // load the round-trip can exceed 5s). 15s keeps CI robust while still
+    // catching a genuine stall.
+    private static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(15);
+
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
         public List<byte[]> Packets { get; } = new();
@@ -88,14 +96,14 @@ public class DayExpiryE2ETests
             var newOrder = BuildNewOrderSingle(clOrdId: 13_001, secId: SecId,
                 side: '1', tif: '0', qty: 100, priceMantissa: 123_400, expireDate: 0);
             await stream.WriteAsync(newOrder);
-            var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var er1 = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
 
             host.TriggerDailyReset(reason: "test-day-expiry");
 
             // The resting Day BUY must come back as an ER_Cancel carrying the
             // terminal EXPIRED('C') OrdStatus.
-            var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var er2 = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, er2.TemplateId);
             Assert.Equal((byte)'1', er2.Body[18]);   // Side = Buy
             Assert.Equal((byte)'C', er2.Body[19]);   // OrdStatus = EXPIRED
@@ -145,12 +153,12 @@ public class DayExpiryE2ETests
             var newOrder = BuildNewOrderSingle(clOrdId: 13_101, secId: SecId,
                 side: '1', tif: '1', qty: 100, priceMantissa: 123_400, expireDate: 0);
             await stream.WriteAsync(newOrder);
-            var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var er1 = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
 
             host.TriggerDailyReset(reason: "test-day-keep-gtc");
 
-            var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var er2 = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportModify, er2.TemplateId);
             Assert.Equal((byte)'R', er2.Body[19]);   // OrdStatus = RESTATED
         }

@@ -18,6 +18,14 @@ public class GtRestatementE2ETests
 {
     private const long SecId = 900000000001L;
 
+    // Generous read budget for the wire round-trips: these E2E tests run in the
+    // full suite under coverage instrumentation, which adds enough overhead that
+    // a 5s budget is occasionally too tight (the frames DO arrive — the
+    // TcpTransport drain-race that could drop them was fixed in #548 — but under
+    // load the round-trip can exceed 5s). 15s keeps CI robust while still
+    // catching a genuine stall.
+    private static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(15);
+
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
         public List<byte[]> Packets { get; } = new();
@@ -92,14 +100,14 @@ public class GtRestatementE2ETests
             var gtc = BuildNewOrderSingle(clOrdId: 13_001, secId: SecId, side: '1',
                 qty: 100, priceMantissa: 123_400, tif: '1', expireDate: 0);
             await stream.WriteAsync(gtc);
-            var erGtcNew = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var erGtcNew = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, erGtcNew.TemplateId);
 
             // Resting future-dated GTD order at a non-crossing price.
             var gtd = BuildNewOrderSingle(clOrdId: 13_002, secId: SecId, side: '1',
                 qty: 200, priceMantissa: 123_300, tif: '6', expireDate: futureExpire);
             await stream.WriteAsync(gtd);
-            var erGtdNew = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            var erGtdNew = await ReadFrameAsync(stream, ReadTimeout);
             Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, erGtdNew.TemplateId);
 
             host.TriggerDailyReset(reason: "test-gt-restatement");
@@ -107,7 +115,7 @@ public class GtRestatementE2ETests
             // Both surviving orders must come back as restatement ER_Modify frames.
             var restates = new List<ReadFrame>();
             for (int i = 0; i < 2; i++)
-                restates.Add(await ReadFrameAsync(stream, TimeSpan.FromSeconds(5)));
+                restates.Add(await ReadFrameAsync(stream, ReadTimeout));
 
             foreach (var r in restates)
             {
