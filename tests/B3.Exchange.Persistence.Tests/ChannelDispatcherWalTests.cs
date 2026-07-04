@@ -268,8 +268,18 @@ public class ChannelDispatcherWalTests
             metrics: metricsB, throttle: throttle);
         // Drive RunLoopAsync's initial LoadPersistedStateOnLoopThread by
         // starting the dispatcher and waiting for the replayed registry state.
+        //
+        // Wait on the *terminal* replay signal (WalReplays metric), not just
+        // the registry count: ReplayWalOnLoopThread applies each record via
+        // ProcessOne (which populates the registry) and only increments
+        // AddWalReplays once, after the replay loop completes. Keying the
+        // wait off OrderRegistryCount>=3 alone (an intermediate effect) let
+        // the test observe WalReplays==0 and flake on the assert below under
+        // load (#543 follow-up). WalReplays>=1 implies every replayed record's
+        // ProcessOne already ran, so the registry is fully populated too.
         dispB.Start();
-        Assert.True(await WaitForAsync(() => dispB.OrderRegistryCount >= 3,
+        Assert.True(await WaitForAsync(
+            () => metricsB.WalReplays >= 1 && dispB.OrderRegistryCount >= 3,
             ReadyTimeout), "dispatcher did not replay WAL tail before timeout");
 
         Assert.Equal(3, dispB.OrderRegistryCount);
