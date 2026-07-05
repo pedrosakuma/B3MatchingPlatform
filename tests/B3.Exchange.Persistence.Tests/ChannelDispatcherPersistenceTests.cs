@@ -759,9 +759,16 @@ public class ChannelDispatcherPersistenceTests
         Assert.True(EnqueueOrder(disp, session, "CL-3", 0xB2, 6002UL));
         probe.DrainInbound();
 
-        // Writer thread should be blocked inside Save with the first
-        // submitted snapshot, while the next two were coalesced.
-        Assert.True(await WaitForAsync(() => metrics.SnapshotDroppedByBackpressure >= 2,
+        // At least one submit must have been coalesced. Three snapshots are
+        // submitted synchronously by DrainInbound; the writer thread blocks
+        // inside the first Save it dequeues (BlockingPersister), so it can
+        // remove at most one snapshot from the single-slot mailbox during the
+        // burst. With 3 submits and <=1 removal the backpressure drop count is
+        // deterministically 1 or 2 (never 0) — assert >= 1. (Asserting >= 2 was
+        // racy: whenever the writer dequeued the first snapshot before the third
+        // submit landed the count froze at 1, and no wait budget could recover
+        // it because the writer stays blocked in Save.)
+        Assert.True(await WaitForAsync(() => metrics.SnapshotDroppedByBackpressure >= 1,
             TimeSpan.FromSeconds(2)));
         Assert.Equal(0, blocking.SaveCount); // still blocked
 
