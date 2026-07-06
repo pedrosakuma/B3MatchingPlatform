@@ -294,7 +294,7 @@ public sealed class ExchangeHost : IAsyncDisposable
             {
                 sink = WrapResilient(
                     BuildUdpSink(ch.Transport, ch.IncrementalGroup, ch.IncrementalPort,
-                        ch.LocalInterface, ch.Ttl),
+                        ch.LocalInterface, ch.Ttl, ch.UnicastDnsReResolveIntervalMs),
                     channelMetrics);
             }
             if (sink is IDisposable d) _ownedSinks.Add(d);
@@ -484,7 +484,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 {
                     snapSink = WrapResilientCounting(
                         BuildUdpSink(ch.Transport, snap.Group, snap.Port,
-                            ch.LocalInterface, snap.Ttl ?? ch.Ttl),
+                            ch.LocalInterface, snap.Ttl ?? ch.Ttl, ch.UnicastDnsReResolveIntervalMs),
                         channelMetrics, UmdfFeedKind.Snapshot);
                 }
                 if (snapSink is IDisposable sd) _ownedSinks.Add(sd);
@@ -538,7 +538,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                 {
                     var localIface = idCfg.LocalInterface ?? ch.LocalInterface;
                     idSink = WrapResilientCounting(
-                        BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl),
+                        BuildUdpSink(ch.Transport, idCfg.Group, idCfg.Port, localIface, idCfg.Ttl, ch.UnicastDnsReResolveIntervalMs),
                         channelMetrics, UmdfFeedKind.InstrumentDef);
                 }
                 if (idSink is IDisposable idd) _ownedSinks.Add(idd);
@@ -826,19 +826,21 @@ public sealed class ExchangeHost : IAsyncDisposable
         => new CountingUdpPacketSinkDecorator(WrapResilient(inner, metrics), metrics, feed);
 
     private IUmdfPacketSink BuildUdpSink(UmdfTransport transport, string host, int port,
-        string? localInterface, byte ttl)
+        string? localInterface, byte ttl, int unicastDnsReResolveIntervalMs = 15_000)
     {
         if (transport == UmdfTransport.Unicast)
         {
             // Unicast mode is bridge-network friendly: `host` is treated as
-            // a DNS name (or IP literal) and resolved on construction. The
+            // a DNS name (or IP literal) and re-resolved periodically (issue
+            // #554) so downstream pod restarts don't blackhole the feed. The
             // multicast-only options (TTL, local interface) are ignored —
             // log a warning if the operator set them so they don't expect
             // multicast routing semantics.
             if (localInterface is not null)
                 _logger.LogWarning("transport=unicast: ignoring localInterface='{Iface}' (multicast-only)", localInterface);
             return new UnicastUdpPacketSink(host, port,
-                _loggerFactory.CreateLogger<UnicastUdpPacketSink>());
+                _loggerFactory.CreateLogger<UnicastUdpPacketSink>(),
+                TimeSpan.FromMilliseconds(unicastDnsReResolveIntervalMs));
         }
         var local = localInterface != null ? IPAddress.Parse(localInterface) : null;
         return new MulticastUdpPacketSink(IPAddress.Parse(host), port,

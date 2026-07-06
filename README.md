@@ -131,6 +131,12 @@ docker compose -f docker-compose.bridge.yml up
 This mode is **PREVIEW** until the consumer side ships in
 [B3MarketDataPlatform#2](https://github.com/pedrosakuma/B3MarketDataPlatform/issues/2).
 
+Unicast destinations are DNS names resolved on startup and re-resolved in the
+background every `unicastDnsReResolveIntervalMs` (default 15s, per channel)
+so a downstream pod restart (new IP behind the same name) doesn't silently
+blackhole the feed; set it to `0` to restore the old resolve-once behaviour
+(issue #554).
+
 The host needs network access for both the multicast publish socket and the
 EntryPoint TCP listener (default port 9876).
 
