@@ -32,7 +32,9 @@ public sealed class UnicastUdpPacketSink : IUmdfPacketSink, IDisposable
     private readonly ILogger<UnicastUdpPacketSink> _logger;
     private readonly string _originalHost;
     private readonly int _port;
+    private readonly TimeSpan _reResolveInterval;
     private readonly Timer? _reResolveTimer;
+    private volatile bool _disposed;
 
     // Reference-type field: assignment is atomic, so Publish (dispatch
     // thread) reading it concurrently with the timer callback swapping it
@@ -60,6 +62,7 @@ public sealed class UnicastUdpPacketSink : IUmdfPacketSink, IDisposable
         _logger = logger;
         _originalHost = host;
         _port = port;
+        _reResolveInterval = reResolveInterval;
         // Picking the first AddressFamily.InterNetwork record keeps
         // behaviour aligned with MulticastUdpPacketSink, which is
         // hard-coded to IPv4.
@@ -75,43 +78,68 @@ public sealed class UnicastUdpPacketSink : IUmdfPacketSink, IDisposable
 
         if (reResolveInterval > TimeSpan.Zero)
         {
-            _reResolveTimer = new Timer(ReResolveCallback, null, reResolveInterval, reResolveInterval);
+            // Non-recurring: the callback reschedules itself (in `finally`)
+            // only after it finishes. A recurring `Timer(..., period, period)`
+            // can fire again before a slow DNS lookup returns, letting an
+            // older/stale resolution overwrite a newer one on `_destination`
+            // once both callbacks complete out of order.
+            _reResolveTimer = new Timer(ReResolveCallback, null, reResolveInterval, Timeout.InfiniteTimeSpan);
         }
     }
 
     private void ReResolveCallback(object? state)
     {
-        IPAddress freshAddress;
         try
         {
-            var addresses = Dns.GetHostAddresses(_originalHost, AddressFamily.InterNetwork);
-            if (addresses.Length == 0)
+            IPAddress freshAddress;
+            try
             {
-                _logger.LogWarning(
-                    "unicast UDP sink: re-resolve of '{Host}' returned no IPv4 addresses; keeping cached destination {Address}:{Port}",
+                var addresses = Dns.GetHostAddresses(_originalHost, AddressFamily.InterNetwork);
+                if (addresses.Length == 0)
+                {
+                    _logger.LogWarning(
+                        "unicast UDP sink: re-resolve of '{Host}' returned no IPv4 addresses; keeping cached destination {Address}:{Port}",
+                        _originalHost, _destination.Address, _port);
+                    return;
+                }
+                freshAddress = addresses[0];
+            }
+            catch (Exception ex)
+            {
+                // Best-effort background re-resolve: a transient DNS outage must
+                // not take down the sink or crash the timer thread. Keep sending
+                // to the last-known-good address and try again next tick.
+                _logger.LogWarning(ex,
+                    "unicast UDP sink: re-resolve of '{Host}' failed; keeping cached destination {Address}:{Port}",
                     _originalHost, _destination.Address, _port);
                 return;
             }
-            freshAddress = addresses[0];
-        }
-        catch (Exception ex)
-        {
-            // Best-effort background re-resolve: a transient DNS outage must
-            // not take down the sink or crash the timer thread. Keep sending
-            // to the last-known-good address and try again next tick.
-            _logger.LogWarning(ex,
-                "unicast UDP sink: re-resolve of '{Host}' failed; keeping cached destination {Address}:{Port}",
-                _originalHost, _destination.Address, _port);
-            return;
-        }
 
-        var cached = _destination;
-        if (!freshAddress.Equals(cached.Address))
+            var cached = _destination;
+            if (!freshAddress.Equals(cached.Address))
+            {
+                _logger.LogWarning(
+                    "unicast UDP sink: DNS drift detected for '{Host}' ({OldAddress} -> {NewAddress}); rebinding destination:{Port}",
+                    _originalHost, cached.Address, freshAddress, _port);
+                _destination = new IPEndPoint(freshAddress, _port);
+            }
+        }
+        finally
         {
-            _logger.LogWarning(
-                "unicast UDP sink: DNS drift detected for '{Host}' ({OldAddress} -> {NewAddress}); rebinding destination:{Port}",
-                _originalHost, cached.Address, freshAddress, _port);
-            _destination = new IPEndPoint(freshAddress, _port);
+            // Rearm only if we haven't been disposed concurrently — `Change`
+            // on a disposed Timer throws ObjectDisposedException, which would
+            // otherwise escape on the thread-pool thread.
+            if (!_disposed)
+            {
+                try
+                {
+                    _reResolveTimer?.Change(_reResolveInterval, Timeout.InfiniteTimeSpan);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Race with Dispose() — nothing left to reschedule.
+                }
+            }
         }
     }
 
@@ -122,6 +150,7 @@ public sealed class UnicastUdpPacketSink : IUmdfPacketSink, IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         _reResolveTimer?.Dispose();
         _socket.Dispose();
     }
