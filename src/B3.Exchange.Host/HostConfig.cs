@@ -348,6 +348,17 @@ public sealed class ChannelConfig
     public UmdfTransport Transport { get; set; } = UmdfTransport.Multicast;
 
     /// <summary>
+    /// Issue #554 — for <c>transport=unicast</c> only, how often (in
+    /// milliseconds) the sink re-resolves its DNS name in the background and
+    /// rebinds the destination if the resolved address drifted (e.g. the
+    /// downstream pod restarted with a new IP). Defaults to <c>15000</c>
+    /// (15s). Set to <c>0</c> to restore the legacy resolve-once-at-startup
+    /// behaviour. Ignored for <c>transport=multicast</c>.
+    /// </summary>
+    [JsonPropertyName("unicastDnsReResolveIntervalMs")]
+    public int UnicastDnsReResolveIntervalMs { get; set; } = 15_000;
+
+    /// <summary>
     /// Self-trade prevention policy applied by this channel's matching engine.
     /// Defaults to <c>none</c> (preserves legacy behaviour). Accepted values
     /// (case-insensitive): <c>none</c>, <c>cancel-aggressor</c>,
