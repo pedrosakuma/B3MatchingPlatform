@@ -108,6 +108,21 @@ podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}
 
+# -- FIXP session-resync persistence (issue #405/#406, chart surface #556).
+#    Merged onto the default bridge config's `tcp` block (not a full-file
+#    replace) so an env can flip persistence on for one field. Empty
+#    `retransmitPersistenceDir` (the default) disables it — ephemeral FIXP
+#    state, matching HostConfig's own default. When enabling it on a chart
+#    consumer already mounting the `persistence.dataDir` volume, a sibling
+#    directory such as `/var/lib/b3matching/fixp-sessions` reuses the same
+#    PVC without a new volume.
+tcp:
+  retransmitPersistenceDir: ""
+  # -- Bytes. Default matches HostConfig.MaxJournalBytes (256 MiB).
+  maxJournalBytes: 268435456
+  # -- Hours. Default matches HostConfig.MaxJournalRetentionHours.
+  maxJournalRetentionHours: 24
+
 # -- Escape hatch: full override of the bridge config / instruments JSON.
 #    When set, the string wins over the shipped Layer-1 default file (the
 #    marketData.host templating still applies via `tpl` for bridgeJson).
