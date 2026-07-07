@@ -13,7 +13,7 @@ ghcr.io/pedrosakuma/b3-matching            (image, digest-pinned per env)
 
 ```bash
 helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace b3-prod --create-namespace \
   --set image.digest=sha256:... \
   --set marketData.host=marketdata
@@ -50,6 +50,9 @@ helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching \
 | `marketData.udpPorts` | `[30084, 30184, 31084]` | egress UDP ports (match the bridge config) |
 | `colocation.enabled` / `colocation.matchTargetLabels` | `true` / `{app.kubernetes.io/name: marketdata}` | podAffinity target |
 | `persistence.storageClassName` / `.size` | `managed-csi-premium` / `4Gi` | WAL volume (prefer ZRS where the SKU/region supports it) |
+| `tcp.retransmitPersistenceDir` | `""` (disabled) | FIXP session-resync journal/state dir (#405/#406). Merged onto the default `tcp` block — set to a sibling of `persistence.mountPath` (e.g. `/var/lib/b3matching/fixp-sessions`) to reuse the existing PVC. |
+| `tcp.maxJournalBytes` | `268435456` (256 MiB) | retransmit journal quota per session, matches `HostConfig` default |
+| `tcp.maxJournalRetentionHours` | `24` | retransmit journal max age, matches `HostConfig` default |
 | `resources` | `cpu 100m`, `mem 512Mi/1Gi` | keep trimmed for lean nodes |
 | `networkPolicy.enabled` | `true` | ingress/egress allows |
 | `config.bridgeJson` / `config.instrumentsJson` | `""` | full-override escape hatch |

@@ -35,7 +35,14 @@
     "enteringFirm": 1,
     "heartbeatIntervalMs": 30000,
     "idleTimeoutMs": 30000,
-    "testRequestGraceMs": 5000
+    "testRequestGraceMs": 5000,
+    // FIXP session-resync persistence (#405/#406), exposed as first-class
+    // values (chart issue #556) instead of requiring a full bridgeJson
+    // override. Empty retransmitPersistenceDir (the .Values.tcp default)
+    // disables it, matching HostConfig's own ephemeral-by-default behavior.
+    "retransmitPersistenceDir": {{ .Values.tcp.retransmitPersistenceDir | quote }},
+    "maxJournalBytes": {{ .Values.tcp.maxJournalBytes | int64 }},
+    "maxJournalRetentionHours": {{ .Values.tcp.maxJournalRetentionHours }}
   },
   "auth": {
     "devMode": true
