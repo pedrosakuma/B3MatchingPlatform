@@ -10,7 +10,15 @@ type: application
 # Chart version follows SemVer and is released in lockstep with the image
 # (see docs/HELM-CHART.md § Versioning contract). appVersion tracks the
 # b3-matching image version this chart was validated against.
-version: 0.2.0
+#
+# 0.3.0 (B3TradingPlatform#683 follow-up): networkPolicy.fixpClientSelector
+# (single matchLabels) renamed to networkPolicy.fixpClientSelectors (list of
+# matchLabels, OR'd `from` entries) so a second FIXP client — the
+# market-maker-bot's own session 10102, distinct from trading-host's FIRM01
+# session 10101 — can be admitted on fixpPort without opening it to
+# everything. Breaking values-key rename; bump any release's values before
+# upgrading.
+version: 0.3.0
 appVersion: "0.1.0"
 
 kubeVersion: ">=1.27.0-0"

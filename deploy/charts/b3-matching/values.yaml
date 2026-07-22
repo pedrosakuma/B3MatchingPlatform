@@ -72,13 +72,21 @@ service:
   httpPort: 8080
 
 # -- NetworkPolicy for the legitimate hops this Layer-1 component owns:
-#    ingress trading-host -> matching:9876 (metrics 8080 stays cluster-internal,
-#    it is simply not admitted) and egress matching -> marketData UDP.
+#    ingress {trading-host, market-maker-bot} -> matching:9876 (metrics 8080
+#    stays cluster-internal, it is simply not admitted) and egress
+#    matching -> marketData UDP.
 networkPolicy:
   enabled: true
-  # Pod selector of the allowed FIXP client (trading-host).
-  fixpClientSelector:
-    app.kubernetes.io/name: trading-host
+  # List of pod selectors for FIXP clients allowed to reach fixpPort. Each
+  # entry becomes its own `from` podSelector (OR'd, not merged into one
+  # matchLabels) — trading-host is the FIRM01 session owner; a second,
+  # independent FIXP session (e.g. market-maker-bot, session 10102) is a
+  # separate pod with its own app.kubernetes.io/name, so it needs its own
+  # list entry rather than sharing trading-host's label. Renamed from the
+  # singular `fixpClientSelector` (B3TradingPlatform#683 — the
+  # market-maker-bot overlay needed a second admitted FIXP client).
+  fixpClientSelectors:
+    - app.kubernetes.io/name: trading-host
   # Pod selector of the marketdata consumer for the UDP egress allow.
   marketDataSelector:
     app.kubernetes.io/name: marketdata
