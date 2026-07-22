@@ -1,7 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
 # NetworkPolicy for the legitimate hops this Layer-1 component owns:
 #
-#   trading-host ──9876(FIXP)──► matching ──UDP(30084/30184/31084)──► marketdata
+#   {trading-host, market-maker-bot} ──9876(FIXP)──► matching ──UDP(30084/30184/31084)──► marketdata
 #
 # Metrics (8080) is deliberately NOT admitted, so it stays cluster-internal.
 # Egress is restricted to the marketdata UDP feed + DNS — the latter is
@@ -20,11 +20,17 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # admit only trading-host FIXP (9876); /metrics (8080) stays internal.
+    # admit only the configured FIXP clients (9876); /metrics (8080) stays
+    # internal. Each fixpClientSelectors entry is its own `from` podSelector
+    # (OR'd) — every distinct FIXP session (trading-host's FIRM01 session,
+    # market-maker-bot's session 10102, ...) is a separate pod with its own
+    # app.kubernetes.io/name label, so a single matchLabels can't admit both.
     - from:
+        {{- range .Values.networkPolicy.fixpClientSelectors }}
         - podSelector:
             matchLabels:
-              {{- toYaml .Values.networkPolicy.fixpClientSelector | nindent 14 }}
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.service.fixpPort }}
