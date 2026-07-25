@@ -34,8 +34,9 @@ public class SnapshotPacketBuilderTests
         var buf = new byte[SnapshotPacketBuilder.DefaultPacketBufferSize];
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(buf,
-            channelNumber: 84, sequenceVersion: 0, firstSequenceNumber: 100,
+            channelNumber: 84, snapshotSequenceVersion: 0, firstSequenceNumber: 100,
             sendingTimeNanos: 1_700_000_000_000_000_000UL, securityId: 7L, lastRptSeq: null,
+            incrementalSequenceVersion: 7,
             bids: ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
             asks: ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
             onPacket: sink.OnPacket);
@@ -48,12 +49,13 @@ public class SnapshotPacketBuilderTests
         Assert.Equal(100u, hdr.SequenceNumber);
 
         // Snapshot header parses with all-zero counts and null lastRptSeq.
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             sink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var rdr));
         Assert.Equal(0u, rdr.Data.TotNumReports);
         Assert.Equal(0u, rdr.Data.TotNumBids);
         Assert.Equal(0u, rdr.Data.TotNumOffers);
         Assert.Null(rdr.Data.LastRptSeq);
+        Assert.Equal((ushort)7, rdr.Data.LastSequenceVersion);
     }
 
     [Fact]
@@ -65,19 +67,21 @@ public class SnapshotPacketBuilderTests
         var bids = new[] { Bid(100_0000L, 500L, 1), Bid(99_0000L, 200L, 2) };
         var asks = new[] { Ask(101_0000L, 300L, 3) };
 
-        int packets = SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 50, 1UL, 7L, lastRptSeq: 99u,
+        int packets = SnapshotPacketBuilder.WriteSnapshot(
+            buf, 84, 0, 50, 1UL, 7L, lastRptSeq: 99u, incrementalSequenceVersion: 8,
             bids, asks, sink.OnPacket);
 
         Assert.Equal(1, packets);
         var pkt = sink.Packets[0];
 
         // Header counts derived from input spans.
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
         Assert.Equal(3u, hdr.Data.TotNumReports);
         Assert.Equal(2u, hdr.Data.TotNumBids);
         Assert.Equal(1u, hdr.Data.TotNumOffers);
         Assert.Equal(99u, hdr.Data.LastRptSeq);
+        Assert.Equal((ushort)8, hdr.Data.LastSequenceVersion);
 
         // After the header frame, the same packet must contain the Orders_71 frame.
         int after = FrameOffset + WireOffsets.SnapHeaderBlockLength;
@@ -103,8 +107,8 @@ public class SnapshotPacketBuilderTests
         // 600 entries at maxEntriesPerChunk=255 → chunks of (255, 255, 90).
         // Each 255-entry chunk frame = 23 + 255*42 = 10733 bytes; the trailing
         // 90-entry chunk = 23 + 90*42 = 3803 bytes. Packet 1 (16 KB buffer)
-        // fits PacketHeader + Header_30 + ONE 255-entry chunk (16+44+10733 ≈
-        // 10793 bytes; second chunk would push to 21 KB and overflow). Packet
+        // fits PacketHeader + Header_30 + ONE 255-entry chunk (16+46+10733 ≈
+        // 10795 bytes; second chunk would push to 21 KB and overflow). Packet
         // 2 fits the second 255-entry chunk PLUS the 90-entry chunk
         // (16+10733+3803 = 14552 bytes). So we expect exactly 2 packets.
         var bids = new UmdfWireEncoder.SnapshotEntry[400];
@@ -114,6 +118,7 @@ public class SnapshotPacketBuilderTests
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0,
             firstSequenceNumber: 1000, sendingTimeNanos: 42UL, securityId: 7L, lastRptSeq: 12345u,
+            incrementalSequenceVersion: 11,
             bids, asks, sink.OnPacket);
 
         Assert.Equal(2, packets);
@@ -127,7 +132,7 @@ public class SnapshotPacketBuilderTests
             Assert.Equal(42UL, pkthdr.SendingTime);
         }
 
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             sink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
         Assert.Equal(600u, hdr.Data.TotNumReports);
         Assert.Equal(400u, hdr.Data.TotNumBids);
@@ -157,7 +162,7 @@ public class SnapshotPacketBuilderTests
     public void BufferTooSmallForSingleEntry_Throws()
     {
         var sink = new CapturingHandler();
-        // Buffer must fit packet 1 (PacketHeader 16 + Header_30 frame 44 = 60)
+        // Buffer must fit packet 1 (PacketHeader 16 + Header_30 frame 46 = 62)
         // but be too small to add a 1-entry Orders_71 frame (16 + 65 = 81).
         // Use 70 bytes so packet 1 carries header only and packet 2 has
         // PacketHeader (16) + 54 bytes free, less than the 65 bytes a single
@@ -166,7 +171,7 @@ public class SnapshotPacketBuilderTests
 
         var bids = new[] { Bid(1L, 1L, 1) };
         Assert.Throws<ArgumentException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, null,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, null, 1,
                 bids, ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket));
     }
 
@@ -181,7 +186,8 @@ public class SnapshotPacketBuilderTests
 
         // cap=3 → expect 4 chunks (3,3,3,1). They all fit in one 16 KB buffer
         // alongside the snapshot header → 1 packet.
-        int packets = SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, lastRptSeq: 1u,
+        int packets = SnapshotPacketBuilder.WriteSnapshot(
+            buf, 84, 0, 0, 0, 7L, lastRptSeq: 1u, incrementalSequenceVersion: 1,
             bids, ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket,
             maxEntriesPerChunk: 3);
 
@@ -214,12 +220,12 @@ public class SnapshotPacketBuilderTests
         var sink = new CapturingHandler();
         var buf = new byte[1024];
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null, 1,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 sink.OnPacket, maxEntriesPerChunk: 0));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null, 1,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 sink.OnPacket, maxEntriesPerChunk: 256));

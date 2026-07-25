@@ -28,7 +28,7 @@ public sealed partial class ChannelDispatcher
             // Snapshot ticks bypass the per-command incremental packet buffer
             // entirely — they have their own sink + sequence space owned by
             // the rotator and emit one or more complete packets directly.
-            _snapshotRotator?.PublishNext();
+            _snapshotRotator?.PublishNext(_sequenceVersion);
             return;
         }
 

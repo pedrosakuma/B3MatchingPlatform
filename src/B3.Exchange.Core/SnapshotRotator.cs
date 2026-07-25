@@ -94,14 +94,16 @@ public sealed class SnapshotRotator
     /// least 1, since even an empty book emits the header packet. Caller MUST
     /// invoke from the dispatcher thread so that
     /// <see cref="ISnapshotBookSource.EnumerateBook"/> observes a stable book.
+    /// <paramref name="incrementalSequenceVersion"/> must be captured from the
+    /// dispatcher in the same turn as the book and RptSeq watermark.
     /// </summary>
-    public int PublishNext()
+    public int PublishNext(ushort incrementalSequenceVersion)
     {
         var ids = _source.SecurityIds;
         if (ids.Count == 0) return 0;
         long securityId = ids[_rotationIndex % ids.Count];
         _rotationIndex = (_rotationIndex + 1) % ids.Count;
-        return PublishFor(securityId);
+        return PublishFor(securityId, incrementalSequenceVersion);
     }
 
     /// <summary>
@@ -109,7 +111,7 @@ public sealed class SnapshotRotator
     /// without advancing the rotation cursor. Useful for tests and for
     /// targeted re-publishes.
     /// </summary>
-    public int PublishFor(long securityId)
+    public int PublishFor(long securityId, ushort incrementalSequenceVersion)
     {
         // Materialise the book sides into lists. Snapshot ticks are
         // low-frequency (typically every few seconds per instrument) so a
@@ -142,11 +144,12 @@ public sealed class SnapshotRotator
         int packetsEmitted = SnapshotPacketBuilder.WriteSnapshot(
             buffer: _packetBuf,
             channelNumber: channel,
-            sequenceVersion: version,
+            snapshotSequenceVersion: version,
             firstSequenceNumber: firstSeq,
             sendingTimeNanos: nowNanos,
             securityId: securityId,
             lastRptSeq: lastRptSeq,
+            incrementalSequenceVersion: incrementalSequenceVersion,
             bids: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bidsList),
             asks: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(asksList),
             onPacket: pkt => sink.Publish(channel, pkt),
