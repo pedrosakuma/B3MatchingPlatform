@@ -643,9 +643,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
-    /// <c>OrderMassActionRequest</c>. The report is sent ahead of the
-    /// per-order <c>ExecutionReport_Cancel</c> messages that the engine
-    /// emits asynchronously for the matching resting orders.
+    /// <c>OrderMassActionRequest</c>.
     /// </summary>
     public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
         byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,

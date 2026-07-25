@@ -371,30 +371,39 @@ public sealed partial class FixpSession
                         fixedBlock, now, out var mcCmd, out var mcClOrd, out var mcMsg);
                     if (mcOutcome == InboundMessageDecoder.InboundDecodeOutcome.Success)
                     {
-                        // Spec §4.8 — under normal load we ack synchronously
-                        // with OrderMassActionReport(ACCEPTED) ahead of the
-                        // per-order ER_Cancel frames the engine emits later.
-                        // This ordering matters: the ACCEPTED ack travels
-                        // straight to the TCP stream from the gateway thread
-                        // while the ER_Cancel frames go through the
-                        // dispatcher's UMDF-packet path, so reversing it
-                        // would let cancels race ahead. We therefore keep
-                        // ACCEPTED-first and, if the enqueue then fails due
-                        // to backpressure (#153), follow up with a
-                        // BusinessMessageReject(SystemBusy) so the peer
-                        // knows the action will not be performed.
+                        // Issue #569: ACCEPTED is a terminal barrier. The
+                        // callback fires only after every resolved batch has
+                        // executed and every resulting ER_Cancel has been
+                        // offered to the ordered FIXP business stream.
                         byte? sideByte = mcCmd.SideFilter switch
                         {
                             Matching.Side.Buy => (byte)'1',
                             Matching.Side.Sell => (byte)'2',
                             _ => null,
                         };
-                        WriteOrderMassActionReport(mcClOrd,
-                            OrderMassActionReportEncoder.MassActionResponseAccepted,
-                            massActionRejectReason: null,
-                            side: sideByte, securityId: mcCmd.SecurityId,
-                            transactTimeNanos: now);
-                        if (!_sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm))
+                        uint refSeqNum = fixedBlock.Length >= 8
+                            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
+                            : 0u;
+                        if (!_sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm, outcome =>
+                        {
+                            if (outcome.Succeeded)
+                            {
+                                WriteOrderMassActionReport(mcClOrd,
+                                    OrderMassActionReportEncoder.MassActionResponseAccepted,
+                                    massActionRejectReason: null,
+                                    side: sideByte, securityId: mcCmd.SecurityId,
+                                    transactTimeNanos: now);
+                            }
+                            else
+                            {
+                                WriteSystemBusyReject(
+                                    EntryPointFrameReader.TidOrderMassActionRequest,
+                                    refSeqNum,
+                                    mcClOrd,
+                                    "MassCancel",
+                                    "System busy: mass cancel could not complete");
+                            }
+                        }))
                         {
                             WriteSystemBusyReject(
                                 templateId: EntryPointFrameReader.TidOrderMassActionRequest,

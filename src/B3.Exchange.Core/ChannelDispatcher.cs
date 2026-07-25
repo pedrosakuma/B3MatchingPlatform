@@ -269,6 +269,8 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _hasCurrentSession;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
+    private bool _currentMassCancelReportsEnqueued;
+    private bool _trackMassCancelReports;
     /// <summary>
     /// Ingress timestamp of the inbound command currently being dispatched
     /// (#GAP-11 / #49). Captured from the command's <c>EnteredAtNanos</c> at

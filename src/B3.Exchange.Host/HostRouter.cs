@@ -99,6 +99,17 @@ public sealed class HostRouter : IInboundCommandSink
     }
 
     public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm)
+        => EnqueueMassCancelCore(cmd, session, enteringFirm, completion: null);
+
+    public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm,
+        Action<MassCancelOutcome> onCompleted)
+    {
+        ArgumentNullException.ThrowIfNull(onCompleted);
+        return EnqueueMassCancelCore(cmd, session, enteringFirm, onCompleted);
+    }
+
+    private bool EnqueueMassCancelCore(in MassCancelCommand cmd, SessionId session, uint enteringFirm,
+        Action<MassCancelOutcome>? completion)
     {
         // Spec §4.8 / #GAP-19. Resolve the (session, firm, Side?, SecurityId?)
         // filter against each channel's local OrderRegistry (#167); group
@@ -116,18 +127,32 @@ public sealed class HostRouter : IInboundCommandSink
             foreach (var (orderId, _) in matches) list.Add(orderId);
             (perChannel ??= new Dictionary<ChannelDispatcher, List<long>>())[disp] = list;
         }
-        if (perChannel == null) return true;
+        if (perChannel == null)
+        {
+            completion?.Invoke(MassCancelOutcome.Completed(0));
+            return true;
+        }
 
-        // Fan-out: report backpressure if ANY targeted channel rejected the
-        // resolved batch. Partial accept is preserved (whatever made it
-        // onto a queue stays there) — the gateway treats this as a single
-        // reject from the client's POV (OrderMassActionReport REJECTED).
+        MassCancelFanoutCompletion? fanout = completion is null
+            ? null
+            : new MassCancelFanoutCompletion(perChannel.Count, completion);
+
+        // Fan-out: report backpressure if any targeted channel rejected the
+        // resolved batch. Partial execution is preserved (whatever made it
+        // onto a queue stays there), but a solicited request is fail-closed:
+        // suppress its terminal callback so the gateway emits SystemBusy and
+        // never emits ACCEPTED.
         bool allOk = true;
         foreach (var (disp, ids) in perChannel)
         {
-            if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd))
+            if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd,
+                fanout is null ? null : fanout.OnChannelCompleted))
                 allOk = false;
         }
+        if (!allOk)
+            fanout?.Suppress();
+        else
+            fanout?.Arm();
         return allOk;
     }
 
@@ -202,6 +227,50 @@ public sealed class HostRouter : IInboundCommandSink
         orderId = 0;
         securityId = 0;
         return false;
+    }
+
+    private sealed class MassCancelFanoutCompletion
+    {
+        private readonly Action<MassCancelOutcome> _completion;
+        private int _remaining;
+        private int _totalAffected;
+        private int _failed;
+        private int _state;
+
+        public MassCancelFanoutCompletion(int channelCount, Action<MassCancelOutcome> completion)
+        {
+            _remaining = channelCount;
+            _completion = completion;
+        }
+
+        public void OnChannelCompleted(MassCancelOutcome outcome)
+        {
+            if (!outcome.Succeeded)
+                Interlocked.Exchange(ref _failed, 1);
+            Interlocked.Add(ref _totalAffected, outcome.TotalAffectedOrders);
+            if (Interlocked.Decrement(ref _remaining) == 0)
+                TryComplete();
+        }
+
+        public void Arm()
+        {
+            if (Interlocked.CompareExchange(ref _state, 1, 0) == 0
+                && Volatile.Read(ref _remaining) == 0)
+                TryComplete();
+        }
+
+        public void Suppress() => Interlocked.CompareExchange(ref _state, 2, 0);
+
+        private void TryComplete()
+        {
+            if (Volatile.Read(ref _remaining) != 0
+                || Interlocked.CompareExchange(ref _state, 3, 1) != 1)
+                return;
+
+            _completion(Volatile.Read(ref _failed) == 0
+                ? MassCancelOutcome.Completed(Volatile.Read(ref _totalAffected))
+                : MassCancelOutcome.SystemBusy);
+        }
     }
 
     private void RejectUnknownInstrument(long secId, SessionId session, ulong clOrdIdValue, byte[]? memo = null)

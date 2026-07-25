@@ -114,6 +114,8 @@ public sealed partial class ChannelDispatcher
             item.ExpireDayCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; ExpireDay rejected"));
+            if (item.Kind == WorkKind.MassCancel)
+                CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
             return;
         }
 
@@ -241,6 +243,9 @@ public sealed partial class ChannelDispatcher
             WorkKind.MassCancel => item.MassCancel?.Command.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
+        _trackMassCancelReports = item.Kind == WorkKind.MassCancel
+            && item.MassCancelCompletion is not null;
+        _currentMassCancelReportsEnqueued = true;
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
@@ -466,8 +471,22 @@ public sealed partial class ChannelDispatcher
                         // routed back to the originating session by the
                         // Gateway router.
                         var mc = item.MassCancel!;
-                        if (mc.OrderIds.Count > 0)
-                            _engine.MassCancel(mc.OrderIds, mc.Command);
+                        int affected;
+                        try
+                        {
+                            affected = mc.OrderIds.Count > 0
+                                ? _engine.MassCancel(mc.OrderIds, mc.Command)
+                                : 0;
+                        }
+                        catch
+                        {
+                            CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+                            throw;
+                        }
+                        CompleteMassCancel(item.MassCancelCompletion,
+                            _currentMassCancelReportsEnqueued
+                                ? MassCancelOutcome.Completed(affected)
+                                : MassCancelOutcome.SystemBusy);
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -540,6 +559,8 @@ public sealed partial class ChannelDispatcher
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
             _currentReceivedTimeNanos = ulong.MaxValue;
+            _trackMassCancelReports = false;
+            _currentMassCancelReportsEnqueued = true;
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
             // Issue #484: flush the last buffered IOC aggressor ER with
@@ -624,7 +645,7 @@ public sealed partial class ChannelDispatcher
             FailWorkItemCompletion(in pending, error);
     }
 
-    private static void FailWorkItemCompletion(in WorkItem item, Exception error)
+    private void FailWorkItemCompletion(in WorkItem item, Exception error)
     {
         item.PhaseCompletion?.TrySetException(error);
         item.HaltCompletion?.TrySetException(error);
@@ -635,6 +656,22 @@ public sealed partial class ChannelDispatcher
         item.ExpireGtdCompletion?.TrySetException(error);
         item.RestateGtCompletion?.TrySetException(error);
         item.ExpireDayCompletion?.TrySetException(error);
+        CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+    }
+
+    private void CompleteMassCancel(Action<MassCancelOutcome>? completion, MassCancelOutcome outcome)
+    {
+        if (completion is null) return;
+        try
+        {
+            completion(outcome);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel completion callback failed",
+                ChannelNumber);
+        }
     }
 
     /// <summary>

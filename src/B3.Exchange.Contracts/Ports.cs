@@ -166,28 +166,38 @@ public interface IInboundCommandSink
     bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm);
 
     /// <summary>
-    /// Enqueues a mass-cancel command (OrderMassActionRequest template 701,
-    /// spec §4.8 / #GAP-19). The dispatcher walks its
-    /// <c>OrderOwnership</c> map for every resting order owned by the
-    /// originating <paramref name="session"/> + <paramref name="enteringFirm"/>
-    /// that matches the optional Side / SecurityId filters and cancels
-    /// each (one <c>ExecutionReport_Cancel</c> per order back to the
-    /// originating session). The caller (gateway) is responsible for
-    /// emitting the matching <c>OrderMassActionReport</c> (template 702)
-    /// acknowledgement on the same wire.
+    /// Enqueues an unsolicited mass-cancel command, such as
+    /// cancel-on-disconnect. The router resolves the session/firm/filter
+    /// against each channel and enqueues the resulting order IDs.
     ///
     /// <para>A <c>SecurityId == 0</c> on the command means "any
     /// instrument"; the host router fans the command out to every
     /// dispatcher in that case.</para>
     ///
-    /// <para>Returns <c>false</c> when ANY targeted channel's queue is
-    /// full (partial accept is still possible — what gets enqueued stays
-    /// enqueued); the gateway MUST then emit
-    /// <c>OrderMassActionReport(REJECTED)</c> with reason "system busy"
-    /// instead of the ACCEPTED ack so the peer learns the request was
-    /// dropped under load.</para>
+    /// <para>Returns <c>false</c> when any targeted channel refuses the
+    /// work. Partial execution remains possible when a later channel rejects
+    /// after an earlier channel accepted its batch.</para>
     /// </summary>
     bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm);
+
+    /// <summary>
+    /// Enqueues a solicited OrderMassActionRequest (template 701).
+    /// <paramref name="onCompleted"/> is invoked exactly once only after all
+    /// successfully-enqueued channel batches have executed and every
+    /// resulting cancellation ExecutionReport has been offered to the
+    /// ordered FIXP business stream. A failed outcome represents a terminal
+    /// system-busy condition; the caller MUST emit no accepted report.
+    ///
+    /// <para>Returns <c>false</c> when the work could not be enqueued. In that
+    /// case <paramref name="onCompleted"/> is not invoked and the caller must
+    /// emit BusinessMessageReject(SystemBusy) immediately.</para>
+    ///
+    /// <para>The default is fail-closed so existing non-routing test doubles
+    /// and adapters cannot accidentally restore the former premature
+    /// acceptance behavior.</para>
+    /// </summary>
+    bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm,
+        Action<MassCancelOutcome> onCompleted) => false;
 
     /// <summary>Called when a frame fails decoding. Logging hook only — the
     /// Gateway-side <c>FixpSession</c> is responsible for the actual

@@ -134,16 +134,23 @@ public sealed partial class FixpSession
         uint refSeqNum = fixedBlock.Length >= 8
             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
             : 0u;
+        WriteSystemBusyReject(templateId, refSeqNum, clOrdId, workKindLabel,
+            "System busy: dispatcher queue full", memo);
+    }
+
+    internal void WriteSystemBusyReject(ushort templateId, uint refSeqNum, ulong clOrdId,
+        string workKindLabel, string text, ReadOnlyMemory<byte> memo = default)
+    {
         WriteBusinessMessageReject(
             refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
             refSeqNum: refSeqNum,
             businessRejectRefId: clOrdId,
             businessRejectReason: BusinessMessageRejectEncoder.Reason.SystemBusy,
-            text: "System busy: dispatcher queue full",
+            text: text,
             memo: memo);
         _logger.LogWarning(
-            "fixp session {ConnectionId} system-busy reject (dispatcher queue full) template={Template} workKind={WorkKind}",
-            ConnectionId, templateId, workKindLabel);
+            "fixp session {ConnectionId} system-busy reject template={Template} workKind={WorkKind}: {Text}",
+            ConnectionId, templateId, workKindLabel, text);
     }
 
     /// <summary>

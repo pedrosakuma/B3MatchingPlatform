@@ -299,11 +299,14 @@ public class WalAppendFailurePolicyTests
                 BuyClOrdIdValue: 100, SellClOrdIdValue: 101, CrossId: 999);
             Assert.True(disp.EnqueueCross(cross, new SessionId("S1"), enteringFirm: 700));
 
+            var massCancelCompletion = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             Assert.True(disp.EnqueueResolvedMassCancel(
                 new long[] { 12345L },
                 new SessionId("S1"),
                 enteringFirm: 700,
-                enteredAtNanos: 0));
+                new MassCancelCommand(0, null, 0),
+                outcome => massCancelCompletion.TrySetResult(outcome)));
 
             disp.Start();
 
@@ -318,6 +321,8 @@ public class WalAppendFailurePolicyTests
             // loop gate is what kept them away from the engine.
             Assert.Equal(1, wal.AppendCalls);
             Assert.Equal(0, outbound.NewCount);
+            var massCancelOutcome = await massCancelCompletion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(massCancelOutcome.Succeeded);
             // Engine never observed the Cross — both orders would be
             // resting if it had.
             Assert.Equal(0, disp.OrderRegistryCount);

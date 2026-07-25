@@ -257,8 +257,10 @@ public sealed partial class ChannelDispatcher
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
             DecrementOpenOrders(owner.Firm);
-            _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
+            bool enqueued = _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
+            if (_trackMassCancelReports && !enqueued)
+                _currentMassCancelReportsEnqueued = false;
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
@@ -577,8 +579,10 @@ public sealed partial class ChannelDispatcher
                 Memo: e.Memo,
                 OrdType: e.StopType,
                 StopPxMantissa: e.StopPxMantissa);
-            _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
+            bool enqueued = _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
+            if (_trackMassCancelReports && !enqueued)
+                _currentMassCancelReportsEnqueued = false;
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
