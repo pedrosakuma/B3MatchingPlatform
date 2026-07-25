@@ -373,9 +373,10 @@ public sealed partial class ChannelDispatcher
             _metrics?.IncWalAppendFailure();
             Volatile.Write(ref _walHalted, 1);
             _logger.LogCritical(ex,
-                "channel {ChannelNumber}: WAL ReadAll failed during boot recovery; channel marked WAL-halted",
+                "channel {ChannelNumber}: WAL ReadAll failed during boot recovery; channel marked WAL-halted and startup aborted",
                 ChannelNumber);
-            return new WalReplayOutcome(Succeeded: false, RecordCount: 0);
+            throw new IOException(
+                $"channel {ChannelNumber}: failed to read WAL during boot recovery", ex);
         }
         if (records.Count == 0)
         {

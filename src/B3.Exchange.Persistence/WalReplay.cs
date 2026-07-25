@@ -30,7 +30,9 @@ internal sealed class WalReplayCounters
 /// per-record Crc32C framing, distinguishes torn-final writes
 /// (tolerated, return the prefix) from mid-stream corruption
 /// (throws <see cref="WalCorruptionException"/>), and counts legacy
-/// records (pre-#285 lines without a CRC suffix).
+/// records (pre-#285 lines without a CRC suffix). Missing and genuinely
+/// empty files return an empty result; file open/read failures propagate so
+/// startup recovery cannot mistake an unreadable WAL for an empty one.
 /// </summary>
 internal static class WalReplay
 {
@@ -54,24 +56,15 @@ internal static class WalReplay
             return new WalReplayResult(Array.Empty<WalRecord>(), 0, 0);
         }
         var result = new List<WalRecord>();
-        List<string> rawLines;
-        try
+        List<string> rawLines = new();
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (var reader = new StreamReader(fs, Encoding.UTF8))
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            using var reader = new StreamReader(fs, Encoding.UTF8);
-            rawLines = new List<string>();
             string? line;
             while ((line = reader.ReadLine()) is not null)
             {
                 rawLines.Add(line);
             }
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex,
-                "channel {ChannelNumber}: failed to read WAL at {Path}; treating as empty",
-                channelNumber, path);
-            return new WalReplayResult(Array.Empty<WalRecord>(), 0, 0);
         }
 
         int lastNonEmptyIdx = -1;

@@ -351,18 +351,13 @@ public sealed partial class ChannelDispatcher
             // Issue #269: no snapshot but possibly WAL records from a
             // crash before the first snapshot ever ran. Replay rebuilds
             // the engine from scratch.
-            var replay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return replay.Succeeded && replay.RecordCount > 0;
+            var walReplay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
+            return walReplay.Succeeded && walReplay.RecordCount > 0;
         }
         try
         {
             RestoreChannelState(snapshot);
             _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
-            // Issue #269: replay any WAL records that were appended
-            // after the snapshot was taken — closes the gap between
-            // the most-recent snapshot and the moment of the crash.
-            var replay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
-            return replay.Succeeded;
         }
         catch (InvalidOperationException ex)
         {
@@ -383,6 +378,12 @@ public sealed partial class ChannelDispatcher
                 ChannelNumber);
             throw;
         }
+        // Issue #269: replay any WAL records that were appended after the
+        // snapshot was taken. Keep this outside the snapshot restore catch
+        // block so WAL I/O failures retain their own fatal classification.
+        var walReplayAfterSnapshot = ReplayWalOnLoopThread(
+            snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
+        return walReplayAfterSnapshot.Succeeded;
     }
 
     /// <summary>
@@ -400,7 +401,9 @@ public sealed partial class ChannelDispatcher
                 $"channel {ChannelNumber}: startup epoch transition requires a state persister");
 
         ushort restoredVersion = _sequenceVersion;
-        ushort preparedVersion = (ushort)(restoredVersion + 1);
+        ushort preparedVersion = UmdfSequenceVersion.NextOrThrow(
+            restoredVersion,
+            $"channel {ChannelNumber} startup incremental epoch");
         Volatile.Write(ref _sequenceVersion, preparedVersion);
         Volatile.Write(ref _sequenceNumber, 0u);
         _retxBuffer?.Reset();

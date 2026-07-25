@@ -354,6 +354,70 @@ public sealed class ChannelDispatcherStartupEpochTests
     }
 
     [Fact]
+    public async Task WalReadFailure_AbortsStartupWithoutSavingResetOrTruncatingTail()
+    {
+        string dataDirectory = Path.Combine(
+            AppContext.BaseDirectory,
+            $"startup-wal-read-failure-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataDirectory);
+        try
+        {
+            var replayOrder = new NewOrderCommand(
+                "WAL-BID", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                Px(9.50m), 100, 404, 5_000);
+            var tail = new WalRecord(
+                Seq: 4, Kind: WalRecordKind.NewOrder, SessionValue: "40004",
+                Firm: 404, ClOrdId: 0xA004, OrigClOrdId: 0,
+                NewOrder: replayOrder, Cancel: null, Replace: null);
+            using (var seedWal = new FileChannelWriteAheadLog(
+                dataDirectory,
+                Channel,
+                NullLogger<FileChannelWriteAheadLog>.Instance))
+            {
+                seedWal.Append(tail);
+            }
+
+            string walPath = Path.Combine(dataDirectory, $"channel-{Channel}.wal");
+            byte[] tailBefore = File.ReadAllBytes(walPath);
+            var initial = RichRestoredSnapshot();
+            var persister = new RecordingPersister(initial);
+            var sink = new RecordingPacketSink();
+            var wal = new FileChannelWriteAheadLog(
+                dataDirectory,
+                Channel,
+                NullLogger<FileChannelWriteAheadLog>.Instance);
+            var dispatcher = BuildDispatcher(
+                persister, sink, new RecordingOutbound(), wal, out _);
+
+            using (new FileStream(
+                walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                var error = Assert.Throws<IOException>(() => dispatcher.Start());
+
+                Assert.Contains("failed to read WAL during boot recovery", error.Message);
+                Assert.False(dispatcher.IsWalHealthy);
+                Assert.Equal((ushort)9, dispatcher.SequenceVersion);
+                Assert.Equal(77u, dispatcher.SequenceNumber);
+                Assert.Equal(0, persister.SaveCount);
+                Assert.Equal(initial, persister.Last);
+                Assert.Empty(sink.Packets);
+                await dispatcher.DisposeAsync();
+            }
+
+            Assert.Equal(tailBefore, File.ReadAllBytes(walPath));
+            using var verifyWal = new FileChannelWriteAheadLog(
+                dataDirectory,
+                Channel,
+                NullLogger<FileChannelWriteAheadLog>.Instance);
+            Assert.Equal(4L, Assert.Single(verifyWal.ReadAll()).Seq);
+        }
+        finally
+        {
+            try { Directory.Delete(dataDirectory, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task CrashBeforeResetPublication_NextStartupSkipsPreparedVersion()
     {
         var persister = new RecordingPersister(RichRestoredSnapshot(version: 7));
@@ -408,20 +472,46 @@ public sealed class ChannelDispatcherStartupEpochTests
     }
 
     [Fact]
-    public async Task StartupEpoch_UsesExistingUshortWrapSemantics()
+    public async Task StartupEpoch_ExhaustedVersionFailsBeforePersistenceOrReset()
     {
-        var persister = new RecordingPersister(
-            RichRestoredSnapshot(version: ushort.MaxValue));
+        var initial = RichRestoredSnapshot(version: ushort.MaxValue);
+        var persister = new RecordingPersister(initial);
         var sink = new RecordingPacketSink();
         var dispatcher = BuildDispatcher(
             persister, sink, new RecordingOutbound(), wal: null, out _);
 
-        dispatcher.Start();
+        var error = Assert.Throws<InvalidOperationException>(() => dispatcher.Start());
 
-        Assert.Equal((ushort)0, dispatcher.SequenceVersion);
-        AssertChannelReset(Assert.Single(sink.Packets), expectedVersion: 0);
-        Assert.Equal((ushort)0, persister.Last.SequenceVersion);
+        Assert.Contains("SequenceVersion space is exhausted", error.Message);
+        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(77u, dispatcher.SequenceNumber);
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(initial, persister.Last);
+        Assert.Empty(sink.Packets);
         await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public void OperatorBump_ExhaustedVersionPreservesStateWithoutPersistenceOrReset()
+    {
+        var initial = RichRestoredSnapshot(version: ushort.MaxValue);
+        var persister = new RecordingPersister(initial);
+        var sink = new RecordingPacketSink();
+        var dispatcher = BuildDispatcher(
+            persister, sink, new RecordingOutbound(), wal: null, out _);
+        dispatcher.RestoreChannelState(initial);
+
+        Assert.True(dispatcher.EnqueueOperatorBumpVersion());
+        var error = Assert.Throws<InvalidOperationException>(
+            () => dispatcher.CreateTestProbe().DrainInbound());
+
+        Assert.Contains("SequenceVersion space is exhausted", error.Message);
+        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(77u, dispatcher.SequenceNumber);
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Empty(sink.Packets);
+        Assert.True(dispatcher.TryResolveByClOrdId(101, 0xA001, out var orderId, out _));
+        Assert.Equal(1L, orderId);
     }
 
     private static void AssertChannelReset(byte[] packet, ushort expectedVersion)
