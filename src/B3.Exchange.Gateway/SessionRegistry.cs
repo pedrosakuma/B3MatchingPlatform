@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using B3.Exchange.Contracts;
 
 namespace B3.Exchange.Gateway;
@@ -21,6 +22,8 @@ namespace B3.Exchange.Gateway;
 public sealed class SessionRegistry
 {
     private readonly ConcurrentDictionary<SessionId, FixpSession> _sessions = new();
+    private readonly object _routeLock = new();
+    private readonly ConditionalWeakTable<FixpSession, SessionRoute> _routes = new();
 
     public int Count => _sessions.Count;
 
@@ -31,6 +34,18 @@ public sealed class SessionRegistry
     public void Register(FixpSession session)
     {
         ArgumentNullException.ThrowIfNull(session);
+        lock (_routeLock)
+        {
+            var route = _routes
+                .GetValue(session, static current => new SessionRoute(current))
+                .Resolve();
+            var current = route.Current;
+            if (current is null
+                || ReferenceEquals(current, session)
+                || (current.Identity == session.Identity
+                    && current.SessionVerId <= session.SessionVerId))
+                route.SetCurrent(session);
+        }
         _sessions[session.Identity] = session;
     }
 
@@ -42,6 +57,11 @@ public sealed class SessionRegistry
     {
         ArgumentNullException.ThrowIfNull(session);
         _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(session.Identity, session));
+        lock (_routeLock)
+        {
+            if (_routes.TryGetValue(session, out var route))
+                route.Clear(session);
+        }
     }
 
     /// <summary>
@@ -62,4 +82,50 @@ public sealed class SessionRegistry
 
     public bool TryGet(SessionId session, out FixpSession value)
         => _sessions.TryGetValue(session, out value!);
+
+    internal SessionRoute CaptureRoute(FixpSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        return _routes.GetValue(session, static current => new SessionRoute(current));
+    }
+
+    internal bool TransferTakeOver(FixpSession previous, FixpSession replacement)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(replacement);
+        lock (_routeLock)
+        {
+            if (previous.Identity != replacement.Identity)
+                return false;
+
+            var previousRoute = _routes
+                .GetValue(previous, static current => new SessionRoute(current))
+                .Resolve();
+            var replacementRoute = _routes
+                .GetValue(replacement, static current => new SessionRoute(current))
+                .Resolve();
+            var target = replacement;
+
+            if (!TrySelectCurrent(previousRoute.Current, replacement.Identity, ref target)
+                || !TrySelectCurrent(replacementRoute.Current, replacement.Identity, ref target))
+                return false;
+
+            previousRoute.SetCurrent(target);
+            if (!ReferenceEquals(previousRoute, replacementRoute))
+                replacementRoute.RedirectTo(previousRoute);
+            return true;
+        }
+    }
+
+    private static bool TrySelectCurrent(
+        FixpSession? candidate,
+        SessionId identity,
+        ref FixpSession target)
+    {
+        if (candidate is null) return true;
+        if (candidate.Identity != identity) return false;
+        if (candidate.SessionVerId > target.SessionVerId)
+            target = candidate;
+        return true;
+    }
 }

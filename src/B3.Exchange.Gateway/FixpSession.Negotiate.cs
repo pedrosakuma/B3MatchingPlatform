@@ -237,6 +237,14 @@ public sealed partial class FixpSession
             semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
         // Issue #488: persistence committed — safe to evict the stale session now.
         // Its Release() call is a no-op (registry already holds this session's token).
+        if (evictedByTakeOver is not null
+            && _sessionRegistry is not null
+            && !_sessionRegistry.TransferTakeOver(evictedByTakeOver, this))
+        {
+            _logger.LogError(
+                "session {ConnectionId} failed to transfer logical route from takeover victim {OldConnectionId}",
+                ConnectionId, evictedByTakeOver.ConnectionId);
+        }
         evictedByTakeOver?.Close("session-takeover:evicted-by-newer-verId", CloseKind.SessionTakeOver);
         return NegotiateStep.Accepted(responseFrame,
             $"negotiate-accept (sid={req.SessionId} firm={outcome.Firm.Id})");

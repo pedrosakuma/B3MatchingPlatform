@@ -384,25 +384,28 @@ public sealed partial class FixpSession
                         uint refSeqNum = fixedBlock.Length >= 8
                             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
                             : 0u;
+                        var terminalRoute = _sessionRegistry?.CaptureRoute(this)
+                            ?? new SessionRoute(this);
                         if (!_sink.EnqueueMassCancel(mcCmd, Identity, EnteringFirm, outcome =>
                         {
-                            if (outcome.Succeeded)
+                            terminalRoute.TryInvoke(target =>
                             {
-                                WriteOrderMassActionReport(mcClOrd,
-                                    OrderMassActionReportEncoder.MassActionResponseAccepted,
-                                    massActionRejectReason: null,
-                                    side: sideByte, securityId: mcCmd.SecurityId,
-                                    transactTimeNanos: now);
-                            }
-                            else
-                            {
-                                WriteSystemBusyReject(
+                                if (outcome.Succeeded)
+                                {
+                                    return target.WriteOrderMassActionReport(mcClOrd,
+                                        OrderMassActionReportEncoder.MassActionResponseAccepted,
+                                        massActionRejectReason: null,
+                                        side: sideByte, securityId: mcCmd.SecurityId,
+                                        transactTimeNanos: now);
+                                }
+
+                                return target.WriteSystemBusyReject(
                                     EntryPointFrameReader.TidOrderMassActionRequest,
                                     refSeqNum,
                                     mcClOrd,
                                     "MassCancel",
                                     "System busy: mass cancel could not complete");
-                            }
+                            });
                         }))
                         {
                             WriteSystemBusyReject(

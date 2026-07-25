@@ -129,19 +129,19 @@ public sealed partial class FixpSession
     /// are already bumped by the dispatcher (<c>exch_dispatch_queue_full_total</c>);
     /// this method is purely about telling the offending peer.
     /// </summary>
-    internal void WriteSystemBusyReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string workKindLabel, ReadOnlyMemory<byte> memo = default)
+    internal bool WriteSystemBusyReject(ushort templateId, ReadOnlySpan<byte> fixedBlock, ulong clOrdId, string workKindLabel, ReadOnlyMemory<byte> memo = default)
     {
         uint refSeqNum = fixedBlock.Length >= 8
             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(fixedBlock.Slice(4, 4))
             : 0u;
-        WriteSystemBusyReject(templateId, refSeqNum, clOrdId, workKindLabel,
+        return WriteSystemBusyReject(templateId, refSeqNum, clOrdId, workKindLabel,
             "System busy: dispatcher queue full", memo);
     }
 
-    internal void WriteSystemBusyReject(ushort templateId, uint refSeqNum, ulong clOrdId,
+    internal bool WriteSystemBusyReject(ushort templateId, uint refSeqNum, ulong clOrdId,
         string workKindLabel, string text, ReadOnlyMemory<byte> memo = default)
     {
-        WriteBusinessMessageReject(
+        bool enqueued = WriteBusinessMessageReject(
             refMsgType: BusinessMessageRejectEncoder.MapRefMsgTypeFromTemplateId(templateId),
             refSeqNum: refSeqNum,
             businessRejectRefId: clOrdId,
@@ -151,6 +151,7 @@ public sealed partial class FixpSession
         _logger.LogWarning(
             "fixp session {ConnectionId} system-busy reject template={Template} workKind={WorkKind}: {Text}",
             ConnectionId, templateId, workKindLabel, text);
+        return enqueued;
     }
 
     /// <summary>

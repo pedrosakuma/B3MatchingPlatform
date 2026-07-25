@@ -152,6 +152,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// successful <see cref="SessionClaimRegistry.TryRestoreTakeOver"/>.
     /// </summary>
     private readonly Action<FixpSession>? _onTakeOverRollback;
+    private readonly SessionRegistry? _sessionRegistry;
 
     public long ConnectionId { get; }
 
@@ -381,7 +382,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         bool resumeAsNegotiated = false,
         int? persistedMaxOrderRatePerSecond = null,
         Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null,
-        Action<FixpSession>? onTakeOverRollback = null)
+        Action<FixpSession>? onTakeOverRollback = null,
+        SessionRegistry? sessionRegistry = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ConnectionId = connectionId;
@@ -405,6 +407,7 @@ public sealed partial class FixpSession : IAsyncDisposable
         _options.Validate();
         _onIdentityChanged = onIdentityChanged;
         _onTakeOverRollback = onTakeOverRollback;
+        _sessionRegistry = sessionRegistry;
         if (persistedMaxOrderRatePerSecond is < 0)
             throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;
