@@ -58,8 +58,8 @@ public class ChannelDispatcherWalTests
         { TradeCount++; return true; }
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default)
         { PassiveTradeCount++; return true; }
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default)
-        { PassiveCancelCount++; return true; }
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default)
+        { PassiveCancelCount++; return OrderedStreamWriteResult.CommittedAndEnqueued; }
         public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null)
         { ModifyCount++; return true; }
         public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default)

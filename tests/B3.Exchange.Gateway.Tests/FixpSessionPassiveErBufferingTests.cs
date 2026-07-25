@@ -136,7 +136,10 @@ public class FixpSessionPassiveErBufferingTests
                 TransactTimeNanos: 1_700_000_000_000_000_000UL,
                 Reason: CancelReason.MassCancel,
                 RptSeq: 2);
-            session.WriteExecutionReportCancel(canceled, clOrdIdValue: 5555, origClOrdIdValue: 0);
+            var result = session.WriteExecutionReportCancel(
+                canceled, clOrdIdValue: 5555, origClOrdIdValue: 0);
+            Assert.True(result.IsCommitted);
+            Assert.False(result.IsTransportEnqueued);
             Assert.Equal(depthBefore + 1, session.RetxBufferDepth);
 
             session.Close("test-cleanup");

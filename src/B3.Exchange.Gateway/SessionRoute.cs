@@ -1,5 +1,7 @@
 namespace B3.Exchange.Gateway;
 
+using B3.Exchange.Contracts;
+
 /// <summary>
 /// Stable logical-session route captured by asynchronous gateway work.
 /// A committed session-version takeover transfers the route to the
@@ -8,28 +10,25 @@ namespace B3.Exchange.Gateway;
 /// </summary>
 internal sealed class SessionRoute
 {
+    private static long _nextId;
     private FixpSession? _current;
     private SessionRoute? _redirect;
+    private readonly object _gate = new();
+    private readonly long _id = Interlocked.Increment(ref _nextId);
 
     public SessionRoute(FixpSession initial)
     {
         _current = initial;
     }
 
-    public bool TryInvoke(Func<FixpSession, bool> action)
+    public OrderedStreamWriteResult TryInvoke(
+        Func<FixpSession, OrderedStreamWriteResult> action)
     {
         ArgumentNullException.ThrowIfNull(action);
-        var current = Resolve().Current;
-        if (current is null) return false;
-        if (action(current)) return true;
-
-        // A takeover can linearize between route resolution and enqueue.
-        // Retry only when the route moved to a different logical successor;
-        // never fall through to an unrelated later session after Clear().
-        var replacement = Resolve().Current;
-        return replacement is not null
-            && !ReferenceEquals(replacement, current)
-            && action(replacement);
+        return Execute(route =>
+            route.Current is { } current
+                ? action(current)
+                : OrderedStreamWriteResult.NotCommitted);
     }
 
     internal FixpSession? Current => Volatile.Read(ref _current);
@@ -47,12 +46,62 @@ internal sealed class SessionRoute
     internal void SetCurrent(FixpSession current)
         => Volatile.Write(ref _current, current);
 
+    internal void ClearCurrent(FixpSession expected)
+        => Interlocked.CompareExchange(ref _current, null, expected);
+
     internal void RedirectTo(SessionRoute route)
         => Volatile.Write(ref _redirect, route);
 
     public void Clear(FixpSession expected)
+        => Execute(route =>
+        {
+            route.ClearCurrent(expected);
+            return true;
+        });
+
+    internal T Execute<T>(Func<SessionRoute, T> action)
     {
-        var route = Resolve();
-        Interlocked.CompareExchange(ref route._current, null, expected);
+        ArgumentNullException.ThrowIfNull(action);
+        while (true)
+        {
+            var route = Resolve();
+            lock (route._gate)
+            {
+                if (!ReferenceEquals(route, Resolve()))
+                    continue;
+                return action(route);
+            }
+        }
+    }
+
+    internal static T ExecutePair<T>(
+        SessionRoute first,
+        SessionRoute second,
+        Func<SessionRoute, SessionRoute, T> action)
+    {
+        ArgumentNullException.ThrowIfNull(first);
+        ArgumentNullException.ThrowIfNull(second);
+        ArgumentNullException.ThrowIfNull(action);
+
+        while (true)
+        {
+            var firstRoot = first.Resolve();
+            var secondRoot = second.Resolve();
+            if (ReferenceEquals(firstRoot, secondRoot))
+                return firstRoot.Execute(root => action(root, root));
+
+            var lower = firstRoot._id < secondRoot._id ? firstRoot : secondRoot;
+            var upper = ReferenceEquals(lower, firstRoot) ? secondRoot : firstRoot;
+            lock (lower._gate)
+            {
+                lock (upper._gate)
+                {
+                    if (!ReferenceEquals(firstRoot, first.Resolve())
+                        || !ReferenceEquals(secondRoot, second.Resolve()))
+                        continue;
+                    return action(firstRoot, secondRoot);
+                }
+            }
+        }
     }
 }

@@ -165,8 +165,8 @@ public class FixpSessionThrottleTests
             var session = NewSession(server,
                 new FixpSessionOptions { ThrottleTimeWindowMs = 1_000, ThrottleMaxMessages = 2 },
                 () => 1_000_000L);
-            bool ok = session.WriteBusinessMessageReject(15, 99, 12345, 0, "Throttle limit exceeded");
-            Assert.True(ok);
+            var result = session.WriteBusinessMessageReject(15, 99, 12345, 0, "Throttle limit exceeded");
+            Assert.True(result.IsTransportEnqueued);
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             var ns = client.GetStream();
             var (tid, body) = await ReadOneFrameAsync(ns, cts.Token);

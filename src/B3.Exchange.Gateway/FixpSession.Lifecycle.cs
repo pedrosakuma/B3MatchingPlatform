@@ -41,31 +41,36 @@ public sealed partial class FixpSession
     private void OnTransportClosed(string reason, TcpTransport? originatingTransport)
     {
         if (Volatile.Read(ref _isOpen) == 0) return;
+        if (State != FixpState.Established)
+            MarkCloseRequested();
         // Decision must run under _attachLock so the generation check and
         // the actual lifecycle transition can't be split by a concurrent
         // TryReattach. Without the lock a stale callback could pass the
         // generation check, get preempted while the new transport is
         // installed, then close the new generation.
-        lock (_attachLock)
+        ExecuteLogicalSessionExclusive(() =>
         {
-            if (Volatile.Read(ref _isOpen) == 0) return;
-            // Stale callback from a prior transport generation — ignore.
-            if (originatingTransport is not null && !ReferenceEquals(originatingTransport, _transport))
-                return;
-            // Re-entrancy guard: Suspend() itself calls _transport.Close(...),
-            // which will fire this callback a second time. Once we have detached
-            // (or are about to detach), defer to whichever branch already took
-            // ownership rather than escalating to a full Close.
-            if (Volatile.Read(ref _isAttached) == 0) return;
-            if (State == FixpState.Established)
+            lock (_attachLock)
             {
-                SuspendLocked(reason);
-                return;
+                if (Volatile.Read(ref _isOpen) == 0) return;
+                // Stale callback from a prior transport generation — ignore.
+                if (originatingTransport is not null && !ReferenceEquals(originatingTransport, _transport))
+                    return;
+                // Re-entrancy guard: Suspend() itself calls _transport.Close(...),
+                // which will fire this callback a second time. Once we have detached
+                // (or are about to detach), defer to whichever branch already took
+                // ownership rather than escalating to a full Close.
+                if (Volatile.Read(ref _isAttached) == 0) return;
+                if (State == FixpState.Established)
+                {
+                    SuspendLocked(reason);
+                    return;
+                }
+                // Transport went away before/after Establish — peer is expected
+                // to reconnect, so do not erase persisted state (issue #405).
+                CloseLocked(reason, CloseKind.TransportError);
             }
-            // Transport went away before/after Establish — peer is expected
-            // to reconnect, so do not erase persisted state (issue #405).
-            CloseLocked(reason, CloseKind.TransportError);
-        }
+        });
     }
 
     /// <summary>
@@ -80,10 +85,13 @@ public sealed partial class FixpSession
     /// </summary>
     public void Suspend(string reason)
     {
-        lock (_attachLock)
+        ExecuteLogicalSessionExclusive(() =>
         {
-            SuspendLocked(reason);
-        }
+            lock (_attachLock)
+            {
+                SuspendLocked(reason);
+            }
+        });
     }
 
     /// <summary>
@@ -100,10 +108,13 @@ public sealed partial class FixpSession
     /// </summary>
     public void SuspendForTakeover(string reason)
     {
-        lock (_attachLock)
+        ExecuteLogicalSessionExclusive(() =>
         {
-            SuspendLocked(reason, armCancelOnDisconnect: false);
-        }
+            lock (_attachLock)
+            {
+                SuspendLocked(reason, armCancelOnDisconnect: false);
+            }
+        });
     }
 
     /// <summary>
@@ -201,6 +212,7 @@ public sealed partial class FixpSession
             // State machine refused the demote → fall through to a
             // hard close. Treat as transport loss (peer may reconnect)
             // unless we know otherwise (issue #405).
+            MarkCloseRequested();
             CloseLocked(reason, CloseKind.TransportError);
             return;
         }
@@ -233,13 +245,17 @@ public sealed partial class FixpSession
     /// </summary>
     private void CloseIfTransportCurrent(string reason, TcpTransport originatingTransport)
     {
-        lock (_attachLock)
+        ExecuteLogicalSessionExclusive(() =>
         {
-            if (!ReferenceEquals(_transport, originatingTransport)) return;
-            // Triggered exclusively from background loops (watchdog) on
-            // an idle-timeout / IO error → peer is expected to reconnect.
-            CloseLocked(reason, CloseKind.TransportError);
-        }
+            lock (_attachLock)
+            {
+                if (!ReferenceEquals(_transport, originatingTransport)) return;
+                MarkCloseRequested();
+                // Triggered exclusively from background loops (watchdog) on
+                // an idle-timeout / IO error → peer is expected to reconnect.
+                CloseLocked(reason, CloseKind.TransportError);
+            }
+        });
     }
 
     /// <summary>
@@ -274,11 +290,15 @@ public sealed partial class FixpSession
                 ConnectionId, terminationCode);
         }
 
-        lock (_attachLock)
+        ExecuteLogicalSessionExclusive(() =>
         {
-            if (!ReferenceEquals(_transport, originatingTransport)) return;
-            CloseLocked(reason, kind);
-        }
+            lock (_attachLock)
+            {
+                if (!ReferenceEquals(_transport, originatingTransport)) return;
+                MarkCloseRequested();
+                CloseLocked(reason, kind);
+            }
+        });
     }
 
     /// <summary>
@@ -298,10 +318,14 @@ public sealed partial class FixpSession
     /// </summary>
     public void Close(string reason, CloseKind kind)
     {
-        lock (_attachLock)
+        MarkCloseRequested();
+        ExecuteLogicalSessionExclusive(() =>
         {
-            CloseLocked(reason, kind);
-        }
+            lock (_attachLock)
+            {
+                CloseLocked(reason, kind);
+            }
+        });
     }
 
     /// <summary>
@@ -314,6 +338,7 @@ public sealed partial class FixpSession
     /// </summary>
     private void CloseLocked(string reason, CloseKind kind)
     {
+        MarkCloseRequested();
         if (Interlocked.Exchange(ref _isOpen, 0) == 0) return;
         Volatile.Write(ref _isAttached, 0);
         // Clear the suspended-since timestamp so a concurrent reaper poll
@@ -321,6 +346,7 @@ public sealed partial class FixpSession
         Volatile.Write(ref _suspendedSinceMs, 0);
         StopCodTimerLocked();
         _lastCloseKind = kind;
+        bool ownsLogicalSession = _sessionRegistry?.IsCurrent(this) ?? true;
         _logger.LogInformation(
             "fixp session {ConnectionId} closing (kind={Kind})",
             ConnectionId, kind);
@@ -355,7 +381,7 @@ public sealed partial class FixpSession
         // Issue #488: skip for SessionTakeOver — the new session has the same
         // Identity and has already taken over the claim; evicting ownership
         // entries here would break routing of passive fills to the new session.
-        if (kind != CloseKind.SessionTakeOver)
+        if (kind != CloseKind.SessionTakeOver && ownsLogicalSession)
         {
             try { _sink.OnSessionClosed(Identity); }
             catch (Exception ex)
@@ -378,7 +404,7 @@ public sealed partial class FixpSession
             || kind == CloseKind.KeepaliveLapsed
             || kind == CloseKind.SuspendedTimeout
             || kind == CloseKind.DailyReset;
-        if (removePersistence)
+        if (removePersistence && ownsLogicalSession)
         {
             _retxBuffer.Dispose();
             if (_outboundJournal is not null && SessionId != 0)
@@ -402,7 +428,7 @@ public sealed partial class FixpSession
                 }
             }
         }
-        else if (kind != CloseKind.SessionTakeOver)
+        else if (kind != CloseKind.SessionTakeOver && ownsLogicalSession)
         {
             // Host shutdown / transport error: keep journal + ring;
             // persist final snapshot so the reconnecting peer sees the
@@ -413,6 +439,14 @@ public sealed partial class FixpSession
             // would overwrite the new snapshot with this session's older
             // SessionVerID, rolling durable state backwards.
             SaveStateSnapshotSafe();
+        }
+        else if (kind == CloseKind.SessionTakeOver)
+        {
+            // The successor already deep-copied the retained replay window
+            // while both outbound locks were held. Release this retired
+            // transport generation's pooled frame references without touching
+            // the shared per-SessionID journal.
+            _retxBuffer.Dispose();
         }
         try { _onClosed?.Invoke(this, reason); }
         catch (Exception ex)
@@ -543,16 +577,20 @@ public sealed partial class FixpSession
     /// </summary>
     internal bool TryReapIfSuspended(long thresholdMs)
     {
-        lock (_attachLock)
+        return ExecuteLogicalSessionExclusive(() =>
         {
-            if (Volatile.Read(ref _isOpen) == 0) return false;
-            if (State != FixpState.Suspended) return false;
-            var since = Volatile.Read(ref _suspendedSinceMs);
-            if (since == 0) return false;
-            if (since > thresholdMs) return false;
-            CloseLocked("suspended-timeout", CloseKind.SuspendedTimeout);
-            return true;
-        }
+            lock (_attachLock)
+            {
+                if (Volatile.Read(ref _isOpen) == 0) return false;
+                if (State != FixpState.Suspended) return false;
+                var since = Volatile.Read(ref _suspendedSinceMs);
+                if (since == 0) return false;
+                if (since > thresholdMs) return false;
+                MarkCloseRequested();
+                CloseLocked("suspended-timeout", CloseKind.SuspendedTimeout);
+                return true;
+            }
+        });
     }
 
     public async ValueTask DisposeAsync()

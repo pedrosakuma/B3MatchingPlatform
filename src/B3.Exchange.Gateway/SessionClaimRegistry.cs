@@ -116,6 +116,13 @@ public sealed class SessionClaimRegistry
         ZeroVersion,
     }
 
+    public enum TakeOverFinalizeResult
+    {
+        Committed,
+        RolledBack,
+        ClaimLost,
+    }
+
     /// <summary>
     /// Atomically validate <paramref name="sessionVerId"/> against the
     /// monotonic-per-process rule and (on success) register
@@ -273,5 +280,64 @@ public sealed class SessionClaimRegistry
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Finalizes a previously accepted forced takeover while holding the claim
+    /// lock. The callback therefore observes a stable claim owner. If the
+    /// callback declines or throws, the victim claim and previous version
+    /// watermark are restored before the method returns.
+    ///
+    /// A replacement transport can close after <see cref="TryForceTakeOver"/>
+    /// and release its claim while persistence is still running. When the
+    /// active slot is vacant and the recorded version still equals
+    /// <paramref name="newVerId"/>, that close is treated as a failed takeover
+    /// and the victim is restored. A different active token means a newer
+    /// takeover won; this method leaves it untouched.
+    /// </summary>
+    internal TakeOverFinalizeResult TryFinalizeTakeOver(
+        uint sessionId,
+        ulong newVerId,
+        object newToken,
+        object oldToken,
+        ulong oldVerId,
+        Func<bool> commit)
+    {
+        ArgumentNullException.ThrowIfNull(newToken);
+        ArgumentNullException.ThrowIfNull(oldToken);
+        ArgumentNullException.ThrowIfNull(commit);
+
+        lock (_lock)
+        {
+            bool replacementOwnsClaim =
+                _activeClaims.TryGetValue(sessionId, out var current)
+                && ReferenceEquals(current, newToken);
+            bool replacementReleasedClaim =
+                !_activeClaims.ContainsKey(sessionId)
+                && _lastSessionVerId.TryGetValue(sessionId, out var last)
+                && last == newVerId;
+
+            if (!replacementOwnsClaim && !replacementReleasedClaim)
+                return TakeOverFinalizeResult.ClaimLost;
+
+            if (replacementOwnsClaim)
+            {
+                try
+                {
+                    if (commit())
+                        return TakeOverFinalizeResult.Committed;
+                }
+                catch
+                {
+                    _activeClaims[sessionId] = oldToken;
+                    _lastSessionVerId[sessionId] = oldVerId;
+                    throw;
+                }
+            }
+
+            _activeClaims[sessionId] = oldToken;
+            _lastSessionVerId[sessionId] = oldVerId;
+            return TakeOverFinalizeResult.RolledBack;
+        }
     }
 }

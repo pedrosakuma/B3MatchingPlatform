@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -31,6 +32,29 @@ public class FixpSessionMassActionCompletionTests
 
         public void OnDecodeError(SessionId session, string error) { }
         public void OnSessionClosed(SessionId session) { }
+    }
+
+    private sealed class FailFirstAppendJournal : IFixpOutboundJournal
+    {
+        private int _appendCalls;
+        public List<OutboundJournalEntry> Entries { get; } = new();
+
+        public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
+        {
+            if (Interlocked.Increment(ref _appendCalls) == 1)
+                throw new IOException("injected first append failure");
+            Entries.Add(new OutboundJournalEntry(seq, timestampNanos, frame.ToArray()));
+        }
+
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
+        public void PruneUpTo(uint sessionId, uint uptoSeq) { }
+        public IReadOnlyList<OutboundJournalEntry> ReadRange(uint sessionId, uint fromSeq, int count)
+            => Entries.Where(entry => entry.Seq >= fromSeq).Take(count).ToArray();
+        public uint MaxSeq(uint sessionId) => Entries.Count == 0 ? 0u : Entries.Max(entry => entry.Seq);
+        public long EntryCount(uint sessionId) => Entries.Count;
+        public void Remove(uint sessionId) => Entries.Clear();
+        public IReadOnlyCollection<uint> ListSessions() => Array.Empty<uint>();
+        public void Dispose() { }
     }
 
     [Fact]
@@ -112,7 +136,43 @@ public class FixpSessionMassActionCompletionTests
         }
     }
 
-    private static FixpSession StartSession(NetworkStream server, IInboundCommandSink sink)
+    [Fact]
+    public async Task AcceptedReportCommitFailure_EmitsSystemBusyAtSameSequence()
+    {
+        var sink = new ControlledSink();
+        var journal = new FailFirstAppendJournal();
+        var (server, client) = await ConnectPairAsync();
+        try
+        {
+            var session = StartSession(server, sink, journal);
+            await client.GetStream().WriteAsync(BuildRequest(clOrdId: 7004, msgSeqNum: 12));
+
+            var complete = await sink.Completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            complete(MassCancelOutcome.Completed(1));
+
+            var reject = await ReadFrameAsync(client.GetStream());
+            AssertSystemBusy(reject, expectedRefSeqNum: 12, expectedClOrdId: 7004);
+            Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(
+                reject.Body.AsSpan(4, 4)));
+            var persisted = Assert.Single(journal.Entries);
+            Assert.Equal(1u, persisted.Seq);
+            Assert.Equal(EntryPointFrameReader.TidBusinessMessageReject,
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    persisted.Frame.AsSpan(EntryPointFrameReader.SofhSize + 2, 2)));
+            Assert.Equal(1, session.RetxBufferDepth);
+            session.Close("test");
+        }
+        finally
+        {
+            client.Close();
+            server.Dispose();
+        }
+    }
+
+    private static FixpSession StartSession(
+        NetworkStream server,
+        IInboundCommandSink sink,
+        IFixpOutboundJournal? outboundJournal = null)
     {
         var session = new FixpSession(
             connectionId: 1,
@@ -120,7 +180,8 @@ public class FixpSessionMassActionCompletionTests
             sessionId: 100,
             stream: server,
             sink: sink,
-            logger: NullLogger<FixpSession>.Instance);
+            logger: NullLogger<FixpSession>.Instance,
+            outboundJournal: outboundJournal);
         session.Start();
         session.ApplyTransition(FixpEvent.Negotiate);
         session.ApplyTransition(FixpEvent.Establish);

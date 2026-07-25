@@ -62,7 +62,7 @@ public interface ICoreOutbound
     /// <c>OrigClOrdID</c>); pass zero when the cancel was not initiated by
     /// a request from a live session (e.g. engine-internal cancel).
     /// </summary>
-    bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId,
+    OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId,
         in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default);
 

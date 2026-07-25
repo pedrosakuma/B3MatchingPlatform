@@ -269,7 +269,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _hasCurrentSession;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
-    private bool _currentMassCancelReportsEnqueued;
+    private bool _currentMassCancelReportsCommitted;
     private bool _trackMassCancelReports;
     /// <summary>
     /// Ingress timestamp of the inbound command currently being dispatched

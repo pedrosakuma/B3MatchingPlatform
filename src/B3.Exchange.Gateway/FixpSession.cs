@@ -107,6 +107,8 @@ public sealed partial class FixpSession : IAsyncDisposable
     private long _msgSeqNum;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    private int _closeRequested;
+    private int _takeOverCommitFence;
     /// <summary>De-dup CAS guard for <c>SuspendLocked</c>. Distinct from
     /// <c>_isAttached</c> so that the public <c>IsAttached</c> flag can stay
     /// true throughout teardown + state transition and only flip to false
@@ -356,6 +358,13 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// observable. Diagnostic only.</summary>
     public bool IsRegistered => Volatile.Read(ref _isOpen) == 1;
 
+    internal bool IsLiveTakeOverCandidate =>
+        Volatile.Read(ref _closeRequested) == 0
+        && Volatile.Read(ref _isOpen) == 1
+        && Volatile.Read(ref _isAttached) == 1
+        && _transport.IsOpen
+        && State == FixpState.Negotiated;
+
     /// <summary>Stable handle for the currently-attached TCP transport,
     /// or <c>null</c> when the session is Suspended (no attached
     /// transport). Format <c>"tx-&lt;hex(connectionId)&gt;"</c>.
@@ -479,6 +488,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             sessionId: () => SessionId,
             sessionVerId: () => SessionVerId,
             nextMsgSeqNum: NextMsgSeqNum,
+            rollbackMsgSeqNum: RollbackMsgSeqNum,
             transport: () => _transport!,
             retxBuffer: _retxBuffer,
             outboundLock: _outboundLock,
@@ -582,10 +592,94 @@ public sealed partial class FixpSession : IAsyncDisposable
 
     private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
 
+    private void RollbackMsgSeqNum(uint allocated)
+    {
+        if ((uint)Volatile.Read(ref _msgSeqNum) != allocated)
+            throw new InvalidOperationException(
+                $"cannot roll back outbound sequence {allocated}; allocator advanced concurrently");
+        Volatile.Write(ref _msgSeqNum, allocated - 1u);
+    }
+
     /// <summary>Peek the value <see cref="NextMsgSeqNum"/> would return on
     /// its next call without consuming a sequence number. Used by FIXP
     /// <c>Sequence</c> frames, which announce but do not consume.</summary>
     private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
+
+    private void ExecuteLogicalSessionExclusive(Action action)
+    {
+        if (_sessionRegistry is null)
+        {
+            action();
+            return;
+        }
+        _sessionRegistry.ExecuteExclusive(this, action);
+    }
+
+    private T ExecuteLogicalSessionExclusive<T>(Func<T> action)
+    {
+        if (_sessionRegistry is null)
+            return action();
+        return _sessionRegistry.ExecuteExclusive(this, action);
+    }
+
+    private void MarkCloseRequested()
+    {
+        Interlocked.CompareExchange(ref _takeOverCommitFence, 1, 0);
+        Volatile.Write(ref _closeRequested, 1);
+    }
+
+    internal bool TrySealTakeOverCandidate()
+    {
+        if (!IsLiveTakeOverCandidate) return false;
+        int state = Interlocked.CompareExchange(ref _takeOverCommitFence, 2, 0);
+        return state is 0 or 2;
+    }
+
+    internal bool TryAdoptOutboundStateForTakeOver(
+        FixpSession previous,
+        Func<bool> commit)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(commit);
+        if (!ReferenceEquals(_outboundJournal, previous._outboundJournal))
+            return false;
+
+        var first = ConnectionId < previous.ConnectionId ? _outboundLock : previous._outboundLock;
+        var second = ReferenceEquals(first, _outboundLock) ? previous._outboundLock : _outboundLock;
+        lock (first)
+        {
+            lock (second)
+            {
+                if (!IsLiveTakeOverCandidate || !previous.IsRegistered)
+                    return false;
+                if (!previous._retxBuffer.TryCopyRetainedFramesTo(_retxBuffer))
+                    return false;
+
+                uint maxSeq = Math.Max(
+                    (uint)Volatile.Read(ref _msgSeqNum),
+                    (uint)Volatile.Read(ref previous._msgSeqNum));
+                if (_outboundJournal is not null)
+                {
+                    try
+                    {
+                        maxSeq = Math.Max(maxSeq, _outboundJournal.MaxSeq(SessionId));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "fixp session {ConnectionId} failed to reconcile outbound journal during takeover",
+                            ConnectionId);
+                        return false;
+                    }
+                }
+
+                Volatile.Write(ref _msgSeqNum, maxSeq);
+                _outboundEncoder.AdvanceMassActionReportSeqTo(
+                    previous._outboundEncoder.MassActionReportSeq);
+                return commit();
+            }
+        }
+    }
 
     /// <summary>
     /// Decodes and processes a FIXP <c>RetransmitRequest</c> (template
@@ -611,21 +705,42 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Sequence's seq matches what the peer will see next.</para>
     /// </summary>
     private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
-        => _retransmitController.ProcessAndEnqueueRetransmitRequest(fixedBlock);
+    {
+        var copy = fixedBlock.ToArray();
+        ExecuteLogicalSessionExclusive(() =>
+            _retransmitController.ProcessAndEnqueueRetransmitRequest(copy));
+    }
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         ulong clOrdIdValue = 0, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue, memo);
+    {
+        var report = e;
+        return ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportNew(
+                report, receivedTimeNanos, durability, clOrdIdValue, memo));
+    }
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability, memo);
+    {
+        var report = e;
+        return ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportTrade(
+                report, isAggressor, ownerOrderId, clOrdIdValue,
+                leavesQty, cumQty, durability, memo));
+    }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
+    public OrderedStreamWriteResult WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos, durability, memo);
+    {
+        var report = e;
+        return ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportCancel(
+                report, clOrdIdValue, origClOrdIdValue,
+                receivedTimeNanos, durability, memo));
+    }
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
@@ -635,36 +750,53 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Matching.InvestorId? investorId = null,
         B3.Exchange.Matching.OrderType ordType = B3.Exchange.Matching.OrderType.Limit,
         long? protectionPriceMantissa = null)
-        => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId,
-            ordType, protectionPriceMantissa);
+        => ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportModify(
+                securityId, orderId, clOrdIdValue, origClOrdIdValue,
+                side, newPriceMantissa, newRemainingQty, transactTimeNanos,
+                rptSeq, receivedTimeNanos, durability, memo, investorId,
+                ordType, protectionPriceMantissa));
 
     public bool WriteExecutionReportRestate(in B3.Exchange.Matching.OrderRestatedEvent e, ulong ownerClOrdId,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportRestate(e, ownerClOrdId, durability, memo);
+    {
+        var report = e;
+        return ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportRestate(
+                report, ownerClOrdId, durability, memo));
+    }
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
     /// <c>OrderMassActionRequest</c>.
     /// </summary>
-    public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
+    public OrderedStreamWriteResult WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
         byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,
         string? text = null)
-        => _outboundEncoder.WriteOrderMassActionReport(clOrdIdValue, massActionResponse,
-            massActionRejectReason, side, securityId, transactTimeNanos, text);
+        => ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteOrderMassActionReport(
+                clOrdIdValue, massActionResponse, massActionRejectReason,
+                side, securityId, transactTimeNanos, text));
 
     public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue, durability, memo);
+    {
+        var report = e;
+        return ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteExecutionReportReject(
+                report, clOrdIdValue, durability, memo));
+    }
 
     public bool WriteSessionReject(byte terminationCode)
         => _outboundEncoder.WriteSessionReject(terminationCode);
 
-    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+    public OrderedStreamWriteResult WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
         uint businessRejectReason, string? text = null, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteBusinessMessageReject(refMsgType, refSeqNum, businessRejectRefId,
-            businessRejectReason, text, memo);
+        => ExecuteLogicalSessionExclusive(() =>
+            _outboundEncoder.WriteBusinessMessageReject(
+                refMsgType, refSeqNum, businessRejectRefId,
+                businessRejectReason, text, memo));
 
     /// <summary>
     /// Maps engine <see cref="RejectReason"/> to the FIX OrdRejReason wire code

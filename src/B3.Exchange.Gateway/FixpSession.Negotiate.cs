@@ -139,8 +139,17 @@ public sealed partial class FixpSession
             // idle-timeout detected the dead TCP. If the new sessionVerId is
             // strictly greater, atomically evict the stale claim and continue
             // to the accept path.
-            claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
-                out var evicted);
+            bool activeClaimIsCommitted =
+                _sessionRegistry is null
+                || !_claims.TryGetActiveClaim(req.SessionId, out var activeHolder, out _)
+                || activeHolder is not FixpSession activeSession
+                || _sessionRegistry.IsCurrent(activeSession);
+            object? evicted = null;
+            if (activeClaimIsCommitted)
+            {
+                claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
+                    out evicted);
+            }
             if (claim == SessionClaimRegistry.ClaimResult.Accepted && evicted is FixpSession oldSession)
             {
                 _logger.LogInformation(
@@ -182,7 +191,22 @@ public sealed partial class FixpSession
         // leak an accepted SessionVerID into the peer's view that no
         // post-restart boot would honor, allowing a stale-version
         // Negotiate to be replayed against a clean SessionClaimRegistry.
-        if (!TrySaveStateSnapshot())
+        SessionClaimRegistry.TakeOverFinalizeResult? takeOverFinalize = null;
+        bool committed;
+        if (evictedByTakeOver is not null && _sessionRegistry is not null)
+        {
+            takeOverFinalize = _sessionRegistry.TryCommitTakeOver(
+                evictedByTakeOver,
+                this,
+                _claims,
+                evictedVerId);
+            committed = takeOverFinalize == SessionClaimRegistry.TakeOverFinalizeResult.Committed;
+        }
+        else
+        {
+            committed = TrySaveStateSnapshot();
+        }
+        if (!committed)
         {
             // Roll back the in-memory claim taken above so the session
             // can be retried by the peer (same SessionVerID, same TCP
@@ -195,11 +219,15 @@ public sealed partial class FixpSession
             // no-op (returns false) if a concurrent racing takeover has
             // already won the registry in the window between
             // TryForceTakeOver and here.
-            var takeOverRolledBack = false;
+            var takeOverRolledBack =
+                takeOverFinalize == SessionClaimRegistry.TakeOverFinalizeResult.RolledBack;
             if (evictedByTakeOver is not null)
             {
-                takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
-                    this, evictedByTakeOver, evictedVerId);
+                if (takeOverFinalize is null)
+                {
+                    takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
+                        this, evictedByTakeOver, evictedVerId);
+                }
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
@@ -216,7 +244,9 @@ public sealed partial class FixpSession
             // rollback so routing is restored — but only when the claim was
             // actually handed back (takeOverRolledBack), to stay in lock-step
             // with the claim registry and avoid clobbering a racing takeover.
-            if (takeOverRolledBack && evictedByTakeOver is not null)
+            if (takeOverRolledBack
+                && evictedByTakeOver is not null
+                && _sessionRegistry is null)
             {
                 _onTakeOverRollback?.Invoke(evictedByTakeOver);
             }
@@ -235,17 +265,13 @@ public sealed partial class FixpSession
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,
             req.TimestampNanos, outcome.Firm.EnteringFirmCode,
             semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
-        // Issue #488: persistence committed — safe to evict the stale session now.
-        // Its Release() call is a no-op (registry already holds this session's token).
-        if (evictedByTakeOver is not null
-            && _sessionRegistry is not null
-            && !_sessionRegistry.TransferTakeOver(evictedByTakeOver, this))
-        {
-            _logger.LogError(
-                "session {ConnectionId} failed to transfer logical route from takeover victim {OldConnectionId}",
-                ConnectionId, evictedByTakeOver.ConnectionId);
-        }
-        evictedByTakeOver?.Close("session-takeover:evicted-by-newer-verId", CloseKind.SessionTakeOver);
+        // With a SessionRegistry, TryCommitTakeOver atomically persisted the
+        // reconciled outbound state, switched the logical route, and closed the
+        // victim. Directly-constructed legacy sessions retain the old fallback.
+        if (evictedByTakeOver is not null && _sessionRegistry is null)
+            evictedByTakeOver.Close(
+                "session-takeover:evicted-by-newer-verId",
+                CloseKind.SessionTakeOver);
         return NegotiateStep.Accepted(responseFrame,
             $"negotiate-accept (sid={req.SessionId} firm={outcome.Firm.Id})");
     }

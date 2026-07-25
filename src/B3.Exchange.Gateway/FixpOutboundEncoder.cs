@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using System.Buffers.Binary;
+using B3.Exchange.Contracts;
 using B3.Exchange.Contracts.Time;
 using B3.Exchange.Matching;
 using DurabilityHandle = B3.Exchange.Contracts.DurabilityHandle;
@@ -27,6 +28,7 @@ internal sealed class FixpOutboundEncoder
     private readonly Func<uint> _sessionId;
     private readonly Func<ulong> _sessionVerId;
     private readonly Func<uint> _nextMsgSeqNum;
+    private readonly Action<uint> _rollbackMsgSeqNum;
     private readonly Func<TcpTransport> _transport;
     private readonly RetransmitBuffer _retxBuffer;
     private readonly object _outboundLock;
@@ -41,10 +43,19 @@ internal sealed class FixpOutboundEncoder
     /// pair is globally unique.</summary>
     private long _massActionReportSeq;
 
+    internal long MassActionReportSeq => Volatile.Read(ref _massActionReportSeq);
+
+    internal void AdvanceMassActionReportSeqTo(long value)
+    {
+        if (value > Volatile.Read(ref _massActionReportSeq))
+            Volatile.Write(ref _massActionReportSeq, value);
+    }
+
     public FixpOutboundEncoder(
         Func<uint> sessionId,
         Func<ulong> sessionVerId,
         Func<uint> nextMsgSeqNum,
+        Action<uint> rollbackMsgSeqNum,
         Func<TcpTransport> transport,
         RetransmitBuffer retxBuffer,
         object outboundLock,
@@ -55,6 +66,7 @@ internal sealed class FixpOutboundEncoder
         _sessionId = sessionId;
         _sessionVerId = sessionVerId;
         _nextMsgSeqNum = nextMsgSeqNum;
+        _rollbackMsgSeqNum = rollbackMsgSeqNum;
         _transport = transport;
         _retxBuffer = retxBuffer;
         _outboundLock = outboundLock;
@@ -78,6 +90,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return false;
                 ExecutionReportEncoder.EncodeExecReportNew(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), e.InsertTimestampNanos,
                     e.Side, clOrd, e.OrderId, e.SecurityId, e.OrderId,
@@ -85,7 +98,7 @@ internal sealed class FixpOutboundEncoder
                     e.OrdType, TimeInForce.Day,
                     e.RemainingQuantity, e.PriceMantissa,
                     memo.Span, receivedTimeNanos, e.ProtectionPriceMantissa, e.CrossType, e.CrossPrioritization);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability).IsTransportEnqueued;
             }
         }
         finally
@@ -104,6 +117,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return false;
                 ExecutionReportEncoder.EncodeExecReportTrade(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                     side, clOrdIdValue, ownerOrderId, e.SecurityId, ownerOrderId,
@@ -113,7 +127,7 @@ internal sealed class FixpOutboundEncoder
                     isAggressor ? e.RestingFirm : e.AggressorFirm,
                     tradeDate: 0,
                     orderQty: leavesQty + cumQty, memo.Span, e.CrossType, e.CrossPrioritization);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability).IsTransportEnqueued;
             }
         }
         finally
@@ -122,16 +136,17 @@ internal sealed class FixpOutboundEncoder
         }
     }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
+    public OrderedStreamWriteResult WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
     {
-        if (!_isOpen()) return false;
+        if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
         var exact = PooledOutboundFrame.Rent(ExecutionReportEncoder.TotalSize(ExecutionReportEncoder.ExecReportCancelBlock, memo.Length));
         try
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
                 ExecutionReportEncoder.EncodeExecReportCancel(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                     e.Side, clOrdIdValue, origClOrdIdValue, e.OrderId,
@@ -164,6 +179,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return false;
                 ExecutionReportEncoder.EncodeExecReportModify(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), transactTimeNanos,
                     side, clOrdIdValue, origClOrdIdValue, orderId,
@@ -173,7 +189,7 @@ internal sealed class FixpOutboundEncoder
                     investorId: investorId,
                     ordType: ordType,
                     protectionPriceMantissa: protectionPriceMantissa);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability).IsTransportEnqueued;
             }
         }
         finally
@@ -197,6 +213,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return false;
                 ExecutionReportEncoder.EncodeExecReportRestate(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                     e.Side, ownerClOrdId, e.OrderId,
@@ -205,7 +222,7 @@ internal sealed class FixpOutboundEncoder
                     tif: e.Tif, expireDate: e.ExpireDate,
                     ordType: e.OrdType, stopPxMantissa: e.StopPxMantissa,
                     memo: memo.Span, investorId: e.InvestorId);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability).IsTransportEnqueued;
             }
         }
         finally
@@ -219,11 +236,11 @@ internal sealed class FixpOutboundEncoder
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
     /// <c>OrderMassActionRequest</c>.
     /// </summary>
-    public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
+    public OrderedStreamWriteResult WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
         byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,
         string? text = null)
     {
-        if (!_isOpen()) return false;
+        if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
         ulong reportId = (ulong)Interlocked.Increment(ref _massActionReportSeq);
         int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text!.Length, OrderMassActionReportEncoder.MaxTextLength);
         var exact = PooledOutboundFrame.Rent(OrderMassActionReportEncoder.TotalSize(textLen));
@@ -231,6 +248,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
                 OrderMassActionReportEncoder.EncodeOrderMassActionReportWithText(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), transactTimeNanos,
                     clOrdIdValue, reportId, transactTimeNanos,
@@ -254,11 +272,12 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return false;
                 ExecutionReportEncoder.EncodeExecReportReject(exact.Span,
                     _sessionId(), _nextMsgSeqNum(), e.TransactTimeNanos,
                     clOrdIdValue, origClOrdIdValue: 0, e.SecurityId, e.OrderIdOrZero,
                     rej, e.TransactTimeNanos, memo.Span);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability).IsTransportEnqueued;
             }
         }
         finally
@@ -284,10 +303,10 @@ internal sealed class FixpOutboundEncoder
         }
     }
 
-    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+    public OrderedStreamWriteResult WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
         uint businessRejectReason, string? text = null, ReadOnlyMemory<byte> memo = default)
     {
-        if (!_isOpen()) return false;
+        if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
         int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text.Length, BusinessMessageRejectEncoder.MaxTextLength);
         int total = BusinessMessageRejectEncoder.TotalSize(memo.Length, textLen);
         var exact = PooledOutboundFrame.Rent(total);
@@ -295,6 +314,7 @@ internal sealed class FixpOutboundEncoder
         {
             lock (_outboundLock)
             {
+                if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
                 BusinessMessageRejectEncoder.EncodeBusinessMessageRejectWithText(
                     exact.Span, _sessionId(), _nextMsgSeqNum(), _timeSource.NowNanos(),
                     refMsgType, refSeqNum, businessRejectRefId, businessRejectReason, text, memo.Span);
@@ -314,7 +334,9 @@ internal sealed class FixpOutboundEncoder
     /// transport. Centralizes the two-step "buffer + enqueue" so every
     /// business-frame write site has identical semantics.
     /// </summary>
-    private bool AppendAndEnqueueLocked(PooledOutboundFrame exact, DurabilityHandle durability = default)
+    private OrderedStreamWriteResult AppendAndEnqueueLocked(
+        PooledOutboundFrame exact,
+        DurabilityHandle durability = default)
     {
         // OutboundBusinessHeader.MsgSeqNum sits at body offset 4
         // (SessionID(4) | MsgSeqNum(4) | …) → absolute offset
@@ -325,8 +347,17 @@ internal sealed class FixpOutboundEncoder
         // Append BEFORE enqueue: per spec recovery semantics, any seq
         // that has been allocated MUST be replayable, even if the local
         // send queue rejects the frame (gpt-5.5 critique #9).
-        _retxBuffer.Append(seq, exact);
-        return _transport().TryEnqueueFrame(exact, durability);
+        try
+        {
+            _retxBuffer.Append(seq, exact);
+        }
+        catch
+        {
+            _rollbackMsgSeqNum(seq);
+            throw;
+        }
+        return OrderedStreamWriteResult.FromTransportAdmission(
+            _transport().TryEnqueueFrame(exact, durability));
     }
 
     /// <summary>

@@ -245,7 +245,7 @@ public sealed partial class ChannelDispatcher
         };
         _trackMassCancelReports = item.Kind == WorkKind.MassCancel
             && item.MassCancelCompletion is not null;
-        _currentMassCancelReportsEnqueued = true;
+        _currentMassCancelReportsCommitted = true;
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
@@ -484,7 +484,7 @@ public sealed partial class ChannelDispatcher
                             throw;
                         }
                         CompleteMassCancel(item.MassCancelCompletion,
-                            _currentMassCancelReportsEnqueued
+                            _currentMassCancelReportsCommitted
                                 ? MassCancelOutcome.Completed(affected)
                                 : MassCancelOutcome.SystemBusy);
                         break;
@@ -560,7 +560,7 @@ public sealed partial class ChannelDispatcher
             _currentOrigClOrdId = 0;
             _currentReceivedTimeNanos = ulong.MaxValue;
             _trackMassCancelReports = false;
-            _currentMassCancelReportsEnqueued = true;
+            _currentMassCancelReportsCommitted = true;
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
             // Issue #484: flush the last buffered IOC aggressor ER with

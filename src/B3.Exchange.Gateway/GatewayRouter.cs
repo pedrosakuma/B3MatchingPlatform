@@ -50,34 +50,45 @@ public sealed class GatewayRouter : ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportNew"); return false; }
-        return s.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue, e.Memo ?? ReadOnlyMemory<byte>.Empty);
+        var report = e;
+        return Route(session, "ExecReportNew", s =>
+            s.WriteExecutionReportNew(report, receivedTimeNanos, durability, clOrdIdValue,
+                report.Memo ?? ReadOnlyMemory<byte>.Empty));
     }
 
     public bool WriteExecutionReportTrade(ContractsSessionId session, in TradeEvent e, bool isAggressor,
         long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
         DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability, isAggressor ? (e.AggressorMemo ?? ReadOnlyMemory<byte>.Empty) : (e.RestingMemo ?? ReadOnlyMemory<byte>.Empty));
+        var report = e;
+        return Route(session, "ExecReportTrade", s =>
+            s.WriteExecutionReportTrade(report, isAggressor, ownerOrderId, clOrdIdValue,
+                leavesQty, cumQty, durability,
+                isAggressor
+                    ? report.AggressorMemo ?? ReadOnlyMemory<byte>.Empty
+                    : report.RestingMemo ?? ReadOnlyMemory<byte>.Empty));
     }
 
     public bool WriteExecutionReportPassiveTrade(ContractsSessionId ownerSession, ulong ownerClOrdId, long restingOrderId,
         in TradeEvent e, long leavesQty, long cumQty,
         DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveTrade"); return false; }
-        return s.WriteExecutionReportTrade(e, isAggressor: false, restingOrderId, ownerClOrdId, leavesQty, cumQty, durability,
-            e.RestingMemo ?? ReadOnlyMemory<byte>.Empty);
+        var report = e;
+        return Route(ownerSession, "ExecReportPassiveTrade", s =>
+            s.WriteExecutionReportTrade(report, isAggressor: false, restingOrderId,
+                ownerClOrdId, leavesQty, cumQty, durability,
+                report.RestingMemo ?? ReadOnlyMemory<byte>.Empty));
     }
 
-    public bool WriteExecutionReportPassiveCancel(ContractsSessionId ownerSession, ulong ownerClOrdId, long orderId,
+    public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(ContractsSessionId ownerSession, ulong ownerClOrdId, long orderId,
         in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportPassiveCancel"); return false; }
+        var report = e;
         ulong clOrdIdOnWire = requesterClOrdIdOrZero != 0 ? requesterClOrdIdOrZero : ownerClOrdId;
-        return s.WriteExecutionReportCancel(e, clOrdIdOnWire, ownerClOrdId, receivedTimeNanos, durability, e.Memo ?? ReadOnlyMemory<byte>.Empty);
+        return RouteOrdered(ownerSession, "ExecReportPassiveCancel", s =>
+            s.WriteExecutionReportCancel(report, clOrdIdOnWire, ownerClOrdId,
+                receivedTimeNanos, durability, report.Memo ?? ReadOnlyMemory<byte>.Empty));
     }
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
@@ -86,12 +97,11 @@ public sealed class GatewayRouter : ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         Matching.InvestorId? investorId = null)
-    {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportModify"); return false; }
-        return s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability,
-            memo: default, investorId: investorId);
-    }
+        => Route(session, "ExecReportModify", s =>
+            s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue,
+                origClOrdIdValue, side, newPriceMantissa, newRemainingQty,
+                transactTimeNanos, rptSeq, receivedTimeNanos, durability,
+                memo: default, investorId: investorId));
 
     public bool WriteExecutionReportModify(ContractsSessionId session, long securityId, long orderId,
         ulong clOrdIdValue, ulong origClOrdIdValue,
@@ -100,26 +110,59 @@ public sealed class GatewayRouter : ICoreOutbound
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         Matching.InvestorId? investorId = null)
-    {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportModify"); return false; }
-        return s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability,
-            memo: default, investorId: investorId, ordType: ordType, protectionPriceMantissa: protectionPriceMantissa);
-    }
+        => Route(session, "ExecReportModify", s =>
+            s.WriteExecutionReportModify(securityId, orderId, clOrdIdValue,
+                origClOrdIdValue, side, newPriceMantissa, newRemainingQty,
+                transactTimeNanos, rptSeq, receivedTimeNanos, durability,
+                memo: default, investorId: investorId, ordType: ordType,
+                protectionPriceMantissa: protectionPriceMantissa));
 
     public bool WriteExecutionReportReject(ContractsSessionId session, in RejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(session, out var s)) { LogMiss(session, "ExecReportReject"); return false; }
-        return s.WriteExecutionReportReject(e, clOrdIdValue, durability, e.Memo ?? ReadOnlyMemory<byte>.Empty);
+        var report = e;
+        return Route(session, "ExecReportReject", s =>
+            s.WriteExecutionReportReject(report, clOrdIdValue, durability,
+                report.Memo ?? ReadOnlyMemory<byte>.Empty));
     }
 
     public bool WriteExecutionReportRestate(ContractsSessionId ownerSession, ulong ownerClOrdId,
         in OrderRestatedEvent e, DurabilityHandle durability = default)
     {
-        if (!_registry.TryGet(ownerSession, out var s)) { LogMiss(ownerSession, "ExecReportRestate"); return false; }
-        return s.WriteExecutionReportRestate(e, ownerClOrdId, durability,
-            e.Memo ?? ReadOnlyMemory<byte>.Empty);
+        var report = e;
+        return Route(ownerSession, "ExecReportRestate", s =>
+            s.WriteExecutionReportRestate(report, ownerClOrdId, durability,
+                report.Memo ?? ReadOnlyMemory<byte>.Empty));
+    }
+
+    private bool Route(
+        ContractsSessionId session,
+        string kind,
+        Func<FixpSession, bool> write)
+    {
+        bool found = false;
+        bool result = _registry.TryInvoke(session, current =>
+        {
+            found = true;
+            return write(current);
+        });
+        if (!found) LogMiss(session, kind);
+        return result;
+    }
+
+    private OrderedStreamWriteResult RouteOrdered(
+        ContractsSessionId session,
+        string kind,
+        Func<FixpSession, OrderedStreamWriteResult> write)
+    {
+        bool found = false;
+        var result = _registry.TryInvokeOrdered(session, current =>
+        {
+            found = true;
+            return write(current);
+        });
+        if (!found) LogMiss(session, kind);
+        return result;
     }
 
     private void LogMiss(ContractsSessionId session, string kind)

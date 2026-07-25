@@ -529,10 +529,10 @@ public sealed partial class ChannelDispatcher
         public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId,
             long restingOrderId, in TradeEvent e, long leavesQty, long cumQty,
             DurabilityHandle durability = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId,
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId,
             long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero,
             ulong receivedTimeNanos = ulong.MaxValue,
-            DurabilityHandle durability = default) => true;
+            DurabilityHandle durability = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
             ulong clOrdIdValue, ulong origClOrdIdValue,
             MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos,

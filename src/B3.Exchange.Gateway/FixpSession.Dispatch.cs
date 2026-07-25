@@ -392,19 +392,40 @@ public sealed partial class FixpSession
                             {
                                 if (outcome.Succeeded)
                                 {
-                                    return target.WriteOrderMassActionReport(mcClOrd,
-                                        OrderMassActionReportEncoder.MassActionResponseAccepted,
-                                        massActionRejectReason: null,
-                                        side: sideByte, securityId: mcCmd.SecurityId,
-                                        transactTimeNanos: now);
+                                    try
+                                    {
+                                        var accepted = target.WriteOrderMassActionReport(mcClOrd,
+                                            OrderMassActionReportEncoder.MassActionResponseAccepted,
+                                            massActionRejectReason: null,
+                                            side: sideByte, securityId: mcCmd.SecurityId,
+                                            transactTimeNanos: now);
+                                        if (accepted.IsCommitted)
+                                            return accepted;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogWarning(ex,
+                                            "fixp session {ConnectionId} failed to commit terminal mass-action report",
+                                            ConnectionId);
+                                    }
                                 }
 
-                                return target.WriteSystemBusyReject(
-                                    EntryPointFrameReader.TidOrderMassActionRequest,
-                                    refSeqNum,
-                                    mcClOrd,
-                                    "MassCancel",
-                                    "System busy: mass cancel could not complete");
+                                try
+                                {
+                                    return target.WriteSystemBusyReject(
+                                        EntryPointFrameReader.TidOrderMassActionRequest,
+                                        refSeqNum,
+                                        mcClOrd,
+                                        "MassCancel",
+                                        "System busy: mass cancel could not complete");
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex,
+                                        "fixp session {ConnectionId} failed to commit mass-action SystemBusy reject",
+                                        ConnectionId);
+                                    return OrderedStreamWriteResult.NotCommitted;
+                                }
                             });
                         }))
                         {

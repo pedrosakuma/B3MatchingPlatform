@@ -24,11 +24,12 @@ public class HostRouterTests
     {
         public List<RejectEvent> Rejects { get; } = new();
         public List<string> Events { get; } = new();
-        public bool CancelEnqueueResult { get; set; } = true;
+        public OrderedStreamWriteResult CancelWriteResult { get; set; } =
+            OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportNew(B3.Exchange.Contracts.SessionId session, uint enteringFirm, ulong clOrdIdValue, in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle durability = default) { Events.Add("new"); return true; }
         public bool WriteExecutionReportTrade(B3.Exchange.Contracts.SessionId session, in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty, DurabilityHandle durability = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId, long restingOrderId, in TradeEvent e, long leavesQty, long cumQty, DurabilityHandle durability = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle durability = default) { Events.Add("cancel"); return CancelEnqueueResult; }
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle durability = default) { Events.Add("cancel"); return CancelWriteResult; }
         public bool WriteExecutionReportModify(B3.Exchange.Contracts.SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle durability = default, InvestorId? investorId = null) => true;
         public bool WriteExecutionReportReject(B3.Exchange.Contracts.SessionId session, in RejectEvent e, ulong clOrdIdValue, DurabilityHandle durability = default) { Rejects.Add(e); return true; }
     }
@@ -146,7 +147,10 @@ public class HostRouterTests
     public void SolicitedMassCancel_CancelReportFailureCompletesSystemBusy()
     {
         var inst = CreateInstrument();
-        var outbound = new RecordingOutbound { CancelEnqueueResult = false };
+        var outbound = new RecordingOutbound
+        {
+            CancelWriteResult = OrderedStreamWriteResult.NotCommitted,
+        };
         var disp = CreateDispatcher(inst, outbound);
         var router = new HostRouter(
             new Dictionary<long, ChannelDispatcher> { [inst.SecurityId] = disp },
@@ -175,6 +179,39 @@ public class HostRouterTests
 
         Assert.Equal(new[] { "cancel", "complete" }, outbound.Events);
         Assert.False(outcome?.Succeeded);
+    }
+
+    [Fact]
+    public void SolicitedMassCancel_BufferedCancelReportCompletesAccepted()
+    {
+        var inst = CreateInstrument();
+        var outbound = new RecordingOutbound
+        {
+            CancelWriteResult = OrderedStreamWriteResult.Committed,
+        };
+        var disp = CreateDispatcher(inst, outbound);
+        var router = new HostRouter(
+            new Dictionary<long, ChannelDispatcher> { [inst.SecurityId] = disp },
+            outbound, NullLogger<HostRouter>.Instance);
+        var session = new SessionId("s1");
+        var probe = disp.CreateTestProbe();
+
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("1", inst.SecurityId, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10m), 100, 7, 1),
+            session, enteringFirm: 7, clOrdIdValue: 1));
+        probe.DrainInbound();
+
+        MassCancelOutcome? outcome = null;
+        Assert.True(router.EnqueueMassCancel(
+            new MassCancelCommand(inst.SecurityId, null, 2),
+            session, enteringFirm: 7,
+            completed => outcome = completed));
+
+        probe.DrainInbound();
+
+        Assert.True(outcome?.Succeeded);
+        Assert.Equal(1, outcome?.TotalAffectedOrders);
     }
 
     [Fact]

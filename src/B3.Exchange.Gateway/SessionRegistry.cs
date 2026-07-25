@@ -6,23 +6,21 @@ namespace B3.Exchange.Gateway;
 
 /// <summary>
 /// In-memory map from <see cref="SessionId"/> to the live
-/// <see cref="FixpSession"/> that currently terminates that session.
+/// <see cref="FixpSession"/> that currently terminates that logical session,
+/// plus the per-logical-session coordination routes used by outbound writes,
+/// lifecycle closure, and higher-version takeover.
 ///
-/// <para>Phase 1 stub: today there is exactly one TCP transport per
-/// session (entries appear on accept, vanish on disconnect). Phase 2
-/// (FIXP Establish + reattach) and Phase 3 (Suspended sessions backed by
-/// retransmission rings) will replace the value type with a richer
-/// <c>FixpSessionHandle</c> that survives transport churn.</para>
-///
-/// <para>Thread-safety: register / deregister can race with
-/// <see cref="TryGet"/> calls coming from any
-/// <see cref="ChannelDispatcher"/> dispatch thread. Backed by
-/// <see cref="ConcurrentDictionary{TKey, TValue}"/> for that reason.</para>
+/// <para>Each logical session has its own <see cref="SessionRoute"/> gate, so
+/// unrelated firms never serialize their execution reports behind a global
+/// lock. Route handles merge only after a takeover is fully persisted. A
+/// delayed callback captured on the victim therefore follows the committed
+/// successor but can never follow an unrelated later reuse of the numeric
+/// SessionID.</para>
 /// </summary>
 public sealed class SessionRegistry
 {
     private readonly ConcurrentDictionary<SessionId, FixpSession> _sessions = new();
-    private readonly object _routeLock = new();
+    private readonly object _mapLock = new();
     private readonly ConditionalWeakTable<FixpSession, SessionRoute> _routes = new();
 
     public int Count => _sessions.Count;
@@ -34,19 +32,21 @@ public sealed class SessionRegistry
     public void Register(FixpSession session)
     {
         ArgumentNullException.ThrowIfNull(session);
-        lock (_routeLock)
+        var route = RouteFor(session);
+        route.Execute(root =>
         {
-            var route = _routes
-                .GetValue(session, static current => new SessionRoute(current))
-                .Resolve();
-            var current = route.Current;
+            var current = root.Current;
             if (current is null
                 || ReferenceEquals(current, session)
                 || (current.Identity == session.Identity
                     && current.SessionVerId <= session.SessionVerId))
-                route.SetCurrent(session);
-        }
-        _sessions[session.Identity] = session;
+                root.SetCurrent(session);
+            lock (_mapLock)
+            {
+                _sessions[session.Identity] = session;
+            }
+            return true;
+        });
     }
 
     /// <summary>Removes the session if it is the currently-registered
@@ -56,12 +56,16 @@ public sealed class SessionRegistry
     public void Deregister(FixpSession session)
     {
         ArgumentNullException.ThrowIfNull(session);
-        _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(session.Identity, session));
-        lock (_routeLock)
+        RouteFor(session).Execute(root =>
         {
-            if (_routes.TryGetValue(session, out var route))
-                route.Clear(session);
-        }
+            lock (_mapLock)
+            {
+                _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(
+                    session.Identity, session));
+            }
+            root.ClearCurrent(session);
+            return true;
+        });
     }
 
     /// <summary>
@@ -74,58 +78,162 @@ public sealed class SessionRegistry
         ArgumentNullException.ThrowIfNull(session);
         // Avoid unnecessary churn when identity hasn't changed (e.g., rehydrated sessions)
         if (oldIdentity == newIdentity) return;
-        // Publish new key BEFORE removing old key to minimize routing miss window
-        _sessions[newIdentity] = session;
-        // Remove old key only if it still points to this session
-        _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(oldIdentity, session));
+        RouteFor(session).Execute(route =>
+        {
+            if (!ReferenceEquals(route.Current, session))
+                return false;
+            lock (_mapLock)
+            {
+                // A higher-version Negotiate creates a replacement FixpSession,
+                // but the previous logical session remains authoritative until
+                // takeover persistence and outbound-state transfer commit.
+                _sessions.TryAdd(newIdentity, session);
+                _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(
+                    oldIdentity, session));
+            }
+            return true;
+        });
     }
 
     public bool TryGet(SessionId session, out FixpSession value)
         => _sessions.TryGetValue(session, out value!);
 
-    internal SessionRoute CaptureRoute(FixpSession session)
+    internal bool IsCurrent(FixpSession session)
     {
         ArgumentNullException.ThrowIfNull(session);
-        return _routes.GetValue(session, static current => new SessionRoute(current));
-    }
-
-    internal bool TransferTakeOver(FixpSession previous, FixpSession replacement)
-    {
-        ArgumentNullException.ThrowIfNull(previous);
-        ArgumentNullException.ThrowIfNull(replacement);
-        lock (_routeLock)
+        lock (_mapLock)
         {
-            if (previous.Identity != replacement.Identity)
-                return false;
-
-            var previousRoute = _routes
-                .GetValue(previous, static current => new SessionRoute(current))
-                .Resolve();
-            var replacementRoute = _routes
-                .GetValue(replacement, static current => new SessionRoute(current))
-                .Resolve();
-            var target = replacement;
-
-            if (!TrySelectCurrent(previousRoute.Current, replacement.Identity, ref target)
-                || !TrySelectCurrent(replacementRoute.Current, replacement.Identity, ref target))
-                return false;
-
-            previousRoute.SetCurrent(target);
-            if (!ReferenceEquals(previousRoute, replacementRoute))
-                replacementRoute.RedirectTo(previousRoute);
-            return true;
+            return _sessions.TryGetValue(session.Identity, out var current)
+                && ReferenceEquals(current, session);
         }
     }
 
-    private static bool TrySelectCurrent(
-        FixpSession? candidate,
-        SessionId identity,
-        ref FixpSession target)
+    internal SessionRoute CaptureRoute(FixpSession session)
     {
-        if (candidate is null) return true;
-        if (candidate.Identity != identity) return false;
-        if (candidate.SessionVerId > target.SessionVerId)
-            target = candidate;
-        return true;
+        ArgumentNullException.ThrowIfNull(session);
+        return RouteFor(session);
     }
+
+    internal bool TryInvoke(SessionId session, Func<FixpSession, bool> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        FixpSession current;
+        lock (_mapLock)
+        {
+            if (!_sessions.TryGetValue(session, out current!))
+                return false;
+        }
+        return RouteFor(current).Execute(route =>
+            route.Current is { } target ? action(target) : false);
+    }
+
+    internal OrderedStreamWriteResult TryInvokeOrdered(
+        SessionId session,
+        Func<FixpSession, OrderedStreamWriteResult> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        FixpSession current;
+        lock (_mapLock)
+        {
+            if (!_sessions.TryGetValue(session, out current!))
+                return OrderedStreamWriteResult.NotCommitted;
+        }
+        return RouteFor(current).Execute(route =>
+            route.Current is { } target
+                ? action(target)
+                : OrderedStreamWriteResult.NotCommitted);
+    }
+
+    internal void ExecuteExclusive(FixpSession session, Action action)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(action);
+        RouteFor(session).Execute(_ =>
+        {
+            action();
+            return true;
+        });
+    }
+
+    internal T ExecuteExclusive<T>(FixpSession session, Func<T> action)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(action);
+        return RouteFor(session).Execute(_ => action());
+    }
+
+    internal SessionClaimRegistry.TakeOverFinalizeResult TryCommitTakeOver(
+        FixpSession previous,
+        FixpSession replacement,
+        SessionClaimRegistry claims,
+        ulong previousSessionVerId)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(replacement);
+        ArgumentNullException.ThrowIfNull(claims);
+
+        var previousHandle = RouteFor(previous);
+        var replacementHandle = RouteFor(replacement);
+        return SessionRoute.ExecutePair(previousHandle, replacementHandle,
+            (previousRoute, replacementRoute) =>
+        {
+            var identity = replacement.Identity;
+            var result = claims.TryFinalizeTakeOver(
+                replacement.SessionId,
+                replacement.SessionVerId,
+                replacement,
+                previous,
+                previousSessionVerId,
+                commit: () =>
+                {
+                    lock (_mapLock)
+                    {
+                        if (previous.Identity != replacement.Identity
+                            || !_sessions.TryGetValue(identity, out var registered)
+                            || !ReferenceEquals(registered, previous)
+                            || !replacement.IsLiveTakeOverCandidate)
+                            return false;
+                    }
+
+                    return replacement.TryAdoptOutboundStateForTakeOver(previous, () =>
+                    {
+                        if (!replacement.IsLiveTakeOverCandidate)
+                            return false;
+                        if (!replacement.TrySaveStateSnapshot())
+                            return false;
+                        if (!replacement.TrySealTakeOverCandidate())
+                            return false;
+
+                        if (!ReferenceEquals(previousRoute.Current, previous)
+                            || !ReferenceEquals(replacementRoute.Current, replacement))
+                            return false;
+
+                        previousRoute.SetCurrent(replacement);
+                        if (!ReferenceEquals(previousRoute, replacementRoute))
+                            replacementRoute.RedirectTo(previousRoute);
+                        lock (_mapLock)
+                        {
+                            _sessions[identity] = replacement;
+                        }
+                        previous.Close(
+                            "session-takeover:evicted-by-newer-verId",
+                            CloseKind.SessionTakeOver);
+                        return true;
+                    });
+                });
+
+            if (result == SessionClaimRegistry.TakeOverFinalizeResult.RolledBack)
+            {
+                lock (_mapLock)
+                {
+                    _sessions[identity] = previous;
+                }
+                previous.SaveStateSnapshotSafe();
+            }
+            return result;
+        });
+    }
+
+    private SessionRoute RouteFor(FixpSession session)
+        => _routes.GetValue(session, static current => new SessionRoute(current));
 }

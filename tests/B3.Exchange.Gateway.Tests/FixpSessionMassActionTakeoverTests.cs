@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Text;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -31,6 +32,90 @@ public class FixpSessionMassActionTakeoverTests
 
         public void OnDecodeError(SessionId session, string error) { }
         public void OnSessionClosed(SessionId session) { }
+    }
+
+    private sealed class StrictJournal : IFixpOutboundJournal
+    {
+        private readonly object _lock = new();
+        private readonly SortedDictionary<uint, OutboundJournalEntry> _entries = new();
+
+        public IReadOnlyList<OutboundJournalEntry> Entries
+        {
+            get { lock (_lock) return _entries.Values.ToArray(); }
+        }
+
+        public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
+        {
+            lock (_lock)
+            {
+                if (_entries.Count > 0 && seq <= _entries.Keys.Max())
+                    throw new InvalidOperationException("outbound sequence must be strictly monotonic");
+                _entries.Add(seq, new OutboundJournalEntry(seq, timestampNanos, frame.ToArray()));
+            }
+        }
+
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
+        public void PruneUpTo(uint sessionId, uint uptoSeq) { }
+        public uint MaxSeq(uint sessionId)
+        {
+            lock (_lock) return _entries.Count == 0 ? 0u : _entries.Keys.Max();
+        }
+        public long EntryCount(uint sessionId)
+        {
+            lock (_lock) return _entries.Count;
+        }
+        public IReadOnlyList<OutboundJournalEntry> ReadRange(uint sessionId, uint fromSeq, int count)
+        {
+            lock (_lock)
+            {
+                return _entries.Values
+                    .Where(entry => entry.Seq >= fromSeq)
+                    .Take(count)
+                    .ToArray();
+            }
+        }
+        public void Remove(uint sessionId)
+        {
+            lock (_lock) _entries.Clear();
+        }
+        public IReadOnlyCollection<uint> ListSessions() => new[] { 1u };
+        public void Dispose() { }
+    }
+
+    private sealed class BlockingStatePersister : IFixpSessionStatePersister
+    {
+        private readonly object _lock = new();
+        private readonly ManualResetEventSlim _releaseTakeOverSave = new(false);
+        private FixpSessionStateSnapshot? _lastSaved;
+
+        public bool BlockTakeOverSave { get; set; }
+        public TaskCompletionSource<bool> TakeOverSaveEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public FixpSessionStateSnapshot? LastSaved
+        {
+            get { lock (_lock) return _lastSaved; }
+        }
+
+        public void Save(in FixpSessionStateSnapshot snapshot)
+        {
+            if (BlockTakeOverSave && snapshot.SessionVerId == 3)
+            {
+                TakeOverSaveEntered.TrySetResult(true);
+                _releaseTakeOverSave.Wait(TimeSpan.FromSeconds(5));
+            }
+            lock (_lock) _lastSaved = snapshot;
+        }
+
+        public void ReleaseTakeOverSave() => _releaseTakeOverSave.Set();
+        public FixpSessionStateSnapshot? Load(uint sessionId) => LastSaved;
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
+            => LastSaved is { } saved ? new[] { saved } : Array.Empty<FixpSessionStateSnapshot>();
+        public void Remove(uint sessionId)
+        {
+            lock (_lock) _lastSaved = null;
+        }
+        public void Dispose() => _releaseTakeOverSave.Dispose();
     }
 
     [Fact]
@@ -63,7 +148,7 @@ public class FixpSessionMassActionTakeoverTests
             ownerClOrdId: 5001,
             orderId: canceled.OrderId,
             canceled,
-            requesterClOrdIdOrZero: 7001));
+            requesterClOrdIdOrZero: 7001).IsCommitted);
         complete(MassCancelOutcome.Completed(1));
 
         var cancel = await ReadOneFrameAsync(replacementClient.GetStream());
@@ -98,10 +183,149 @@ public class FixpSessionMassActionTakeoverTests
         await AssertNoFrameAsync(unrelatedClient.GetStream());
     }
 
+    [Fact]
+    public async Task PersistenceEnabledTakeover_ContinuesSequenceAcrossCancelAndTerminalReport()
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        var journal = new StrictJournal();
+        var state = new BlockingStatePersister();
+        await using var listener = BuildListener(
+            sink, registry, claims, journal, state);
+        listener.Start();
+
+        using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
+        await oldClient.GetStream().WriteAsync(BuildMassActionRequest(clOrdId: 7101));
+        var complete = await sink.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
+        var canceled = CreateMassCancelEvent(orderId: 56, rptSeq: 1);
+        var cancelResult = gateway.WriteExecutionReportPassiveCancel(
+            new SessionId("1"), ownerClOrdId: 5002, orderId: canceled.OrderId,
+            canceled, requesterClOrdIdOrZero: 7101);
+        Assert.True(cancelResult.IsCommitted);
+        var cancel = await ReadOneFrameAsync(oldClient.GetStream());
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel.TemplateId);
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(cancel.Body.AsSpan(4, 4)));
+
+        using var replacementClient = await ConnectAndEstablishAsync(listener, sessionVerId: 3);
+        complete(MassCancelOutcome.Completed(1));
+
+        var report = await ReadOneFrameAsync(replacementClient.GetStream());
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(report.Body.AsSpan(4, 4)));
+
+        var entries = journal.Entries;
+        Assert.Equal(new uint[] { 1, 2 }, entries.Select(entry => entry.Seq));
+        Assert.Equal(
+            new[]
+            {
+                EntryPointFrameReader.TidExecutionReportCancel,
+                EntryPointFrameReader.TidOrderMassActionReport,
+            },
+            entries.Select(entry => BinaryPrimitives.ReadUInt16LittleEndian(
+                entry.Frame.AsSpan(EntryPointFrameReader.SofhSize + 2, 2))));
+        Assert.Equal(2u, listener.ActiveSessions.Single(
+            session => session.SessionVerId == 3).OutboundSeq);
+    }
+
+    [Fact]
+    public async Task ReplacementCloseDuringTakeoverPersistence_RetainsVictim()
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        var state = new BlockingStatePersister { BlockTakeOverSave = true };
+        await using var listener = BuildListener(
+            sink, registry, claims, outboundJournal: null, statePersister: state);
+        listener.Start();
+
+        using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
+        var oldSession = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 2);
+
+        using var replacementClient = await ConnectAndSendNegotiateAsync(
+            listener, sessionVerId: 3);
+        await state.TakeOverSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var replacement = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 3);
+        var closeTask = Task.Run(() =>
+            replacement.Close("test-close-during-takeover", CloseKind.TransportError));
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => !replacement.IsLiveTakeOverCandidate,
+            TimeSpan.FromSeconds(5)));
+
+        state.ReleaseTakeOverSave();
+        await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.Contains(oldSession)
+                && !listener.ActiveSessions.Contains(replacement),
+            TimeSpan.FromSeconds(5)));
+        Assert.True(registry.TryGet(new SessionId("1"), out var current));
+        Assert.Same(oldSession, current);
+        Assert.True(claims.TryGetActiveClaim(1, out var holder, out var version));
+        Assert.Same(oldSession, holder);
+        Assert.Equal(2UL, version);
+        Assert.Equal(2UL, state.LastSaved?.SessionVerId);
+
+        var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
+        var canceled = CreateMassCancelEvent(orderId: 57, rptSeq: 2);
+        Assert.True(gateway.WriteExecutionReportPassiveCancel(
+            new SessionId("1"), ownerClOrdId: 5003, orderId: canceled.OrderId,
+            canceled, requesterClOrdIdOrZero: 7102).IsCommitted);
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel,
+            (await ReadOneFrameAsync(oldClient.GetStream())).TemplateId);
+    }
+
+    [Fact]
+    public async Task TerminalRouteInvocation_LinearizesWithLogicalTransfer()
+    {
+        var registry = new SessionRegistry();
+        var sink = new ControlledSink();
+        await using var oldSession = new FixpSession(
+            connectionId: 10, enteringFirm: 42, sessionId: 1,
+            stream: new MemoryStream(), sink: sink,
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        await using var replacement = new FixpSession(
+            connectionId: 11, enteringFirm: 42, sessionId: 1,
+            stream: new MemoryStream(), sink: sink,
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        registry.Register(oldSession);
+        var route = registry.CaptureRoute(oldSession);
+        var entered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+
+        var invocation = Task.Run(() => route.TryInvoke(current =>
+        {
+            Assert.Same(oldSession, current);
+            entered.TrySetResult(true);
+            release.Wait(TimeSpan.FromSeconds(5));
+            return OrderedStreamWriteResult.Committed;
+        }));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var transfer = Task.Run(() =>
+            registry.ExecuteExclusive(oldSession, () => route.SetCurrent(replacement)));
+        await Task.Delay(50);
+        Assert.False(transfer.IsCompleted);
+
+        release.Set();
+        Assert.True((await invocation).IsCommitted);
+        await transfer.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Same(replacement, route.Current);
+    }
+
     private static EntryPointListener BuildListener(
         IInboundCommandSink sink,
         SessionRegistry registry,
-        SessionClaimRegistry claims)
+        SessionClaimRegistry claims,
+        IFixpOutboundJournal? outboundJournal = null,
+        IFixpSessionStatePersister? statePersister = null)
     {
         var firms = new FirmRegistry(
             new[] { new Firm("F1", "Firm 1", 42) },
@@ -127,35 +351,34 @@ public class FixpSessionMassActionTakeoverTests
             negotiationValidator: new NegotiationValidator(
                 firms, claims, devMode: true, timestampSkewToleranceNs: 0),
             sessionClaims: claims,
-            establishValidator: new EstablishValidator(timestampSkewToleranceNs: 0));
+            establishValidator: new EstablishValidator(timestampSkewToleranceNs: 0),
+            outboundJournal: outboundJournal,
+            statePersister: statePersister);
     }
+
+    private static OrderCanceledEvent CreateMassCancelEvent(long orderId, uint rptSeq) =>
+        new(
+            SecurityId: 123,
+            OrderId: orderId,
+            Side: Side.Buy,
+            PriceMantissa: 100_000,
+            RemainingQuantityAtCancel: 100,
+            TransactTimeNanos: 1,
+            Reason: CancelReason.MassCancel,
+            RptSeq: rptSeq);
 
     private static async Task<TcpClient> ConnectAndEstablishAsync(
         EntryPointListener listener,
         ulong sessionVerId)
     {
-        var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var client = await ConnectAndSendNegotiateAsync(listener, sessionVerId);
         var stream = client.GetStream();
-        var credentials = Encoding.UTF8.GetBytes(
-            "{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
         var buffer = new byte[512];
 
-        int length = EntryPointFixpFrameCodec.EncodeNegotiate(buffer,
-            sessionId: 1,
-            sessionVerId: sessionVerId,
-            timestampNanos: 0,
-            enteringFirm: 42,
-            onBehalfFirm: null,
-            credentials: credentials,
-            clientIp: ReadOnlySpan<byte>.Empty,
-            clientAppName: ReadOnlySpan<byte>.Empty,
-            clientAppVersion: ReadOnlySpan<byte>.Empty);
-        await stream.WriteAsync(buffer.AsMemory(0, length));
         Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
             (await ReadOneFrameAsync(stream)).TemplateId);
 
-        length = EntryPointFixpFrameCodec.EncodeEstablish(buffer,
+        int length = EntryPointFixpFrameCodec.EncodeEstablish(buffer,
             sessionId: 1,
             sessionVerId: sessionVerId,
             timestampNanos: 0,
@@ -167,6 +390,29 @@ public class FixpSessionMassActionTakeoverTests
         await stream.WriteAsync(buffer.AsMemory(0, length));
         Assert.Equal(EntryPointFrameReader.TidEstablishAck,
             (await ReadOneFrameAsync(stream)).TemplateId);
+        return client;
+    }
+
+    private static async Task<TcpClient> ConnectAndSendNegotiateAsync(
+        EntryPointListener listener,
+        ulong sessionVerId)
+    {
+        var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var credentials = Encoding.UTF8.GetBytes(
+            "{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
+        var buffer = new byte[512];
+        int length = EntryPointFixpFrameCodec.EncodeNegotiate(buffer,
+            sessionId: 1,
+            sessionVerId: sessionVerId,
+            timestampNanos: 0,
+            enteringFirm: 42,
+            onBehalfFirm: null,
+            credentials: credentials,
+            clientIp: ReadOnlySpan<byte>.Empty,
+            clientAppName: ReadOnlySpan<byte>.Empty,
+            clientAppVersion: ReadOnlySpan<byte>.Empty);
+        await client.GetStream().WriteAsync(buffer.AsMemory(0, length));
         return client;
     }
 

@@ -136,6 +136,10 @@ internal sealed class RetransmitBuffer : IDisposable
         bool evicted;
         lock (_lock)
         {
+            // Persistence is the first half of the ordered-stream commit.
+            // If it fails, leave the in-memory ring untouched so callers can
+            // emit SystemBusy without an ACCEPTED frame remaining replayable.
+            _onAppendPersist?.Invoke(seq, frame);
             evicted = _count == Capacity;
             ReleasePooledAt(_head);
             _frames[_head] = frame;
@@ -144,11 +148,6 @@ internal sealed class RetransmitBuffer : IDisposable
             _head = (_head + 1) % Capacity;
             if (_count < Capacity) _count++;
             _lastSeq = seq;
-            // Issue #405: every append is mirrored to the persistent
-            // outbound journal. Callback runs INSIDE the lock so the
-            // on-disk order matches the in-memory order (both producer
-            // threads serialize on _lock anyway).
-            _onAppendPersist?.Invoke(seq, frame);
         }
         // Issue #288: surface eviction + suspended-write counters outside
         // the lock so a slow metrics consumer cannot back-pressure the
@@ -163,6 +162,7 @@ internal sealed class RetransmitBuffer : IDisposable
         bool evicted;
         lock (_lock)
         {
+            _onAppendPersist?.Invoke(seq, frame.Buffer.AsSpan(0, frame.Length));
             evicted = _count == Capacity;
             ReleasePooledAt(_head);
             frame.AddRef();
@@ -172,7 +172,6 @@ internal sealed class RetransmitBuffer : IDisposable
             _head = (_head + 1) % Capacity;
             if (_count < Capacity) _count++;
             _lastSeq = seq;
-            _onAppendPersist?.Invoke(seq, frame.Buffer.AsSpan(0, frame.Length));
         }
         if (evicted) _metrics?.IncBufferEvictions();
         if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();
@@ -201,6 +200,43 @@ internal sealed class RetransmitBuffer : IDisposable
     }
 
     public int Count { get { lock (_lock) { return _count; } } }
+
+    /// <summary>
+    /// Copies the retained ordered-stream window into a fresh takeover
+    /// successor without invoking the persistence callback again. The
+    /// persistent journal is shared by SessionID and already contains these
+    /// frames; re-appending would violate its strictly-monotonic sequence
+    /// contract. The newest frames are retained when capacities differ.
+    /// </summary>
+    internal bool TryCopyRetainedFramesTo(RetransmitBuffer target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        if (ReferenceEquals(this, target)) return true;
+
+        lock (_lock)
+        {
+            lock (target._lock)
+            {
+                if (target._count != 0) return false;
+
+                int copyCount = Math.Min(_count, target.Capacity);
+                int sourceFirst = (_head - copyCount + Capacity) % Capacity;
+                for (int i = 0; i < copyCount; i++)
+                {
+                    int sourceIndex = (sourceFirst + i) % Capacity;
+                    target._frames[i] = FrameSpanAt(sourceIndex).ToArray();
+                    target._pooledFrames[i] = null;
+                    target._seqs[i] = _seqs[sourceIndex];
+                }
+                target._count = copyCount;
+                target._head = copyCount % target.Capacity;
+                target._lastSeq = copyCount == 0
+                    ? 0u
+                    : target._seqs[copyCount - 1];
+                return true;
+            }
+        }
+    }
 
     public void Dispose()
     {
