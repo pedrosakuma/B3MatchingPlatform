@@ -16,7 +16,7 @@ public sealed partial class ChannelDispatcher
     internal void ProcessOne(in WorkItem item)
     {
         AssertOnLoopThread();
-        EnsureIncrementalPublicationCapacity(in item);
+        EnsureLiveWorkCanBegin(in item);
         // Issue #173: dispatch_wait = enqueue → loop pickup. EnqueueTicks
         // is 0 for in-process synthetic items (e.g. snapshot tick scheduled
         // via Timer); skip the observation in that case to avoid skewing
@@ -558,19 +558,15 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private void EnsureIncrementalPublicationCapacity(in WorkItem item)
+    private void EnsureLiveWorkCanBegin(in WorkItem item)
     {
-        if (!MayRequireIncrementalPublication(item.Kind)
-            || _sequenceNumber != uint.MaxValue)
-        {
-            return;
-        }
+        if (!RequiresLiveIncrementalEpoch(item.Kind)) return;
 
         try
         {
-            _ = UmdfSequenceVersion.NextOrThrow(
+            UmdfSequenceVersion.EnsureCanBeginLiveWork(
                 _sequenceVersion,
-                $"channel {ChannelNumber} automatic incremental epoch rollover");
+                $"channel {ChannelNumber} incremental work-item boundary");
         }
         catch (InvalidOperationException ex)
         {
@@ -580,12 +576,34 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private static bool MayRequireIncrementalPublication(WorkKind kind)
-        => kind is not WorkKind.SnapshotRotation
-            and not WorkKind.OperatorSnapshotNow
-            and not WorkKind.OperatorPersistSnapshot
-            and not WorkKind.AuditCheckpoint
-            and not WorkKind.ShutdownBarrier;
+    private static bool RequiresLiveIncrementalEpoch(WorkKind kind)
+        => kind switch
+        {
+            WorkKind.New
+                or WorkKind.Cancel
+                or WorkKind.Replace
+                or WorkKind.Cross
+                or WorkKind.MassCancel
+                or WorkKind.PriceBandPublish
+                or WorkKind.OperatorBumpVersion
+                or WorkKind.OperatorTradeBust
+                or WorkKind.OperatorSetTradingPhase
+                or WorkKind.OperatorUncrossAuction
+                or WorkKind.OperatorHaltInstrument
+                or WorkKind.OperatorResumeInstrument
+                or WorkKind.OperatorBustV2
+                or WorkKind.OperatorExpireSecurity
+                or WorkKind.OperatorExpireGtd
+                or WorkKind.OperatorExpireDay => true,
+            WorkKind.DecodeError
+                or WorkKind.SnapshotRotation
+                or WorkKind.OperatorSnapshotNow
+                or WorkKind.OperatorPersistSnapshot
+                or WorkKind.AuditCheckpoint
+                or WorkKind.ShutdownBarrier
+                or WorkKind.OperatorRestateGt => false,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown dispatcher work kind"),
+        };
 
     private InvalidOperationException CreateSequenceFatal(InvalidOperationException cause)
     {

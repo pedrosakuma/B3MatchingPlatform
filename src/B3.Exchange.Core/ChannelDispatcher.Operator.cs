@@ -30,12 +30,12 @@ public sealed partial class ChannelDispatcher
         ushort nextIncrementalVersion;
         try
         {
-            nextIncrementalVersion = UmdfSequenceVersion.NextOrThrow(
+            nextIncrementalVersion = UmdfSequenceVersion.NextLiveOrThrow(
                 _sequenceVersion,
                 $"channel {ChannelNumber} operator incremental epoch");
             if (_snapshotRotator is { } snapshotRotator)
             {
-                _ = UmdfSequenceVersion.NextOrThrow(
+                _ = UmdfSequenceVersion.NextLiveOrThrow(
                     snapshotRotator.SequenceVersion,
                     $"channel {ChannelNumber} operator snapshot epoch");
             }

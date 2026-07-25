@@ -412,7 +412,7 @@ public sealed partial class ChannelDispatcher
                 $"channel {ChannelNumber}: startup epoch transition requires a state persister");
 
         ushort restoredVersion = _sequenceVersion;
-        ushort preparedVersion = UmdfSequenceVersion.NextOrThrow(
+        ushort preparedVersion = UmdfSequenceVersion.NextLiveOrThrow(
             restoredVersion,
             $"channel {ChannelNumber} startup incremental epoch");
         Volatile.Write(ref _sequenceVersion, preparedVersion);

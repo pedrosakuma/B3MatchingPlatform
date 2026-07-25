@@ -577,10 +577,12 @@ public sealed class ChannelDispatcherStartupEpochTests
         await second.DisposeAsync();
     }
 
-    [Fact]
-    public async Task StartupEpoch_ExhaustedVersionFailsBeforePersistenceOrReset()
+    [Theory]
+    [InlineData((ushort)65534)]
+    [InlineData(ushort.MaxValue)]
+    public async Task StartupEpoch_TerminalVersionFailsBeforePersistenceOrReset(ushort version)
     {
-        var initial = RichRestoredSnapshot(version: ushort.MaxValue);
+        var initial = RichRestoredSnapshot(version);
         var persister = new RecordingPersister(initial);
         var sink = new RecordingPacketSink();
         var dispatcher = BuildDispatcher(
@@ -589,7 +591,7 @@ public sealed class ChannelDispatcherStartupEpochTests
         var error = Assert.Throws<InvalidOperationException>(() => dispatcher.Start());
 
         Assert.Contains("SequenceVersion space is exhausted", error.Message);
-        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(version, dispatcher.SequenceVersion);
         Assert.Equal(77u, dispatcher.SequenceNumber);
         Assert.Equal(0, persister.SaveCount);
         Assert.Equal(initial, persister.Last);
@@ -597,10 +599,12 @@ public sealed class ChannelDispatcherStartupEpochTests
         await dispatcher.DisposeAsync();
     }
 
-    [Fact]
-    public void OperatorBump_ExhaustedVersionPreservesStateWithoutPersistenceOrReset()
+    [Theory]
+    [InlineData((ushort)65534)]
+    [InlineData(ushort.MaxValue)]
+    public void OperatorBump_TerminalVersionPreservesStateWithoutPersistenceOrReset(ushort version)
     {
-        var initial = RichRestoredSnapshot(version: ushort.MaxValue);
+        var initial = RichRestoredSnapshot(version);
         var persister = new RecordingPersister(initial);
         var sink = new RecordingPacketSink();
         var dispatcher = BuildDispatcher(
@@ -612,7 +616,7 @@ public sealed class ChannelDispatcherStartupEpochTests
             () => dispatcher.CreateTestProbe().DrainInbound());
 
         Assert.Contains("SequenceVersion space is exhausted", error.Message);
-        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(version, dispatcher.SequenceVersion);
         Assert.Equal(77u, dispatcher.SequenceNumber);
         Assert.Equal(0, persister.SaveCount);
         Assert.Empty(sink.Packets);
