@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// Owns the snapshot/restore plumbing wired through
 /// <see cref="IChannelStatePersister"/>; integrates with
 /// <c>ProcessOne</c> via <see cref="OnAfterCommandFlushed"/> and with
-/// <c>RunLoopAsync</c> via <see cref="LoadPersistedStateOnLoopThread"/>.
+/// <c>RunLoop</c> via <see cref="LoadPersistedStateOnLoopThread"/>.
 ///
 /// <para>All state mutation paths assume single-threaded invocation on
 /// the dispatch loop thread (mirrors the engine's invariant). The
@@ -306,7 +306,7 @@ public sealed partial class ChannelDispatcher
     /// <summary>
     /// Loads the persisted snapshot (when a persister is wired) and
     /// applies it on the dispatch thread. Called from
-    /// <see cref="RunLoopAsync"/> immediately after
+    /// <c>RunLoop</c> immediately after
     /// <c>BindToDispatchThread</c>, so the engine's owner thread is the
     /// loop thread for both the restore and every subsequent dispatch.
     ///
@@ -320,7 +320,7 @@ public sealed partial class ChannelDispatcher
     /// flag) before restarting. <c>TryLoad</c>-time IO failures are
     /// also fatal for the same reason.</para>
     /// </summary>
-    private void LoadPersistedStateOnLoopThread()
+    private bool LoadPersistedStateOnLoopThread()
     {
         if (_persister is null)
         {
@@ -329,7 +329,7 @@ public sealed partial class ChannelDispatcher
             // empty engine so a crash before the very first snapshot is
             // recoverable.
             ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return;
+            return false;
         }
         ChannelStateSnapshot? snapshot;
         var loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -351,8 +351,8 @@ public sealed partial class ChannelDispatcher
             // Issue #269: no snapshot but possibly WAL records from a
             // crash before the first snapshot ever ran. Replay rebuilds
             // the engine from scratch.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return;
+            var replay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
+            return replay.Succeeded && replay.RecordCount > 0;
         }
         try
         {
@@ -361,7 +361,8 @@ public sealed partial class ChannelDispatcher
             // Issue #269: replay any WAL records that were appended
             // after the snapshot was taken — closes the gap between
             // the most-recent snapshot and the moment of the crash.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
+            var replay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
+            return replay.Succeeded;
         }
         catch (InvalidOperationException ex)
         {
@@ -385,6 +386,63 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
+    /// Starts a new incremental UMDF epoch after successful snapshot/WAL
+    /// recovery without mutating the restored matching state (issue #571).
+    /// The prepared epoch is synchronously persisted before ChannelReset_11
+    /// is published, so a crash can skip a version but cannot reuse one that
+    /// was already prepared or published.
+    /// </summary>
+    private void PrepareAndPublishStartupEpochOnLoopThread()
+    {
+        AssertOnLoopThread();
+        if (_persister is null)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: startup epoch transition requires a state persister");
+
+        ushort restoredVersion = _sequenceVersion;
+        ushort preparedVersion = (ushort)(restoredVersion + 1);
+        Volatile.Write(ref _sequenceVersion, preparedVersion);
+        Volatile.Write(ref _sequenceNumber, 0u);
+        _retxBuffer?.Reset();
+
+        var snapshot = CaptureChannelState();
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            long bytes = _persister.Save(snapshot);
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            if (_metrics is { } metrics)
+            {
+                metrics.SnapshotWrite.ObserveTicks(elapsed);
+                metrics.IncSnapshotSaveOk();
+                if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
+                metrics.SetSnapshotLastSuccessUnixMs(nowMs);
+            }
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncSnapshotSaveFailure();
+            _metrics?.IncDispatcherCrashes();
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: failed to durably prepare startup UMDF epoch {SequenceVersion}; reset will not be published",
+                ChannelNumber, preparedVersion);
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: failed to durably prepare startup UMDF epoch {preparedVersion}", ex);
+        }
+
+        _commandsSincePersist = 0;
+        _lastPersistUnixMs = nowMs;
+        _pendingDirty = false;
+        TruncateWalAfterSyncSave(snapshot.LastAppliedSeq);
+
+        EmitChannelResetPacket();
+        _logger.LogInformation(
+            "channel {ChannelNumber}: startup UMDF epoch advanced {RestoredVersion}->{PreparedVersion}; restored state preserved and ChannelReset_11 published at packet sequence 1",
+            ChannelNumber, restoredVersion, preparedVersion);
+    }
+
+    /// <summary>
     /// Hook invoked by <c>ProcessOne</c> after a successful flush.
     /// Captures the channel state and forwards it to the persister
     /// best-effort — exceptions are logged and swallowed so persistence
@@ -405,6 +463,12 @@ public sealed partial class ChannelDispatcher
         // Done before any early-return so the sink sees boundaries even
         // when no persister is wired (cheap when the sink is the no-op).
         _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
+        // WAL replay reconstructs state from an already-durable command log.
+        // Persisting each replay turn is both unnecessary and unsafe with the
+        // async writer: an old-epoch snapshot could land after the startup
+        // epoch has been durably prepared. The single synchronous save in
+        // PrepareAndPublishStartupEpochOnLoopThread absorbs the full replay.
+        if (_replayMode) return;
         if (_persister is null) return;
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (!force)

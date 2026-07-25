@@ -283,8 +283,10 @@ public class ChannelDispatcherWalTests
             ReadyTimeout), "dispatcher did not replay WAL tail before timeout");
 
         Assert.Equal(3, dispB.OrderRegistryCount);
-        // Replay must NOT publish on the wire or send ERs.
-        Assert.Equal(0, sinkB.Published);
+        // Replay itself must not publish historical events. Once recovery is
+        // complete, startup emits exactly one ChannelReset_11 for the new
+        // durable epoch.
+        Assert.Equal(1, sinkB.Published);
         Assert.Equal(0, outB.NewCount);
         // Replay metric reflects the 1 record consumed (the snapshot
         // covered the first 2 commands; only CL-C was in the WAL tail).

@@ -761,9 +761,20 @@ Write-Ahead Log between snapshots so recovery is nearly RPO-zero.
    `persistence.orphanSessionPolicy` — `drop` (default) increments
    `exch_owner_orphans_dropped_total`; `reject` fails the channel
    closed.
-4. The first outbound packet is stamped with `SequenceNumber+1`
-   under the previous `SequenceVersion`. Consumers that miss the
-   gap recover via the snapshot multicast feed.
+4. After successful restore + replay, the dispatcher increments the
+   incremental `SequenceVersion`, resets `SequenceNumber` to 0, and
+   synchronously persists that full authoritative state. This save bypasses
+   `asyncWriter`: the new epoch must be durable before it can be published.
+5. Only after the save succeeds, the dispatcher publishes
+   `ChannelReset_11` as incremental packet sequence 1. The matching books,
+   stops, phases, counters, and ownership registry are not cleared.
+6. Snapshot headers published afterward carry the same incremental epoch in
+   `LastSequenceVersion`; consumers rebuild the preserved book from the
+   snapshot feed. The TCP listener is opened only after this transition.
+
+If the process dies after step 4 but before step 5, the next startup loads the
+prepared version and increments again. A version may therefore be skipped, but
+an already-prepared or already-published version is never reused.
 
 ### 7.2 Admin endpoints
 

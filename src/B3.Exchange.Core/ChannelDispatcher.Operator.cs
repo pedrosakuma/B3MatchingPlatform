@@ -35,9 +35,17 @@ public sealed partial class ChannelDispatcher
         Volatile.Write(ref _sequenceNumber, 0u);
         _snapshotRotator?.BumpSequenceVersion();
 
-        // Force-write the ChannelReset_11 frame using the standard
-        // ReserveOrFlush/Commit path so the packet header reflects the
-        // NEW SequenceVersion.
+        EmitChannelResetPacket();
+    }
+
+    /// <summary>
+    /// Emits one <c>ChannelReset_11</c> packet under the dispatcher's current
+    /// sequence version. The caller is responsible for establishing the
+    /// desired epoch and any engine-state semantics before invoking it.
+    /// </summary>
+    private void EmitChannelResetPacket()
+    {
+        AssertOnLoopThread();
         _packetWritten = 0;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize

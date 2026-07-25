@@ -17,6 +17,10 @@ public sealed partial class ChannelDispatcher
         _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
         _loopTask = Task.Factory.StartNew(() => RunLoop(_cts.Token),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // Startup recovery and the durable UMDF epoch transition run on the
+        // single-writer thread. Do not let the host open its TCP listener
+        // until that work, including ChannelReset_11 publication, completes.
+        _startupCompleted.Task.GetAwaiter().GetResult();
     }
 
     // Issue #138 / PR-5: dispatch loop runs synchronously on the LongRunning
@@ -28,14 +32,19 @@ public sealed partial class ChannelDispatcher
     // by the Debug assert and observable as 504 timeouts in E2E tests.
     private void RunLoop(CancellationToken ct)
     {
-        _writerGuard.BindToCurrentThread();
-        _engine.BindToDispatchThread(Thread.CurrentThread);
-        LoadPersistedStateOnLoopThread();
-
-        var reader = _inbound.Reader;
-        var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
         try
         {
+            _writerGuard.BindToCurrentThread();
+            _engine.BindToDispatchThread(Thread.CurrentThread);
+            bool recoveredDurableState = LoadPersistedStateOnLoopThread();
+            if (recoveredDurableState && IsWalHealthy)
+            {
+                PrepareAndPublishStartupEpochOnLoopThread();
+            }
+            _startupCompleted.TrySetResult(true);
+
+            var reader = _inbound.Reader;
+            var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
             while (true)
             {
                 RecordHeartbeat();
@@ -76,6 +85,7 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
+            _startupCompleted.TrySetException(ex);
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
         finally
@@ -86,7 +96,7 @@ public sealed partial class ChannelDispatcher
 
     private async Task DrainInboundBeforeStoppingSnapshotWriterAsync()
     {
-        if (_loopTask is null) return;
+        if (_loopTask is null || _loopTask.IsCompleted || _startupCompleted.Task.IsFaulted) return;
         var drained = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var item = new WorkItem(WorkKind.ShutdownBarrier, default, 0, false,
             0, 0, null, null, null, null, ShutdownBarrier: drained);
