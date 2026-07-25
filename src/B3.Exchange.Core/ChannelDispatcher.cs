@@ -374,9 +374,18 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
 
     private readonly CancellationTokenSource _cts = new();
     private int _drainOnCancellation;
+    private int _startCalled;
+    private int _activationCalled;
+    private int _channelFatal;
     private Task? _loopTask;
     private readonly TaskCompletionSource<bool> _startupCompleted =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _activationRequested =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _activationCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _startupEpochPrepared;
+    private ushort _startupRestoredVersion;
     // Single-thread invariant (ADR 0009 / issues #138, #169, #384).
     // Captured on entry to RunLoop; used by AssertOnLoopThread() to enforce
     // the dispatch-thread invariant in DEBUG builds. Backed by the shared

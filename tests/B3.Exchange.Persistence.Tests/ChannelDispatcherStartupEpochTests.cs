@@ -282,12 +282,12 @@ public sealed class ChannelDispatcherStartupEpochTests
             new MatchingEngineSnapshotSource(engine, [Petr, Vale]),
             snapshotSink));
 
-        dispatcher.Start();
+        dispatcher.PrepareStartup();
 
         Assert.Equal((ushort)10, dispatcher.SequenceVersion);
-        Assert.Equal(1u, dispatcher.SequenceNumber);
-        Assert.Single(incremental.Packets);
-        AssertChannelReset(incremental.Packets[0], expectedVersion: 10);
+        Assert.Equal(0u, dispatcher.SequenceNumber);
+        Assert.Empty(incremental.Packets);
+        Assert.Empty(snapshotSink.Packets);
 
         var prepared = persister.Last;
         Assert.Equal((ushort)10, prepared.SequenceVersion);
@@ -305,6 +305,12 @@ public sealed class ChannelDispatcherStartupEpochTests
             halt => halt.SecurityId == Vale
                 && halt.Reason == (byte)HaltReason.RegulatoryHalt
                 && halt.Note == "restored halt");
+
+        dispatcher.Activate();
+
+        Assert.Equal(1u, dispatcher.SequenceNumber);
+        Assert.Single(incremental.Packets);
+        AssertChannelReset(incremental.Packets[0], expectedVersion: 10);
 
         Assert.True(dispatcher.TryResolveByClOrdId(101, 0xA001, out var bidOrderId, out _));
         Assert.Equal(1L, bidOrderId);

@@ -35,9 +35,17 @@ public sealed partial class ChannelDispatcher : IUmdfFrameSink
         AssertOnLoopThread();
         if (_sequenceNumber == uint.MaxValue)
         {
-            ushort newVer = UmdfSequenceVersion.NextOrThrow(
-                _sequenceVersion,
-                $"channel {ChannelNumber} automatic incremental epoch rollover");
+            ushort newVer;
+            try
+            {
+                newVer = UmdfSequenceVersion.NextOrThrow(
+                    _sequenceVersion,
+                    $"channel {ChannelNumber} automatic incremental epoch rollover");
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw CreateSequenceFatal(ex);
+            }
             Volatile.Write(ref _sequenceVersion, newVer);
             Volatile.Write(ref _sequenceNumber, 0u);
             // The packet buffer's SequenceVersion was written by

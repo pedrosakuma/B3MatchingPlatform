@@ -27,14 +27,22 @@ public sealed partial class ChannelDispatcher
         // invariant — ProcessOne is the sole caller and is invoked only
         // from the dispatch loop.
         AssertOnLoopThread();
-        ushort nextIncrementalVersion = UmdfSequenceVersion.NextOrThrow(
-            _sequenceVersion,
-            $"channel {ChannelNumber} operator incremental epoch");
-        if (_snapshotRotator is { } snapshotRotator)
+        ushort nextIncrementalVersion;
+        try
         {
-            _ = UmdfSequenceVersion.NextOrThrow(
-                snapshotRotator.SequenceVersion,
-                $"channel {ChannelNumber} operator snapshot epoch");
+            nextIncrementalVersion = UmdfSequenceVersion.NextOrThrow(
+                _sequenceVersion,
+                $"channel {ChannelNumber} operator incremental epoch");
+            if (_snapshotRotator is { } snapshotRotator)
+            {
+                _ = UmdfSequenceVersion.NextOrThrow(
+                    snapshotRotator.SequenceVersion,
+                    $"channel {ChannelNumber} operator snapshot epoch");
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw CreateSequenceFatal(ex);
         }
 
         _engine.ResetForChannelReset();

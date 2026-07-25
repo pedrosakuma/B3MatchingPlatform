@@ -14,13 +14,44 @@ public sealed partial class ChannelDispatcher
 {
     public void Start()
     {
+        PrepareStartup();
+        Activate();
+    }
+
+    /// <summary>
+    /// Phase 1 startup: starts the owner thread, restores snapshot/WAL state,
+    /// and durably prepares a new startup epoch when recovery found state.
+    /// No ChannelReset or live work is published until <see cref="Activate"/>.
+    /// </summary>
+    public void PrepareStartup()
+    {
+        if (Interlocked.CompareExchange(ref _startCalled, 1, 0) != 0)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber} dispatcher startup has already been prepared");
+
         _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
         _loopTask = Task.Factory.StartNew(() => RunLoop(_cts.Token),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-        // Startup recovery and the durable UMDF epoch transition run on the
-        // single-writer thread. Do not let the host open its TCP listener
-        // until that work, including ChannelReset_11 publication, completes.
+        // Recovery and durable epoch preparation run on the single-writer
+        // thread. The loop then waits at the activation barrier without
+        // consuming live work.
         _startupCompleted.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Phase 2 startup: signals the owner thread to publish any prepared
+    /// ChannelReset and begin draining live work. Idempotent after success.
+    /// </summary>
+    public void Activate()
+    {
+        if (Volatile.Read(ref _startCalled) == 0)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber} dispatcher must be prepared before activation");
+
+        _startupCompleted.Task.GetAwaiter().GetResult();
+        if (Interlocked.CompareExchange(ref _activationCalled, 1, 0) == 0)
+            _activationRequested.TrySetResult(true);
+        _activationCompleted.Task.GetAwaiter().GetResult();
     }
 
     // Issue #138 / PR-5: dispatch loop runs synchronously on the LongRunning
@@ -39,9 +70,13 @@ public sealed partial class ChannelDispatcher
             bool recoveredDurableState = LoadPersistedStateOnLoopThread();
             if (recoveredDurableState && IsWalHealthy)
             {
-                PrepareAndPublishStartupEpochOnLoopThread();
+                PrepareStartupEpochOnLoopThread();
             }
             _startupCompleted.TrySetResult(true);
+
+            if (!WaitForActivationRequest(ct)) return;
+            ActivatePreparedStartupEpochOnLoopThread();
+            _activationCompleted.TrySetResult(true);
 
             var reader = _inbound.Reader;
             var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
@@ -72,6 +107,7 @@ public sealed partial class ChannelDispatcher
                         ProcessOne(item);
                     }
                     catch (OperationCanceledException) { throw; }
+                    catch (Exception) when (Volatile.Read(ref _channelFatal) != 0) { throw; }
                     catch (Exception ex)
                     {
                         _metrics?.IncDispatcherCrashes();
@@ -85,7 +121,9 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
+            MarkChannelFatal(ex);
             _startupCompleted.TrySetException(ex);
+            _activationCompleted.TrySetException(ex);
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
         finally
@@ -95,12 +133,27 @@ public sealed partial class ChannelDispatcher
             // state after _startupCompleted has been faulted.
             if (_startupCompleted.Task.IsCompletedSuccessfully)
                 FlushPendingSnapshotOnShutdownSafely();
+            _activationCompleted.TrySetCanceled();
         }
+    }
+
+    private bool WaitForActivationRequest(CancellationToken ct)
+    {
+        AssertOnLoopThread();
+        var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
+        while (!_activationRequested.Task.Wait(heartbeatMs))
+        {
+            RecordHeartbeat();
+            if (ct.IsCancellationRequested) return false;
+        }
+        _activationRequested.Task.GetAwaiter().GetResult();
+        return true;
     }
 
     private async Task DrainInboundBeforeStoppingSnapshotWriterAsync()
     {
-        if (_loopTask is null || _loopTask.IsCompleted || _startupCompleted.Task.IsFaulted) return;
+        if (_loopTask is null || _loopTask.IsCompleted || _startupCompleted.Task.IsFaulted
+            || !_activationCompleted.Task.IsCompletedSuccessfully) return;
         var drained = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var item = new WorkItem(WorkKind.ShutdownBarrier, default, 0, false,
             0, 0, null, null, null, null, ShutdownBarrier: drained);
@@ -204,6 +257,21 @@ public sealed partial class ChannelDispatcher
         /// the loop and so must trigger the shutdown hook explicitly.
         /// </summary>
         public void FlushPendingSnapshotOnShutdown() => _disp.FlushPendingSnapshotOnShutdown();
+
+        /// <summary>Completes when the background dispatch loop exits.</summary>
+        public Task LoopCompletion => _disp._loopTask ?? Task.CompletedTask;
+
+        /// <summary>
+        /// Fast-forwards the incremental sequence tuple while quiescent.
+        /// Used only by rollover/exhaustion tests before startup.
+        /// </summary>
+        public void SetSequence(ushort version, uint number)
+        {
+            if (_disp._loopTask is not null)
+                throw new InvalidOperationException("sequence test seam requires a quiescent dispatcher");
+            _disp.TestSetSequenceVersion(version);
+            _disp.TestSetSequenceNumber(number);
+        }
     }
 
     public async ValueTask DisposeAsync()

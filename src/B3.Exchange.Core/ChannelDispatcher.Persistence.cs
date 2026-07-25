@@ -397,13 +397,14 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
-    /// Starts a new incremental UMDF epoch after successful snapshot/WAL
-    /// recovery without mutating the restored matching state (issue #571).
-    /// The prepared epoch is synchronously persisted before ChannelReset_11
-    /// is published, so a crash can skip a version but cannot reuse one that
-    /// was already prepared or published.
+    /// Durably prepares a new incremental UMDF epoch after successful
+    /// snapshot/WAL recovery without mutating the restored matching state
+    /// (issue #571). Publication is deliberately deferred to
+    /// <see cref="ActivatePreparedStartupEpochOnLoopThread"/> so a
+    /// multi-channel host can finish recovery for every channel before any
+    /// external feed output escapes.
     /// </summary>
-    private void PrepareAndPublishStartupEpochOnLoopThread()
+    private void PrepareStartupEpochOnLoopThread()
     {
         AssertOnLoopThread();
         if (_persister is null)
@@ -449,10 +450,27 @@ public sealed partial class ChannelDispatcher
         _pendingDirty = false;
         TruncateWalAfterSyncSave(snapshot.LastAppliedSeq);
 
+        _startupRestoredVersion = restoredVersion;
+        _startupEpochPrepared = true;
+        _logger.LogInformation(
+            "channel {ChannelNumber}: startup UMDF epoch durably prepared {RestoredVersion}->{PreparedVersion}; awaiting activation",
+            ChannelNumber, restoredVersion, preparedVersion);
+    }
+
+    /// <summary>
+    /// Publishes the phase-1 prepared startup reset. Must run on the owner
+    /// thread; the host only signals activation from its startup thread.
+    /// </summary>
+    private void ActivatePreparedStartupEpochOnLoopThread()
+    {
+        AssertOnLoopThread();
+        if (!_startupEpochPrepared) return;
+
         EmitChannelResetPacket();
+        _startupEpochPrepared = false;
         _logger.LogInformation(
             "channel {ChannelNumber}: startup UMDF epoch advanced {RestoredVersion}->{PreparedVersion}; restored state preserved and ChannelReset_11 published at packet sequence 1",
-            ChannelNumber, restoredVersion, preparedVersion);
+            ChannelNumber, _startupRestoredVersion, _sequenceVersion);
     }
 
     /// <summary>
@@ -480,7 +498,7 @@ public sealed partial class ChannelDispatcher
         // Persisting each replay turn is both unnecessary and unsafe with the
         // async writer: an old-epoch snapshot could land after the startup
         // epoch has been durably prepared. The single synchronous save in
-        // PrepareAndPublishStartupEpochOnLoopThread absorbs the full replay.
+        // PrepareStartupEpochOnLoopThread absorbs the full replay.
         if (_replayMode) return;
         if (_persister is null) return;
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

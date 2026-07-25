@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 using RejectEvent = B3.Exchange.Matching.RejectEvent;
 
 namespace B3.Exchange.Core;
@@ -15,6 +16,7 @@ public sealed partial class ChannelDispatcher
     internal void ProcessOne(in WorkItem item)
     {
         AssertOnLoopThread();
+        EnsureIncrementalPublicationCapacity(in item);
         // Issue #173: dispatch_wait = enqueue → loop pickup. EnqueueTicks
         // is 0 for in-process synthetic items (e.g. snapshot tick scheduled
         // via Timer); skip the observation in that case to avoid skewing
@@ -554,6 +556,67 @@ public sealed partial class ChannelDispatcher
             _aggressorIsIoc = false;
             engineSpan?.Dispose();
         }
+    }
+
+    private void EnsureIncrementalPublicationCapacity(in WorkItem item)
+    {
+        if (!MayRequireIncrementalPublication(item.Kind)
+            || _sequenceNumber != uint.MaxValue)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = UmdfSequenceVersion.NextOrThrow(
+                _sequenceVersion,
+                $"channel {ChannelNumber} automatic incremental epoch rollover");
+        }
+        catch (InvalidOperationException ex)
+        {
+            var fatal = CreateSequenceFatal(ex);
+            FailWorkItemCompletion(in item, fatal);
+            throw fatal;
+        }
+    }
+
+    private static bool MayRequireIncrementalPublication(WorkKind kind)
+        => kind is not WorkKind.SnapshotRotation
+            and not WorkKind.OperatorSnapshotNow
+            and not WorkKind.OperatorPersistSnapshot
+            and not WorkKind.AuditCheckpoint
+            and not WorkKind.ShutdownBarrier;
+
+    private InvalidOperationException CreateSequenceFatal(InvalidOperationException cause)
+    {
+        var fatal = new InvalidOperationException(cause.Message, cause);
+        MarkChannelFatal(fatal);
+        _logger.LogCritical(fatal,
+            "channel {ChannelNumber}: incremental UMDF sequence space exhausted; channel failed closed before command side effects",
+            ChannelNumber);
+        return fatal;
+    }
+
+    private void MarkChannelFatal(Exception error)
+    {
+        if (Interlocked.Exchange(ref _channelFatal, 1) != 0) return;
+
+        _inbound.Writer.TryComplete(error);
+        while (_inbound.Reader.TryRead(out var pending))
+            FailWorkItemCompletion(in pending, error);
+    }
+
+    private static void FailWorkItemCompletion(in WorkItem item, Exception error)
+    {
+        item.PhaseCompletion?.TrySetException(error);
+        item.HaltCompletion?.TrySetException(error);
+        item.BustCompletion?.TrySetException(error);
+        item.AuditCheckpoint?.Prepared.TrySetException(error);
+        item.ShutdownBarrier?.TrySetException(error);
+        item.ExpireCompletion?.TrySetException(error);
+        item.ExpireGtdCompletion?.TrySetException(error);
+        item.RestateGtCompletion?.TrySetException(error);
+        item.ExpireDayCompletion?.TrySetException(error);
     }
 
     /// <summary>

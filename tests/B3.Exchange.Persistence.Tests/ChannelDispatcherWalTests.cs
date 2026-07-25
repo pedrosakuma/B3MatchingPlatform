@@ -77,6 +77,27 @@ public class ChannelDispatcherWalTests
         }
     }
 
+    private sealed class RecordingWal : IChannelWriteAheadLog
+    {
+        private readonly List<WalRecord> _records = new();
+
+        public int AppendCount { get; private set; }
+
+        public int Append(WalRecord record)
+        {
+            AppendCount++;
+            _records.Add(record);
+            return 1;
+        }
+
+        public IReadOnlyList<WalRecord> ReadAll() => _records.ToArray();
+        public void Truncate() => _records.Clear();
+        public void TruncateThrough(long throughSeq)
+            => _records.RemoveAll(record => record.Seq <= throughSeq);
+        public long PendingDurableSeqOrZero => _records.Count == 0 ? 0 : _records[^1].Seq;
+        public void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
+    }
+
     private sealed class TempDir : IDisposable
     {
         public string Path { get; }
@@ -215,6 +236,58 @@ public class ChannelDispatcherWalTests
         // After a successful snapshot, the WAL on disk is empty.
         Assert.Empty(wal.ReadAll());
         wal.Dispose();
+    }
+
+    [Fact]
+    public async Task SequenceExhaustion_FailsClosedBeforeWalEngineRegistryRepliesOrPublication()
+    {
+        var persister = new InMemoryPersister();
+        var wal = new RecordingWal();
+        var sink = new NoOpPacketSink();
+        var outbound = new CountingOutbound();
+        MatchingEngine? engine = null;
+        var dispatcher = new ChannelDispatcher(
+            channelNumber: 84,
+            engineFactory: eventSink =>
+            {
+                engine = new MatchingEngine([Petr4], eventSink,
+                    NullLogger<MatchingEngine>.Instance);
+                return engine;
+            },
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = sink,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Persister = persister,
+                Wal = wal,
+            });
+
+        var probe = dispatcher.CreateTestProbe();
+        probe.SetSequence(ushort.MaxValue, uint.MaxValue);
+        dispatcher.PrepareStartup();
+        Assert.True(EnqueueOrder(
+            dispatcher, new SessionId("57001"), "EXHAUSTED", 0x571, 1_000UL));
+        Assert.True(dispatcher.EnqueueOperatorPersistSnapshot());
+
+        dispatcher.Activate();
+        await probe.LoopCompletion.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(uint.MaxValue, dispatcher.SequenceNumber);
+        Assert.Equal(1L, engine!.PeekNextOrderId);
+        Assert.Equal(0u, engine.CurrentRptSeq);
+        Assert.Equal(0, engine.OrderCount(Sec));
+        Assert.Equal(0, dispatcher.OrderRegistryCount);
+        Assert.Equal(0, wal.AppendCount);
+        Assert.Empty(wal.ReadAll());
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(0, outbound.NewCount);
+        Assert.Equal(0, sink.Published);
+        Assert.False(EnqueueOrder(
+            dispatcher, new SessionId("57002"), "AFTER-FATAL", 0x572, 2_000UL));
+
+        await dispatcher.DisposeAsync();
     }
 
     [Fact]

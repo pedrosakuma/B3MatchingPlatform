@@ -666,6 +666,25 @@ public partial class ChannelDispatcherTests
         Assert.Empty(pkt.Packets);
     }
 
+    [Fact]
+    public void SequenceExhaustion_FailsClosedBeforePotentiallyNoOpCommand()
+    {
+        var (disp, pkt, _) = NewDispatcher();
+        var completion = new TaskCompletionSource<PhaseChangeOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        disp.CreateTestProbe().SetSequence(ushort.MaxValue, uint.MaxValue);
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(
+            Petr, TradingPhase.Open, completion));
+        var error = Assert.Throws<InvalidOperationException>(
+            () => DrainInbound(disp));
+
+        Assert.Contains("SequenceVersion space is exhausted", error.Message);
+        Assert.True(completion.Task.IsFaulted);
+        Assert.Empty(pkt.Packets);
+        Assert.Equal(0, disp.OrderRegistryCount);
+    }
+
     private static int OrderOwnerCount(ChannelDispatcher disp)
     {
         // Owner state moved to Gateway (OrderOwnershipMap); kept as a no-op

@@ -281,6 +281,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         // across every channel so OptionExpirySweeper can fan out per
         // option series at end-of-trading-day.
         var instrumentDispatcherPairs = new List<(Instrument Instrument, ChannelDispatcher Dispatcher)>();
+        var publisherStarts = new List<Action>();
         foreach (var ch in _config.Channels)
         {
             var instruments = InstrumentLoader.LoadFromFile(ch.InstrumentsFile);
@@ -408,8 +409,12 @@ public sealed class ExchangeHost : IAsyncDisposable
                     DropRootDir = dropRootDir,
                     AmendmentsPublisher = amendmentsPublisher,
                 });
-            disp.Start();
             _dispatchers.Add(disp);
+            // Phase 1: recover + durably prepare the next epoch on the
+            // dispatcher's owner thread, but do not publish the reset or
+            // consume live work yet. Every channel must reach this barrier
+            // before any external feed output is enabled.
+            disp.PrepareStartup();
             foreach (var inst in instruments)
             {
                 if (routing.ContainsKey(inst.SecurityId))
@@ -449,26 +454,29 @@ public sealed class ExchangeHost : IAsyncDisposable
                     int retentionDays = audit.RetentionDays;
                     byte chNum = ch.ChannelNumber;
                     var retentionLogger = _loggerFactory.CreateLogger<B3.Exchange.PostTrade.FileAuditLogWriter>();
-                    var timer = new Timer(_ =>
+                    publisherStarts.Add(() =>
                     {
-                        try
+                        var timer = new Timer(_ =>
                         {
-                            int deleted = capturedWriter.PruneOldDays(
-                                DateOnly.FromDateTime(DateTime.UtcNow), retentionDays);
-                            if (deleted > 0)
+                            try
                             {
-                                retentionLogger.LogInformation(
-                                    "channel {ChannelNumber}: pruned {Count} expired audit file(s) (retentionDays={RetentionDays})",
-                                    chNum, deleted, retentionDays);
+                                int deleted = capturedWriter.PruneOldDays(
+                                    DateOnly.FromDateTime(DateTime.UtcNow), retentionDays);
+                                if (deleted > 0)
+                                {
+                                    retentionLogger.LogInformation(
+                                        "channel {ChannelNumber}: pruned {Count} expired audit file(s) (retentionDays={RetentionDays})",
+                                        chNum, deleted, retentionDays);
+                                }
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            retentionLogger.LogWarning(ex,
-                                "channel {ChannelNumber}: audit log retention prune failed", chNum);
-                        }
-                    }, null, TimeSpan.FromMinutes(1), TimeSpan.FromHours(24));
-                    _auditRetentionTimers.Add(timer);
+                            catch (Exception ex)
+                            {
+                                retentionLogger.LogWarning(ex,
+                                    "channel {ChannelNumber}: audit log retention prune failed", chNum);
+                            }
+                        }, null, TimeSpan.FromMinutes(1), TimeSpan.FromHours(24));
+                        _auditRetentionTimers.Add(timer);
+                    });
                 }
             }
 
@@ -501,8 +509,11 @@ public sealed class ExchangeHost : IAsyncDisposable
 
                 var cadence = TimeSpan.FromMilliseconds(Math.Max(50, snap.CadenceMs));
                 var capturedDisp = disp;
-                var timer = new Timer(_ => capturedDisp.EnqueueSnapshotTick(), null, cadence, cadence);
-                _snapshotTimers.Add(timer);
+                publisherStarts.Add(() =>
+                {
+                    var timer = new Timer(_ => capturedDisp.EnqueueSnapshotTick(), null, cadence, cadence);
+                    _snapshotTimers.Add(timer);
+                });
                 _logger.LogInformation("channel {ChannelNumber}: snapshot → {Group}:{Port} every {CadenceMs:n0}ms",
                     ch.ChannelNumber, snap.Group, snap.Port, cadence.TotalMilliseconds);
             }
@@ -515,8 +526,11 @@ public sealed class ExchangeHost : IAsyncDisposable
                 {
                     disp.AttachPriceBandPublisher(publisher);
                     var capturedDisp = disp;
-                    var timer = new Timer(_ => capturedDisp.EnqueuePriceBandTick(), null, cadence, cadence);
-                    _priceBandTimers.Add(timer);
+                    publisherStarts.Add(() =>
+                    {
+                        var timer = new Timer(_ => capturedDisp.EnqueuePriceBandTick(), null, cadence, cadence);
+                        _priceBandTimers.Add(timer);
+                    });
                     _logger.LogInformation("channel {ChannelNumber}: price-band on incremental feed every {CadenceMs:n0}ms for {InstrumentCount} instruments",
                         ch.ChannelNumber, cadence.TotalMilliseconds, publisher.Count);
                 }
@@ -548,11 +562,28 @@ public sealed class ExchangeHost : IAsyncDisposable
                     instruments: instruments,
                     sink: idSink,
                     cadence: TimeSpan.FromMilliseconds(idCfg.CadenceMs));
-                publisher.Start();
                 _instrumentDefPublishers.Add(publisher);
+                publisherStarts.Add(publisher.Start);
                 _logger.LogInformation("channel {ChannelNumber}: instrument-def → {Group}:{Port} every {CadenceMs}ms",
                     ch.ChannelNumber, idCfg.Group, idCfg.Port, idCfg.CadenceMs);
             }
+        }
+
+        // Phase 2: only after every channel has recovered and durably
+        // prepared its epoch do we let each owner thread publish the reset.
+        // Publishers/timers start only after all activations succeed, and
+        // listener/readiness/live traffic remain later in this method.
+        try
+        {
+            foreach (var dispatcher in _dispatchers)
+                dispatcher.Activate();
+            foreach (var startPublisher in publisherStarts)
+                startPublisher();
+        }
+        catch
+        {
+            await StopAsync().ConfigureAwait(false);
+            throw;
         }
 
         _router = new HostRouter(routing, gatewayRouter, _loggerFactory.CreateLogger<HostRouter>());
