@@ -645,6 +645,27 @@ public partial class ChannelDispatcherTests
         Assert.Equal((uint)1, MemoryMarshal.Read<uint>(packet.AsSpan(4, 4)));
     }
 
+    [Fact]
+    public void SequenceNumber_RolloverAtMaximumVersion_FailsWithoutPublishingReservedVersion()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+
+        disp.TestSetSequenceVersion(ushort.MaxValue);
+        disp.TestSetSequenceNumber(uint.MaxValue);
+        disp.EnqueueNewOrder(
+            new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                Px(10m), 100, 7, 1_000UL),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
+
+        var error = Assert.Throws<InvalidOperationException>(() => DrainInbound(disp));
+
+        Assert.Contains("SequenceVersion space is exhausted", error.Message);
+        Assert.Equal(ushort.MaxValue, disp.SequenceVersion);
+        Assert.Equal(uint.MaxValue, disp.SequenceNumber);
+        Assert.Empty(pkt.Packets);
+    }
+
     private static int OrderOwnerCount(ChannelDispatcher disp)
     {
         // Owner state moved to Gateway (OrderOwnershipMap); kept as a no-op

@@ -328,7 +328,7 @@ public sealed partial class ChannelDispatcher
             // (e.g. tests with WAL-only configs). Replay against the
             // empty engine so a crash before the very first snapshot is
             // recoverable.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
+            ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
             return false;
         }
         ChannelStateSnapshot? snapshot;
@@ -351,8 +351,8 @@ public sealed partial class ChannelDispatcher
             // Issue #269: no snapshot but possibly WAL records from a
             // crash before the first snapshot ever ran. Replay rebuilds
             // the engine from scratch.
-            var walReplay = ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return walReplay.Succeeded && walReplay.RecordCount > 0;
+            var walReplay = ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
+            return walReplay.RecordCount > 0;
         }
         try
         {
@@ -381,9 +381,19 @@ public sealed partial class ChannelDispatcher
         // Issue #269: replay any WAL records that were appended after the
         // snapshot was taken. Keep this outside the snapshot restore catch
         // block so WAL I/O failures retain their own fatal classification.
-        var walReplayAfterSnapshot = ReplayWalOnLoopThread(
-            snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
-        return walReplayAfterSnapshot.Succeeded;
+        ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
+        return true;
+    }
+
+    private WalReplayOutcome ReplayWalForStartupOrThrow(long snapshotLastAppliedSeq)
+    {
+        var outcome = ReplayWalOnLoopThread(snapshotLastAppliedSeq);
+        if (!outcome.Succeeded)
+        {
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: WAL replay failed during boot recovery; startup aborted");
+        }
+        return outcome;
     }
 
     /// <summary>

@@ -393,11 +393,9 @@ public class ChannelDispatcherWalTests
         var metricsB = new ChannelMetrics(84);
         var dispB = BuildDispatcher(persister, wal2, out var sinkB, out var outB,
             metrics: metricsB);
-        dispB.Start();
+        var error = Assert.Throws<InvalidOperationException>(() => dispB.Start());
 
-        Assert.True(await WaitForAsync(() => !dispB.IsWalHealthy,
-            ReadyTimeout), "dispatcher did not halt on the snapshot/WAL boundary gap before timeout");
-
+        Assert.Contains("WAL replay failed during boot recovery", error.Message);
         Assert.False(dispB.IsWalHealthy);
         // Engine must remain at the snapshot baseline (2 resting orders);
         // the post-gap record was not applied.

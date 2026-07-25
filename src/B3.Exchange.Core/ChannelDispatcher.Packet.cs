@@ -35,12 +35,14 @@ public sealed partial class ChannelDispatcher : IUmdfFrameSink
         AssertOnLoopThread();
         if (_sequenceNumber == uint.MaxValue)
         {
-            Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
+            ushort newVer = UmdfSequenceVersion.NextOrThrow(
+                _sequenceVersion,
+                $"channel {ChannelNumber} automatic incremental epoch rollover");
+            Volatile.Write(ref _sequenceVersion, newVer);
             Volatile.Write(ref _sequenceNumber, 0u);
             // The packet buffer's SequenceVersion was written by
             // ReserveOrFlush with the pre-bump value; rewrite it now so the
             // on-wire header matches the new (version, seq) tuple.
-            ushort newVer = _sequenceVersion;
             System.Runtime.InteropServices.MemoryMarshal.Write(
                 _packetBuf.AsSpan(B3.Umdf.WireEncoder.WireOffsets.PacketHeaderSequenceVersionOffset, 2),
                 in newVer);
@@ -90,6 +92,10 @@ public sealed partial class ChannelDispatcher : IUmdfFrameSink
     /// thread-safety contract beyond "called from the test thread on a
     /// quiescent dispatcher".</summary>
     internal void TestSetSequenceNumber(uint value) => Volatile.Write(ref _sequenceNumber, value);
+
+    /// <summary>Test seam for exercising SequenceVersion exhaustion. Must be
+    /// called only while the dispatcher is quiescent.</summary>
+    internal void TestSetSequenceVersion(ushort value) => Volatile.Write(ref _sequenceVersion, value);
 
     private Span<byte> ReserveOrFlush(int frameSize)
     {

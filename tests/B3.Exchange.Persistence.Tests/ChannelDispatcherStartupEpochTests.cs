@@ -154,6 +154,22 @@ public sealed class ChannelDispatcherStartupEpochTests
         public void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
     }
 
+    private sealed class CorruptWal : IChannelWriteAheadLog
+    {
+        public int Append(WalRecord record) => throw new NotSupportedException();
+
+        public IReadOnlyList<WalRecord> ReadAll()
+            => throw new WalCorruptionException(Channel, 1, "simulated WAL corruption");
+
+        public void Truncate() { }
+
+        public void TruncateThrough(long throughSeq) { }
+
+        public long PendingDurableSeqOrZero => 0;
+
+        public void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
+    }
+
     private static ChannelStateSnapshot RichRestoredSnapshot(ushort version = 9)
     {
         var bid = new RestingOrderRecord(
@@ -415,6 +431,90 @@ public sealed class ChannelDispatcherStartupEpochTests
         {
             try { Directory.Delete(dataDirectory, recursive: true); } catch { }
         }
+    }
+
+    [Fact]
+    public async Task WalCorruption_FaultsStartupBeforeReadinessResetSnapshotOrLiveTraffic()
+    {
+        var initial = RichRestoredSnapshot();
+        var persister = new RecordingPersister(initial);
+        var incremental = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var dispatcher = BuildDispatcher(
+            persister, incremental, outbound, new CorruptWal(), out var engine);
+        var snapshot = new RecordingPacketSink();
+        dispatcher.AttachSnapshotRotator(new SnapshotRotator(
+            Channel,
+            new MatchingEngineSnapshotSource(engine, [Petr, Vale]),
+            snapshot));
+        Assert.True(dispatcher.EnqueueSnapshotTick());
+        Assert.True(dispatcher.EnqueueNewOrder(
+            new NewOrderCommand(
+                "QUEUED-LIVE", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                Px(9.00m), 100, 505, 6_000),
+            new SessionId("50005"), enteringFirm: 505, clOrdIdValue: 0xC005));
+
+        var error = Assert.Throws<InvalidOperationException>(() => dispatcher.Start());
+
+        Assert.Contains("WAL replay failed during boot recovery", error.Message);
+        Assert.False(dispatcher.IsWalHealthy);
+        Assert.False(new WalHaltReadinessProbe([dispatcher]).IsReady);
+        Assert.Equal((ushort)9, dispatcher.SequenceVersion);
+        Assert.Equal(77u, dispatcher.SequenceNumber);
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(initial, persister.Last);
+        Assert.Empty(incremental.Packets);
+        Assert.Empty(snapshot.Packets);
+        Assert.Empty(outbound.Accepted);
+        await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task WalBoundaryGap_FaultsStartupBeforeReadinessResetSnapshotOrLiveTraffic()
+    {
+        var initial = RichRestoredSnapshot();
+        var gapRecord = new WalRecord(
+            Seq: initial.LastAppliedSeq + 2,
+            Kind: WalRecordKind.NewOrder,
+            SessionValue: "40004",
+            Firm: 404,
+            ClOrdId: 0xA004,
+            OrigClOrdId: 0,
+            NewOrder: new NewOrderCommand(
+                "WAL-GAP", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                Px(9.50m), 100, 404, 5_000),
+            Cancel: null,
+            Replace: null);
+        var persister = new RecordingPersister(initial);
+        var incremental = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var dispatcher = BuildDispatcher(
+            persister, incremental, outbound, new InMemoryWal(gapRecord), out var engine);
+        var snapshot = new RecordingPacketSink();
+        dispatcher.AttachSnapshotRotator(new SnapshotRotator(
+            Channel,
+            new MatchingEngineSnapshotSource(engine, [Petr, Vale]),
+            snapshot));
+        Assert.True(dispatcher.EnqueueSnapshotTick());
+        Assert.True(dispatcher.EnqueueNewOrder(
+            new NewOrderCommand(
+                "QUEUED-LIVE", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
+                Px(9.00m), 100, 505, 6_000),
+            new SessionId("50005"), enteringFirm: 505, clOrdIdValue: 0xD005));
+
+        var error = Assert.Throws<InvalidOperationException>(() => dispatcher.Start());
+
+        Assert.Contains("WAL replay failed during boot recovery", error.Message);
+        Assert.False(dispatcher.IsWalHealthy);
+        Assert.False(new WalHaltReadinessProbe([dispatcher]).IsReady);
+        Assert.Equal((ushort)9, dispatcher.SequenceVersion);
+        Assert.Equal(77u, dispatcher.SequenceNumber);
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(initial, persister.Last);
+        Assert.Empty(incremental.Packets);
+        Assert.Empty(snapshot.Packets);
+        Assert.Empty(outbound.Accepted);
+        await dispatcher.DisposeAsync();
     }
 
     [Fact]

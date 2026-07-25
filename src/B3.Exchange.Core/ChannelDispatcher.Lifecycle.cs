@@ -90,7 +90,11 @@ public sealed partial class ChannelDispatcher
         }
         finally
         {
-            FlushPendingSnapshotOnShutdownSafely();
+            // A failed boot must leave the recovered artifacts untouched.
+            // In particular, never persist a snapshot of partially replayed
+            // state after _startupCompleted has been faulted.
+            if (_startupCompleted.Task.IsCompletedSuccessfully)
+                FlushPendingSnapshotOnShutdownSafely();
         }
     }
 
