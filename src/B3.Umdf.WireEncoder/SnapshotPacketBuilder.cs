@@ -43,7 +43,8 @@ public static class SnapshotPacketBuilder
     /// <see cref="DefaultPacketBufferSize"/> handles a full 255-entry chunk
     /// with margin.</param>
     /// <param name="channelNumber">UMDF snapshot channel number.</param>
-    /// <param name="sequenceVersion">Current snapshot sequence version.</param>
+    /// <param name="snapshotSequenceVersion">Current snapshot-loop sequence
+    /// version written to each packet header.</param>
     /// <param name="firstSequenceNumber">Sequence number for the first packet
     /// of this snapshot. Subsequent packets within the same snapshot use
     /// successive numbers.</param>
@@ -54,6 +55,10 @@ public static class SnapshotPacketBuilder
     /// <param name="lastRptSeq">Last incremental RptSeq published before this
     /// snapshot was taken; consumers gate snapshot acceptance on this value.
     /// Pass <c>null</c> for an empty illiquid snapshot (per B3 §7.4).</param>
+    /// <param name="incrementalSequenceVersion">Incremental-channel sequence
+    /// version represented by the captured book and watermarks. Written as
+    /// <c>LastSequenceVersion</c> in Header_30; independent from
+    /// <paramref name="snapshotSequenceVersion"/>.</param>
     /// <param name="bids">Resting bid orders in price-time priority (best
     /// price first within a side).</param>
     /// <param name="asks">Resting ask orders in price-time priority.</param>
@@ -62,11 +67,12 @@ public static class SnapshotPacketBuilder
     public static int WriteSnapshot(
         Span<byte> buffer,
         byte channelNumber,
-        ushort sequenceVersion,
+        ushort snapshotSequenceVersion,
         uint firstSequenceNumber,
         ulong sendingTimeNanos,
         long securityId,
         uint? lastRptSeq,
+        ushort incrementalSequenceVersion,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
         PacketHandler onPacket,
@@ -86,9 +92,10 @@ public static class SnapshotPacketBuilder
         int packetCount = 0;
 
         // ------------------------- Packet 1: header --------------------------
-        int p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, sequenceVersion, seqNum, sendingTimeNanos);
+        int p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
         int headerLen = UmdfWireEncoder.WriteSnapshotHeaderFrame(buffer.Slice(p),
-            securityId, totReports, totBids, totOffers, totNumStats: 0, lastRptSeq: lastRptSeq);
+            securityId, totReports, totBids, totOffers, totNumStats: 0,
+            lastRptSeq: lastRptSeq, lastSequenceVersion: incrementalSequenceVersion);
         p += headerLen;
 
         // Pack as many Orders_71 chunks as fit in the remaining space.
@@ -109,7 +116,7 @@ public static class SnapshotPacketBuilder
         while (bidIdx < bids.Length || askIdx < asks.Length)
         {
             seqNum++;
-            p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, sequenceVersion, seqNum, sendingTimeNanos);
+            p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
             // Pack up to buffer capacity.
             while (true)
             {

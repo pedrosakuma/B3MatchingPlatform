@@ -53,7 +53,7 @@ public class SnapshotRotatorTests
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink, timeSource: new FakeNanosTimeSource(1234UL));
 
-        int packets = rot.PublishNext();
+        int packets = rot.PublishNext(incrementalSequenceVersion: 3);
 
         Assert.Equal(1, packets);
         Assert.Single(sink.Packets);
@@ -66,11 +66,12 @@ public class SnapshotRotatorTests
         Assert.Equal(1u, hdr.SequenceNumber);
         Assert.Equal(1234UL, hdr.SendingTime);
 
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(42L, (long)(ulong)snapHdr.Data.SecurityID);
         Assert.Equal(0u, snapHdr.Data.TotNumReports);
         Assert.Null(snapHdr.Data.LastRptSeq); // illiquid: §7.4
+        Assert.Equal((ushort)3, snapHdr.Data.LastSequenceVersion);
     }
 
     [Fact]
@@ -94,17 +95,18 @@ public class SnapshotRotatorTests
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
 
-        int packets = rot.PublishNext();
+        int packets = rot.PublishNext(incrementalSequenceVersion: 4);
         Assert.Equal(1, packets);
         Assert.Single(sink.Packets);
 
         var pkt = sink.Packets[0];
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(3u, snapHdr.Data.TotNumReports);
         Assert.Equal(2u, snapHdr.Data.TotNumBids);
         Assert.Equal(1u, snapHdr.Data.TotNumOffers);
         Assert.Equal(17u, snapHdr.Data.LastRptSeq);
+        Assert.Equal((ushort)4, snapHdr.Data.LastSequenceVersion);
 
         // Same packet must carry an Orders_71 frame with NumInGroup == 3.
         int after = FrameOffset + WireOffsets.SnapHeaderBlockLength;
@@ -121,7 +123,7 @@ public class SnapshotRotatorTests
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 5, source: src, sink: sink);
 
-        for (int i = 0; i < 4; i++) rot.PublishNext(); // wraps after 3
+        for (int i = 0; i < 4; i++) rot.PublishNext(incrementalSequenceVersion: 1); // wraps after 3
 
         Assert.Equal(4, sink.Packets.Count);
         // Each tick → 1 packet (empty book), so SequenceNumber == 4.
@@ -132,7 +134,7 @@ public class SnapshotRotatorTests
         long[] expected = new[] { 11L, 22L, 33L, 11L };
         for (int i = 0; i < expected.Length; i++)
         {
-            Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+            Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
                 sink.Packets[i].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
             Assert.Equal(expected[i], (long)(ulong)hdr.Data.SecurityID);
             ref readonly var packetHdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[i].AsSpan(0, PacketHeaderSize));
@@ -154,7 +156,7 @@ public class SnapshotRotatorTests
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
 
-        int packets = rot.PublishNext();
+        int packets = rot.PublishNext(incrementalSequenceVersion: 1);
         Assert.True(packets >= 2, $"expected multi-packet snapshot, got {packets}");
         Assert.Equal((uint)packets, rot.SequenceNumber);
 
@@ -186,14 +188,14 @@ public class SnapshotRotatorTests
     }
 
     [Fact]
-    public void BumpSequenceVersion_BumpsVersionAndResetsSequenceNumber()
+    public void BumpSequenceVersion_DoesNotChangeIncrementalLastSequenceVersion()
     {
         var src = new FakeSource { SecurityIds = new[] { 1L } };
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 1, source: src, sink: sink);
 
-        rot.PublishNext();
-        rot.PublishNext();
+        rot.PublishNext(incrementalSequenceVersion: 9);
+        rot.PublishNext(incrementalSequenceVersion: 9);
         Assert.Equal(2u, rot.SequenceNumber);
         Assert.Equal((ushort)1, rot.SequenceVersion);
 
@@ -202,11 +204,14 @@ public class SnapshotRotatorTests
         Assert.Equal((ushort)2, rot.SequenceVersion);
         Assert.Equal(0u, rot.SequenceNumber);
 
-        rot.PublishNext();
+        rot.PublishNext(incrementalSequenceVersion: 9);
         // Next packet: SequenceVersion=2, SequenceNumber=1
         ref readonly var hdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[^1].AsSpan(0, PacketHeaderSize));
         Assert.Equal((ushort)2, hdr.SequenceVersion);
         Assert.Equal(1u, hdr.SequenceNumber);
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            sink.Packets[^1].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
+        Assert.Equal((ushort)9, snapHdr.Data.LastSequenceVersion);
     }
 
     [Fact]
@@ -219,13 +224,14 @@ public class SnapshotRotatorTests
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 1, source: src, sink: sink);
 
-        rot.PublishNext();
+        rot.PublishNext(incrementalSequenceVersion: 1);
 
         var pkt = sink.Packets[0];
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
         Assert.Equal(0u, hdr.Data.TotNumReports);
         Assert.Equal(5u, hdr.Data.LastRptSeq);
+        Assert.Equal((ushort)1, hdr.Data.LastSequenceVersion);
     }
 }
 
@@ -236,6 +242,10 @@ public class SnapshotRotatorTests
 /// </summary>
 public class ChannelDispatcherSnapshotTests
 {
+    private const int PacketHeaderSize = WireOffsets.PacketHeaderSize;
+    private const int FrameOffset = PacketHeaderSize
+                                    + WireOffsets.FramingHeaderSize
+                                    + WireOffsets.SbeMessageHeaderSize;
     private const long Petr = 900_000_000_001L;
     private static B3.Exchange.Instruments.Instrument Petr4 => new()
     {
@@ -285,6 +295,9 @@ public class ChannelDispatcherSnapshotTests
         Assert.Empty(incSink.Packets);            // incremental sink untouched
         Assert.Equal(1u, rotator.SequenceNumber); // snap-channel seq advanced
         Assert.Equal(0u, disp.SequenceNumber);    // inc-channel seq untouched
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            snapSink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapshotHeader));
+        Assert.Equal(disp.SequenceVersion, snapshotHeader.Data.LastSequenceVersion);
     }
 
     [Fact]
@@ -326,13 +339,100 @@ public class ChannelDispatcherSnapshotTests
         Assert.Single(snapSink.Packets);
         var pkt = snapSink.Packets[0];
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var hdr));
         Assert.Equal(3u, hdr.Data.TotNumReports);
         Assert.Equal(2u, hdr.Data.TotNumBids);
         Assert.Equal(1u, hdr.Data.TotNumOffers);
         // After 3 OrderAccepted events the engine's RptSeq is 3.
         Assert.Equal(3u, hdr.Data.LastRptSeq);
+        Assert.Equal(disp.SequenceVersion, hdr.Data.LastSequenceVersion);
+    }
+
+    [Fact]
+    public void SnapshotTick_ReflectsIncrementalVersionBump()
+    {
+        var incSink = new CapturingSink();
+        var snapSink = new CapturingSink();
+        MatchingEngine? engine = null;
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: s => { engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance); return engine; },
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = incSink,
+                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                TimeSource = new FakeNanosTimeSource(1UL),
+                TradeDate = 1,
+            });
+        var rotator = new SnapshotRotator(channelNumber: 1,
+            source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
+            sink: snapSink, timeSource: new FakeNanosTimeSource(1UL));
+        disp.AttachSnapshotRotator(rotator);
+
+        Assert.True(disp.EnqueueOperatorBumpVersion());
+        Drain(disp);
+        Assert.True(disp.EnqueueSnapshotTick());
+        Drain(disp);
+
+        Assert.Single(snapSink.Packets);
+        ref readonly var packetHeader = ref MemoryMarshal.AsRef<PacketHeader>(
+            snapSink.Packets[0].AsSpan(0, PacketHeaderSize));
+        Assert.Equal((ushort)2, packetHeader.SequenceVersion);
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            snapSink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapshotHeader));
+        Assert.Equal(disp.SequenceVersion, snapshotHeader.Data.LastSequenceVersion);
+        Assert.Equal((ushort)2, snapshotHeader.Data.LastSequenceVersion);
+    }
+
+    [Fact]
+    public void SnapshotTick_ReflectsRestoredIncrementalVersion()
+    {
+        var sourceDispatcher = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: s => new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance),
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new CapturingSink(),
+                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                TimeSource = new FakeNanosTimeSource(1UL),
+                TradeDate = 1,
+            });
+        var restoredState = sourceDispatcher.CaptureChannelState() with { SequenceVersion = 7 };
+
+        var snapSink = new CapturingSink();
+        MatchingEngine? restoredEngine = null;
+        var restoredDispatcher = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: s =>
+            {
+                restoredEngine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance);
+                return restoredEngine;
+            },
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new CapturingSink(),
+                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                TimeSource = new FakeNanosTimeSource(1UL),
+                TradeDate = 1,
+            });
+        var rotator = new SnapshotRotator(channelNumber: 1,
+            source: new MatchingEngineSnapshotSource(restoredEngine!, new[] { Petr }),
+            sink: snapSink, timeSource: new FakeNanosTimeSource(1UL));
+        restoredDispatcher.AttachSnapshotRotator(rotator);
+        restoredDispatcher.RestoreChannelState(restoredState);
+
+        Assert.True(restoredDispatcher.EnqueueSnapshotTick());
+        Drain(restoredDispatcher);
+
+        Assert.Single(snapSink.Packets);
+        ref readonly var packetHeader = ref MemoryMarshal.AsRef<PacketHeader>(
+            snapSink.Packets[0].AsSpan(0, PacketHeaderSize));
+        Assert.Equal((ushort)1, packetHeader.SequenceVersion);
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            snapSink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapshotHeader));
+        Assert.Equal((ushort)7, snapshotHeader.Data.LastSequenceVersion);
+        Assert.Equal(restoredDispatcher.SequenceVersion, snapshotHeader.Data.LastSequenceVersion);
     }
 
     private static void Drain(ChannelDispatcher disp) => disp.CreateTestProbe().DrainInbound();

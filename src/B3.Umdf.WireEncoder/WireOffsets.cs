@@ -66,14 +66,15 @@ public static class WireOffsets
     public const int TradeBodyTransactTimeOffset = 44;     // ulong nanos
     public const int TradeBodyRptSeqOffset = 52;           // uint
 
-    // ---- SnapshotFullRefresh_Header_30 ----
-    public const int SnapHeaderBlockLength = 32;
+    // ---- SnapshotFullRefresh_Header_30 (V16; V15 added LastSequenceVersion@32) ----
+    public const int SnapHeaderBlockLength = 34;
     public const int SnapHeaderBodySecurityIdOffset = 0;          // long
     public const int SnapHeaderBodyTotNumReportsOffset = 12;      // uint
     public const int SnapHeaderBodyTotNumBidsOffset = 16;         // uint
     public const int SnapHeaderBodyTotNumOffersOffset = 20;       // uint
     public const int SnapHeaderBodyTotNumStatsOffset = 24;        // ushort
     public const int SnapHeaderBodyLastRptSeqOffset = 28;         // uint (0 = NULL)
+    public const int SnapHeaderBodyLastSequenceVersionOffset = 32; // ushort (0 = NULL)
 
     // ---- SnapshotFullRefresh_Orders_MBO_71 (group-based) ----
     public const int SnapOrdersHeaderBlockLength = 8;          // SecurityID only as block-level
