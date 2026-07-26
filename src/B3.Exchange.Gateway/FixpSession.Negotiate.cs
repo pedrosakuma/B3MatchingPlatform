@@ -85,7 +85,10 @@ public sealed partial class FixpSession
                     $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
             }
             // Issue #485: update Identity to stable FIXP SessionId (legacy path).
-            UpdateIdentityAfterNegotiate(req.SessionId);
+            UpdateIdentityAfterNegotiate(
+                req.SessionId,
+                replaceRetired: true,
+                out _);
             SessionId = req.SessionId;
             EnteringFirm = req.EnteringFirm;
             SessionVerId = req.SessionVerId;
@@ -180,7 +183,32 @@ public sealed partial class FixpSession
         _ = ApplyTransition(FixpEvent.Negotiate);
         // Issue #485: update Identity to the stable FIXP SessionId and notify
         // the registry to re-index. Capture the old identity for rollback.
-        var pendingIdentity = UpdateIdentityAfterNegotiate(req.SessionId);
+        var pendingIdentity = UpdateIdentityAfterNegotiate(
+            req.SessionId,
+            replaceRetired: evictedByTakeOver is null,
+            out var identityUpdated);
+        if (!identityUpdated)
+        {
+            if (evictedByTakeOver is not null)
+            {
+                _claims.TryRestoreTakeOver(
+                    req.SessionId,
+                    this,
+                    evictedByTakeOver,
+                    evictedVerId);
+            }
+            _claims.Release(req.SessionId, this);
+            _claimedSessionId = 0;
+            RollbackIdentity(pendingIdentity);
+
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                "negotiate-reject (UNSPECIFIED: session claim/route handoff lost)");
+        }
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;

@@ -234,10 +234,14 @@ public sealed partial class FixpSession
                     // machine has already moved to Terminated, the
                     // claim is already logically dead — release it
                     // synchronously so the next Negotiate succeeds
-                    // even on slow CI hardware. Close() re-issues the
-                    // Release; SessionClaimRegistry.Release is
-                    // idempotent and scoped by ReferenceEquals to this
-                    // session, so the second call is a no-op.
+                    // even on slow CI hardware. The Terminated transition
+                    // above is deliberately published first: SessionRegistry
+                    // may then conditionally transfer this retired route to
+                    // the newly claimed session before our delayed close
+                    // callback deregisters us. Close() re-issues the Release;
+                    // SessionClaimRegistry.Release is idempotent and scoped by
+                    // ReferenceEquals to this session, so the second call is
+                    // a no-op.
                     if (_claimedSessionId != 0 && _claims is not null)
                     {
                         try { _claims.Release(_claimedSessionId, this); } catch { }

@@ -19,6 +19,13 @@ namespace B3.Exchange.Gateway;
 /// </summary>
 public sealed class SessionRegistry
 {
+    private enum IdentityUpdateAttempt
+    {
+        Updated,
+        Retry,
+        Rejected,
+    }
+
     private readonly ConcurrentDictionary<SessionId, FixpSession> _sessions = new();
     private readonly object _mapLock = new();
     private readonly ConditionalWeakTable<FixpSession, SessionRoute> _routes = new();
@@ -74,25 +81,175 @@ public sealed class SessionRegistry
     /// and registers it under the new identity. No-op when identities match.
     /// </summary>
     public void UpdateIdentity(FixpSession session, SessionId oldIdentity, SessionId newIdentity)
+        => _ = TryUpdateIdentity(
+            session,
+            oldIdentity,
+            newIdentity,
+            claims: null,
+            claimedSessionId: 0,
+            replaceRetired: true);
+
+    /// <summary>
+    /// Re-indexes a newly claimed session while proving that it still owns the
+    /// FIXP claim. A terminal predecessor is conditionally replaced and its
+    /// stable route is transferred so delayed work follows the successor. A
+    /// live predecessor remains mapped until the takeover commit path performs
+    /// its persisted state transfer.
+    /// </summary>
+    internal bool TryUpdateIdentity(
+        FixpSession session,
+        SessionId oldIdentity,
+        SessionId newIdentity,
+        SessionClaimRegistry? claims,
+        uint claimedSessionId,
+        bool replaceRetired)
     {
         ArgumentNullException.ThrowIfNull(session);
-        // Avoid unnecessary churn when identity hasn't changed (e.g., rehydrated sessions)
-        if (oldIdentity == newIdentity) return;
-        RouteFor(session).Execute(route =>
+        if (session.Identity != newIdentity)
+            throw new ArgumentException("session identity must match new identity", nameof(newIdentity));
+
+        if (oldIdentity == newIdentity)
         {
-            if (!ReferenceEquals(route.Current, session))
-                return false;
+            if (claims is null) return true;
+            return claims.TryExecuteIfOwned(claimedSessionId, session, static () => { });
+        }
+
+        while (true)
+        {
+            FixpSession? previous;
             lock (_mapLock)
             {
-                // A higher-version Negotiate creates a replacement FixpSession,
-                // but the previous logical session remains authoritative until
-                // takeover persistence and outbound-state transfer commit.
-                _sessions.TryAdd(newIdentity, session);
-                _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(
-                    oldIdentity, session));
+                _sessions.TryGetValue(newIdentity, out previous);
             }
-            return true;
-        });
+
+            IdentityUpdateAttempt attempt;
+            if (previous is null
+                || ReferenceEquals(previous, session)
+                || !replaceRetired)
+            {
+                attempt = RouteFor(session).Execute(replacementRoute =>
+                {
+                    if (!ReferenceEquals(replacementRoute.Current, session))
+                        return IdentityUpdateAttempt.Rejected;
+
+                    var result = IdentityUpdateAttempt.Rejected;
+                    bool owned = ExecuteWithClaim(claims, claimedSessionId, session, () =>
+                    {
+                        lock (_mapLock)
+                        {
+                            if (_sessions.TryGetValue(newIdentity, out var current))
+                            {
+                                if (!ReferenceEquals(current, session))
+                                {
+                                    result = replaceRetired
+                                        ? IdentityUpdateAttempt.Retry
+                                        : IdentityUpdateAttempt.Updated;
+                                    if (!replaceRetired)
+                                    {
+                                        _sessions.TryRemove(
+                                            new KeyValuePair<SessionId, FixpSession>(
+                                                oldIdentity, session));
+                                    }
+                                    return;
+                                }
+                            }
+                            else if (!_sessions.TryAdd(newIdentity, session))
+                            {
+                                result = IdentityUpdateAttempt.Retry;
+                                return;
+                            }
+
+                            _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(
+                                oldIdentity, session));
+                            result = IdentityUpdateAttempt.Updated;
+                        }
+                    });
+                    return owned ? result : IdentityUpdateAttempt.Rejected;
+                });
+            }
+            else
+            {
+                var previousHandle = RouteFor(previous);
+                var replacementHandle = RouteFor(session);
+                attempt = SessionRoute.ExecutePair(previousHandle, replacementHandle,
+                    (previousRoute, replacementRoute) =>
+                {
+                    if (!ReferenceEquals(replacementRoute.Current, session))
+                        return IdentityUpdateAttempt.Rejected;
+
+                    var previousCurrent = previousRoute.Current;
+                    if (previousCurrent is not null
+                        && !ReferenceEquals(previousCurrent, previous)
+                        && !ReferenceEquals(previousCurrent, session))
+                        return IdentityUpdateAttempt.Retry;
+
+                    var result = IdentityUpdateAttempt.Rejected;
+                    bool transferRoute = false;
+                    bool owned = ExecuteWithClaim(claims, claimedSessionId, session, () =>
+                    {
+                        lock (_mapLock)
+                        {
+                            if (_sessions.TryGetValue(newIdentity, out var current))
+                            {
+                                if (ReferenceEquals(current, previous))
+                                {
+                                    if (!CanReplace(previous))
+                                    {
+                                        result = IdentityUpdateAttempt.Rejected;
+                                        return;
+                                    }
+                                    if (!_sessions.TryUpdate(newIdentity, session, previous))
+                                    {
+                                        result = IdentityUpdateAttempt.Retry;
+                                        return;
+                                    }
+                                    transferRoute = true;
+                                }
+                                else if (ReferenceEquals(current, session))
+                                {
+                                    transferRoute = CanReplace(previous);
+                                }
+                                else
+                                {
+                                    result = IdentityUpdateAttempt.Retry;
+                                    return;
+                                }
+                            }
+                            else
+                            {
+                                if (!CanReplace(previous))
+                                {
+                                    result = IdentityUpdateAttempt.Retry;
+                                    return;
+                                }
+                                if (!_sessions.TryAdd(newIdentity, session))
+                                {
+                                    result = IdentityUpdateAttempt.Retry;
+                                    return;
+                                }
+                                transferRoute = true;
+                            }
+
+                            _sessions.TryRemove(new KeyValuePair<SessionId, FixpSession>(
+                                oldIdentity, session));
+                            result = IdentityUpdateAttempt.Updated;
+                        }
+
+                        if (transferRoute)
+                        {
+                            previousRoute.SetCurrent(session);
+                            if (!ReferenceEquals(previousRoute, replacementRoute))
+                                replacementRoute.RedirectTo(previousRoute);
+                        }
+                    });
+                    return owned ? result : IdentityUpdateAttempt.Rejected;
+                });
+            }
+
+            if (attempt == IdentityUpdateAttempt.Retry)
+                continue;
+            return attempt == IdentityUpdateAttempt.Updated;
+        }
     }
 
     public bool TryGet(SessionId session, out FixpSession value)
@@ -236,4 +393,21 @@ public sealed class SessionRegistry
 
     private SessionRoute RouteFor(FixpSession session)
         => _routes.GetValue(session, static current => new SessionRoute(current));
+
+    private static bool CanReplace(FixpSession session)
+        => session.State == FixpState.Terminated || !session.IsRegistered;
+
+    private static bool ExecuteWithClaim(
+        SessionClaimRegistry? claims,
+        uint claimedSessionId,
+        FixpSession session,
+        Action action)
+    {
+        if (claims is null)
+        {
+            action();
+            return true;
+        }
+        return claims.TryExecuteIfOwned(claimedSessionId, session, action);
+    }
 }

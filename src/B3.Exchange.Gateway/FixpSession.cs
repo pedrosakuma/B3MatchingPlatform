@@ -225,12 +225,29 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Called from both the legacy and credentials-based Negotiate paths.
     /// Returns the old identity so the caller can roll back if needed.
     /// </summary>
-    private ContractsSessionId UpdateIdentityAfterNegotiate(uint fixpSessionId)
+    private ContractsSessionId UpdateIdentityAfterNegotiate(
+        uint fixpSessionId,
+        bool replaceRetired,
+        out bool updated)
     {
         var oldIdentity = Identity;
         var newIdentity = new ContractsSessionId(fixpSessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         Identity = newIdentity;
-        _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+        if (_sessionRegistry is not null)
+        {
+            updated = _sessionRegistry.TryUpdateIdentity(
+                this,
+                oldIdentity,
+                newIdentity,
+                _claims,
+                fixpSessionId,
+                replaceRetired);
+        }
+        else
+        {
+            _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+            updated = true;
+        }
         return oldIdentity;
     }
 
@@ -243,7 +260,10 @@ public sealed partial class FixpSession : IAsyncDisposable
     {
         var current = Identity;
         Identity = oldIdentity;
-        _onIdentityChanged?.Invoke(this, current, oldIdentity);
+        if (_sessionRegistry is not null)
+            _sessionRegistry.UpdateIdentity(this, current, oldIdentity);
+        else
+            _onIdentityChanged?.Invoke(this, current, oldIdentity);
     }
 
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;

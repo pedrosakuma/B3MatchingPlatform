@@ -224,6 +224,28 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Runs <paramref name="action"/> while the claim lock proves that
+    /// <paramref name="claimToken"/> is still the active owner. Registry
+    /// handoffs use this to keep the FIXP claim and logical-session route in
+    /// lock-step when a terminating transport is replaced before its delayed
+    /// close callback deregisters it.
+    /// </summary>
+    internal bool TryExecuteIfOwned(uint sessionId, object claimToken, Action action)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_lock)
+        {
+            if (!_activeClaims.TryGetValue(sessionId, out var owner)
+                || !ReferenceEquals(owner, claimToken))
+                return false;
+
+            action();
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Releases the claim for <paramref name="sessionId"/> if (and only
     /// if) it is currently held by <paramref name="claimToken"/>. Safe to
     /// call from any thread; safe to call multiple times. Does not
