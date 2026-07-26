@@ -169,10 +169,102 @@ public class FixpSessionMassActionCompletionTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TerminalCompletionDuringReattach_IsBufferedUntilEstablishAckAndReplay(
+        bool succeeded)
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var (server1, client1) = await ConnectPairAsync();
+        var session = StartSession(server1, sink, sessionRegistry: registry);
+        registry.Register(session);
+        try
+        {
+            await client1.GetStream().WriteAsync(BuildRequest(clOrdId: 7005, msgSeqNum: 9));
+            var complete = await sink.Completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+            client1.Close();
+            Assert.True(await TestUtil.WaitUntilAsync(
+                () => session.State == FixpState.Suspended,
+                TimeSpan.FromSeconds(3)));
+
+            var (server2, client2) = await ConnectPairAsync();
+            try
+            {
+                Assert.True(session.TryReattach(server2));
+
+                complete(succeeded
+                    ? MassCancelOutcome.Completed(0)
+                    : MassCancelOutcome.SystemBusy);
+                Assert.Equal(1u, session.OutboundSeq);
+
+                var establish = new byte[256];
+                int establishLength = EntryPointFixpFrameCodec.EncodeEstablish(
+                    establish,
+                    sessionId: 100,
+                    sessionVerId: 0,
+                    timestampNanos: 1,
+                    keepAliveIntervalMillis: 10_000,
+                    nextSeqNo: 10,
+                    cancelOnDisconnectType: 0,
+                    codTimeoutWindowMillis: 0,
+                    credentials: ReadOnlySpan<byte>.Empty);
+                var stream2 = client2.GetStream();
+                await stream2.WriteAsync(establish.AsMemory(0, establishLength));
+
+                var ack = await ReadFrameAsync(stream2);
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
+                Assert.Equal(2u,
+                    BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
+
+                await stream2.WriteAsync(BuildRetransmitRequest(
+                    sessionId: 100, timestampNanos: 2, fromSeqNo: 1, count: 1));
+                Assert.Equal(EntryPointFrameReader.TidRetransmission,
+                    (await ReadFrameAsync(stream2)).TemplateId);
+
+                var terminal = await ReadFrameAsync(stream2);
+                Assert.Equal(1u,
+                    BinaryPrimitives.ReadUInt32LittleEndian(terminal.Body.AsSpan(4, 4)));
+                if (succeeded)
+                {
+                    Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport,
+                        terminal.TemplateId);
+                    Assert.Equal(7005UL,
+                        BinaryPrimitives.ReadUInt64LittleEndian(terminal.Body.AsSpan(20, 8)));
+                }
+                else
+                {
+                    AssertSystemBusy(terminal,
+                        expectedRefSeqNum: 9,
+                        expectedClOrdId: 7005);
+                }
+
+                var sequence = await ReadFrameAsync(stream2);
+                Assert.Equal(EntryPointFrameReader.TidSequence, sequence.TemplateId);
+                Assert.Equal(2u,
+                    BinaryPrimitives.ReadUInt32LittleEndian(sequence.Body.AsSpan(0, 4)));
+            }
+            finally
+            {
+                client2.Close();
+            }
+        }
+        finally
+        {
+            session.Close("test");
+            await session.DisposeAsync();
+            client1.Close();
+            server1.Dispose();
+        }
+    }
+
     private static FixpSession StartSession(
         NetworkStream server,
         IInboundCommandSink sink,
-        IFixpOutboundJournal? outboundJournal = null)
+        IFixpOutboundJournal? outboundJournal = null,
+        SessionRegistry? sessionRegistry = null)
     {
         var session = new FixpSession(
             connectionId: 1,
@@ -181,7 +273,8 @@ public class FixpSessionMassActionCompletionTests
             stream: server,
             sink: sink,
             logger: NullLogger<FixpSession>.Instance,
-            outboundJournal: outboundJournal);
+            outboundJournal: outboundJournal,
+            sessionRegistry: sessionRegistry);
         session.Start();
         session.ApplyTransition(FixpEvent.Negotiate);
         session.ApplyTransition(FixpEvent.Establish);
@@ -208,6 +301,23 @@ public class FixpSessionMassActionCompletionTests
         body[47] = (byte)'V';
         body[48] = (byte)'M';
         body[49] = (byte)'F';
+        return frame;
+    }
+
+    private static byte[] BuildRetransmitRequest(
+        uint sessionId, ulong timestampNanos, uint fromSeqNo, uint count)
+    {
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 20];
+        EntryPointFrameReader.WriteHeader(frame,
+            messageLength: (ushort)frame.Length,
+            blockLength: 20,
+            templateId: EntryPointFrameReader.TidRetransmitRequest,
+            version: 0);
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(4, 8), timestampNanos);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(12, 4), fromSeqNo);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(16, 4), count);
         return frame;
     }
 

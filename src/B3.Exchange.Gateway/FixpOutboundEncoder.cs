@@ -32,6 +32,7 @@ internal sealed class FixpOutboundEncoder
     private readonly Func<TcpTransport> _transport;
     private readonly RetransmitBuffer _retxBuffer;
     private readonly object _outboundLock;
+    private readonly Func<bool> _canEnqueueBusiness;
     private readonly INanosTimeSource _timeSource;
     private readonly Func<bool> _isOpen;
     private readonly Action _close;
@@ -59,6 +60,7 @@ internal sealed class FixpOutboundEncoder
         Func<TcpTransport> transport,
         RetransmitBuffer retxBuffer,
         object outboundLock,
+        Func<bool> canEnqueueBusiness,
         INanosTimeSource timeSource,
         Func<bool> isOpen,
         Action close)
@@ -70,6 +72,7 @@ internal sealed class FixpOutboundEncoder
         _transport = transport;
         _retxBuffer = retxBuffer;
         _outboundLock = outboundLock;
+        _canEnqueueBusiness = canEnqueueBusiness;
         _timeSource = timeSource;
         _isOpen = isOpen;
         _close = close;
@@ -356,6 +359,8 @@ internal sealed class FixpOutboundEncoder
             _rollbackMsgSeqNum(seq);
             throw;
         }
+        if (!_canEnqueueBusiness())
+            return OrderedStreamWriteResult.Committed;
         return OrderedStreamWriteResult.FromTransportAdmission(
             _transport().TryEnqueueFrame(exact, durability));
     }

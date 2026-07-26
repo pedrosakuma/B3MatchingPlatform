@@ -522,45 +522,54 @@ public sealed partial class FixpSession
                     ConnectionId);
             }
         }
-        lock (_attachLock)
+        // Business writers and EstablishAck serialize on _outboundLock.
+        // Acquire it before publishing the replacement transport so no writer
+        // can observe the new generation while its Ack admission gate is open.
+        // The lock order matches outbound send-failure handling
+        // (_outboundLock -> _attachLock) and avoids inversion.
+        lock (_outboundLock)
         {
-            // Re-validate after the unlock-await-relock window: a
-            // concurrent Close (e.g. reaper) may have terminated the
-            // session while we waited.
-            if (Volatile.Read(ref _isOpen) == 0) return false;
-            if (Volatile.Read(ref _isAttached) == 1) return false;
-            if (State != FixpState.Suspended) return false;
+            lock (_attachLock)
+            {
+                // Re-validate after the unlock-join-relock window: a
+                // concurrent Close (e.g. reaper) may have terminated the
+                // session while we waited.
+                if (Volatile.Read(ref _isOpen) == 0) return false;
+                if (Volatile.Read(ref _isAttached) == 1) return false;
+                if (State != FixpState.Suspended) return false;
 
-            _logger.LogInformation(
-                "fixp session {ConnectionId} re-attaching transport (sessionId={SessionId} sessionVerId={SessionVerId})",
-                ConnectionId, SessionId, SessionVerId);
+                _logger.LogInformation(
+                    "fixp session {ConnectionId} re-attaching transport (sessionId={SessionId} sessionVerId={SessionVerId})",
+                    ConnectionId, SessionId, SessionVerId);
 
-            try { _cts.Dispose(); } catch (ObjectDisposedException) { /* concurrent dispose; benign */ }
-            _cts = new CancellationTokenSource();
-            _transport = CreateBoundTransport(rebindStream);
-            // The new transport is back; cancel-on-disconnect grace is
-            // satisfied (issue #54 spec §4.7: reconnect inside the
-            // window cancels the pending CoD trigger).
-            StopCodTimerLocked();
-            Volatile.Write(ref _suspendedSinceMs, 0);
-            Volatile.Write(ref _lastInboundMs, NowMs());
-            Volatile.Write(ref _isAttached, 1);
-            // Installing a fresh attached generation begins a new suspend
-            // cycle: clear the one-shot SuspendLocked guard so a subsequent
-            // disconnect can demote this session again. Without this reset a
-            // second drop after any reattach would silently no-op the suspend
-            // (the guard is only otherwise cleared on the never-attached early
-            // return), leaving the session wedged Established over a dead
-            // transport.
-            Volatile.Write(ref _suspendInProgress, 0);
+                try { _cts.Dispose(); } catch (ObjectDisposedException) { /* concurrent dispose; benign */ }
+                _cts = new CancellationTokenSource();
+                _transportReadyForBusiness = false;
+                _transport = CreateBoundTransport(rebindStream);
+                // The new transport is back; cancel-on-disconnect grace is
+                // satisfied (issue #54 spec §4.7: reconnect inside the
+                // window cancels the pending CoD trigger).
+                StopCodTimerLocked();
+                Volatile.Write(ref _suspendedSinceMs, 0);
+                Volatile.Write(ref _lastInboundMs, NowMs());
+                Volatile.Write(ref _isAttached, 1);
+                // Installing a fresh attached generation begins a new suspend
+                // cycle: clear the one-shot SuspendLocked guard so a subsequent
+                // disconnect can demote this session again. Without this reset a
+                // second drop after any reattach would silently no-op the suspend
+                // (the guard is only otherwise cleared on the never-attached early
+                // return), leaving the session wedged Established over a dead
+                // transport.
+                Volatile.Write(ref _suspendInProgress, 0);
 
-            // Spin up new send / recv / watchdog loops bound to the fresh
-            // transport + cancellation source. The buffered Establish frame
-            // already inside `rebindStream` will flow through the recv loop
-            // and drive ProcessEstablish → state machine Suspended → Established.
-            _transport.StartSendLoop(_cts.Token);
-            _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
-            _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
+                // Spin up new send / recv / watchdog loops bound to the fresh
+                // transport + cancellation source. The buffered Establish frame
+                // already inside `rebindStream` will flow through the recv loop
+                // and drive ProcessEstablish → state machine Suspended → Established.
+                _transport.StartSendLoop(_cts.Token);
+                _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
+                _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
+            }
         }
         return true;
     }

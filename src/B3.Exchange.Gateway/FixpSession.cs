@@ -68,6 +68,14 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     private readonly object _outboundLock = new();
     /// <summary>
+    /// Guards transport admission during the reattach handshake. Business
+    /// frames continue to consume sequence numbers and enter the retransmit
+    /// buffer while this is false, but they cannot enter the newly attached
+    /// transport until its EstablishAck has been enqueued. Access only while
+    /// holding <see cref="_outboundLock"/>.
+    /// </summary>
+    private bool _transportReadyForBusiness = true;
+    /// <summary>
     /// Per-session retransmission ring buffer (issue #46, spec §4.5.6).
     /// Holds copies of the wire frames for ExecutionReport_* and
     /// BusinessMessageReject — the buffered business templates that
@@ -492,6 +500,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             transport: () => _transport!,
             retxBuffer: _retxBuffer,
             outboundLock: _outboundLock,
+            canEnqueueBusiness: () => _transportReadyForBusiness,
             timeSource: _timeSource,
             // Use IsRegistered (not IsOpen) so that passive ERs delivered while
             // the session is Suspended (transport down, but session-state alive)

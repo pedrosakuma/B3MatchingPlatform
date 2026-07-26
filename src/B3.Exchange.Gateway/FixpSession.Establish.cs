@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using System.Buffers;
+using System.Buffers.Binary;
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -151,7 +152,27 @@ public sealed partial class FixpSession
         if (step.IsAccepted)
         {
             _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
-            if (!_transport.TryEnqueueFrame(step.AckFrame!))
+            var ackFrame = step.AckFrame!;
+            bool enqueued = ExecuteLogicalSessionExclusive(() =>
+            {
+                lock (_outboundLock)
+                {
+                    // A deferred business completion may have committed while
+                    // the reattached transport was waiting for Establish. Patch
+                    // nextSeqNo and enqueue the Ack under the same lock used by
+                    // business sequence allocation, then open transport
+                    // admission before releasing it. Queue FIFO therefore keeps
+                    // every subsequently admitted business frame behind the Ack.
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        ackFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + 28, 4),
+                        PeekNextMsgSeqNum());
+                    if (!_transport.TryEnqueueFrame(ackFrame))
+                        return false;
+                    _transportReadyForBusiness = true;
+                    return true;
+                }
+            });
+            if (!enqueued)
             {
                 _logger.LogWarning("session {ConnectionId} could not enqueue EstablishAck — closing",
                     ConnectionId);
