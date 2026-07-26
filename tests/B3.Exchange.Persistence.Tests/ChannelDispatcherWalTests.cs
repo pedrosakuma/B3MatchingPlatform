@@ -44,13 +44,26 @@ public class ChannelDispatcherWalTests
     private sealed class CountingOutbound : ICoreOutbound
     {
         public int NewCount;
+        public int TradeCount;
+        public int PassiveTradeCount;
+        public int PassiveCancelCount;
+        public int ModifyCount;
+        public int RejectCount;
+        public int ReplyCount => NewCount + TradeCount + PassiveTradeCount
+            + PassiveCancelCount + ModifyCount + RejectCount;
+
         public bool WriteExecutionReportNew(SessionId s, uint f, ulong c, in OrderAcceptedEvent e, ulong r = ulong.MaxValue, DurabilityHandle d = default)
         { NewCount++; return true; }
-        public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
-        public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default) => true;
+        public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default)
+        { TradeCount++; return true; }
+        public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default)
+        { PassiveTradeCount++; return true; }
+        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default)
+        { PassiveCancelCount++; return true; }
+        public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null)
+        { ModifyCount++; return true; }
+        public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default)
+        { RejectCount++; return true; }
     }
 
     private sealed class InMemoryPersister : IChannelStatePersister
@@ -75,6 +88,27 @@ public class ChannelDispatcherWalTests
             }
             return 1;
         }
+    }
+
+    private sealed class RecordingWal : IChannelWriteAheadLog
+    {
+        private readonly List<WalRecord> _records = new();
+
+        public int AppendCount { get; private set; }
+
+        public int Append(WalRecord record)
+        {
+            AppendCount++;
+            _records.Add(record);
+            return 1;
+        }
+
+        public IReadOnlyList<WalRecord> ReadAll() => _records.ToArray();
+        public void Truncate() => _records.Clear();
+        public void TruncateThrough(long throughSeq)
+            => _records.RemoveAll(record => record.Seq <= throughSeq);
+        public long PendingDurableSeqOrZero => _records.Count == 0 ? 0 : _records[^1].Seq;
+        public void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
     }
 
     private sealed class TempDir : IDisposable
@@ -128,6 +162,49 @@ public class ChannelDispatcherWalTests
             new NewOrderCommand(clOrdId, Sec, Side.Buy, OrderType.Limit,
                 TimeInForce.Day, Px(10.00m), 100, 100, nanos),
             session, enteringFirm: 700, clOrdIdValue: clOrdIdValue);
+
+    private static ChannelStateSnapshot MultiPacketCrossingSnapshot()
+    {
+        const int restingOrderCount = 32;
+        var orders = Enumerable.Range(1, restingOrderCount)
+            .Select(i => new RestingOrderRecord(
+                OrderId: i,
+                ClOrdId: $"REST-{i}",
+                Side: Side.Sell,
+                PriceMantissa: Px(10.00m),
+                RemainingQuantity: 100,
+                EnteringFirm: (uint)(800 + i),
+                InsertTimestampNanos: (ulong)i,
+                Tif: TimeInForce.Day,
+                MaxFloor: 0,
+                HiddenQuantity: 0))
+            .ToArray();
+        var owners = Enumerable.Range(1, restingOrderCount)
+            .Select(i => new OrderOwnerSnapshot(
+                OrderId: i,
+                SessionValue: $"8{i:0000}",
+                Firm: (uint)(800 + i),
+                ClOrdId: (ulong)i,
+                Side: Side.Sell,
+                SecurityId: Sec)
+            {
+                OriginalQty = 100,
+            })
+            .ToArray();
+        return new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 0,
+            SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(
+                NextOrderId: restingOrderCount + 1,
+                NextTradeId: 1,
+                RptSeq: 0,
+                Phases: [new EngineStateSnapshot.PhaseEntry(Sec, TradingPhase.Open)],
+                Books: [new EngineStateSnapshot.BookSnapshot(Sec, orders)],
+                Stops: []),
+            Owners: owners);
+    }
 
     // Readiness waits below poll a background dispatcher thread that must
     // be scheduled + finish WAL replay/snapshot work. The operations are
@@ -218,6 +295,105 @@ public class ChannelDispatcherWalTests
     }
 
     [Fact]
+    public async Task PenultimateEpoch_MultiPacketCommandCompletesInTerminalEpoch()
+    {
+        var dispatcher = BuildDispatcher(
+            persister: null, wal: null, out var sink, out var outbound);
+        dispatcher.RestoreChannelState(MultiPacketCrossingSnapshot());
+        var probe = dispatcher.CreateTestProbe();
+        probe.SetSequence(ushort.MaxValue - 1, uint.MaxValue - 1);
+        Assert.True(dispatcher.EnqueueNewOrder(
+            new NewOrderCommand(
+                "FINAL-CROSS", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 3_200, 700, 900UL),
+            new SessionId("57000"), enteringFirm: 700, clOrdIdValue: 0x570));
+
+        probe.DrainInbound();
+
+        Assert.True(sink.Published > 1);
+        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.InRange(dispatcher.SequenceNumber, 1u, uint.MaxValue - 1);
+        Assert.True(outbound.ReplyCount > 0);
+        await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task TerminalEpochBoundary_MultiPacketCommandFailsClosedBeforeAnySideEffects()
+    {
+        var initial = MultiPacketCrossingSnapshot();
+        var persister = new InMemoryPersister();
+        var wal = new RecordingWal();
+        var sink = new NoOpPacketSink();
+        var outbound = new CountingOutbound();
+        MatchingEngine? engine = null;
+        var dispatcher = new ChannelDispatcher(
+            channelNumber: 84,
+            engineFactory: eventSink =>
+            {
+                engine = new MatchingEngine([Petr4], eventSink,
+                    NullLogger<MatchingEngine>.Instance);
+                return engine;
+            },
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = sink,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                Persister = persister,
+                Wal = wal,
+            });
+
+        var probe = dispatcher.CreateTestProbe();
+        dispatcher.RestoreChannelState(initial);
+        probe.SetSequence(ushort.MaxValue, uint.MaxValue - 1);
+        Assert.True(dispatcher.EnqueueNewOrder(
+            new NewOrderCommand(
+                "EXHAUSTED-CROSS", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10.00m), 3_200, 700, 1_000UL),
+            new SessionId("57001"), enteringFirm: 700, clOrdIdValue: 0x571));
+        Assert.True(EnqueueOrder(
+            dispatcher, new SessionId("57002"), "QUEUED-AFTER", 0x572, 2_000UL));
+        Assert.True(dispatcher.EnqueueOperatorPersistSnapshot());
+
+        var error = Assert.Throws<InvalidOperationException>(() => probe.DrainInbound());
+
+        Assert.Contains("terminal wire epoch", error.Message);
+        Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
+        Assert.Equal(uint.MaxValue - 1, dispatcher.SequenceNumber);
+        Assert.Equal(33L, engine!.PeekNextOrderId);
+        Assert.Equal(0u, engine.CurrentRptSeq);
+        Assert.Equal(32, engine.OrderCount(Sec));
+        Assert.Equal(32, dispatcher.OrderRegistryCount);
+        Assert.Equal(0, wal.AppendCount);
+        Assert.Empty(wal.ReadAll());
+        Assert.Equal(0, persister.SaveCount);
+        Assert.Equal(0, outbound.ReplyCount);
+        Assert.Equal(0, sink.Published);
+        Assert.False(EnqueueOrder(
+            dispatcher, new SessionId("57003"), "AFTER-FATAL", 0x573, 3_000UL));
+
+        await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task TerminalEpochBoundary_AllowsNormalShutdown()
+    {
+        var dispatcher = BuildDispatcher(
+            persister: null, wal: null, out var sink, out var outbound);
+        var probe = dispatcher.CreateTestProbe();
+        probe.SetSequence(ushort.MaxValue, uint.MaxValue - 1);
+
+        dispatcher.PrepareStartup();
+        dispatcher.Activate();
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(ReadyTimeout);
+
+        Assert.True(probe.LoopCompletion.IsCompletedSuccessfully);
+        Assert.Equal(0, sink.Published);
+        Assert.Equal(0, outbound.ReplyCount);
+    }
+
+    [Fact]
     public async Task CrashRecovery_SnapshotPlusWal_ReplaysToCrashTimeState()
     {
         using var dir = new TempDir();
@@ -283,8 +459,10 @@ public class ChannelDispatcherWalTests
             ReadyTimeout), "dispatcher did not replay WAL tail before timeout");
 
         Assert.Equal(3, dispB.OrderRegistryCount);
-        // Replay must NOT publish on the wire or send ERs.
-        Assert.Equal(0, sinkB.Published);
+        // Replay itself must not publish historical events. Once recovery is
+        // complete, startup emits exactly one ChannelReset_11 for the new
+        // durable epoch.
+        Assert.Equal(1, sinkB.Published);
         Assert.Equal(0, outB.NewCount);
         // Replay metric reflects the 1 record consumed (the snapshot
         // covered the first 2 commands; only CL-C was in the WAL tail).
@@ -391,11 +569,9 @@ public class ChannelDispatcherWalTests
         var metricsB = new ChannelMetrics(84);
         var dispB = BuildDispatcher(persister, wal2, out var sinkB, out var outB,
             metrics: metricsB);
-        dispB.Start();
+        var error = Assert.Throws<InvalidOperationException>(() => dispB.Start());
 
-        Assert.True(await WaitForAsync(() => !dispB.IsWalHealthy,
-            ReadyTimeout), "dispatcher did not halt on the snapshot/WAL boundary gap before timeout");
-
+        Assert.Contains("WAL replay failed during boot recovery", error.Message);
         Assert.False(dispB.IsWalHealthy);
         // Engine must remain at the snapshot baseline (2 resting orders);
         // the post-gap record was not applied.

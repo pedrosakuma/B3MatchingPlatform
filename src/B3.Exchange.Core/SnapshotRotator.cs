@@ -83,7 +83,9 @@ public sealed class SnapshotRotator
     /// </summary>
     public void BumpSequenceVersion()
     {
-        SequenceVersion = (ushort)(SequenceVersion + 1);
+        SequenceVersion = UmdfSequenceVersion.NextOrThrow(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} epoch");
         SequenceNumber = 0;
     }
 

@@ -418,10 +418,8 @@ public class ChannelDispatcherAuditWatermarkTests
 
         disp2.Start();
         // Quiescence: AddWalReplays runs AFTER the entire WAL replay
-        // foreach completes. SaveCount bumps mid-replay (each command's
-        // OnAfterCommandFlushed under the AlwaysPersist throttle) so it
-        // is NOT a reliable post-replay barrier. Poll WalReplays
-        // directly.
+        // foreach completes. Poll it directly rather than coupling this
+        // audit test to startup snapshot-save behavior.
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (metrics2.WalReplays < 2 && DateTime.UtcNow < deadline)
             Thread.Sleep(10);

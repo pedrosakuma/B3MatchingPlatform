@@ -17,6 +17,8 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
+    private readonly record struct WalReplayOutcome(bool Succeeded, int RecordCount);
+
     /// <summary>
     /// Returns the next sequence number for a state-mutating command
     /// and, when a WAL is wired and we are not currently replaying,
@@ -342,9 +344,9 @@ public sealed partial class ChannelDispatcher
     /// sequences and split points; see also the
     /// <see cref="WalAppendIfEnabled"/> determinism contract.</para>
     /// </summary>
-    private void ReplayWalOnLoopThread(long snapshotLastAppliedSeq)
+    private WalReplayOutcome ReplayWalOnLoopThread(long snapshotLastAppliedSeq)
     {
-        if (_wal is null) return;
+        if (_wal is null) return new WalReplayOutcome(Succeeded: true, RecordCount: 0);
         IReadOnlyList<WalRecord> records;
         try { records = _wal.ReadAll(); }
         catch (B3.Exchange.Core.WalCorruptionException ex)
@@ -357,21 +359,24 @@ public sealed partial class ChannelDispatcher
             // instead. Operators see IsWalHealthy=false on /readyz and
             // a CRITICAL log line; the engine remains at the snapshot
             // baseline (no partial replay).
-            _metrics?.IncWalAppendFailure();
+            _metrics?.IncWalReplayFailure();
             _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
             _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
             Volatile.Write(ref _walHalted, 1);
             _logger.LogCritical(ex,
                 "channel {ChannelNumber}: WAL corruption detected at line {RecordNumber} during boot replay; channel marked WAL-halted, engine left at snapshot baseline (LastAppliedSeq={SnapshotSeq})",
                 ChannelNumber, ex.RecordNumber, snapshotLastAppliedSeq);
-            return;
+            return new WalReplayOutcome(Succeeded: false, RecordCount: 0);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex,
-                "channel {ChannelNumber}: WAL ReadAll failed — skipping replay",
+            _metrics?.IncWalReplayFailure();
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: WAL ReadAll failed during boot recovery; channel marked WAL-halted and startup aborted",
                 ChannelNumber);
-            return;
+            throw new IOException(
+                $"channel {ChannelNumber}: failed to read WAL during boot recovery", ex);
         }
         if (records.Count == 0)
         {
@@ -379,7 +384,7 @@ public sealed partial class ChannelDispatcher
             // (e.g. a WAL composed entirely of corrupt records).
             _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
             _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
-            return;
+            return new WalReplayOutcome(Succeeded: true, RecordCount: 0);
         }
         int replayed = 0;
         int skipped = 0;
@@ -415,18 +420,26 @@ public sealed partial class ChannelDispatcher
                     long expected = snapshotLastAppliedSeq + 1;
                     if (rec.Seq != expected)
                     {
-                        _metrics?.IncWalAppendFailure();
+                        _metrics?.IncWalReplayFailure();
                         _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
                         _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
                         Volatile.Write(ref _walHalted, 1);
                         _logger.LogCritical(
                             "channel {ChannelNumber}: WAL replay aborted — snapshot/WAL boundary gap (snapshotLastAppliedSeq={SnapshotSeq}, firstReplayableSeq={FirstSeq}, expected={Expected}); channel marked WAL-halted, engine left at snapshot baseline",
                             ChannelNumber, snapshotLastAppliedSeq, rec.Seq, expected);
-                        return;
+                        return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
                     }
                 }
                 var item = TryBuildReplayWorkItem(rec);
-                if (item is null) continue;
+                if (item is null)
+                {
+                    _metrics?.IncWalReplayFailure();
+                    Volatile.Write(ref _walHalted, 1);
+                    _logger.LogCritical(
+                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} has no matching payload; channel marked WAL-halted and startup epoch transition suppressed",
+                        ChannelNumber, rec.Seq, rec.Kind);
+                    return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
+                }
                 try
                 {
                     ProcessOne(item);
@@ -434,9 +447,12 @@ public sealed partial class ChannelDispatcher
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex,
-                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} threw; continuing",
+                    _metrics?.IncWalReplayFailure();
+                    Volatile.Write(ref _walHalted, 1);
+                    _logger.LogCritical(ex,
+                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} threw; channel marked WAL-halted and startup epoch transition suppressed",
                         ChannelNumber, rec.Seq, rec.Kind);
+                    return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
                 }
             }
         }
@@ -464,6 +480,7 @@ public sealed partial class ChannelDispatcher
         _logger.LogInformation(
             "channel {ChannelNumber}: WAL replay complete — replayed={Replayed} skipped={Skipped} corrupt={Corrupt} legacy={Legacy} (snapshotLastAppliedSeq={SnapshotSeq})",
             ChannelNumber, replayed, skipped, _wal.LastReadCorruptCount, _wal.LastReadLegacyCount, snapshotLastAppliedSeq);
+        return new WalReplayOutcome(Succeeded: true, RecordCount: records.Count);
     }
 
     private static WorkItem? TryBuildReplayWorkItem(WalRecord rec)

@@ -74,9 +74,10 @@ public interface IChannelWriteAheadLog : IDurabilityBarrier
     /// <summary>
     /// Returns every record currently in the log in append order.
     /// Invoked on cold start before the dispatcher begins consuming the
-    /// inbound queue. Records that fail to deserialize are skipped and
-    /// the implementation logs the corruption — replay continues with
-    /// the surviving records.
+    /// inbound queue. A missing or genuinely empty log returns an empty
+    /// list. Implementations must throw on open/read failures and on
+    /// non-tail corruption so recovery cannot silently skip durable state.
+    /// A torn final write may return the surviving valid prefix.
     /// </summary>
     IReadOnlyList<WalRecord> ReadAll();
 

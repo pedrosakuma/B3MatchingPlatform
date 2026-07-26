@@ -232,6 +232,17 @@ Exposes:
   when `asyncWriter=true`) and writes it atomically into one of N
   rolling generation slots. Optional Write-Ahead Log records every
   state-mutating command between snapshots, replayed on cold start.
+  When a snapshot or WAL state is recovered, startup preserves that complete
+  authoritative state but begins a new incremental UMDF epoch: it increments
+  `SequenceVersion`, resets `SequenceNumber` to 0, synchronously persists the
+  transition, then emits `ChannelReset_11` as packet sequence 1. The TCP
+  listener opens only afterward. Snapshot headers identify the same
+  incremental epoch through `LastSequenceVersion`, allowing consumers to
+  rebuild the preserved book without synthesizing replacement orders.
+  WAL open/read failures abort startup rather than being treated as an empty
+  log. `SequenceVersion=0` is reserved as the SBE null value; if the restored
+  version is already `65535`, startup fails before persisting or publishing a
+  reset instead of wrapping.
   * `dataDir` — directory holding the per-channel snapshot file(s) and
     optional WAL. The host creates it if missing. Mount a durable
     volume here in container deployments (e.g. `/var/lib/b3matching`

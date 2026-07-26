@@ -27,17 +27,43 @@ public sealed partial class ChannelDispatcher
         // invariant — ProcessOne is the sole caller and is invoked only
         // from the dispatch loop.
         AssertOnLoopThread();
+        ushort nextIncrementalVersion;
+        try
+        {
+            nextIncrementalVersion = UmdfSequenceVersion.NextLiveOrThrow(
+                _sequenceVersion,
+                $"channel {ChannelNumber} operator incremental epoch");
+            if (_snapshotRotator is { } snapshotRotator)
+            {
+                _ = UmdfSequenceVersion.NextLiveOrThrow(
+                    snapshotRotator.SequenceVersion,
+                    $"channel {ChannelNumber} operator snapshot epoch");
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw CreateSequenceFatal(ex);
+        }
+
         _engine.ResetForChannelReset();
         _orders.Clear();
         RecordAllBookCounts();
         ClearOpenOrderCounts();
-        Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
+        Volatile.Write(ref _sequenceVersion, nextIncrementalVersion);
         Volatile.Write(ref _sequenceNumber, 0u);
         _snapshotRotator?.BumpSequenceVersion();
 
-        // Force-write the ChannelReset_11 frame using the standard
-        // ReserveOrFlush/Commit path so the packet header reflects the
-        // NEW SequenceVersion.
+        EmitChannelResetPacket();
+    }
+
+    /// <summary>
+    /// Emits one <c>ChannelReset_11</c> packet under the dispatcher's current
+    /// sequence version. The caller is responsible for establishing the
+    /// desired epoch and any engine-state semantics before invoking it.
+    /// </summary>
+    private void EmitChannelResetPacket()
+    {
+        AssertOnLoopThread();
         _packetWritten = 0;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize

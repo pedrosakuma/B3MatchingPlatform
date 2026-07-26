@@ -412,9 +412,9 @@ public sealed class ChannelConfig
     /// Optional per-channel persistence (issue #260). When present, the
     /// dispatcher loads any existing snapshot from
     /// <see cref="PersistenceConfig.DataDir"/>/<c>channel-{N}.snapshot</c>
-    /// at boot and persists a fresh snapshot after every command flush so
-    /// a restart resumes with the working order book + RptSeq + counters
-    /// intact. Omit to keep the legacy stateless boot.
+    /// at boot, replays its WAL, then durably starts a new incremental UMDF
+    /// epoch while preserving the working order book + RptSeq + counters.
+    /// Omit to keep the legacy stateless boot.
     /// </summary>
     [JsonPropertyName("persistence")] public PersistenceConfig? Persistence { get; set; }
 

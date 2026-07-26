@@ -49,6 +49,33 @@ public sealed class WalReplayTests
     }
 
     [Fact]
+    public void ReadAll_returns_empty_when_file_is_empty()
+    {
+        var dir = NewTempDir();
+        var path = Path.Combine(dir, "channel-1.wal");
+        File.WriteAllBytes(path, []);
+
+        var result = WalReplay.ReadAll(path, 1, NullLogger.Instance);
+
+        Assert.Empty(result.Records);
+        Assert.Equal(0, result.CorruptCount);
+        Assert.Equal(0, result.LegacyCount);
+    }
+
+    [Fact]
+    public void ReadAll_propagates_file_open_failure()
+    {
+        var dir = NewTempDir();
+        var path = Path.Combine(dir, "channel-1.wal");
+        File.WriteAllText(path, "durable tail");
+        using var exclusive = new FileStream(
+            path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+        Assert.Throws<IOException>(() =>
+            WalReplay.ReadAll(path, 1, NullLogger.Instance));
+    }
+
+    [Fact]
     public void ReadAll_reads_back_framed_records()
     {
         var dir = NewTempDir();

@@ -39,9 +39,10 @@ public sealed record OrderOwnerSnapshot(
 ///
 /// <para><b>Out of scope (v1):</b> the UMDF retransmit ring, snapshot
 /// rotator cursor, and any in-flight buffered packet are NOT persisted
-/// — restored channels emit fresh packets at <c>SequenceNumber+1</c> with
-/// the previous <c>SequenceVersion</c>; consumers that miss the gap
-/// recover via the snapshot feed.</para>
+/// — after restore the dispatcher durably prepares a new incremental
+/// <c>SequenceVersion</c>, resets <c>SequenceNumber</c>, and publishes
+/// <c>ChannelReset_11</c>. Consumers rebuild the preserved authoritative
+/// book through the snapshot feed.</para>
 /// </summary>
 public sealed record ChannelStateSnapshot(
     /// <summary>Snapshot schema version. Bumped on incompatible layout
