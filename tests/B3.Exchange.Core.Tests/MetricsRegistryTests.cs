@@ -60,6 +60,23 @@ public class MetricsRegistryTests
     }
 
     [Fact]
+    public void WalFailureMetrics_SeparateAppendFromBootReplay()
+    {
+        var reg = new MetricsRegistry();
+        var channel = reg.RegisterChannel(84);
+        channel.IncWalAppendFailure();
+        channel.IncWalReplayFailure();
+        channel.IncWalReplayFailure();
+
+        var text = reg.RenderProm();
+
+        Assert.Equal(1, channel.WalAppendFailures);
+        Assert.Equal(2, channel.WalReplayFailures);
+        Assert.Contains("exch_wal_append_failures_total{channel=\"84\"} 1\n", text);
+        Assert.Contains("exch_wal_replay_failures_total{channel=\"84\"} 2\n", text);
+    }
+
+    [Fact]
     public void StartupReadinessProbe_FlipsOnMarkReady()
     {
         var p = new StartupReadinessProbe("startup");

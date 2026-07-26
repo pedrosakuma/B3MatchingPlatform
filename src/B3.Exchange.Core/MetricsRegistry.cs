@@ -182,6 +182,7 @@ public sealed class ChannelMetrics
     private long _walReplays;
     private long _walRecordCorruptions;
     private long _walRecordsLegacy;
+    private long _walReplayFailures;
     /// <summary>
     /// Issue #286: cumulative count of WAL <c>Append</c> calls that
     /// threw. Bumped from <c>WalAppendIfEnabled</c> regardless of the
@@ -219,6 +220,10 @@ public sealed class ChannelMetrics
     /// (i.e. written by a pre-#285 host). Tracks the migration tail
     /// after upgrading.</summary>
     public long WalRecordsLegacy => Interlocked.Read(ref _walRecordsLegacy);
+    /// <summary>Issue #571: boot-time WAL read, validation, or replay
+    /// failures. Distinct from append failures so operators can separate
+    /// recovery faults from live write-path durability faults.</summary>
+    public long WalReplayFailures => Interlocked.Read(ref _walReplayFailures);
     /// <summary>Issue #286: WAL <c>Append</c> calls that threw.
     /// Counted under both <see cref="WalAppendFailurePolicy.Continue"/>
     /// and <see cref="WalAppendFailurePolicy.Halt"/> so the metric is
@@ -261,6 +266,7 @@ public sealed class ChannelMetrics
         if (count > 0) Interlocked.Add(ref _walRecordsLegacy, count);
     }
     public void IncWalAppendFailure() => Interlocked.Increment(ref _walAppendFailures);
+    public void IncWalReplayFailure() => Interlocked.Increment(ref _walReplayFailures);
     public void IncWalHaltReject() => Interlocked.Increment(ref _walHaltRejects);
     /// <summary>Issue #329 PR-4: bumped from <c>ChannelDispatcher</c>'s WAL
     /// truncation gate when the audit watermark is behind the snapshot seq
@@ -797,6 +803,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_append_failures_total",
             "Issue #286: WAL Append() calls that threw (disk full, EIO, permission flip, etc.). Counted under both the Continue and Halt failure policies — the canonical alert signal that the persistence layer is unhealthy on this channel.",
             channels, c => c.WalAppendFailures);
+        EmitCounter(sb, "exch_wal_replay_failures_total",
+            "Issue #571: boot-time WAL read, validation, or replay failures that abort channel startup. Distinct from live Append() failures so operators can route recovery and write-path alerts independently.",
+            channels, c => c.WalReplayFailures);
         EmitCounter(sb, "exch_wal_halt_rejects_total",
             "Issue #286: producer-side Enqueue* rejections after the channel was WAL-halted. Always 0 unless the channel runs with persistence.wal.onAppendFailure=halt; non-zero means the operator must restart the host after fixing the underlying disk fault.",
             channels, c => c.WalHaltRejects);

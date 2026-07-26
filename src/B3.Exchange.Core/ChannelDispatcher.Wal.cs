@@ -359,7 +359,7 @@ public sealed partial class ChannelDispatcher
             // instead. Operators see IsWalHealthy=false on /readyz and
             // a CRITICAL log line; the engine remains at the snapshot
             // baseline (no partial replay).
-            _metrics?.IncWalAppendFailure();
+            _metrics?.IncWalReplayFailure();
             _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
             _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
             Volatile.Write(ref _walHalted, 1);
@@ -370,7 +370,7 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
-            _metrics?.IncWalAppendFailure();
+            _metrics?.IncWalReplayFailure();
             Volatile.Write(ref _walHalted, 1);
             _logger.LogCritical(ex,
                 "channel {ChannelNumber}: WAL ReadAll failed during boot recovery; channel marked WAL-halted and startup aborted",
@@ -420,7 +420,7 @@ public sealed partial class ChannelDispatcher
                     long expected = snapshotLastAppliedSeq + 1;
                     if (rec.Seq != expected)
                     {
-                        _metrics?.IncWalAppendFailure();
+                        _metrics?.IncWalReplayFailure();
                         _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
                         _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
                         Volatile.Write(ref _walHalted, 1);
@@ -433,7 +433,7 @@ public sealed partial class ChannelDispatcher
                 var item = TryBuildReplayWorkItem(rec);
                 if (item is null)
                 {
-                    _metrics?.IncWalAppendFailure();
+                    _metrics?.IncWalReplayFailure();
                     Volatile.Write(ref _walHalted, 1);
                     _logger.LogCritical(
                         "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} has no matching payload; channel marked WAL-halted and startup epoch transition suppressed",
@@ -447,7 +447,7 @@ public sealed partial class ChannelDispatcher
                 }
                 catch (Exception ex)
                 {
-                    _metrics?.IncWalAppendFailure();
+                    _metrics?.IncWalReplayFailure();
                     Volatile.Write(ref _walHalted, 1);
                     _logger.LogCritical(ex,
                         "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} threw; channel marked WAL-halted and startup epoch transition suppressed",
