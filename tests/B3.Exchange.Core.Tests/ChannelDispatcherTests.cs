@@ -279,7 +279,158 @@ public partial class ChannelDispatcherTests
     }
 
     [Fact]
-    public void MaxOpenOrdersPerFirm_IocCanTradeAtCapAndReleaseRestingSlot()
+    public void MaxOpenOrdersPerFirm_PriorityLosingReplaceTransfersSlotAcrossDispatcherRace()
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var owner = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var contender = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            owner.Id, owner.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(first);
+        long orderId = Assert.Single(owner.News).OrderId;
+
+        int transitionCount = 0;
+        first.CreateTestProbe().SetOpenOrderTransitionHook(() =>
+        {
+            transitionCount++;
+            second.EnqueueNewOrder(new NewOrderCommand("RACE", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 2_500UL),
+                contender.Id, contender.EnteringFirm, clOrdIdValue: 99UL);
+            DrainInbound(second);
+        });
+
+        first.EnqueueReplace(new ReplaceOrderCommand("2", Petr, orderId, Px(9m), 100, 2_000UL),
+            owner.Id, owner.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        DrainInbound(first);
+
+        Assert.Equal(1, transitionCount);
+        Assert.Equal(2, owner.News.Count);
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(contender.Rejects).Reason);
+        Assert.Equal(1, tracker.Count(7));
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_CrossResidualTransfersSlotAcrossDispatcherRace()
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var external = new FakeSession(firstOutbound) { EnteringFirm = 8 };
+        var crosser = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var contender = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("EXT", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(9.99m), 100, 8, 1_000UL),
+            external.Id, external.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(first);
+
+        int transitionCount = 0;
+        first.CreateTestProbe().SetOpenOrderTransitionHook(() =>
+        {
+            transitionCount++;
+            second.EnqueueNewOrder(new NewOrderCommand("RACE", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3_000UL),
+                contender.Id, contender.EnteringFirm, clOrdIdValue: 99UL);
+            DrainInbound(second);
+        });
+
+        var cross = new CrossOrderCommand(
+            new NewOrderCommand("B", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 7, 2_000UL),
+            new NewOrderCommand("S", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 200, 7, 2_000UL),
+            BuyClOrdIdValue: 10UL,
+            SellClOrdIdValue: 11UL,
+            CrossId: 999UL)
+        {
+            CrossType = CrossType.AgainstBook,
+            CrossPrioritization = CrossPrioritization.BuyPrioritized,
+            MaxSweepQty = 100,
+        };
+        first.EnqueueCross(cross, crosser.Id, crosser.EnteringFirm);
+        DrainInbound(first);
+
+        Assert.Equal(1, transitionCount);
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(contender.Rejects).Reason);
+        Assert.Equal(1, tracker.Count(7));
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_TransitionExceptionReleasesTransferredSlot()
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var owner = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var contender = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
+            owner.Id, owner.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(first);
+        long orderId = Assert.Single(owner.News).OrderId;
+        first.CreateTestProbe().SetOpenOrderTransitionHook(
+            () => throw new InvalidOperationException("simulated transition failure"));
+
+        first.EnqueueReplace(new ReplaceOrderCommand("2", Petr, orderId, Px(9m), 100, 2_000UL),
+            owner.Id, owner.EnteringFirm, clOrdIdValue: 2UL, origClOrdIdValue: 1UL);
+        Assert.Throws<InvalidOperationException>(() => DrainInbound(first));
+        Assert.Equal(0, tracker.Count(7));
+
+        second.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3_000UL),
+            contender.Id, contender.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(second);
+
+        Assert.Single(contender.News);
+        Assert.Empty(contender.Rejects);
+        Assert.Equal(1, tracker.Count(7));
+    }
+
+    [Theory]
+    [InlineData(TimeInForce.IOC)]
+    [InlineData(TimeInForce.FOK)]
+    public void MaxOpenOrdersPerFirm_ImmediateReplaceReleasesTransferredSlotWhenFullyFilled(TimeInForce tif)
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var owner = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var maker = new FakeSession(firstOutbound) { EnteringFirm = 8 };
+        var contender = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("O", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 1_000UL),
+            owner.Id, owner.EnteringFirm, clOrdIdValue: 1UL);
+        first.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 1_500UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(first);
+        long orderId = Assert.Single(owner.News).OrderId;
+
+        first.EnqueueReplace(new ReplaceOrderCommand("R", Petr, orderId, 0, 100, 2_000UL)
+        {
+            NewOrdType = OrderType.Market,
+            NewTif = tif,
+        }, owner.Id, owner.EnteringFirm, clOrdIdValue: 3UL, origClOrdIdValue: 1UL);
+        DrainInbound(first);
+        Assert.Equal(0, tracker.Count(7));
+
+        second.EnqueueNewOrder(new NewOrderCommand("N", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3_000UL),
+            contender.Id, contender.EnteringFirm, clOrdIdValue: 4UL);
+        DrainInbound(second);
+
+        Assert.Single(contender.News);
+        Assert.Empty(contender.Rejects);
+        Assert.Equal(1, tracker.Count(7));
+    }
+
+    [Theory]
+    [InlineData(TimeInForce.IOC)]
+    [InlineData(TimeInForce.FOK)]
+    public void MaxOpenOrdersPerFirm_ImmediateOrderCanTradeAtCapAndReleaseRestingSlot(TimeInForce tif)
     {
         var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
         var reply = new FakeSession(outbound) { EnteringFirm = 7 };
@@ -287,7 +438,7 @@ public partial class ChannelDispatcherTests
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
             reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
-        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, TimeInForce.IOC, Px(10m), 100, 7, 2_000UL),
+        disp.EnqueueNewOrder(new NewOrderCommand("2", Petr, Side.Buy, OrderType.Limit, tif, Px(10m), 100, 7, 2_000UL),
             reply.Id, reply.EnteringFirm, clOrdIdValue: 2UL);
         DrainInbound(disp);
         disp.EnqueueNewOrder(new NewOrderCommand("3", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(11m), 100, 7, 3_000UL),
@@ -296,6 +447,59 @@ public partial class ChannelDispatcherTests
 
         Assert.Equal(2, reply.News.Count);
         Assert.Empty(reply.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_EngineRejectReleasesReservation()
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var rejected = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var accepted = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("BAD", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 0, 7, 1_000UL),
+            rejected.Id, rejected.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(first);
+        Assert.Equal(RejectReason.QuantityNonPositive, Assert.Single(rejected.Rejects).Reason);
+        Assert.Equal(0, tracker.Count(7));
+
+        second.EnqueueNewOrder(new NewOrderCommand("GOOD", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 2_000UL),
+            accepted.Id, accepted.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(second);
+
+        Assert.Single(accepted.News);
+        Assert.Equal(1, tracker.Count(7));
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_FullyFilledDayAggressorReleasesReservation()
+    {
+        var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var (first, _, firstOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 1, openOrderTracker: tracker);
+        var (second, _, secondOutbound) = NewDispatcher(
+            maxOpenOrdersPerFirm: 1, channelNumber: 2, openOrderTracker: tracker);
+        var maker = new FakeSession(firstOutbound) { EnteringFirm = 8 };
+        var aggressor = new FakeSession(firstOutbound) { EnteringFirm = 7 };
+        var accepted = new FakeSession(secondOutbound) { EnteringFirm = 7 };
+
+        first.EnqueueNewOrder(new NewOrderCommand("M", Petr, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 8, 1_000UL),
+            maker.Id, maker.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(first);
+        first.EnqueueNewOrder(new NewOrderCommand("A", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 2_000UL),
+            aggressor.Id, aggressor.EnteringFirm, clOrdIdValue: 2UL);
+        DrainInbound(first);
+        Assert.Equal(0, tracker.Count(7));
+
+        second.EnqueueNewOrder(new NewOrderCommand("N", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 3_000UL),
+            accepted.Id, accepted.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(second);
+
+        Assert.Single(accepted.News);
+        Assert.Equal(1, tracker.Count(7));
     }
 
     [Fact]

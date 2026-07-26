@@ -258,6 +258,15 @@ public sealed partial class ChannelDispatcher
         /// </summary>
         public void FlushPendingSnapshotOnShutdown() => _disp.FlushPendingSnapshotOnShutdown();
 
+        /// <summary>
+        /// Installs a synchronous callback invoked after a Replace/Cross
+        /// terminal event transfers an existing firm slot into the current
+        /// command's successor reservation. Tests use it to interleave a
+        /// second dispatcher at the exact transition boundary.
+        /// </summary>
+        public void SetOpenOrderTransitionHook(Action? hook)
+            => _disp._openOrderTransitionHookForTesting = hook;
+
         /// <summary>Completes when the background dispatch loop exits.</summary>
         public Task LoopCompletion => _disp._loopTask ?? Task.CompletedTask;
 

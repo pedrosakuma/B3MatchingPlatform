@@ -267,15 +267,6 @@ public sealed partial class ChannelDispatcher
         }
         _reservedOpenOrderFirm = item.Firm;
         _reservedOpenOrderSlots = requiredOpenOrderSlots;
-        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
-        {
-            if (!WalAppendIfEnabled(in item))
-            {
-                ReleaseUnusedOpenOrderReservation();
-                _metrics?.IncWalHaltReject();
-                return;
-            }
-        }
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -284,22 +275,33 @@ public sealed partial class ChannelDispatcher
         // Fast path: skip the virtual StartActivity call when no listeners
         // are attached (round-2 perf #11).
         System.Diagnostics.Activity? engineSpan = null;
-        if (ExchangeTelemetry.Source.HasListeners())
-        {
-            engineSpan = ExchangeTelemetry.Source.StartActivity(
-                ExchangeTelemetry.SpanEngineProcess,
-                System.Diagnostics.ActivityKind.Internal,
-                item.ParentContext);
-            if (engineSpan is not null)
-            {
-                engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
-                engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
-                if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
-                if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
-            }
-        }
         try
         {
+            if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
+            {
+                if (!WalAppendIfEnabled(in item))
+                {
+                    _metrics?.IncWalHaltReject();
+                    return;
+                }
+            }
+
+            _currentWorkKind = item.Kind;
+            if (ExchangeTelemetry.Source.HasListeners())
+            {
+                engineSpan = ExchangeTelemetry.Source.StartActivity(
+                    ExchangeTelemetry.SpanEngineProcess,
+                    System.Diagnostics.ActivityKind.Internal,
+                    item.ParentContext);
+                if (engineSpan is not null)
+                {
+                    engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+                    engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
+                    if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
+                    if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+                }
+            }
+
             switch (item.Kind)
             {
                 case WorkKind.New:
@@ -544,6 +546,7 @@ public sealed partial class ChannelDispatcher
             _hasCurrentSession = false;
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
+            _currentWorkKind = null;
             _currentReceivedTimeNanos = ulong.MaxValue;
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;

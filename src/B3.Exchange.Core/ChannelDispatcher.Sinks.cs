@@ -495,8 +495,28 @@ public sealed partial class ChannelDispatcher
     private void UntrackOpenOrder(long orderId)
     {
         if (!_openOrderFirmByOrderId.Remove(orderId, out uint firm)) return;
-        _openOrderTracker.Release(firm, 1);
+        bool retained = RetainReleasedOpenOrderSlot(firm);
+        if (!retained)
+            _openOrderTracker.Release(firm, 1);
         DecrementLocalOpenOrderCount(firm);
+        if (retained)
+            _openOrderTransitionHookForTesting?.Invoke();
+    }
+
+    private bool RetainReleasedOpenOrderSlot(uint firm)
+    {
+        if (_currentWorkKind is not (WorkKind.Replace or WorkKind.Cross)
+            || firm != _currentFirm)
+        {
+            return false;
+        }
+
+        if (_reservedOpenOrderSlots == 0)
+            _reservedOpenOrderFirm = firm;
+        else if (_reservedOpenOrderFirm != firm)
+            return false;
+        _reservedOpenOrderSlots++;
+        return true;
     }
 
     private void DecrementLocalOpenOrderCount(uint firm)
