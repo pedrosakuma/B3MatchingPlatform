@@ -253,22 +253,25 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
-        if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
+        int requiredOpenOrderSlots = _replayMode ? 0 : RequiredOpenOrderSlots(in item);
+        if (requiredOpenOrderSlots > 0
+            && !_openOrderTracker.TryReserve(item.Firm, requiredOpenOrderSlots))
         {
             _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.NewOrder!);
+            _openOrderMetrics?.IncLimitRejected(item.Firm);
+            if (item.Kind == WorkKind.New)
+                EmitOpenOrderLimitReject(item.NewOrder!);
+            else
+                EmitOpenOrderLimitReject(item.Cross!);
             return;
         }
-        if (item.Kind == WorkKind.Cross && WouldExceedOpenOrderLimit(item.Firm, requiredSlots: 2))
-        {
-            _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.Cross!);
-            return;
-        }
+        _reservedOpenOrderFirm = item.Firm;
+        _reservedOpenOrderSlots = requiredOpenOrderSlots;
         if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
         {
             if (!WalAppendIfEnabled(in item))
             {
+                ReleaseUnusedOpenOrderReservation();
                 _metrics?.IncWalHaltReject();
                 return;
             }
@@ -489,6 +492,8 @@ public sealed partial class ChannelDispatcher
         }
         finally
         {
+            ReleaseUnusedOpenOrderReservation();
+            ReleaseTerminalTriggeredOpenOrders();
             // Issue #173: engine_process = engine entry → engine exit
             // (regardless of crash/success). outbound_emit measured
             // separately around FlushPacket so the two phases are
@@ -706,10 +711,32 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private bool WouldExceedOpenOrderLimit(uint enteringFirm, int requiredSlots = 1)
+    private static int RequiredOpenOrderSlots(in WorkItem item)
     {
-        int current = _openOrdersByFirm.TryGetValue(enteringFirm, out int count) ? count : 0;
-        return current + requiredSlots > _maxOpenOrdersPerFirm;
+        return item.Kind switch
+        {
+            WorkKind.New => CanRest(item.NewOrder!) ? 1 : 0,
+            // Cross legs execute serially at one cross price. The prioritized
+            // leg may rest before the other leg consumes it, but both legs
+            // cannot remain open simultaneously; at most one residual rests.
+            WorkKind.Cross => CanRest(item.Cross!.Buy) || CanRest(item.Cross.Sell) ? 1 : 0,
+            _ => 0,
+        };
+    }
+
+    private static bool CanRest(NewOrderCommand order)
+    {
+        if (order.PreTradeRejectReason is not null || order.UnsupportedOrderCharacteristic)
+            return false;
+        return order.Tif is not (B3.Exchange.Matching.TimeInForce.IOC or B3.Exchange.Matching.TimeInForce.FOK);
+    }
+
+    private void ReleaseUnusedOpenOrderReservation()
+    {
+        if (_reservedOpenOrderSlots > 0)
+            _openOrderTracker.Release(_reservedOpenOrderFirm, _reservedOpenOrderSlots);
+        _reservedOpenOrderFirm = 0;
+        _reservedOpenOrderSlots = 0;
     }
 
     private void EmitOpenOrderLimitReject(NewOrderCommand order)

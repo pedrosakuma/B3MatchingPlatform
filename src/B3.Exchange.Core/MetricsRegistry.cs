@@ -425,6 +425,7 @@ public readonly record struct FirmInfo(string Id, string Name, uint EnteringFirm
 public sealed class OpenOrderMetrics
 {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(byte Channel, uint Firm), long> _byFirmChannel = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, long> _limitRejectedByFirm = new();
 
     public void Set(byte channelNumber, uint firm, long count)
         => _byFirmChannel[(channelNumber, firm)] = Math.Max(0, count);
@@ -441,6 +442,12 @@ public sealed class OpenOrderMetrics
         }
         return totals;
     }
+
+    public void IncLimitRejected(uint firm)
+        => _limitRejectedByFirm.AddOrUpdate(firm, 1, static (_, current) => current + 1);
+
+    public KeyValuePair<uint, long>[] LimitRejectedByFirmSnapshot()
+        => _limitRejectedByFirm.ToArray();
 }
 
 /// <summary>
@@ -1059,11 +1066,24 @@ public sealed class MetricsRegistry
 
     private void EmitOpenOrdersPerFirm(StringBuilder sb)
     {
-        sb.Append("# HELP open_orders_per_firm Current resting open orders per entering firm across all channels (issue #430 pre-trade risk cap).\n");
+        sb.Append("# HELP open_orders_per_firm Current resting open orders per entering firm across all channels (issue #567 host-wide pre-trade risk cap).\n");
         sb.Append("# TYPE open_orders_per_firm gauge\n");
         foreach (var kv in _openOrders.TotalsByFirm())
         {
             sb.Append("open_orders_per_firm{firm=\"")
+              .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+
+        sb.Append("# HELP open_order_limit_rejected_total New-order requests rejected because the entering firm reached maxOpenOrdersPerFirm.\n");
+        sb.Append("# TYPE open_order_limit_rejected_total counter\n");
+        var rejects = _openOrders.LimitRejectedByFirmSnapshot();
+        Array.Sort(rejects, static (a, b) => a.Key.CompareTo(b.Key));
+        foreach (var kv in rejects)
+        {
+            sb.Append("open_order_limit_rejected_total{firm=\"")
               .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
               .Append("\"} ")
               .Append(kv.Value.ToString(CultureInfo.InvariantCulture))

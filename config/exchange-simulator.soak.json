@@ -11,6 +11,7 @@
     "testRequestGraceMs": 5000
   },
   "auth": { "devMode": true, "requireFixpHandshake": true },
+  "maxOpenOrdersPerFirm": 100000,
   "firms": [
     { "id": "soakFirm", "name": "Soak Firm", "enteringFirmCode": 1 }
   ],

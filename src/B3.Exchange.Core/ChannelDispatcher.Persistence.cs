@@ -157,6 +157,13 @@ public sealed partial class ChannelDispatcher
         // appends keep increasing monotonically across the restart.
         _lastAppliedSeq = snapshot.LastAppliedSeq;
 
+        foreach (var book in snapshot.Engine.Books)
+            foreach (var order in book.Orders)
+                TrackOpenOrder(order.OrderId, order.EnteringFirm);
+        if (snapshot.Engine.Stops is { } restoredStops)
+            foreach (var stop in restoredStops)
+                TrackOpenOrder(stop.OrderId, stop.EnteringFirm);
+
         long droppedOrphans = 0;
 
         // Issue #319: build a (orderId -> remainingQty) lookup from the
@@ -208,7 +215,6 @@ public sealed partial class ChannelDispatcher
             }
             _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId,
                 originalQty: origQty, cumQty: o.CumQty);
-            IncrementOpenOrders(o.Firm);
         }
         if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
         RecordAllBookCounts();

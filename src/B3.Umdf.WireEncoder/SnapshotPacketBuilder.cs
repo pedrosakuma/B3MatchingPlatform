@@ -81,6 +81,22 @@ public static class SnapshotPacketBuilder
         ArgumentNullException.ThrowIfNull(onPacket);
         if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
             throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
+        if (buffer.Length < WireOffsets.PacketHeaderSize
+            + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SnapHeaderBlockLength)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({buffer.Length} bytes) for SnapshotFullRefresh_Header_30.",
+                nameof(buffer));
+        }
+        if ((bids.Length != 0 || asks.Length != 0)
+            && MaxOrdersEntriesThatFit(buffer.Length - WireOffsets.PacketHeaderSize) == 0)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({buffer.Length} bytes) for a single Orders_71 entry frame ({OrdersFrameSize(1)} bytes); increase buffer size.",
+                nameof(buffer));
+        }
 
         // Header_30 stamps total counts so consumers can size their buffers
         // and detect a complete refresh once they accumulate that many entries.
@@ -102,10 +118,11 @@ public static class SnapshotPacketBuilder
         int bidIdx = 0, askIdx = 0;
         while (true)
         {
-            int chunkSize = NextChunkSize(bids, asks, ref bidIdx, ref askIdx, maxEntriesPerChunk);
+            int chunkSize = NextChunkSize(
+                bids, asks, bidIdx, askIdx,
+                Math.Min(maxEntriesPerChunk, MaxOrdersEntriesThatFit(buffer.Length - p)));
             if (chunkSize == 0) break;
             int frameSize = OrdersFrameSize(chunkSize);
-            if (p + frameSize > buffer.Length) break; // doesn't fit → emit current packet first
             WriteOrdersChunk(buffer.Slice(p), securityId, bids, asks, ref bidIdx, ref askIdx, chunkSize);
             p += frameSize;
         }
@@ -120,21 +137,11 @@ public static class SnapshotPacketBuilder
             // Pack up to buffer capacity.
             while (true)
             {
-                int chunkSize = NextChunkSize(bids, asks, ref bidIdx, ref askIdx, maxEntriesPerChunk);
+                int chunkSize = NextChunkSize(
+                    bids, asks, bidIdx, askIdx,
+                    Math.Min(maxEntriesPerChunk, MaxOrdersEntriesThatFit(buffer.Length - p)));
                 if (chunkSize == 0) break;
                 int frameSize = OrdersFrameSize(chunkSize);
-                if (p + frameSize > buffer.Length)
-                {
-                    // Edge case: even one entry doesn't fit. Caller passed too
-                    // small a buffer.
-                    if (chunkSize == 1)
-                        throw new ArgumentException(
-                            $"buffer too small ({buffer.Length} bytes) for a single Orders_71 entry frame ({frameSize} bytes); increase buffer size.",
-                            nameof(buffer));
-                    // Otherwise loop will retry with a smaller chunk.
-                    maxEntriesPerChunk = Math.Min(maxEntriesPerChunk, chunkSize - 1);
-                    continue;
-                }
                 WriteOrdersChunk(buffer.Slice(p), securityId, bids, asks, ref bidIdx, ref askIdx, chunkSize);
                 p += frameSize;
             }
@@ -151,11 +158,20 @@ public static class SnapshotPacketBuilder
          + WireOffsets.SnapOrdersGroupSizeEncodingSize
          + WireOffsets.SnapOrdersEntrySize * entries;
 
+    private static int MaxOrdersEntriesThatFit(int availableBytes)
+    {
+        int fixedBytes = OrdersFrameSize(0);
+        return availableBytes <= fixedBytes
+            ? 0
+            : (availableBytes - fixedBytes) / WireOffsets.SnapOrdersEntrySize;
+    }
+
     private static int NextChunkSize(
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
-        ref int bidIdx, ref int askIdx, int cap)
+        int bidIdx, int askIdx, int cap)
     {
+        if (cap <= 0) return 0;
         int remaining = (bids.Length - bidIdx) + (asks.Length - askIdx);
         return Math.Min(remaining, cap);
     }

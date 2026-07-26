@@ -176,6 +176,14 @@ Exposes:
     dispatcher records a heartbeat on every loop wakeup (1 s timer +
     every processed command), so a stuck or dead loop is detected within
     `livenessStaleMs + ~1s`.
+* `maxOpenOrdersPerFirm` — host-wide maximum number of simultaneously open
+  resting or parked-stop orders for one `EnteringFirm`, aggregated across all
+  channels. Default `100000` for backward compatibility. Admission reserves
+  capacity atomically before a resting-capable new order reaches the engine;
+  IOC/FOK orders do not consume capacity. Breaches produce
+  `ExecutionReport_Reject(OrdRejReason=3 OrderExceedsLimit)`. Restored books
+  are always rebuilt completely even if an operator lowers the limit below the
+  recovered count; only subsequent resting-capable orders are rejected.
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
 * `channels[].selfTradePrevention` — per-channel self-trade prevention policy
@@ -222,7 +230,10 @@ Exposes:
   `maxEntriesPerChunk` caps the per-`Orders_71` group size (defaults to
   30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
   `snapshot` block to publish only the incremental feed (no bootstrap for
-  mid-session consumers).
+  mid-session consumers). Books larger than one packet are capacity-chunked
+  across consecutive snapshot packets; the first packet's Header_30 total
+  counts, `LastRptSeq`, and `LastSequenceVersion` describe the complete
+  refresh, and every packet shares one sending timestamp.
 * `persistence` *(optional, per channel — issue #260 + roadmap #262–#272)*
   — enables order book + counter persistence so a restart resumes with
   the live working book, RptSeq, order/trade-id allocators, untriggered

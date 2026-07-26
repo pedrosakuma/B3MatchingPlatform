@@ -143,31 +143,44 @@ public class SnapshotRotatorTests
     }
 
     [Fact]
-    public void LargeBook_ChunksIntoMultiplePacketsAndStepsSequence()
+    public void LargeBookAboveLegacyBufferLimit_PublishesCompleteSnapshotAndStepsSequence()
     {
         var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
         var bids = new List<RestingOrderView>();
-        for (int i = 0; i < 400; i++) bids.Add(Order(i + 1, Side.Buy, 100_0000 - i, 100));
+        for (int i = 0; i < 20_000; i++) bids.Add(Order(i + 1, Side.Buy, 100_0000 - i, 100));
         var asks = new List<RestingOrderView>();
-        for (int i = 0; i < 200; i++) asks.Add(Order(10_000 + i, Side.Sell, 101_0000 + i, 100));
+        for (int i = 0; i < 5_000; i++) asks.Add(Order(100_000 + i, Side.Sell, 101_0000 + i, 100));
         src.Books[(7L, Side.Buy)] = bids;
         src.Books[(7L, Side.Sell)] = asks;
 
         var sink = new CapturingSink();
-        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
+        var rot = new SnapshotRotator(
+            channelNumber: 84,
+            source: src,
+            sink: sink,
+            timeSource: new FakeNanosTimeSource(123_456UL));
 
-        int packets = rot.PublishNext(incrementalSequenceVersion: 1);
+        int packets = rot.PublishNext(incrementalSequenceVersion: 17);
         Assert.True(packets >= 2, $"expected multi-packet snapshot, got {packets}");
         Assert.Equal((uint)packets, rot.SequenceNumber);
 
-        // PacketHeader.SequenceNumber stepped 1..N within this snapshot.
         for (int i = 0; i < packets; i++)
         {
             ref readonly var pkthdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[i].AsSpan(0, PacketHeaderSize));
             Assert.Equal((uint)(i + 1), pkthdr.SequenceNumber);
+            Assert.Equal((ushort)1, pkthdr.SequenceVersion);
+            Assert.Equal(123_456UL, pkthdr.SendingTime);
+            Assert.InRange(sink.Packets[i].Length, 1, SnapshotPacketBuilder.DefaultPacketBufferSize);
         }
 
-        // Sum NumInGroup across every Orders_71 frame in every packet → 600.
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            sink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var header));
+        Assert.Equal(25_000u, header.Data.TotNumReports);
+        Assert.Equal(20_000u, header.Data.TotNumBids);
+        Assert.Equal(5_000u, header.Data.TotNumOffers);
+        Assert.Equal(99u, header.Data.LastRptSeq);
+        Assert.Equal((ushort)17, header.Data.LastSequenceVersion);
+
         int totalEntries = 0;
         for (int i = 0; i < packets; i++)
         {
@@ -184,7 +197,7 @@ public class SnapshotRotatorTests
                 p += frameLen;
             }
         }
-        Assert.Equal(600, totalEntries);
+        Assert.Equal(25_000, totalEntries);
     }
 
     [Fact]
