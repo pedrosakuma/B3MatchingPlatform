@@ -159,7 +159,17 @@ public sealed class GatewayRouter : ICoreOutbound
         var result = _registry.TryInvokeOrdered(session, current =>
         {
             found = true;
-            return write(current);
+            try
+            {
+                return write(current);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "ordered gateway write {Kind} failed for session {Session}; reporting NotCommitted",
+                    kind, session);
+                return OrderedStreamWriteResult.NotCommitted;
+            }
         });
         if (!found) LogMiss(session, kind);
         return result;

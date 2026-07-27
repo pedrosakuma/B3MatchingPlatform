@@ -61,6 +61,9 @@ public interface ICoreOutbound
     /// on the wire (with the owner's original ClOrdId becoming
     /// <c>OrigClOrdID</c>); pass zero when the cancel was not initiated by
     /// a request from a live session (e.g. engine-internal cancel).
+    /// Ordered retransmit/journal commitment failures must be represented by
+    /// <see cref="OrderedStreamWriteResult.NotCommitted"/> rather than thrown
+    /// after the matching engine has already removed the order.
     /// </summary>
     OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId,
         in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue,

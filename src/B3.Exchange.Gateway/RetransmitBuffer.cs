@@ -138,20 +138,28 @@ internal sealed class RetransmitBuffer : IDisposable
                 nameof(seq),
                 "FIXP business sequence zero is invalid");
         bool evicted;
-        lock (_lock)
+        try
         {
-            // Persistence is the first half of the ordered-stream commit.
-            // If it fails, leave the in-memory ring untouched so callers can
-            // emit SystemBusy without an ACCEPTED frame remaining replayable.
-            _onAppendPersist?.Invoke(seq, frame);
-            evicted = _count == Capacity;
-            ReleasePooledAt(_head);
-            _frames[_head] = frame;
-            _pooledFrames[_head] = null;
-            _seqs[_head] = seq;
-            _head = (_head + 1) % Capacity;
-            if (_count < Capacity) _count++;
-            _lastSeq = seq;
+            lock (_lock)
+            {
+                // Persistence is the first half of the ordered-stream commit.
+                // If it fails, leave the in-memory ring untouched so callers can
+                // emit SystemBusy without an ACCEPTED frame remaining replayable.
+                _onAppendPersist?.Invoke(seq, frame);
+                evicted = _count == Capacity;
+                ReleasePooledAt(_head);
+                _frames[_head] = frame;
+                _pooledFrames[_head] = null;
+                _seqs[_head] = seq;
+                _head = (_head + 1) % Capacity;
+                if (_count < Capacity) _count++;
+                _lastSeq = seq;
+            }
+        }
+        catch
+        {
+            _metrics?.IncOutboundCommitFailure();
+            throw;
         }
         // Issue #288: surface eviction + suspended-write counters outside
         // the lock so a slow metrics consumer cannot back-pressure the
@@ -168,18 +176,26 @@ internal sealed class RetransmitBuffer : IDisposable
                 nameof(seq),
                 "FIXP business sequence zero is invalid");
         bool evicted;
-        lock (_lock)
+        try
         {
-            _onAppendPersist?.Invoke(seq, frame.Buffer.AsSpan(0, frame.Length));
-            evicted = _count == Capacity;
-            ReleasePooledAt(_head);
-            frame.AddRef();
-            _frames[_head] = null;
-            _pooledFrames[_head] = frame;
-            _seqs[_head] = seq;
-            _head = (_head + 1) % Capacity;
-            if (_count < Capacity) _count++;
-            _lastSeq = seq;
+            lock (_lock)
+            {
+                _onAppendPersist?.Invoke(seq, frame.Buffer.AsSpan(0, frame.Length));
+                evicted = _count == Capacity;
+                ReleasePooledAt(_head);
+                frame.AddRef();
+                _frames[_head] = null;
+                _pooledFrames[_head] = frame;
+                _seqs[_head] = seq;
+                _head = (_head + 1) % Capacity;
+                if (_count < Capacity) _count++;
+                _lastSeq = seq;
+            }
+        }
+        catch
+        {
+            _metrics?.IncOutboundCommitFailure();
+            throw;
         }
         if (evicted) _metrics?.IncBufferEvictions();
         if (_isSuspended is { } cb && cb()) _metrics?.IncPassiveErBuffered();

@@ -58,6 +58,7 @@ public sealed class ChannelMetrics
     private long _dispatchQueueFull;
     private long _decodeErrors;
     private long _dispatcherCrashes;
+    private long _massCancelReportFailures;
     private long _publishErrors;
     private long _publishErrorsHostUnreachable;
     private long _publishErrorsMessageTooLarge;
@@ -139,6 +140,7 @@ public sealed class ChannelMetrics
     public long DispatchQueueFull => Interlocked.Read(ref _dispatchQueueFull);
     public long DecodeErrors => Interlocked.Read(ref _decodeErrors);
     public long DispatcherCrashes => Interlocked.Read(ref _dispatcherCrashes);
+    public long MassCancelReportFailures => Interlocked.Read(ref _massCancelReportFailures);
     public long PublishErrors => Interlocked.Read(ref _publishErrors);
     public long PublishErrorsHostUnreachable => Interlocked.Read(ref _publishErrorsHostUnreachable);
     public long PublishErrorsMessageTooLarge => Interlocked.Read(ref _publishErrorsMessageTooLarge);
@@ -153,6 +155,7 @@ public sealed class ChannelMetrics
     public void IncDispatchQueueFull() => Interlocked.Increment(ref _dispatchQueueFull);
     public void IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
     public void IncDispatcherCrashes() => Interlocked.Increment(ref _dispatcherCrashes);
+    public void IncMassCancelReportFailure() => Interlocked.Increment(ref _massCancelReportFailures);
     public void IncPublishErrorSocketError() => Interlocked.Increment(ref _publishErrors);
     public void IncPublishErrorHostUnreachable() => Interlocked.Increment(ref _publishErrorsHostUnreachable);
     public void IncPublishErrorMessageTooLarge() => Interlocked.Increment(ref _publishErrorsMessageTooLarge);
@@ -715,6 +718,9 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_fixp_passive_er_buffered_total",
             "Total outbound FIXP business frames appended to a per-session RetransmitBuffer while the session was Suspended (the issue #217 path: passive ExecutionReports keep being encoded after the transport drops, awaiting a reattach + RetransmitRequest). Quantifies how much reattach traffic is post-disconnect catch-up (issue #288).",
             _retransmit.PassiveErBuffered);
+        EmitProcessCounter(sb, "exch_fixp_outbound_commit_failures_total",
+            "Total FIXP outbound retransmit/journal append failures. The business MsgSeqNum is rolled back and the ordered write reports NotCommitted; a non-zero rate indicates degraded private-stream durability.",
+            _retransmit.OutboundCommitFailures);
         if (EmitFixpSessionLabels && sessionSnap.Length > 0)
         {
             EmitSessionRetransmitUtilizationPercent(sb, sessionSnap);
@@ -784,6 +790,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_snapshot_dropped_by_backpressure_total",
             "Total snapshots that the BackgroundSnapshotWriter (issue #268) discarded because a newer snapshot was submitted before the previous one had been written. Last-write-wins semantics preserve correctness — each snapshot is a complete state image — but a high rate indicates the writer cannot keep up with the loop and RPO is degraded.",
             channels, c => c.SnapshotDroppedByBackpressure);
+        EmitCounter(sb, "exch_mass_cancel_report_failures_total",
+            "Total solicited mass-cancel channel batches whose passive cancellation ExecutionReports did not all commit to their ordered FIXP streams. The batch still publishes UMDF for applied cancellations and completes with SystemBusy.",
+            channels, c => c.MassCancelReportFailures);
 
         // Issue #269: Write-Ahead Log counters. Append rate equals the
         // accepted state-mutating command rate when the WAL is enabled;

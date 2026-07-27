@@ -562,7 +562,11 @@ public sealed partial class FixpSession : IAsyncDisposable
             // fails when the transport is dead; the buffered frame is replayed
             // on a subsequent Establish + RetransmitRequest. Issue #217 / L4.
             isOpen: () => IsRegistered,
-            close: Close);
+            close: Close,
+            onCancelCommitFailure: (ex, seq) =>
+                _logger.LogError(ex,
+                    "fixp session {ConnectionId} sessionId={SessionId} failed to commit passive ExecutionReport_Cancel seq={Sequence}; returning NotCommitted so the solicited mass-cancel barrier can publish UMDF and emit SystemBusy",
+                    ConnectionId, SessionId, seq));
         _retransmitController = new FixpRetransmitController(
             sessionId: () => SessionId,
             transport: () => _transport!,

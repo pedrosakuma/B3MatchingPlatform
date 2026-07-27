@@ -36,6 +36,12 @@ public sealed record ChannelDispatcherOptions
     public bool UseAsyncSnapshotWriter { get; init; }
     public IChannelWriteAheadLog? Wal { get; init; }
     public WalAppendFailurePolicy WalAppendFailurePolicy { get; init; } = WalAppendFailurePolicy.Continue;
+    /// <summary>
+    /// Maximum off-loop wait for a solicited mass-cancel's WAL durability
+    /// boundary.
+    /// </summary>
+    public TimeSpan MassCancelDurabilityTimeout { get; init; } =
+        TimeSpan.FromSeconds(5);
     public Func<string, bool>? SessionExists { get; init; }
     public OrphanSessionPolicy OrphanPolicy { get; init; } = OrphanSessionPolicy.Drop;
     public IReadOnlyList<long>? SeedSecurityIds { get; init; }

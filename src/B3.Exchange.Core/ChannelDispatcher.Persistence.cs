@@ -571,65 +571,77 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private bool TryCompleteMassCancelDurability()
+    private Task<bool> BeginMassCancelDurability(long commandSeq)
     {
-        _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
+        _postTradeSink.OnCommandBoundary(commandSeq);
         if (_replayMode)
-            return true;
+            return Task.FromResult(true);
 
         if (_wal is not null)
         {
-            try
-            {
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
-                    _cts.Token);
-                timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                _wal.WaitForDurable(_lastAppliedSeq, timeout.Token);
-            }
-            catch (Exception ex)
-            {
-                _metrics?.IncWalAppendFailure();
-                _metrics?.IncDispatcherCrashes();
-                Volatile.Write(ref _walHalted, 1);
-                _logger.LogCritical(ex,
-                    "channel {ChannelNumber}: mass-cancel WAL durability failed at seq={Seq}; channel marked unhealthy and terminal ACCEPTED suppressed",
-                    ChannelNumber, _lastAppliedSeq);
-                return false;
-            }
-
             OnAfterCommandFlushed(recordCommandBoundary: false);
-            return true;
+            if (_wal.DurableSeqOrZero >= commandSeq)
+                return Task.FromResult(true);
+
+            var wal = _wal;
+            return Task.Run(() => WaitForMassCancelWalDurability(
+                wal, commandSeq));
         }
 
         if (_persister is null)
-            return true;
+            return Task.FromResult(true);
 
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        var snapshot = CaptureChannelState();
+        var persister = _persister;
+        return Task.Run(() =>
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                long bytes = persister.Save(snapshot);
+                long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                if (_metrics is { } metrics)
+                {
+                    metrics.SnapshotWrite.ObserveTicks(elapsed);
+                    metrics.IncSnapshotSaveOk();
+                    if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
+                    metrics.SetSnapshotLastSuccessUnixMs(nowMs);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _metrics?.IncSnapshotSaveFailure();
+                _metrics?.IncDispatcherCrashes();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: asynchronous mass-cancel snapshot failed; terminal ACCEPTED suppressed",
+                    ChannelNumber);
+                return false;
+            }
+        });
+    }
+
+    private bool WaitForMassCancelWalDurability(
+        IChannelWriteAheadLog wal,
+        long commandSeq)
+    {
         try
         {
-            var snapshot = CaptureChannelState();
-            long bytes = _persister.Save(snapshot);
-            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
-            if (_metrics is { } metrics)
-            {
-                metrics.SnapshotWrite.ObserveTicks(elapsed);
-                metrics.IncSnapshotSaveOk();
-                if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
-                metrics.SetSnapshotLastSuccessUnixMs(nowMs);
-            }
-            _commandsSincePersist = 0;
-            _lastPersistUnixMs = nowMs;
-            _pendingDirty = false;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                _cts.Token);
+            timeout.CancelAfter(_massCancelDurabilityTimeout);
+            wal.WaitForDurable(commandSeq, timeout.Token);
             return true;
         }
         catch (Exception ex)
         {
-            _metrics?.IncSnapshotSaveFailure();
+            _metrics?.IncWalAppendFailure();
             _metrics?.IncDispatcherCrashes();
-            _logger.LogError(ex,
-                "channel {ChannelNumber}: synchronous mass-cancel snapshot failed; terminal ACCEPTED suppressed",
-                ChannelNumber);
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: mass-cancel WAL durability failed at seq={Seq}; channel marked unhealthy and terminal ACCEPTED suppressed",
+                ChannelNumber, commandSeq);
             return false;
         }
     }

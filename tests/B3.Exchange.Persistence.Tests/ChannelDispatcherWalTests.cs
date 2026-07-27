@@ -135,6 +135,11 @@ public class ChannelDispatcherWalTests
 
         public TaskCompletionSource<bool> WaitEntered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> WaitExited { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Exception? WaitFailure { get; init; }
+        public long DurableSeqOrZero => 0;
+        public bool DisposeCalled { get; private set; }
 
         public int Append(WalRecord record)
         {
@@ -171,11 +176,25 @@ public class ChannelDispatcherWalTests
             long seq, CancellationToken cancellationToken = default)
         {
             WaitEntered.TrySetResult(true);
-            _release.Wait(cancellationToken);
+            try
+            {
+                if (WaitFailure is { } failure)
+                    throw failure;
+                _release.Wait(cancellationToken);
+            }
+            finally
+            {
+                WaitExited.TrySetResult(true);
+            }
         }
 
         public void Release() => _release.Set();
-        public void Dispose() => _release.Dispose();
+        public void Dispose()
+        {
+            if (DisposeCalled) return;
+            DisposeCalled = true;
+            _release.Dispose();
+        }
     }
 
     private sealed class TempDir : IDisposable
@@ -201,7 +220,8 @@ public class ChannelDispatcherWalTests
         ChannelMetrics? metrics = null,
         SnapshotThrottlePolicy? throttle = null,
         bool useAsyncSnapshotWriter = false,
-        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null)
+        B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null,
+        TimeSpan? massCancelDurabilityTimeout = null)
     {
         var localSink = sink = new NoOpPacketSink();
         var localOutbound = outbound = new CountingOutbound();
@@ -220,6 +240,8 @@ public class ChannelDispatcherWalTests
                 UseAsyncSnapshotWriter = useAsyncSnapshotWriter,
                 Wal = wal,
                 PostTradeSink = postTradeSink,
+                MassCancelDurabilityTimeout = massCancelDurabilityTimeout
+                    ?? TimeSpan.FromSeconds(5),
             });
     }
 
@@ -375,12 +397,12 @@ public class ChannelDispatcherWalTests
     }
 
     [Fact]
-    public async Task MassCancel_TerminalCompletionWaitsForWalDurability()
+    public async Task MassCancel_DurabilityWaitDoesNotBlockUnrelatedCommands()
     {
         using var wal = new BlockingWal();
         var session = new SessionId("S1");
         var disp = BuildDispatcher(
-            persister: null, wal, out _, out _);
+            persister: null, wal, out _, out var outbound);
         try
         {
             disp.Start();
@@ -402,6 +424,18 @@ public class ChannelDispatcherWalTests
             Assert.False(completion.Task.IsCompleted);
             Assert.False(disp.TryResolveByClOrdId(700, 1, out _, out _));
 
+            Assert.True(EnqueueOrder(
+                disp,
+                new SessionId("S2"),
+                "CL-2",
+                2,
+                nanos: 3));
+            Assert.True(await WaitForAsync(
+                () => disp.TryResolveByClOrdId(700, 2, out _, out _),
+                ReadyTimeout));
+            Assert.Equal(2, outbound.NewCount);
+            Assert.False(completion.Task.IsCompleted);
+
             wal.Release();
             var terminal = await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(terminal.Succeeded);
@@ -414,7 +448,115 @@ public class ChannelDispatcherWalTests
     }
 
     [Fact]
-    public void MassCancel_SnapshotFailure_CompletesSystemBusyWithoutAcceptedOutcome()
+    public async Task MassCancel_DurabilityTimeout_CompletesSystemBusy()
+    {
+        using var wal = new BlockingWal();
+        var session = new SessionId("S1");
+        var disp = BuildDispatcher(
+            persister: null,
+            wal,
+            out _,
+            out _,
+            massCancelDurabilityTimeout: TimeSpan.FromMilliseconds(100));
+        try
+        {
+            disp.Start();
+            Assert.True(EnqueueOrder(disp, session, "CL-1", 1, nanos: 1));
+            Assert.True(await WaitForAsync(
+                () => disp.TryResolveByClOrdId(700, 1, out _, out _),
+                ReadyTimeout));
+            Assert.True(disp.TryResolveByClOrdId(
+                700, 1, out var orderId, out _));
+
+            var completion = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(disp.EnqueueResolvedMassCancel(
+                [orderId], session, enteringFirm: 700,
+                new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+                outcome => completion.TrySetResult(outcome)));
+
+            var outcome = await completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(outcome.Succeeded);
+            Assert.False(disp.IsWalHealthy);
+        }
+        finally
+        {
+            wal.Release();
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MassCancel_DurabilityFailure_CompletesSystemBusy()
+    {
+        using var wal = new BlockingWal
+        {
+            WaitFailure = new IOException("simulated fsync failure"),
+        };
+        var session = new SessionId("S1");
+        var disp = BuildDispatcher(
+            persister: null, wal, out _, out _);
+        try
+        {
+            disp.Start();
+            Assert.True(EnqueueOrder(disp, session, "CL-1", 1, nanos: 1));
+            Assert.True(await WaitForAsync(
+                () => disp.TryResolveByClOrdId(700, 1, out _, out _),
+                ReadyTimeout));
+            Assert.True(disp.TryResolveByClOrdId(
+                700, 1, out var orderId, out _));
+
+            var completion = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(disp.EnqueueResolvedMassCancel(
+                [orderId], session, enteringFirm: 700,
+                new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+                outcome => completion.TrySetResult(outcome)));
+
+            var outcome = await completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(outcome.Succeeded);
+            Assert.False(disp.IsWalHealthy);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MassCancel_DisposeCancelsWaitBeforeWalDisposal()
+    {
+        using var wal = new BlockingWal();
+        var session = new SessionId("S1");
+        var disp = BuildDispatcher(
+            persister: null, wal, out _, out _);
+
+        disp.Start();
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 1, nanos: 1));
+        Assert.True(await WaitForAsync(
+            () => disp.TryResolveByClOrdId(700, 1, out _, out _),
+            ReadyTimeout));
+        Assert.True(disp.TryResolveByClOrdId(
+            700, 1, out var orderId, out _));
+
+        var completion = new TaskCompletionSource<MassCancelOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueResolvedMassCancel(
+            [orderId], session, enteringFirm: 700,
+            new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+            outcome => completion.TrySetResult(outcome)));
+        await wal.WaitEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        await disp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.True(wal.DisposeCalled);
+        Assert.True(wal.WaitExited.Task.IsCompletedSuccessfully);
+        Assert.False((await completion.Task.WaitAsync(
+            TimeSpan.FromSeconds(3))).Succeeded);
+    }
+
+    [Fact]
+    public async Task MassCancel_SnapshotFailure_CompletesSystemBusyWithoutAcceptedOutcome()
     {
         var persister = new TogglePersister();
         var session = new SessionId("S1");
@@ -427,14 +569,16 @@ public class ChannelDispatcherWalTests
         Assert.True(disp.TryResolveByClOrdId(700, 1, out var orderId, out _));
 
         persister.FailSaves = true;
-        MassCancelOutcome? terminal = null;
+        var terminal = new TaskCompletionSource<MassCancelOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         Assert.True(disp.EnqueueResolvedMassCancel(
             [orderId], session, enteringFirm: 700,
             new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
-            outcome => terminal = outcome));
+            outcome => terminal.TrySetResult(outcome)));
         probe.DrainInbound();
 
-        Assert.False(terminal?.Succeeded);
+        Assert.False((await terminal.Task.WaitAsync(
+            TimeSpan.FromSeconds(3))).Succeeded);
         Assert.False(disp.TryResolveByClOrdId(700, 1, out _, out _));
     }
 

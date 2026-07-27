@@ -558,19 +558,16 @@ public sealed partial class ChannelDispatcher
                 {
                     var terminalOutcome = pendingMassCancelOutcome
                         ?? MassCancelOutcome.SystemBusy;
-                    if (!TryCompleteMassCancelDurability())
-                        terminalOutcome = MassCancelOutcome.SystemBusy;
-                    if (_currentMassCancelReportCompletions is { Count: > 0 } deferred)
-                    {
-                        _ = CompleteMassCancelAfterDeferredAsync(
-                            deferred.ToArray(),
-                            item.MassCancelCompletion,
-                            terminalOutcome);
-                    }
-                    else
-                    {
-                        CompleteMassCancel(item.MassCancelCompletion, terminalOutcome);
-                    }
+                    var durability = BeginMassCancelDurability(_lastAppliedSeq);
+                    var deferred = _currentMassCancelReportCompletions is { Count: > 0 } reports
+                        ? reports.ToArray()
+                        : Array.Empty<Task<OrderedStreamWriteResult>>();
+                    ScheduleMassCancelTerminalCompletion(
+                        durability,
+                        deferred,
+                        item.MassCancelCompletion,
+                        terminalOutcome,
+                        reportFailureAlreadyObserved: !_currentMassCancelReportsCommitted);
                 }
                 else
                 {
@@ -708,20 +705,94 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private async Task CompleteMassCancelAfterDeferredAsync(
+    private void ScheduleMassCancelTerminalCompletion(
+        Task<bool> durability,
         Task<OrderedStreamWriteResult>[] deferred,
         Action<MassCancelOutcome>? completion,
-        MassCancelOutcome outcome)
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
+    {
+        var prior = _massCancelTerminalTail;
+        if (prior.IsCompletedSuccessfully
+            && durability.IsCompletedSuccessfully
+            && deferred.All(static task => task.IsCompletedSuccessfully))
+        {
+            bool deferredFailure = deferred.Any(
+                static task => !task.Result.IsCommitted);
+            if (!durability.Result || deferredFailure)
+            {
+                outcome = MassCancelOutcome.SystemBusy;
+            }
+            if (deferredFailure && !reportFailureAlreadyObserved)
+                _metrics?.IncMassCancelReportFailure();
+            CompleteMassCancel(completion, outcome);
+            return;
+        }
+
+        _massCancelTerminalTail = CompleteMassCancelTerminalAsync(
+            prior,
+            durability,
+            deferred,
+            completion,
+            outcome,
+            reportFailureAlreadyObserved);
+    }
+
+    private async Task CompleteMassCancelTerminalAsync(
+        Task prior,
+        Task<bool> durability,
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
     {
         try
         {
-            var results = await Task.WhenAll(deferred).ConfigureAwait(false);
-            if (results.Any(static result => !result.IsCommitted))
+            await prior.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: prior mass-cancel terminal completion failed",
+                ChannelNumber);
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        try
+        {
+            bool durable = await durability.ConfigureAwait(false);
+            if (!durable)
                 outcome = MassCancelOutcome.SystemBusy;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel durability completion failed",
+                ChannelNumber);
             outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        if (deferred.Length > 0)
+        {
+            try
+            {
+                var results = await Task.WhenAll(deferred).ConfigureAwait(false);
+                if (results.Any(static result => !result.IsCommitted))
+                {
+                    if (!reportFailureAlreadyObserved)
+                        _metrics?.IncMassCancelReportFailure();
+                    outcome = MassCancelOutcome.SystemBusy;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!reportFailureAlreadyObserved)
+                    _metrics?.IncMassCancelReportFailure();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: deferred passive cancellation ExecutionReport commitment failed during solicited mass-cancel",
+                    ChannelNumber);
+                outcome = MassCancelOutcome.SystemBusy;
+            }
         }
         CompleteMassCancel(completion, outcome);
     }

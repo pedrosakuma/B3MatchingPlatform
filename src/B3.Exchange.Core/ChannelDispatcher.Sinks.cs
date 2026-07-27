@@ -673,6 +673,8 @@ public sealed partial class ChannelDispatcher
             return;
         if (!write.IsAccepted)
         {
+            if (_currentMassCancelReportsCommitted)
+                _metrics?.IncMassCancelReportFailure();
             _currentMassCancelReportsCommitted = false;
             return;
         }

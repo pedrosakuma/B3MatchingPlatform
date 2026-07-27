@@ -36,6 +36,7 @@ internal sealed class FixpOutboundEncoder
     private readonly INanosTimeSource _timeSource;
     private readonly Func<bool> _isOpen;
     private readonly Action _close;
+    private readonly Action<Exception, uint> _onCancelCommitFailure;
 
     public FixpOutboundEncoder(
         Func<uint> sessionId,
@@ -48,7 +49,8 @@ internal sealed class FixpOutboundEncoder
         Func<bool> canEnqueueBusiness,
         INanosTimeSource timeSource,
         Func<bool> isOpen,
-        Action close)
+        Action close,
+        Action<Exception, uint> onCancelCommitFailure)
     {
         _sessionId = sessionId;
         _sessionVerId = sessionVerId;
@@ -61,6 +63,7 @@ internal sealed class FixpOutboundEncoder
         _timeSource = timeSource;
         _isOpen = isOpen;
         _close = close;
+        _onCancelCommitFailure = onCancelCommitFailure;
     }
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
@@ -144,7 +147,8 @@ internal sealed class FixpOutboundEncoder
                     memo: memo.Span, receivedTimeNanos: receivedTimeNanos,
                     ordStatus: ExecutionReportEncoder.CancelOrdStatus(e.Reason),
                     ordType: e.OrdType, stopPxMantissa: e.StopPxMantissa);
-                return AppendAndEnqueueLocked(exact, durability);
+                return AppendAndEnqueueLocked(exact, durability,
+                    convertCommitFailureToResult: true);
             }
         }
         finally
@@ -329,7 +333,8 @@ internal sealed class FixpOutboundEncoder
     /// </summary>
     private OrderedStreamWriteResult AppendAndEnqueueLocked(
         PooledOutboundFrame exact,
-        DurabilityHandle durability = default)
+        DurabilityHandle durability = default,
+        bool convertCommitFailureToResult = false)
     {
         // OutboundBusinessHeader.MsgSeqNum sits at body offset 4
         // (SessionID(4) | MsgSeqNum(4) | …) → absolute offset
@@ -344,9 +349,14 @@ internal sealed class FixpOutboundEncoder
         {
             _retxBuffer.Append(seq, exact);
         }
-        catch
+        catch (Exception ex)
         {
             _rollbackMsgSeqNum(seq);
+            if (convertCommitFailureToResult)
+            {
+                _onCancelCommitFailure(ex, seq);
+                return OrderedStreamWriteResult.NotCommitted;
+            }
             throw;
         }
         if (!_canEnqueueBusiness())
