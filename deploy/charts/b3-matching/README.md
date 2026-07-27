@@ -13,7 +13,7 @@ ghcr.io/pedrosakuma/b3-matching            (image, digest-pinned per env)
 
 ```bash
 helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching \
-  --version 0.2.0 \
+  --version 0.3.1 \
   --namespace b3-prod --create-namespace \
   --set image.digest=sha256:... \
   --set marketData.host=marketdata
