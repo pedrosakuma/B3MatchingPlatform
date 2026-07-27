@@ -196,6 +196,114 @@ public class FileChannelStatePersisterTests
             dir.Path, NullLogger<FileChannelStatePersister>.Instance, generations: 0));
     }
 
+    [Fact]
+    public async Task AsyncSaveCapturedBeforeDeleteAll_IsFenced_AndNewGenerationDrainsOnShutdown()
+    {
+        using var dir = new TempDir();
+        var inner = new FileChannelStatePersister(
+            dir.Path, NullLogger<FileChannelStatePersister>.Instance);
+        var blocking = new BlockingGenerationPersister(inner);
+        int savedCallbacks = 0;
+        await using var writer = new BackgroundSnapshotWriter(
+            channelNumber: 84,
+            persister: blocking,
+            logger: NullLogger<BackgroundSnapshotWriter>.Instance,
+            onSaved: _ => Interlocked.Increment(ref savedCallbacks));
+
+        var stale = MakeRichSnapshot(channel: 84) with
+        {
+            LastAppliedSeq = 10,
+        };
+        writer.Submit(stale);
+        await blocking.FirstSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        blocking.DeleteAll(84);
+        blocking.ReleaseFirstSave();
+        await blocking.FirstSaveCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(Directory.GetFiles(dir.Path, "channel-84.snapshot*"));
+        Assert.Null(inner.TryLoad(84));
+        Assert.Equal(0, Volatile.Read(ref savedCallbacks));
+
+        var fresh = stale with
+        {
+            SequenceNumber = 0,
+            SequenceVersion = 1,
+            Engine = stale.Engine with
+            {
+                Books =
+                [
+                    new EngineStateSnapshot.BookSnapshot(
+                        stale.Engine.Books[0].SecurityId,
+                        []),
+                ],
+                Stops = [],
+            },
+            Owners = [],
+            LastAppliedSeq = 1,
+        };
+        writer.Submit(fresh);
+        await writer.StopAsync();
+
+        var loaded = inner.TryLoad(84);
+        Assert.NotNull(loaded);
+        Assert.Equal(1, loaded!.LastAppliedSeq);
+        Assert.Empty(loaded.Engine.Books.Single().Orders);
+        Assert.Empty(loaded.Owners);
+        Assert.Equal(1, Volatile.Read(ref savedCallbacks));
+    }
+
+    private sealed class BlockingGenerationPersister(
+        FileChannelStatePersister inner) : IChannelStatePersister
+    {
+        private readonly ManualResetEventSlim _releaseFirst = new(false);
+        private int _trySaveCalls;
+
+        public TaskCompletionSource<bool> FirstSaveEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> FirstSaveCompleted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ChannelStateSnapshot? TryLoad(byte channelNumber)
+            => inner.TryLoad(channelNumber);
+
+        public long Save(ChannelStateSnapshot snapshot)
+            => inner.Save(snapshot);
+
+        public long CaptureSaveGeneration(byte channelNumber)
+            => inner.CaptureSaveGeneration(channelNumber);
+
+        public bool TrySave(
+            ChannelStateSnapshot snapshot,
+            long saveGeneration,
+            out long bytesWritten)
+        {
+            bool first = Interlocked.Increment(ref _trySaveCalls) == 1;
+            if (first)
+            {
+                FirstSaveEntered.TrySetResult(true);
+                _releaseFirst.Wait();
+            }
+            try
+            {
+                return inner.TrySave(
+                    snapshot,
+                    saveGeneration,
+                    out bytesWritten);
+            }
+            finally
+            {
+                if (first)
+                    FirstSaveCompleted.TrySetResult(true);
+            }
+        }
+
+        public int DeleteAll(byte channelNumber)
+            => inner.DeleteAll(channelNumber);
+
+        public void ReleaseFirstSave() => _releaseFirst.Set();
+    }
+
     private static ChannelStateSnapshot MakeRichSnapshot(byte channel)
     {
         var orders = new[]

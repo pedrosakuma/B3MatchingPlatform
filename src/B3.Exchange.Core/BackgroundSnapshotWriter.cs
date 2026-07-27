@@ -37,10 +37,14 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _writerTask;
 
+    private sealed record PendingSnapshot(
+        ChannelStateSnapshot Snapshot,
+        long SaveGeneration);
+
     // Single-slot mailbox. Mutated only via Interlocked.Exchange so the
     // writer thread can read-and-clear without a lock and Submit can
     // overwrite without contention.
-    private ChannelStateSnapshot? _pending;
+    private PendingSnapshot? _pending;
     private int _stopped;
 
     public BackgroundSnapshotWriter(
@@ -74,7 +78,11 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
     /// </summary>
     public void Submit(ChannelStateSnapshot snapshot)
     {
-        var prior = Interlocked.Exchange(ref _pending, snapshot);
+        long saveGeneration = _persister.CaptureSaveGeneration(
+            snapshot.ChannelNumber);
+        var prior = Interlocked.Exchange(
+            ref _pending,
+            new PendingSnapshot(snapshot, saveGeneration));
         if (prior is not null)
         {
             _metrics?.IncSnapshotDroppedByBackpressure();
@@ -109,12 +117,22 @@ public sealed class BackgroundSnapshotWriter : IAsyncDisposable
 
     private void DrainOnce()
     {
-        var snap = Interlocked.Exchange(ref _pending, null);
-        if (snap is null) return;
+        var pending = Interlocked.Exchange(ref _pending, null);
+        if (pending is null) return;
+        var snap = pending.Snapshot;
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            var bytes = _persister.Save(snap);
+            if (!_persister.TrySave(
+                    snap,
+                    pending.SaveGeneration,
+                    out var bytes))
+            {
+                _logger.LogInformation(
+                    "channel {ChannelNumber}: discarded background snapshot from reset generation {SaveGeneration}",
+                    _channelNumber, pending.SaveGeneration);
+                return;
+            }
             var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
             if (_metrics is { } m)
             {

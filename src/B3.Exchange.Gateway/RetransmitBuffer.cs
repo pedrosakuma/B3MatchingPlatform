@@ -133,6 +133,10 @@ internal sealed class RetransmitBuffer : IDisposable
     public void Append(uint seq, byte[] frame)
     {
         ArgumentNullException.ThrowIfNull(frame);
+        if (seq == 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(seq),
+                "FIXP business sequence zero is invalid");
         bool evicted;
         lock (_lock)
         {
@@ -159,6 +163,10 @@ internal sealed class RetransmitBuffer : IDisposable
     internal void Append(uint seq, PooledOutboundFrame frame)
     {
         ArgumentNullException.ThrowIfNull(frame);
+        if (seq == 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(seq),
+                "FIXP business sequence zero is invalid");
         bool evicted;
         lock (_lock)
         {

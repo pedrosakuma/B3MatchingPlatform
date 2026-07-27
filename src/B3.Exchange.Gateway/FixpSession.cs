@@ -115,6 +115,7 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// claimed).</summary>
     private uint _claimedSessionId;
     private long _msgSeqNum;
+    private int _outboundSequenceExhaustionHandled;
     private int _isOpen = 1;
     private int _isAttached = 1;
     private long _attachmentGeneration = 1;
@@ -569,7 +570,8 @@ public sealed partial class FixpSession : IAsyncDisposable
             outboundLock: _outboundLock,
             sendQueueCapacity: _sendQueueCapacity,
             isOpen: () => IsOpen,
-            peekNextMsgSeqNum: PeekNextMsgSeqNum,
+            tryPeekNextMsgSeqNum: TryPeekNextMsgSeqNum,
+            onSequenceExhausted: HandleOutboundSequenceExhausted,
             applyTransition: ApplyTransition,
             getState: () => State,
             confirmPeerAck: ack => _outboundJournal?.ConfirmPeerAck(SessionId, ack),
@@ -665,7 +667,24 @@ public sealed partial class FixpSession : IAsyncDisposable
             : null;
     }
 
-    private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
+    private uint NextMsgSeqNum()
+    {
+        while (true)
+        {
+            long current = Volatile.Read(ref _msgSeqNum);
+            if ((ulong)current >= uint.MaxValue)
+                throw new InvalidOperationException(
+                    "outbound FIXP MsgSeqNum exhausted");
+            long next = current + 1;
+            if (Interlocked.CompareExchange(
+                    ref _msgSeqNum,
+                    next,
+                    current) == current)
+            {
+                return (uint)next;
+            }
+        }
+    }
 
     private void RollbackMsgSeqNum(uint allocated)
     {
@@ -710,10 +729,18 @@ public sealed partial class FixpSession : IAsyncDisposable
         _pendingNegotiateStateApplied = false;
     }
 
-    /// <summary>Peek the value <see cref="NextMsgSeqNum"/> would return on
-    /// its next call without consuming a sequence number. Used by FIXP
-    /// <c>Sequence</c> frames, which announce but do not consume.</summary>
-    private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
+    /// <summary>
+    /// Peeks the value <see cref="NextMsgSeqNum"/> would return without
+    /// consuming it. Returns <c>null</c> once the uint32 sequence space is
+    /// exhausted so control frames never advertise an invalid zero.
+    /// </summary>
+    private uint? TryPeekNextMsgSeqNum()
+    {
+        long current = Volatile.Read(ref _msgSeqNum);
+        return (ulong)current < uint.MaxValue
+            ? (uint)(current + 1)
+            : null;
+    }
 
     private void ResetBusinessAdmissionLocked()
     {
@@ -750,9 +777,29 @@ public sealed partial class FixpSession : IAsyncDisposable
             {
                 if (Volatile.Read(ref _businessAdmissionState) != 1)
                     return unavailable;
+                if (TryPeekNextMsgSeqNum() is null)
+                {
+                    HandleOutboundSequenceExhausted();
+                    return unavailable;
+                }
                 return write();
             }
         });
+    }
+
+    private void HandleOutboundSequenceExhausted()
+    {
+        if (Interlocked.Exchange(
+                ref _outboundSequenceExhaustionHandled,
+                1) != 0)
+        {
+            return;
+        }
+
+        _logger.LogCritical(
+            "fixp session {ConnectionId} sessionId={SessionId} exhausted outbound uint32 MsgSeqNum; closing before allocating sequence zero",
+            ConnectionId, SessionId);
+        Close("outbound-msg-seq-exhausted", CloseKind.LocalTerminate);
     }
 
     private static TaskCompletionSource<bool> NewAdmissionCompletion() =>
@@ -912,10 +959,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// enqueues all replay clones (each carrying the
     /// <c>PossResend</c> bit), and finally enqueues a <c>Sequence</c>
     /// frame whose <c>nextSeqNo</c> is the next live business seq
-    /// (i.e. <see cref="PeekNextMsgSeqNum"/>). The entire block is
+    /// (i.e. the next available live business sequence). The entire block is
     /// enqueued under <see cref="_outboundLock"/> so live business
     /// writes cannot interleave it on the wire and so the trailing
-    /// Sequence's seq matches what the peer will see next.</para>
+    /// Sequence's seq matches what the peer will see next. If the uint32
+    /// business sequence space is exhausted, the session closes without
+    /// emitting a trailer that advertises zero.</para>
     /// </summary>
     private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
     {

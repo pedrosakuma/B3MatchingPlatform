@@ -65,6 +65,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         public bool Initialized { get; set; }
         public long HighestSavedSeq { get; set; }
         public int LastUsedSlot { get; set; } = -1;
+        public long SaveGeneration { get; set; }
     }
 
     private readonly ChannelPersistenceState[] _channelStates = CreateChannelStates();
@@ -111,64 +112,41 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         {
             if (!state.Initialized)
                 _ = TryLoadCore(snapshot.ChannelNumber, state, logLoaded: false);
+            return SaveLocked(snapshot, state);
+        }
+    }
 
-            if (snapshot.LastAppliedSeq < state.HighestSavedSeq)
+    public long CaptureSaveGeneration(byte channelNumber)
+    {
+        var state = _channelStates[channelNumber];
+        lock (state.Gate)
+        {
+            return state.SaveGeneration;
+        }
+    }
+
+    public bool TrySave(
+        ChannelStateSnapshot snapshot,
+        long saveGeneration,
+        out long bytesWritten)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var state = _channelStates[snapshot.ChannelNumber];
+        lock (state.Gate)
+        {
+            if (saveGeneration != state.SaveGeneration)
             {
+                bytesWritten = 0;
                 _logger.LogWarning(
-                    "channel {ChannelNumber}: skipped stale snapshot save at LastAppliedSeq={SnapshotSeq}; durable high-water mark is {DurableSeq}",
-                    snapshot.ChannelNumber, snapshot.LastAppliedSeq, state.HighestSavedSeq);
-                return 0;
+                    "channel {ChannelNumber}: skipped snapshot from reset generation {SnapshotGeneration}; current generation is {CurrentGeneration}",
+                    snapshot.ChannelNumber, saveGeneration,
+                    state.SaveGeneration);
+                return false;
             }
-
-            int slot = (state.LastUsedSlot + 1) % _generations;
-            var path = SlotPath(snapshot.ChannelNumber, slot);
-            var tmp = TempPath(snapshot.ChannelNumber, slot);
-            long bytesWritten;
-            try
-            {
-                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    if (_writeFormat == SnapshotFileFormat.Binary)
-                    {
-                        var bytes = BinaryChannelStateSnapshotCodec.Encode(snapshot);
-                        fs.Write(bytes, 0, bytes.Length);
-                    }
-                    else
-                    {
-                        JsonSerializer.Serialize(fs, snapshot, JsonOptions);
-                    }
-                    fs.Flush(flushToDisk: true);
-                    bytesWritten = fs.Length;
-                }
-                File.Move(tmp, path, overwrite: true);
-                FsyncDirectory(_dataDir);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "channel {ChannelNumber}: failed to persist snapshot slot {Slot} to {Path}",
-                    snapshot.ChannelNumber, slot, path);
-                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
-                throw;
-            }
-
-            state.LastUsedSlot = slot;
-            state.HighestSavedSeq = Math.Max(
-                state.HighestSavedSeq, snapshot.LastAppliedSeq);
-            // Best-effort: drop the legacy single-file once a generational
-            // write succeeded, so future loads stop considering it.
-            try
-            {
-                var legacy = LegacyPath(snapshot.ChannelNumber);
-                if (File.Exists(legacy)) File.Delete(legacy);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex,
-                    "channel {ChannelNumber}: failed to remove legacy snapshot file (non-fatal)",
-                    snapshot.ChannelNumber);
-            }
-            return bytesWritten;
+            if (!state.Initialized)
+                _ = TryLoadCore(snapshot.ChannelNumber, state, logLoaded: false);
+            bytesWritten = SaveLocked(snapshot, state);
+            return true;
         }
     }
 
@@ -184,6 +162,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         var state = _channelStates[channelNumber];
         lock (state.Gate)
         {
+            state.SaveGeneration = unchecked(state.SaveGeneration + 1);
             int removed = 0;
             for (int i = 0; i < _generations; i++)
             {
@@ -204,6 +183,69 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
             }
             return removed;
         }
+    }
+
+    private long SaveLocked(
+        ChannelStateSnapshot snapshot,
+        ChannelPersistenceState state)
+    {
+        if (snapshot.LastAppliedSeq < state.HighestSavedSeq)
+        {
+            _logger.LogWarning(
+                "channel {ChannelNumber}: skipped stale snapshot save at LastAppliedSeq={SnapshotSeq}; durable high-water mark is {DurableSeq}",
+                snapshot.ChannelNumber, snapshot.LastAppliedSeq, state.HighestSavedSeq);
+            return 0;
+        }
+
+        int slot = (state.LastUsedSlot + 1) % _generations;
+        var path = SlotPath(snapshot.ChannelNumber, slot);
+        var tmp = TempPath(snapshot.ChannelNumber, slot);
+        long bytesWritten;
+        try
+        {
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                if (_writeFormat == SnapshotFileFormat.Binary)
+                {
+                    var bytes = BinaryChannelStateSnapshotCodec.Encode(snapshot);
+                    fs.Write(bytes, 0, bytes.Length);
+                }
+                else
+                {
+                    JsonSerializer.Serialize(fs, snapshot, JsonOptions);
+                }
+                fs.Flush(flushToDisk: true);
+                bytesWritten = fs.Length;
+            }
+            File.Move(tmp, path, overwrite: true);
+            FsyncDirectory(_dataDir);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: failed to persist snapshot slot {Slot} to {Path}",
+                snapshot.ChannelNumber, slot, path);
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+            throw;
+        }
+
+        state.LastUsedSlot = slot;
+        state.HighestSavedSeq = Math.Max(
+            state.HighestSavedSeq, snapshot.LastAppliedSeq);
+        // Best-effort: drop the legacy single-file once a generational
+        // write succeeded, so future loads stop considering it.
+        try
+        {
+            var legacy = LegacyPath(snapshot.ChannelNumber);
+            if (File.Exists(legacy)) File.Delete(legacy);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "channel {ChannelNumber}: failed to remove legacy snapshot file (non-fatal)",
+                snapshot.ChannelNumber);
+        }
+        return bytesWritten;
     }
 
     private static int TryDelete(string path)

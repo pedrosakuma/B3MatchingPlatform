@@ -173,10 +173,18 @@ public sealed partial class FixpSession
         if (SessionId == 0) return true;
         try
         {
+            long outboundMsgSeqNum = Volatile.Read(ref _msgSeqNum);
+            if ((ulong)outboundMsgSeqNum > uint.MaxValue)
+            {
+                _logger.LogCritical(
+                    "fixp session {ConnectionId} sessionId={SessionId} refused to persist invalid outbound MsgSeqNum={OutboundMsgSeqNum}",
+                    ConnectionId, SessionId, outboundMsgSeqNum);
+                return false;
+            }
             var snapshot = new B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot(
                 SessionId: SessionId,
                 SessionVerId: SessionVerId,
-                OutboundMsgSeqNum: (uint)Volatile.Read(ref _msgSeqNum),
+                OutboundMsgSeqNum: (uint)outboundMsgSeqNum,
                 LastIncomingSeqNo: LastIncomingSeqNo,
                 EnteringFirm: EnteringFirm,
                 UpdatedAtNanos: (long)_timeSource.NowNanos());
