@@ -49,7 +49,11 @@ jobs:
           # block every PR); an entrypoint-only file that isn't vendored
           # there also just warns. An actual content mismatch on a shared
           # file is treated the same as a local edit.
-          for f in schemas/*.xml; do
+          # Scoped to files this PR actually touched under schemas/ — PRs
+          # that don't touch schemas/ must not be blocked by pre-existing
+          # drift between the two repos that predates this PR.
+          for f in $changed; do
+            case "$f" in schemas/*.xml) ;; *) continue ;; esac
             name="$(basename "$f")"
             url="https://raw.githubusercontent.com/pedrosakuma/SbeB3UmdfConsumer/main/schemas/$name"
             if remote_sha="$(curl -fsSL --connect-timeout 5 --max-time 15 "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
