@@ -428,7 +428,7 @@ as ADRs are written.
 
 ## 8. Risks and consequences
 
-- **Schema coupling with `SbeB3UmdfConsumer`.** No schema is
+- **Schema coupling with `B3MarketDataPlatform`.** No schema is
   modified — only encoder output. Consumers compatible with UMDF
   v2.2.0 receive the new fields transparently. **Action:** no-op,
   but confirm in the encoder PR that the companion repo's parser

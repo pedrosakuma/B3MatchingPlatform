@@ -568,7 +568,7 @@ umdf_chaos_duplicated_total{channel="1"}  <n>
 umdf_chaos_reordered_total{channel="1"}   <n>
 ```
 
-Recovery scenario (companion `SbeB3UmdfConsumer`):
+Recovery scenario (companion `B3MarketDataPlatform`):
 
 1. Start the host with `dropProbability: 0.01` on a channel of interest.
 2. Drive load with a synthetic trader.

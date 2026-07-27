@@ -2,7 +2,8 @@
 
 Stateful B3 exchange simulator. Inbound: B3 EntryPoint SBE over TCP. Outbound:
 B3 UMDF wire format over UDP multicast, plus SBE ExecutionReports back to the
-TCP client. Companion to the external `SbeB3UmdfConsumer` repo.
+TCP client. Companion to the external `B3MarketDataPlatform` (UMDF
+consumer) and `B3EntryPointClient` (EntryPoint client) repos.
 
 ## Toolchain
 
@@ -70,7 +71,8 @@ Layered projects under `src/` (build order roughly bottom-up):
 1. `B3.EntryPoint.Sbe` / `B3.Umdf.Sbe` — generated SBE bindings from
    `schemas/b3-entrypoint-messages-8.4.2.xml` and
    `schemas/b3-market-data-messages-2.2.0.xml`. Vendored copies; keep in sync
-   with `SbeB3UmdfConsumer` when upgrading.
+   with `B3EntryPointClient` and `B3MarketDataPlatform` respectively when
+   upgrading.
 2. `B3.Umdf.WireEncoder` — stateless byte-level encoders for UMDF MBO / Trade /
    Snapshot frames (V16 schema).
 3. `B3.Exchange.Instruments` — JSON instrument loader.
@@ -115,7 +117,7 @@ Layered projects under `src/` (build order roughly bottom-up):
   per-session firm assignment is not implemented.
 - **Schemas are vendored.** Do not hand-edit files under `schemas/`; regenerate
   the SBE bindings in `B3.*.Sbe` when upgrading and mirror the change in
-  `SbeB3UmdfConsumer`.
+  `B3MarketDataPlatform` (UMDF) / `B3EntryPointClient` (EntryPoint).
 
 ## Configuration
 

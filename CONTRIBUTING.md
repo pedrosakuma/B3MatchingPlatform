@@ -107,5 +107,6 @@ Both must pass before merge.
 
 Do not hand-edit files under `schemas/`. When upgrading B3 EntryPoint
 or UMDF, regenerate the SBE bindings in `B3.*.Sbe` and mirror the
-change in the companion `SbeB3UmdfConsumer` repo. The two repos must
-agree on the schema version.
+change in the companion repo (`B3MarketDataPlatform` for UMDF,
+`B3EntryPointClient` for EntryPoint). The repos must agree on the
+schema version.

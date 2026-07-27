@@ -144,7 +144,8 @@ EntryPoint TCP listener (default port 9876).
 
 `schemas/b3-market-data-messages-2.2.0.xml` and
 `schemas/b3-entrypoint-messages-8.4.2.xml` are vendored copies of the
-official B3 SBE schemas. The same files exist in `SbeB3UmdfConsumer`; keep
+official B3 SBE schemas. The same files exist in `B3MarketDataPlatform`
+(market-data schema) and `B3EntryPointClient` (entrypoint schema); keep
 them in sync when upgrading.
 
 ### Inbound EntryPoint compatibility matrix

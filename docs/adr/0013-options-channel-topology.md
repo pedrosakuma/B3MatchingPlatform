@@ -18,9 +18,9 @@
 
 Real B3 publishes equity options on a UMDF channel distinct from
 cash equities and from derivatives. The simulator must reflect that
-topology so consumers (e.g. `B3MarketDataPlatform`, the
-`SbeB3UmdfConsumer` companion repo) can validate per-group ring
-and cross-group fan-in against a shape that matches production.
+topology so consumers (e.g. the `B3MarketDataPlatform` companion repo)
+can validate per-group ring and cross-group fan-in against a shape
+that matches production.
 
 Two designs were considered while drafting RFC 0002:
 
