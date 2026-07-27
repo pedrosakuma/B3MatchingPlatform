@@ -118,6 +118,8 @@ dependency). Key counters / gauges:
 | `exch_session_cancel_on_disconnect_fired_total` | counter | CoD timer fired and a session-scoped mass-cancel was enqueued (issue #54 / GAP-18). |
 | `exch_throttle_accepted_total` | counter | Inbound app messages allowed through the per-session sliding-window throttle (#56 / GAP-20). |
 | `exch_throttle_rejected_total` | counter | Inbound app messages rejected with `BusinessMessageReject("Throttle limit exceeded")`. |
+| `open_orders_per_firm` | gauge | Host-wide simultaneously open orders by entering firm, summed across channels. |
+| `open_order_limit_rejected_total` | counter | Resting-capable new-order requests rejected after the firm reached `maxOpenOrdersPerFirm`. |
 | `exch_session_state` | gauge | `0`=Idle, `1`=Negotiated, `2`=Established, `3`=Suspended, `4`=Terminated. |
 | `exch_session_attached` | gauge | `1` while a TCP transport is attached, `0` while Suspended. |
 
@@ -282,13 +284,13 @@ Also calibrate `maxOpenOrdersPerFirm` for MM-heavy hosts. The knob is defined
 once in `HostConfig.MaxOpenOrdersPerFirm`
 (`src/B3.Exchange.Host/HostConfig.cs:22`) and defaults to `100_000`; GAP-21a
 records the current behavior in
-[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md). Today the
-host copies that value into each `ChannelDispatcher`, so enforcement is **per
-firm, per channel/dispatcher** — not per session, and not a single host-wide
-aggregate cap. On multi-firm deployments, make sure the value is high enough
-for the resting quote count you expect on each busy options channel, or bursts
-of new option quotes can devolve into `OrdRejReason=3 (OrderExceedsLimit)`
-storms.
+[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md).
+Enforcement is **per firm across the entire host**, not per session or per
+channel. Resting-capable orders reserve capacity atomically before engine
+admission; IOC/FOK orders bypass the cap because they cannot remain open.
+Watch `open_orders_per_firm` and `open_order_limit_rejected_total` and leave
+headroom for quote bursts; breaches produce
+`OrdRejReason=3 (OrderExceedsLimit)`.
 
 What the venue does **not** do for MMs is just as important. Per ADR 0012 and
 RFC 0002 §2.3, the simulator does not enforce market-maker obligations such as
@@ -755,15 +757,31 @@ Write-Ahead Log between snapshots so recovery is nearly RPO-zero.
 2. The dispatcher applies the snapshot, then if a WAL exists it
    replays every record whose sequence number is **greater than**
    `ChannelStateSnapshot.LastAppliedSeq` — so commands that landed
-   between the last snapshot and an unclean shutdown are reapplied.
+   between the last snapshot and an unclean shutdown are reapplied. A missing
+   or genuinely empty WAL is valid; any WAL open/read failure aborts startup
+   before a new snapshot is saved or a reset is published.
 3. Orphaned `OrderOwnerSnapshot` entries (sessionId not in the
    firm/session registry) are handled per
    `persistence.orphanSessionPolicy` — `drop` (default) increments
    `exch_owner_orphans_dropped_total`; `reject` fails the channel
    closed.
-4. The first outbound packet is stamped with `SequenceNumber+1`
-   under the previous `SequenceVersion`. Consumers that miss the
-   gap recover via the snapshot multicast feed.
+4. After successful restore + replay, the dispatcher increments the
+   incremental `SequenceVersion`, resets `SequenceNumber` to 0, and
+   synchronously persists that full authoritative state. This save bypasses
+   `asyncWriter`: the new epoch must be durable before it can be published.
+5. Only after the save succeeds, the dispatcher publishes
+   `ChannelReset_11` as incremental packet sequence 1. The matching books,
+   stops, phases, counters, and ownership registry are not cleared.
+6. Snapshot headers published afterward carry the same incremental epoch in
+   `LastSequenceVersion`; consumers rebuild the preserved book from the
+   snapshot feed. The TCP listener is opened only after this transition.
+
+If the process dies after step 4 but before step 5, the next startup loads the
+prepared version and increments again. A version may therefore be skipped, but
+an already-prepared or already-published version is never reused.
+`SequenceVersion=0` is reserved as the SBE null value. The finite valid epoch
+space ends at `65535`; startup and operator bumps fail before mutating state,
+persisting, or publishing if advancing would wrap to 0.
 
 ### 7.2 Admin endpoints
 

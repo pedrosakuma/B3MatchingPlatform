@@ -262,7 +262,9 @@ public class CaptureRestorePropertyTests
     {
         if (a.NextOrderId != b.NextOrderId) return false;
         if (a.NextTradeId != b.NextTradeId) return false;
-        if (a.RptSeq != b.RptSeq) return false;
+        if (!SeqEqual(a.RptSeqBySecurity, b.RptSeqBySecurity,
+                (x, y) => x.SecurityId == y.SecurityId && x.RptSeq == y.RptSeq))
+            return false;
         if (!SeqEqual(a.Phases, b.Phases, (x, y) => x.SecurityId == y.SecurityId && x.Phase == y.Phase))
             return false;
         if (!SeqEqual(a.Books, b.Books, BookEqual)) return false;

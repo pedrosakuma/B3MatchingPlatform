@@ -75,6 +75,13 @@ internal sealed class WalDurabilityCoordinator : IDisposable
             return;
         }
         _fsyncSignal.Set();
+        using var cancellationRegistration = cancellationToken.Register(
+            static state =>
+            {
+                var gate = (object)state!;
+                lock (gate) Monitor.PulseAll(gate);
+            },
+            _durabilityLock);
         lock (_durabilityLock)
         {
             while (Interlocked.Read(ref _durableSeq) < seq)

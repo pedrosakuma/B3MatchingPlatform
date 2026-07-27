@@ -68,6 +68,16 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     private readonly object _outboundLock = new();
     /// <summary>
+    /// Guards business admission while a logical session is negotiating,
+    /// reattaching, being taken over, or recovering after restart. No routed
+    /// business write may allocate a sequence number or enter the retransmit
+    /// journal until its EstablishAck has been enqueued. Access only while
+    /// holding <see cref="_outboundLock"/>.
+    /// </summary>
+    private bool _transportReadyForBusiness = true;
+    private TaskCompletionSource<bool> _businessAdmissionCompletion = NewAdmissionCompletion();
+    private int _businessAdmissionState;
+    /// <summary>
     /// Per-session retransmission ring buffer (issue #46, spec §4.5.6).
     /// Holds copies of the wire frames for ExecutionReport_* and
     /// BusinessMessageReject — the buffered business templates that
@@ -105,8 +115,13 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// claimed).</summary>
     private uint _claimedSessionId;
     private long _msgSeqNum;
+    private int _outboundSequenceExhaustionHandled;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    private long _attachmentGeneration = 1;
+    private long _reattachReservation;
+    private int _closeRequested;
+    private int _takeOverCommitFence;
     /// <summary>De-dup CAS guard for <c>SuspendLocked</c>. Distinct from
     /// <c>_isAttached</c> so that the public <c>IsAttached</c> flag can stay
     /// true throughout teardown + state transition and only flip to false
@@ -152,6 +167,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// successful <see cref="SessionClaimRegistry.TryRestoreTakeOver"/>.
     /// </summary>
     private readonly Action<FixpSession>? _onTakeOverRollback;
+    private readonly Action<uint>? _onPersistedStateClaimed;
+    private readonly B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? _pendingNegotiateState;
+    private bool _pendingNegotiateStateApplied;
+    private readonly uint _acceptedSessionId;
+    private readonly uint _acceptedEnteringFirm;
+    private readonly SessionRegistry? _sessionRegistry;
 
     public long ConnectionId { get; }
 
@@ -214,12 +235,29 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Called from both the legacy and credentials-based Negotiate paths.
     /// Returns the old identity so the caller can roll back if needed.
     /// </summary>
-    private ContractsSessionId UpdateIdentityAfterNegotiate(uint fixpSessionId)
+    private ContractsSessionId UpdateIdentityAfterNegotiate(
+        uint fixpSessionId,
+        bool replaceRetired,
+        out bool updated)
     {
         var oldIdentity = Identity;
         var newIdentity = new ContractsSessionId(fixpSessionId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         Identity = newIdentity;
-        _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+        if (_sessionRegistry is not null)
+        {
+            updated = _sessionRegistry.TryUpdateIdentity(
+                this,
+                oldIdentity,
+                newIdentity,
+                _claims,
+                fixpSessionId,
+                replaceRetired);
+        }
+        else
+        {
+            _onIdentityChanged?.Invoke(this, oldIdentity, newIdentity);
+            updated = true;
+        }
         return oldIdentity;
     }
 
@@ -232,7 +270,10 @@ public sealed partial class FixpSession : IAsyncDisposable
     {
         var current = Identity;
         Identity = oldIdentity;
-        _onIdentityChanged?.Invoke(this, current, oldIdentity);
+        if (_sessionRegistry is not null)
+            _sessionRegistry.UpdateIdentity(this, current, oldIdentity);
+        else
+            _onIdentityChanged?.Invoke(this, current, oldIdentity);
     }
 
     public bool IsOpen => Volatile.Read(ref _isOpen) == 1 && _transport.IsOpen;
@@ -264,6 +305,10 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// <see cref="IsOpen"/>, which also goes false on terminal Close.
     /// </summary>
     public bool IsAttached => Volatile.Read(ref _isAttached) == 1;
+
+    internal readonly record struct AttachmentSnapshot(
+        FixpState State,
+        long Generation);
 
     /// <summary>
     /// Current FIXP lifecycle state. Mutated only via <see cref="ApplyTransition"/>,
@@ -335,6 +380,14 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Diagnostic only.</summary>
     public int RetxBufferCapacity => _retxBuffer.Capacity;
 
+    internal int BusinessAdmissionState =>
+        Volatile.Read(ref _businessAdmissionState);
+
+    internal int DeferredBusinessWriteCapacity => _sendQueueCapacity;
+
+    internal Task<bool> BusinessAdmissionCompletion =>
+        Volatile.Read(ref _businessAdmissionCompletion).Task;
+
     /// <summary>Last allocated outbound MsgSeqNum (the value the next
     /// emitted business frame's <c>NextMsgSeqNum()</c> call will return
     /// is <c>OutboundSeq + 1</c>). Diagnostic only.</summary>
@@ -354,6 +407,13 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// providers (e.g. <c>/sessions</c>) so suspended sessions remain
     /// observable. Diagnostic only.</summary>
     public bool IsRegistered => Volatile.Read(ref _isOpen) == 1;
+
+    internal bool IsLiveTakeOverCandidate =>
+        Volatile.Read(ref _closeRequested) == 0
+        && Volatile.Read(ref _isOpen) == 1
+        && Volatile.Read(ref _isAttached) == 1
+        && _transport.IsOpen
+        && State == FixpState.Negotiated;
 
     /// <summary>Stable handle for the currently-attached TCP transport,
     /// or <c>null</c> when the session is Suspended (no attached
@@ -379,11 +439,16 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
         bool resumeAsNegotiated = false,
+        bool deferPersistedStateUntilNegotiate = false,
         int? persistedMaxOrderRatePerSecond = null,
         Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null,
-        Action<FixpSession>? onTakeOverRollback = null)
+        Action<FixpSession>? onTakeOverRollback = null,
+        Action<uint>? onPersistedStateClaimed = null,
+        SessionRegistry? sessionRegistry = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
+        _acceptedEnteringFirm = enteringFirm;
+        _acceptedSessionId = sessionId;
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
@@ -405,17 +470,29 @@ public sealed partial class FixpSession : IAsyncDisposable
         _options.Validate();
         _onIdentityChanged = onIdentityChanged;
         _onTakeOverRollback = onTakeOverRollback;
+        _onPersistedStateClaimed = onPersistedStateClaimed;
+        _sessionRegistry = sessionRegistry;
         if (persistedMaxOrderRatePerSecond is < 0)
             throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
+        _pendingNegotiateState = deferPersistedStateUntilNegotiate
+            ? persistedState
+            : null;
+        bool businessAdmissionInitiallyOpen = sessionClaims is null
+            && !resumeAsNegotiated
+            && !deferPersistedStateUntilNegotiate;
+        _transportReadyForBusiness = businessAdmissionInitiallyOpen;
+        _businessAdmissionState = businessAdmissionInitiallyOpen ? 1 : 0;
+        if (businessAdmissionInitiallyOpen)
+            _businessAdmissionCompletion.TrySetResult(true);
         // Issue #405 rehydration: when a state snapshot survives a
         // host restart, seed identity (SessionId / SessionVerId /
         // EnteringFirm) and seq counters BEFORE wiring the buffer
         // callbacks, so the very first journal.Append / state.Save
         // sees the resumed identity rather than the
         // identityFactory-supplied placeholder.
-        if (persistedState is { } state)
+        if (persistedState is { } state && !deferPersistedStateUntilNegotiate)
         {
             SessionId = state.SessionId;
             SessionVerId = state.SessionVerId;
@@ -439,11 +516,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             // incoming Establish event lands as (Negotiated, Establish)
             // → Established. Without this, a peer that legitimately
             // skips Negotiate after a host crash (spec §1.5 RECOVERABLE
-            // serverFlow) would be rejected as UNNEGOTIATED. Negotiate-
-            // shaped resumes (peer abandons old session for a fresh
-            // SessionVerId) keep the default Idle so the normal
-            // handshake gate fires and SeedLastVersion can enforce
-            // monotonicity against the persisted version.
+            // serverFlow) would be rejected as UNNEGOTIATED.
             if (resumeAsNegotiated)
             {
                 State = FixpState.Negotiated;
@@ -476,9 +549,11 @@ public sealed partial class FixpSession : IAsyncDisposable
             sessionId: () => SessionId,
             sessionVerId: () => SessionVerId,
             nextMsgSeqNum: NextMsgSeqNum,
+            rollbackMsgSeqNum: RollbackMsgSeqNum,
             transport: () => _transport!,
             retxBuffer: _retxBuffer,
             outboundLock: _outboundLock,
+            canEnqueueBusiness: () => _transportReadyForBusiness,
             timeSource: _timeSource,
             // Use IsRegistered (not IsOpen) so that passive ERs delivered while
             // the session is Suspended (transport down, but session-state alive)
@@ -487,7 +562,11 @@ public sealed partial class FixpSession : IAsyncDisposable
             // fails when the transport is dead; the buffered frame is replayed
             // on a subsequent Establish + RetransmitRequest. Issue #217 / L4.
             isOpen: () => IsRegistered,
-            close: Close);
+            close: Close,
+            onCancelCommitFailure: (ex, seq) =>
+                _logger.LogError(ex,
+                    "fixp session {ConnectionId} sessionId={SessionId} failed to commit passive ExecutionReport_Cancel seq={Sequence}; returning NotCommitted so the solicited mass-cancel barrier can publish UMDF and emit SystemBusy",
+                    ConnectionId, SessionId, seq));
         _retransmitController = new FixpRetransmitController(
             sessionId: () => SessionId,
             transport: () => _transport!,
@@ -495,7 +574,8 @@ public sealed partial class FixpSession : IAsyncDisposable
             outboundLock: _outboundLock,
             sendQueueCapacity: _sendQueueCapacity,
             isOpen: () => IsOpen,
-            peekNextMsgSeqNum: PeekNextMsgSeqNum,
+            tryPeekNextMsgSeqNum: TryPeekNextMsgSeqNum,
+            onSequenceExhausted: HandleOutboundSequenceExhausted,
             applyTransition: ApplyTransition,
             getState: () => State,
             confirmPeerAck: ack => _outboundJournal?.ConfirmPeerAck(SessionId, ack),
@@ -531,6 +611,20 @@ public sealed partial class FixpSession : IAsyncDisposable
                 // accept a duplicate session.
                 State = FixpState.Idle;
                 _claimedSessionId = 0;
+                SessionId = _acceptedSessionId;
+                SessionVerId = 0;
+                EnteringFirm = _acceptedEnteringFirm;
+                LastIncomingSeqNo = 0;
+                Volatile.Write(ref _msgSeqNum, 0);
+                Identity = _acceptedSessionId != 0
+                    ? new ContractsSessionId(_acceptedSessionId.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture))
+                    : new ContractsSessionId("pending-" + connectionId.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                _onPersistedStateClaimed?.Invoke(resumed.SessionId);
             }
         }
         // The transport's onClose callback funnels back through our
@@ -577,12 +671,279 @@ public sealed partial class FixpSession : IAsyncDisposable
             : null;
     }
 
-    private uint NextMsgSeqNum() => (uint)Interlocked.Increment(ref _msgSeqNum);
+    private uint NextMsgSeqNum()
+    {
+        while (true)
+        {
+            long current = Volatile.Read(ref _msgSeqNum);
+            if ((ulong)current >= uint.MaxValue)
+                throw new InvalidOperationException(
+                    "outbound FIXP MsgSeqNum exhausted");
+            long next = current + 1;
+            if (Interlocked.CompareExchange(
+                    ref _msgSeqNum,
+                    next,
+                    current) == current)
+            {
+                return (uint)next;
+            }
+        }
+    }
 
-    /// <summary>Peek the value <see cref="NextMsgSeqNum"/> would return on
-    /// its next call without consuming a sequence number. Used by FIXP
-    /// <c>Sequence</c> frames, which announce but do not consume.</summary>
-    private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
+    private void RollbackMsgSeqNum(uint allocated)
+    {
+        if ((uint)Volatile.Read(ref _msgSeqNum) != allocated)
+            throw new InvalidOperationException(
+                $"cannot roll back outbound sequence {allocated}; allocator advanced concurrently");
+        Volatile.Write(ref _msgSeqNum, allocated - 1u);
+    }
+
+    private bool TryApplyPendingNegotiateState(uint sessionId)
+    {
+        if (_pendingNegotiateState is not { } state)
+            return true;
+        if (state.SessionId != sessionId)
+            return false;
+
+        try
+        {
+            uint resumedSeq = state.OutboundMsgSeqNum;
+            if (_outboundJournal is not null)
+                resumedSeq = Math.Max(resumedSeq, _outboundJournal.MaxSeq(sessionId));
+            LastIncomingSeqNo = state.LastIncomingSeqNo;
+            Volatile.Write(ref _msgSeqNum, resumedSeq);
+            _pendingNegotiateStateApplied = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to reconcile pending persisted state for sessionId={SessionId}",
+                ConnectionId, sessionId);
+            return false;
+        }
+    }
+
+    private void RollbackPendingNegotiateState()
+    {
+        if (!_pendingNegotiateStateApplied)
+            return;
+        LastIncomingSeqNo = 0;
+        Volatile.Write(ref _msgSeqNum, 0);
+        _pendingNegotiateStateApplied = false;
+    }
+
+    /// <summary>
+    /// Peeks the value <see cref="NextMsgSeqNum"/> would return without
+    /// consuming it. Returns <c>null</c> once the uint32 sequence space is
+    /// exhausted so control frames never advertise an invalid zero.
+    /// </summary>
+    private uint? TryPeekNextMsgSeqNum()
+    {
+        long current = Volatile.Read(ref _msgSeqNum);
+        return (ulong)current < uint.MaxValue
+            ? (uint)(current + 1)
+            : null;
+    }
+
+    private void ResetBusinessAdmissionLocked()
+    {
+        _transportReadyForBusiness = false;
+        var previous = Interlocked.Exchange(
+            ref _businessAdmissionCompletion,
+            NewAdmissionCompletion());
+        Volatile.Write(ref _businessAdmissionState, 0);
+        previous.TrySetResult(false);
+    }
+
+    private void OpenBusinessAdmissionLocked()
+    {
+        _transportReadyForBusiness = true;
+        Volatile.Write(ref _businessAdmissionState, 1);
+        Volatile.Read(ref _businessAdmissionCompletion).TrySetResult(true);
+    }
+
+    private void AbortBusinessAdmission()
+    {
+        lock (_outboundLock)
+        {
+            _transportReadyForBusiness = false;
+            Volatile.Write(ref _businessAdmissionState, 2);
+            Volatile.Read(ref _businessAdmissionCompletion).TrySetResult(false);
+        }
+    }
+
+    private T ExecuteAdmittedBusinessWrite<T>(Func<T> write, T unavailable)
+    {
+        return ExecuteLogicalSessionExclusive(() =>
+        {
+            lock (_outboundLock)
+            {
+                if (Volatile.Read(ref _businessAdmissionState) != 1)
+                    return unavailable;
+                if (TryPeekNextMsgSeqNum() is null)
+                {
+                    HandleOutboundSequenceExhausted();
+                    return unavailable;
+                }
+                return write();
+            }
+        });
+    }
+
+    private void HandleOutboundSequenceExhausted()
+    {
+        if (Interlocked.Exchange(
+                ref _outboundSequenceExhaustionHandled,
+                1) != 0)
+        {
+            return;
+        }
+
+        _logger.LogCritical(
+            "fixp session {ConnectionId} sessionId={SessionId} exhausted outbound uint32 MsgSeqNum; closing before allocating sequence zero",
+            ConnectionId, SessionId);
+        Close("outbound-msg-seq-exhausted", CloseKind.LocalTerminate);
+    }
+
+    private static TaskCompletionSource<bool> NewAdmissionCompletion() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void ExecuteLogicalSessionExclusive(Action action)
+    {
+        if (_sessionRegistry is null)
+        {
+            action();
+            return;
+        }
+        _sessionRegistry.ExecuteExclusive(this, action);
+    }
+
+    private T ExecuteLogicalSessionExclusive<T>(Func<T> action)
+    {
+        if (_sessionRegistry is null)
+            return action();
+        return _sessionRegistry.ExecuteExclusive(this, action);
+    }
+
+    private void MarkCloseRequested()
+    {
+        Interlocked.CompareExchange(ref _takeOverCommitFence, 1, 0);
+        Volatile.Write(ref _closeRequested, 1);
+    }
+
+    internal bool TrySealTakeOverCandidate()
+    {
+        if (!IsLiveTakeOverCandidate) return false;
+        int state = Interlocked.CompareExchange(ref _takeOverCommitFence, 2, 0);
+        return state is 0 or 2;
+    }
+
+    internal void RollbackTakeOverSeal()
+    {
+        int restoredState = Volatile.Read(ref _closeRequested) == 0 ? 0 : 1;
+        Interlocked.CompareExchange(ref _takeOverCommitFence, restoredState, 2);
+    }
+
+    internal bool TryAdoptOutboundStateForTakeOver(
+        FixpSession previous,
+        Action commit)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(commit);
+        if (!ReferenceEquals(_outboundJournal, previous._outboundJournal))
+            return false;
+
+        var first = ConnectionId < previous.ConnectionId ? _outboundLock : previous._outboundLock;
+        var second = ReferenceEquals(first, _outboundLock) ? previous._outboundLock : _outboundLock;
+        lock (first)
+        {
+            lock (second)
+            {
+                if (!IsLiveTakeOverCandidate || !previous.IsRegistered)
+                    return false;
+                if (!previous._retxBuffer.TryCopyRetainedFramesTo(_retxBuffer))
+                    return false;
+
+                uint maxSeq = Math.Max(
+                    (uint)Volatile.Read(ref _msgSeqNum),
+                    (uint)Volatile.Read(ref previous._msgSeqNum));
+                if (_outboundJournal is not null)
+                {
+                    try
+                    {
+                        maxSeq = Math.Max(maxSeq, _outboundJournal.MaxSeq(SessionId));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "fixp session {ConnectionId} failed to reconcile outbound journal during takeover",
+                            ConnectionId);
+                        return false;
+                    }
+                }
+
+                Volatile.Write(ref _msgSeqNum, maxSeq);
+                // Publish the replacement route only after its replay state is
+                // adopted and its business admission gate is closed. A routed
+                // passive ER or deferred completion that linearizes after the
+                // commit blocks before sequence allocation until EstablishAck.
+                ResetBusinessAdmissionLocked();
+                commit();
+                return true;
+            }
+        }
+    }
+
+    internal bool TryResetOutboundStateForRetiredReplacement(
+        FixpSession previous,
+        uint sessionId)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        if (sessionId == 0
+            || !ReferenceEquals(_outboundJournal, previous._outboundJournal)
+            || !ReferenceEquals(_statePersister, previous._statePersister))
+            return false;
+
+        var first = ConnectionId < previous.ConnectionId ? _outboundLock : previous._outboundLock;
+        var second = ReferenceEquals(first, _outboundLock) ? previous._outboundLock : _outboundLock;
+        lock (first)
+        {
+            lock (second)
+            {
+                if (!IsLiveTakeOverCandidate
+                    || (previous.State != FixpState.Terminated && previous.IsRegistered)
+                    || _retxBuffer.Count != 0)
+                    return false;
+
+                try
+                {
+                    if (_outboundJournal is not null)
+                    {
+                        _outboundJournal.Remove(sessionId);
+                        if (_outboundJournal.MaxSeq(sessionId) != 0)
+                            return false;
+                    }
+                    if (_statePersister is not null)
+                    {
+                        _statePersister.Remove(sessionId);
+                        if (_statePersister.Load(sessionId) is not null)
+                            return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} failed to reset retired session persistence for sessionId={SessionId}",
+                        ConnectionId, sessionId);
+                    return false;
+                }
+
+                Volatile.Write(ref _msgSeqNum, 0);
+                return true;
+            }
+        }
+    }
 
     /// <summary>
     /// Decodes and processes a FIXP <c>RetransmitRequest</c> (template
@@ -602,27 +963,53 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// enqueues all replay clones (each carrying the
     /// <c>PossResend</c> bit), and finally enqueues a <c>Sequence</c>
     /// frame whose <c>nextSeqNo</c> is the next live business seq
-    /// (i.e. <see cref="PeekNextMsgSeqNum"/>). The entire block is
+    /// (i.e. the next available live business sequence). The entire block is
     /// enqueued under <see cref="_outboundLock"/> so live business
     /// writes cannot interleave it on the wire and so the trailing
-    /// Sequence's seq matches what the peer will see next.</para>
+    /// Sequence's seq matches what the peer will see next. If the uint32
+    /// business sequence space is exhausted, the session closes without
+    /// emitting a trailer that advertises zero.</para>
     /// </summary>
     private void ProcessAndEnqueueRetransmitRequest(ReadOnlySpan<byte> fixedBlock)
-        => _retransmitController.ProcessAndEnqueueRetransmitRequest(fixedBlock);
+    {
+        var copy = fixedBlock.ToArray();
+        ExecuteLogicalSessionExclusive(() =>
+            _retransmitController.ProcessAndEnqueueRetransmitRequest(copy));
+    }
 
     public bool WriteExecutionReportNew(in OrderAcceptedEvent e, ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default,
         ulong clOrdIdValue = 0, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportNew(e, receivedTimeNanos, durability, clOrdIdValue, memo);
+    {
+        var report = e;
+        return ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportNew(
+                report, receivedTimeNanos, durability, clOrdIdValue, memo),
+            unavailable: false);
+    }
 
     public bool WriteExecutionReportTrade(in TradeEvent e, bool isAggressor, long ownerOrderId, ulong clOrdIdValue, long leavesQty, long cumQty,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportTrade(e, isAggressor, ownerOrderId, clOrdIdValue, leavesQty, cumQty, durability, memo);
+    {
+        var report = e;
+        return ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportTrade(
+                report, isAggressor, ownerOrderId, clOrdIdValue,
+                leavesQty, cumQty, durability, memo),
+            unavailable: false);
+    }
 
-    public bool WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
+    public OrderedStreamWriteResult WriteExecutionReportCancel(in OrderCanceledEvent e, ulong clOrdIdValue, ulong origClOrdIdValue,
         ulong receivedTimeNanos = ulong.MaxValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportCancel(e, clOrdIdValue, origClOrdIdValue, receivedTimeNanos, durability, memo);
+    {
+        var report = e;
+        return ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportCancel(
+                report, clOrdIdValue, origClOrdIdValue,
+                receivedTimeNanos, durability, memo),
+            OrderedStreamWriteResult.NotCommitted);
+    }
 
     public bool WriteExecutionReportModify(long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue,
         B3.Exchange.Matching.Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq,
@@ -632,38 +1019,58 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Matching.InvestorId? investorId = null,
         B3.Exchange.Matching.OrderType ordType = B3.Exchange.Matching.OrderType.Limit,
         long? protectionPriceMantissa = null)
-        => _outboundEncoder.WriteExecutionReportModify(securityId, orderId, clOrdIdValue, origClOrdIdValue,
-            side, newPriceMantissa, newRemainingQty, transactTimeNanos, rptSeq, receivedTimeNanos, durability, memo, investorId,
-            ordType, protectionPriceMantissa);
+        => ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportModify(
+                securityId, orderId, clOrdIdValue, origClOrdIdValue,
+                side, newPriceMantissa, newRemainingQty, transactTimeNanos,
+                rptSeq, receivedTimeNanos, durability, memo, investorId,
+                ordType, protectionPriceMantissa),
+            unavailable: false);
 
     public bool WriteExecutionReportRestate(in B3.Exchange.Matching.OrderRestatedEvent e, ulong ownerClOrdId,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportRestate(e, ownerClOrdId, durability, memo);
+    {
+        var report = e;
+        return ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportRestate(
+                report, ownerClOrdId, durability, memo),
+            unavailable: false);
+    }
 
     /// <summary>
     /// Encodes and enqueues an <c>OrderMassActionReport</c> (template 702,
     /// spec §4.8 / #GAP-19) acknowledging — or rejecting — an inbound
-    /// <c>OrderMassActionRequest</c>. The report is sent ahead of the
-    /// per-order <c>ExecutionReport_Cancel</c> messages that the engine
-    /// emits asynchronously for the matching resting orders.
+    /// <c>OrderMassActionRequest</c>.
     /// </summary>
-    public bool WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
+    public OrderedStreamWriteResult WriteOrderMassActionReport(ulong clOrdIdValue, byte massActionResponse,
         byte? massActionRejectReason, byte? side, long securityId, ulong transactTimeNanos,
         string? text = null)
-        => _outboundEncoder.WriteOrderMassActionReport(clOrdIdValue, massActionResponse,
-            massActionRejectReason, side, securityId, transactTimeNanos, text);
+        => ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteOrderMassActionReport(
+                clOrdIdValue, massActionResponse, massActionRejectReason,
+                side, securityId, transactTimeNanos, text),
+            OrderedStreamWriteResult.NotCommitted);
 
     public bool WriteExecutionReportReject(in B3.Exchange.Matching.RejectEvent e, ulong clOrdIdValue,
         DurabilityHandle durability = default, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteExecutionReportReject(e, clOrdIdValue, durability, memo);
+    {
+        var report = e;
+        return ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteExecutionReportReject(
+                report, clOrdIdValue, durability, memo),
+            unavailable: false);
+    }
 
     public bool WriteSessionReject(byte terminationCode)
         => _outboundEncoder.WriteSessionReject(terminationCode);
 
-    public bool WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
+    public OrderedStreamWriteResult WriteBusinessMessageReject(byte refMsgType, uint refSeqNum, ulong businessRejectRefId,
         uint businessRejectReason, string? text = null, ReadOnlyMemory<byte> memo = default)
-        => _outboundEncoder.WriteBusinessMessageReject(refMsgType, refSeqNum, businessRejectRefId,
-            businessRejectReason, text, memo);
+        => ExecuteAdmittedBusinessWrite(() =>
+            _outboundEncoder.WriteBusinessMessageReject(
+                refMsgType, refSeqNum, businessRejectRefId,
+                businessRejectReason, text, memo),
+            OrderedStreamWriteResult.NotCommitted);
 
     /// <summary>
     /// Maps engine <see cref="RejectReason"/> to the FIX OrdRejReason wire code

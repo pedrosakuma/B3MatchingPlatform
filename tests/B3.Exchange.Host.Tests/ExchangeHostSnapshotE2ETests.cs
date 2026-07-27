@@ -6,6 +6,7 @@ using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
 using B3.Exchange.TestSupport;
+using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -109,7 +110,7 @@ public class ExchangeHostSnapshotE2ETests
         // and a non-null LastRptSeq (because the matching engine has emitted
         // 2 OrderAccepted incremental events → RptSeq ≥ 2).
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(Petr, (long)(ulong)snapHdr.Data.SecurityID);
         Assert.Equal(2u, snapHdr.Data.TotNumReports);
@@ -117,6 +118,7 @@ public class ExchangeHostSnapshotE2ETests
         Assert.Equal(0u, snapHdr.Data.TotNumOffers);
         Assert.NotNull(snapHdr.Data.LastRptSeq);
         Assert.True(snapHdr.Data.LastRptSeq >= 2u);
+        Assert.Equal((ushort)1, snapHdr.Data.LastSequenceVersion);
 
         // Same packet must contain an Orders_71 frame with NumInGroup == 2.
         int after = frameOff + WireOffsets.SnapHeaderBlockLength;
@@ -178,10 +180,144 @@ public class ExchangeHostSnapshotE2ETests
 
         Assert.True(pkt is not null, "snapshot packet not received");
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(0u, snapHdr.Data.TotNumReports);
         Assert.Null(snapHdr.Data.LastRptSeq); // illiquid per B3 §7.4
+        Assert.Equal((ushort)1, snapHdr.Data.LastSequenceVersion);
+    }
+
+    [Fact]
+    public async Task Restart_PublishesResetThenRecoveredSnapshotThenLiveIncremental()
+    {
+        var dataDir = Path.Combine(AppContext.BaseDirectory,
+            "startup-epoch-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dataDir);
+        try
+        {
+            var instrumentsPath = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
+            var cfg = new HostConfig
+            {
+                Auth = new AuthConfig { RequireFixpHandshake = false },
+                Tcp = new TcpConfig { Listen = "127.0.0.1:0", EnteringFirm = 7 },
+                Channels =
+                {
+                    new ChannelConfig
+                    {
+                        ChannelNumber = 84,
+                        IncrementalGroup = "239.255.42.84",
+                        IncrementalPort = 30188,
+                        Ttl = 0,
+                        InstrumentsFile = instrumentsPath,
+                        Persistence = new PersistenceConfig
+                        {
+                            DataDir = dataDir,
+                            Wal = new WalConfig { Enabled = true, FsyncPerWrite = false },
+                        },
+                        Snapshot = new SnapshotChannelConfig
+                        {
+                            Group = "239.255.42.85",
+                            Port = 30189,
+                            Ttl = 0,
+                            CadenceMs = 60_000,
+                        },
+                    },
+                },
+            };
+
+            var initialIncremental = new RecordingPacketSink();
+            await using (var initialHost = new ExchangeHost(
+                cfg, packetSinkFactory: _ => initialIncremental))
+            {
+                await initialHost.StartAsync();
+                using var client = new TcpClient();
+                await client.ConnectAsync(
+                    initialHost.TcpEndpoint!.Address, initialHost.TcpEndpoint.Port);
+                var stream = client.GetStream();
+
+                await stream.WriteAsync(BuildSimpleNewOrder(
+                    2001, Petr, '1', '2', '0', 100, 12_0000));
+                await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+                await stream.WriteAsync(BuildSimpleNewOrder(
+                    2002, Petr, '2', '2', '0', 200, 13_0000));
+                await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+            }
+
+            var recoveredIncremental = new RecordingPacketSink();
+            var recoveredSnapshots = new RecordingPacketSink();
+            await using var recoveredHost = new ExchangeHost(
+                cfg,
+                packetSinkFactory: _ => recoveredIncremental,
+                snapshotSinkFactory: (_, _) => recoveredSnapshots);
+            await recoveredHost.StartAsync();
+
+            byte[] reset;
+            lock (recoveredIncremental.Packets)
+            {
+                reset = Assert.Single(recoveredIncremental.Packets);
+            }
+            Assert.Equal((ushort)2, MemoryMarshal.Read<ushort>(
+                reset.AsSpan(WireOffsets.PacketHeaderSequenceVersionOffset, 2)));
+            Assert.Equal(1u, MemoryMarshal.Read<uint>(
+                reset.AsSpan(WireOffsets.PacketHeaderSequenceNumberOffset, 4)));
+            int resetSbeHeader = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize;
+            Assert.Equal((ushort)11,
+                MemoryMarshal.Read<ushort>(reset.AsSpan(resetSbeHeader + 2, 2)));
+
+            Assert.True(recoveredHost.Dispatchers[0].EnqueueSnapshotTick());
+            byte[]? snapshotPacket = null;
+            var snapshotDeadline = DateTime.UtcNow.AddSeconds(5);
+            while (snapshotPacket is null && DateTime.UtcNow < snapshotDeadline)
+            {
+                lock (recoveredSnapshots.Packets)
+                {
+                    if (recoveredSnapshots.Packets.Count > 0)
+                        snapshotPacket = (byte[])recoveredSnapshots.Packets[0].Clone();
+                }
+                if (snapshotPacket is null) await Task.Delay(10);
+            }
+            Assert.NotNull(snapshotPacket);
+            int snapshotHeaderOffset = WireOffsets.PacketHeaderSize
+                + WireOffsets.FramingHeaderSize
+                + WireOffsets.SbeMessageHeaderSize;
+            Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+                snapshotPacket.AsSpan(
+                    snapshotHeaderOffset, WireOffsets.SnapHeaderBlockLength),
+                out var snapshotHeader));
+            Assert.Equal(2u, snapshotHeader.Data.TotNumReports);
+            Assert.Equal(1u, snapshotHeader.Data.TotNumBids);
+            Assert.Equal(1u, snapshotHeader.Data.TotNumOffers);
+            Assert.Equal((ushort)2, snapshotHeader.Data.LastSequenceVersion);
+
+            using var liveClient = new TcpClient();
+            await liveClient.ConnectAsync(
+                recoveredHost.TcpEndpoint!.Address, recoveredHost.TcpEndpoint.Port);
+            var liveStream = liveClient.GetStream();
+            await liveStream.WriteAsync(BuildSimpleNewOrder(
+                2003, Petr, '1', '2', '0', 100, 11_0000));
+            await ReadFrameAsync(liveStream, TimeSpan.FromSeconds(5));
+
+            byte[]? livePacket = null;
+            var liveDeadline = DateTime.UtcNow.AddSeconds(5);
+            while (livePacket is null && DateTime.UtcNow < liveDeadline)
+            {
+                lock (recoveredIncremental.Packets)
+                {
+                    if (recoveredIncremental.Packets.Count >= 2)
+                        livePacket = (byte[])recoveredIncremental.Packets[1].Clone();
+                }
+                if (livePacket is null) await Task.Delay(10);
+            }
+            Assert.NotNull(livePacket);
+            Assert.Equal((ushort)2, MemoryMarshal.Read<ushort>(
+                livePacket.AsSpan(WireOffsets.PacketHeaderSequenceVersionOffset, 2)));
+            Assert.Equal(2u, MemoryMarshal.Read<uint>(
+                livePacket.AsSpan(WireOffsets.PacketHeaderSequenceNumberOffset, 4)));
+        }
+        finally
+        {
+            TempDirs.TryDelete(dataDir);
+        }
     }
 
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,

@@ -81,7 +81,14 @@ public interface IPostTradeOrchestrator
     /// <param name="tradeDateDaysSinceEpoch">Pre-computed days-since-Unix
     /// for the rejected attempt's audit row (echoed back into the
     /// <see cref="RejectAttemptRecord"/>); avoids re-deriving it here.</param>
-    BustProcessOutcome ProcessBust(in BustRequest request, byte channel, int tradeDateDaysSinceEpoch);
+    /// <param name="beforeAcceptCommit">Optional fail-closed precommit hook,
+    /// invoked with the matched SecurityID after validation but before audit
+    /// or dedup state is mutated.</param>
+    BustProcessOutcome ProcessBust(
+        in BustRequest request,
+        byte channel,
+        int tradeDateDaysSinceEpoch,
+        Action<long>? beforeAcceptCommit = null);
 
     /// <summary>
     /// Republishes <c>amendments.csv</c> for the target day after the

@@ -176,6 +176,14 @@ Exposes:
     dispatcher records a heartbeat on every loop wakeup (1 s timer +
     every processed command), so a stuck or dead loop is detected within
     `livenessStaleMs + ~1s`.
+* `maxOpenOrdersPerFirm` — host-wide maximum number of simultaneously open
+  resting or parked-stop orders for one `EnteringFirm`, aggregated across all
+  channels. Default `100000` for backward compatibility. Admission reserves
+  capacity atomically before a resting-capable new order reaches the engine;
+  IOC/FOK orders do not consume capacity. Breaches produce
+  `ExecutionReport_Reject(OrdRejReason=3 OrderExceedsLimit)`. Restored books
+  are always rebuilt completely even if an operator lowers the limit below the
+  recovered count; only subsequent resting-capable orders are rejected.
 * `channels[]` — one matching engine + one outbound multicast group per
   UMDF channel.
 * `channels[].selfTradePrevention` — per-channel self-trade prevention policy
@@ -222,16 +230,42 @@ Exposes:
   `maxEntriesPerChunk` caps the per-`Orders_71` group size (defaults to
   30, ~1.3 KB per chunk → fits a standard 1500-byte MTU). Omit the
   `snapshot` block to publish only the incremental feed (no bootstrap for
-  mid-session consumers).
+  mid-session consumers). Books larger than one packet are capacity-chunked
+  across consecutive snapshot packets; the first packet's Header_30 total
+  counts, `LastRptSeq`, and `LastSequenceVersion` describe the complete
+  refresh, and every packet shares one sending timestamp.
 * `persistence` *(optional, per channel — issue #260 + roadmap #262–#272)*
   — enables order book + counter persistence so a restart resumes with
-  the live working book, RptSeq, order/trade-id allocators, untriggered
+  the live working book, per-SecurityID RptSeq counters, order/trade-id allocators, untriggered
   stops, and resting-order ownership intact. The dispatcher captures a
   snapshot on the loop thread after every command flush (subject to
   `throttle`), serializes it (synchronously by default, or off-loop
   when `asyncWriter=true`) and writes it atomically into one of N
   rolling generation slots. Optional Write-Ahead Log records every
   state-mutating command between snapshots, replayed on cold start.
+  When a snapshot or WAL state is recovered, startup preserves that complete
+  authoritative state but begins a new incremental UMDF epoch: it increments
+  `SequenceVersion`, resets `SequenceNumber` to 0, synchronously persists the
+  transition, then emits `ChannelReset_11` as packet sequence 1. The TCP
+  listener opens only afterward. Snapshot headers identify the same
+  incremental epoch through `LastSequenceVersion`, allowing consumers to
+  rebuild the preserved book without synthesizing replacement orders. Each
+  header carries its target SecurityID's persisted watermark. Snapshot schema
+  v7 replaced the legacy channel-global `RptSeq` scalar with per-security
+  counters. When loading a v6-or-older snapshot, the legacy high-water mark
+  is assigned to every SecurityID present in that snapshot. Any WAL tail is
+  first replayed with the legacy global allocator, then its exact final
+  high-water mark is assigned to every security before per-security allocation
+  begins. This conservative mapping prevents sequence reuse; the mandatory
+  startup epoch reset and per-symbol snapshots establish the migrated baselines
+  before live traffic.
+  A per-security counter never emits 0 (the SBE null sentinel): allocation
+  fails closed at `uint.MaxValue` until an operator channel reset starts a
+  fresh epoch.
+  WAL open/read failures abort startup rather than being treated as an empty
+  log. `SequenceVersion=0` is reserved as the SBE null value; if the restored
+  version is already `65535`, startup fails before persisting or publishing a
+  reset instead of wrapping.
   * `dataDir` — directory holding the per-channel snapshot file(s) and
     optional WAL. The host creates it if missing. Mount a durable
     volume here in container deployments (e.g. `/var/lib/b3matching`
@@ -405,7 +439,7 @@ healthcheck).
 | `/health/ready`  | 200 once every registered `IReadinessProbe` reports ready; else 503             |
 | `/metrics`       | Prometheus 0.0.4 text exposition (always 200)                                   |
 | `POST /channel/{ch}/snapshot-now`  | Operator command — forces a snapshot publish on the next dispatcher cycle. 202 on enqueue, 404 unknown channel, 503 if the dispatcher's inbound queue is full. |
-| `POST /channel/{ch}/bump-version`  | Operator command — atomically bumps the incremental + snapshot `SequenceVersion`, clears the order book, resets `RptSeq` to 0, and emits a `ChannelReset_11` frame on the incremental channel under the new version. 202 on enqueue, 404 unknown channel, 503 if the queue is full. |
+| `POST /channel/{ch}/bump-version`  | Operator command — atomically bumps the incremental + snapshot `SequenceVersion`, clears the order book, resets every per-SecurityID `RptSeq` counter to 0, and emits a `ChannelReset_11` frame on the incremental channel under the new version. 202 on enqueue, 404 unknown channel, 503 if the queue is full. |
 | `GET /sessions`                    | JSON array of every currently-attached FIXP session (issue #70). |
 | `GET /sessions/{id}`               | JSON object for a single session by `sessionId` (e.g. `conn-2a`). 404 if unknown. |
 | `GET /firms`                       | JSON array of firms declared in `firms[]`. |
@@ -450,8 +484,8 @@ the channel number is unknown, 503 if the queue is full).
 
 `bump-version` is the heart of the channel-reset path:
 
-1. The dispatcher clears every per-instrument book and resets the
-   engine's `RptSeq` counter to 0.
+1. The dispatcher clears every per-instrument book and resets every
+   per-SecurityID `RptSeq` counter to 0.
 2. The incremental `SequenceVersion` is incremented and `SequenceNumber`
    is rebased to 0.
 3. The attached snapshot rotator's `SequenceVersion` is incremented in
@@ -554,8 +588,9 @@ Two distinct multicast streams per channel:
   per-channel rotator publishes a complete snapshot for one instrument per
   tick, round-robining through the channel's instruments. Empty / illiquid
   instruments emit a header-only packet with `LastRptSeq` absent (per B3
-  §7.4). Snapshot packets carry their own `SequenceVersion` / `SequenceNumber`
-  separate from the incremental channel.
+  §7.4). Otherwise `LastRptSeq` is the exact watermark for the snapshot's
+  SecurityID. Snapshot packets carry their own `SequenceVersion` /
+  `SequenceNumber` separate from the incremental channel.
 
 Both streams are compatible with the existing `B3.Umdf.ConsoleApp` consumer
 in this repo.

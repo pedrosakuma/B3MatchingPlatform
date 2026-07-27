@@ -45,7 +45,7 @@ public class ChannelDispatcherOrphanSessionTests
         public bool WriteExecutionReportNew(SessionId s, uint f, ulong c, in OrderAcceptedEvent e, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default) => true;
     }
@@ -53,7 +53,8 @@ public class ChannelDispatcherOrphanSessionTests
     private static ChannelDispatcher BuildDispatcher(
         ChannelMetrics? metrics,
         Func<string, bool>? sessionExists,
-        OrphanSessionPolicy policy)
+        OrphanSessionPolicy policy,
+        FirmOpenOrderTracker? openOrderTracker = null)
     {
         return new ChannelDispatcher(
             channelNumber: 84,
@@ -67,6 +68,8 @@ public class ChannelDispatcherOrphanSessionTests
                 Metrics = metrics,
                 SessionExists = sessionExists,
                 OrphanPolicy = policy,
+                MaxOpenOrdersPerFirm = openOrderTracker?.MaximumPerFirm ?? 100_000,
+                OpenOrderTracker = openOrderTracker,
             });
     }
 
@@ -101,7 +104,7 @@ public class ChannelDispatcherOrphanSessionTests
         var engine = new EngineStateSnapshot(
             NextOrderId: nextId,
             NextTradeId: 1,
-            RptSeq: 0,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(Sec, 0)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: new[] { book });
         return new ChannelStateSnapshot(
@@ -117,9 +120,11 @@ public class ChannelDispatcherOrphanSessionTests
     public void DropPolicy_OrphanOwnerIsSkipped_KnownOwnerIsRegistered()
     {
         var metrics = new ChannelMetrics(84);
+        var openOrders = new FirmOpenOrderTracker(maximumPerFirm: 10);
         var disp = BuildDispatcher(metrics,
             sessionExists: sid => sid == "10101",
-            policy: OrphanSessionPolicy.Drop);
+            policy: OrphanSessionPolicy.Drop,
+            openOrderTracker: openOrders);
         var snap = BuildSnapshotWithOwners("10101", "99999");
 
         disp.RestoreChannelState(snap);
@@ -128,6 +133,7 @@ public class ChannelDispatcherOrphanSessionTests
         // session's owner is in the routing map.
         Assert.Equal(2, snap.Engine.Books.Single().Orders.Count);
         Assert.Equal(1L, metrics.OwnerOrphansDropped);
+        Assert.Equal(2, openOrders.Count(100));
     }
 
     [Fact]

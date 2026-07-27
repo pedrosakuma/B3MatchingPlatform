@@ -80,10 +80,10 @@ public class CrossOrderSemanticsTests
             return true;
         }
 
-        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId, long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default)
         {
             if (_sessions.TryGetValue(ownerSession, out var s)) s.Cancels.Add(e);
-            return true;
+            return OrderedStreamWriteResult.CommittedAndEnqueued;
         }
 
         public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId, ulong clOrdIdValue, ulong origClOrdIdValue, Side side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos, uint rptSeq, ulong receivedTimeNanos = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
@@ -454,7 +454,7 @@ public class CrossOrderSemanticsTests
     }
 
     [Fact]
-    public void MaxOpenOrdersPerFirm_CrossAtCapMinusOneIsRejectedForWorstCaseResidual()
+    public void MaxOpenOrdersPerFirm_CrossAtCapMinusOneUsesSingleResidualSlot()
     {
         var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 2);
         var s = new FakeSession(outbound) { EnteringFirm = 7 };
@@ -467,7 +467,38 @@ public class CrossOrderSemanticsTests
         disp.EnqueueCross(cross, s.Id, s.EnteringFirm);
         DrainInbound(disp);
 
-        Assert.Single(s.News);
+        Assert.Equal(2, s.News.Count);
+        Assert.Empty(s.Rejects);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_CrossWithNoExistingOrdersNeedsOnlyOneSlot()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var s = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        var cross = new CrossOrderCommand(Buy(100, 10m, 10UL), Sell(100, 10m, 11UL), 10UL, 11UL, CrossId: 999UL);
+        disp.EnqueueCross(cross, s.Id, s.EnteringFirm);
+        DrainInbound(disp);
+
+        Assert.Empty(s.Rejects);
+        Assert.Equal(2, s.Trades.Count);
+    }
+
+    [Fact]
+    public void MaxOpenOrdersPerFirm_CrossAtCapIsRejected()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var s = new FakeSession(outbound) { EnteringFirm = 7 };
+
+        disp.EnqueueNewOrder(new NewOrderCommand("OPEN", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 1_000UL),
+            s.Id, s.EnteringFirm, clOrdIdValue: 1UL);
+        DrainInbound(disp);
+
+        var cross = new CrossOrderCommand(Buy(200, 11m, 10UL), Sell(100, 10m, 11UL), 10UL, 11UL, CrossId: 999UL);
+        disp.EnqueueCross(cross, s.Id, s.EnteringFirm);
+        DrainInbound(disp);
+
         Assert.Equal(2, s.Rejects.Count);
         Assert.All(s.Rejects, r => Assert.Equal(RejectReason.OrderExceedsLimit, r.Reason));
         Assert.Equal(new[] { 10UL, 11UL }, s.RejectClOrdIds);

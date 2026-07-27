@@ -1,5 +1,6 @@
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
+using Microsoft.Extensions.Logging;
 using RejectEvent = B3.Exchange.Matching.RejectEvent;
 
 namespace B3.Exchange.Core;
@@ -15,6 +16,7 @@ public sealed partial class ChannelDispatcher
     internal void ProcessOne(in WorkItem item)
     {
         AssertOnLoopThread();
+        EnsureLiveWorkCanBegin(in item);
         // Issue #173: dispatch_wait = enqueue → loop pickup. EnqueueTicks
         // is 0 for in-process synthetic items (e.g. snapshot tick scheduled
         // via Timer); skip the observation in that case to avoid skewing
@@ -28,7 +30,7 @@ public sealed partial class ChannelDispatcher
             // Snapshot ticks bypass the per-command incremental packet buffer
             // entirely — they have their own sink + sequence space owned by
             // the rotator and emit one or more complete packets directly.
-            _snapshotRotator?.PublishNext();
+            _snapshotRotator?.PublishNext(_sequenceVersion);
             return;
         }
 
@@ -42,7 +44,11 @@ public sealed partial class ChannelDispatcher
                 return;
             }
 
-            if (_priceBandPublisher?.PublishOnce(FrameSink, _engine.AllocateNextRptSeq, _timeSource.NowNanos()) > 0)
+            if (_priceBandPublisher?.PublishOnce(
+                    FrameSink,
+                    _engine.EnsureRptSeqCapacityForSynthetic,
+                    _engine.AllocateNextRptSeq,
+                    _timeSource.NowNanos()) > 0)
             {
                 FlushPacket();
                 // PriceBand_22 republish consumes engine RptSeq values, so persist
@@ -112,6 +118,8 @@ public sealed partial class ChannelDispatcher
             item.ExpireDayCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; ExpireDay rejected"));
+            if (item.Kind == WorkKind.MassCancel)
+                CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
             return;
         }
 
@@ -239,10 +247,14 @@ public sealed partial class ChannelDispatcher
             WorkKind.MassCancel => item.MassCancel?.Command.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
+        _trackMassCancelReports = item.Kind == WorkKind.MassCancel
+            && item.MassCancelCompletion is not null;
+        _currentMassCancelReportsCommitted = true;
+        _currentMassCancelReportCompletions?.Clear();
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
-        // observes it. Only New/Cancel/Replace are durable today;
+        // observes it. New/Cancel/Replace/MassCancel are WAL-durable;
         // operator commands force-snapshot post-flush so the
         // resulting state is captured directly. _lastAppliedSeq is
         // advanced by WalAppendIfEnabled regardless, including in
@@ -251,26 +263,7 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
-        if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
-        {
-            _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.NewOrder!);
-            return;
-        }
-        if (item.Kind == WorkKind.Cross && WouldExceedOpenOrderLimit(item.Firm, requiredSlots: 2))
-        {
-            _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.Cross!);
-            return;
-        }
-        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
-        {
-            if (!WalAppendIfEnabled(in item))
-            {
-                _metrics?.IncWalHaltReject();
-                return;
-            }
-        }
+        MassCancelOutcome? pendingMassCancelOutcome = null;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -279,22 +272,50 @@ public sealed partial class ChannelDispatcher
         // Fast path: skip the virtual StartActivity call when no listeners
         // are attached (round-2 perf #11).
         System.Diagnostics.Activity? engineSpan = null;
-        if (ExchangeTelemetry.Source.HasListeners())
-        {
-            engineSpan = ExchangeTelemetry.Source.StartActivity(
-                ExchangeTelemetry.SpanEngineProcess,
-                System.Diagnostics.ActivityKind.Internal,
-                item.ParentContext);
-            if (engineSpan is not null)
-            {
-                engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
-                engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
-                if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
-                if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
-            }
-        }
         try
         {
+            int requiredOpenOrderSlots = _replayMode ? 0 : RequiredOpenOrderSlots(in item);
+            if (requiredOpenOrderSlots > 0
+                && !_openOrderTracker.TryReserve(item.Firm, requiredOpenOrderSlots))
+            {
+                _metrics?.IncOrdersIn();
+                _openOrderMetrics?.IncLimitRejected(item.Firm);
+                if (item.Kind == WorkKind.New)
+                    EmitOpenOrderLimitReject(item.NewOrder!);
+                else
+                    EmitOpenOrderLimitReject(item.Cross!);
+                return;
+            }
+            _reservedOpenOrderFirm = item.Firm;
+            _reservedOpenOrderSlots = requiredOpenOrderSlots;
+
+            if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace or WorkKind.MassCancel)
+            {
+                if (!WalAppendIfEnabled(in item))
+                {
+                    _metrics?.IncWalHaltReject();
+                    if (item.Kind == WorkKind.MassCancel)
+                        CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+                    return;
+                }
+            }
+
+            _currentWorkKind = item.Kind;
+            if (ExchangeTelemetry.Source.HasListeners())
+            {
+                engineSpan = ExchangeTelemetry.Source.StartActivity(
+                    ExchangeTelemetry.SpanEngineProcess,
+                    System.Diagnostics.ActivityKind.Internal,
+                    item.ParentContext);
+                if (engineSpan is not null)
+                {
+                    engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+                    engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
+                    if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
+                    if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+                }
+            }
+
             switch (item.Kind)
             {
                 case WorkKind.New:
@@ -372,6 +393,29 @@ public sealed partial class ChannelDispatcher
                         ulong prioClOrd = buyFirst ? cross.BuyClOrdIdValue : cross.SellClOrdIdValue;
                         var otherLeg = buyFirst ? cross.Sell : cross.Buy;
                         ulong otherClOrd = buyFirst ? cross.SellClOrdIdValue : cross.BuyClOrdIdValue;
+
+                        if (prioLeg.PreTradeRejectReason is not null || otherLeg.PreTradeRejectReason is not null)
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                prioLeg.PreTradeRejectReason is null ? prioLeg.Quantity : 0,
+                                otherLeg.PreTradeRejectReason is null ? otherLeg.Quantity : 0);
+                        }
+                        else if (cross.CrossType == CrossType.AgainstBook && cross.MaxSweepQty > 0)
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                Math.Min(cross.MaxSweepQty, prioLeg.Quantity),
+                                prioLeg.Quantity,
+                                otherLeg.Quantity);
+                        }
+                        else
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                prioLeg.Quantity,
+                                otherLeg.Quantity);
+                        }
 
                         if (prioLeg.PreTradeRejectReason is not null || otherLeg.PreTradeRejectReason is not null)
                         {
@@ -464,8 +508,21 @@ public sealed partial class ChannelDispatcher
                         // routed back to the originating session by the
                         // Gateway router.
                         var mc = item.MassCancel!;
-                        if (mc.OrderIds.Count > 0)
-                            _engine.MassCancel(mc.OrderIds, mc.Command);
+                        int affected;
+                        try
+                        {
+                            affected = mc.OrderIds.Count > 0
+                                ? _engine.MassCancel(mc.OrderIds, mc.Command)
+                                : 0;
+                        }
+                        catch
+                        {
+                            CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+                            throw;
+                        }
+                        pendingMassCancelOutcome = _currentMassCancelReportsCommitted
+                            ? MassCancelOutcome.Completed(affected)
+                            : MassCancelOutcome.SystemBusy;
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -487,6 +544,8 @@ public sealed partial class ChannelDispatcher
         }
         finally
         {
+            ReleaseUnusedOpenOrderReservation();
+            ReleaseTerminalTriggeredOpenOrders();
             // Issue #173: engine_process = engine entry → engine exit
             // (regardless of crash/success). outbound_emit measured
             // separately around FlushPacket so the two phases are
@@ -522,11 +581,29 @@ public sealed partial class ChannelDispatcher
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
-                // Issue #260: persist post-flush so any consumer-visible
-                // event corresponds to a durable snapshot on disk before
-                // the next command is observed. Best-effort: failures are
-                // logged and swallowed by the helper.
-                OnAfterCommandFlushed();
+                if (item.Kind == WorkKind.MassCancel)
+                {
+                    var terminalOutcome = pendingMassCancelOutcome
+                        ?? MassCancelOutcome.SystemBusy;
+                    var durability = BeginMassCancelDurability(_lastAppliedSeq);
+                    var deferred = _currentMassCancelReportCompletions is { Count: > 0 } reports
+                        ? reports.ToArray()
+                        : Array.Empty<Task<OrderedStreamWriteResult>>();
+                    ScheduleMassCancelTerminalCompletion(
+                        durability,
+                        deferred,
+                        item.MassCancelCompletion,
+                        terminalOutcome,
+                        reportFailureAlreadyObserved: !_currentMassCancelReportsCommitted);
+                }
+                else
+                {
+                    // Issue #260: persist post-flush so any consumer-visible
+                    // event corresponds to a durable snapshot on disk before
+                    // the next command is observed. Best-effort: failures are
+                    // logged and swallowed by the helper.
+                    OnAfterCommandFlushed();
+                }
             }
             else
             {
@@ -537,7 +614,11 @@ public sealed partial class ChannelDispatcher
             _hasCurrentSession = false;
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
+            _currentWorkKind = null;
             _currentReceivedTimeNanos = ulong.MaxValue;
+            _trackMassCancelReports = false;
+            _currentMassCancelReportsCommitted = true;
+            _currentMassCancelReportCompletions?.Clear();
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
             // Issue #484: flush the last buffered IOC aggressor ER with
@@ -554,6 +635,217 @@ public sealed partial class ChannelDispatcher
             _aggressorIsIoc = false;
             engineSpan?.Dispose();
         }
+    }
+
+    private void EnsureLiveWorkCanBegin(in WorkItem item)
+    {
+        if (!RequiresLiveIncrementalEpoch(item.Kind)) return;
+
+        try
+        {
+            UmdfSequenceVersion.EnsureCanBeginLiveWork(
+                _sequenceVersion,
+                $"channel {ChannelNumber} incremental work-item boundary");
+        }
+        catch (InvalidOperationException ex)
+        {
+            var fatal = CreateSequenceFatal(ex);
+            FailWorkItemCompletion(in item, fatal);
+            throw fatal;
+        }
+    }
+
+    private static bool RequiresLiveIncrementalEpoch(WorkKind kind)
+        => kind switch
+        {
+            WorkKind.New
+                or WorkKind.Cancel
+                or WorkKind.Replace
+                or WorkKind.Cross
+                or WorkKind.MassCancel
+                or WorkKind.PriceBandPublish
+                or WorkKind.OperatorBumpVersion
+                or WorkKind.OperatorTradeBust
+                or WorkKind.OperatorSetTradingPhase
+                or WorkKind.OperatorUncrossAuction
+                or WorkKind.OperatorHaltInstrument
+                or WorkKind.OperatorResumeInstrument
+                or WorkKind.OperatorBustV2
+                or WorkKind.OperatorExpireSecurity
+                or WorkKind.OperatorExpireGtd
+                or WorkKind.OperatorExpireDay => true,
+            WorkKind.DecodeError
+                or WorkKind.SnapshotRotation
+                or WorkKind.OperatorSnapshotNow
+                or WorkKind.OperatorPersistSnapshot
+                or WorkKind.AuditCheckpoint
+                or WorkKind.ShutdownBarrier
+                or WorkKind.OperatorRestateGt => false,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown dispatcher work kind"),
+        };
+
+    private InvalidOperationException CreateSequenceFatal(InvalidOperationException cause)
+    {
+        var fatal = new InvalidOperationException(cause.Message, cause);
+        MarkChannelFatal(fatal);
+        _logger.LogCritical(fatal,
+            "channel {ChannelNumber}: incremental UMDF sequence space exhausted; channel failed closed before command side effects",
+            ChannelNumber);
+        return fatal;
+    }
+
+    private void MarkChannelFatal(Exception error)
+    {
+        if (Interlocked.Exchange(ref _channelFatal, 1) != 0) return;
+
+        _inbound.Writer.TryComplete(error);
+        while (_inbound.Reader.TryRead(out var pending))
+            FailWorkItemCompletion(in pending, error);
+    }
+
+    private void FailWorkItemCompletion(in WorkItem item, Exception error)
+    {
+        item.PhaseCompletion?.TrySetException(error);
+        item.HaltCompletion?.TrySetException(error);
+        item.BustCompletion?.TrySetException(error);
+        item.AuditCheckpoint?.Prepared.TrySetException(error);
+        item.ShutdownBarrier?.TrySetException(error);
+        item.ExpireCompletion?.TrySetException(error);
+        item.ExpireGtdCompletion?.TrySetException(error);
+        item.RestateGtCompletion?.TrySetException(error);
+        item.ExpireDayCompletion?.TrySetException(error);
+        CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+    }
+
+    private void CompleteMassCancel(Action<MassCancelOutcome>? completion, MassCancelOutcome outcome)
+    {
+        if (completion is null) return;
+        try
+        {
+            completion(outcome);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel completion callback failed",
+                ChannelNumber);
+        }
+    }
+
+    private void ScheduleMassCancelTerminalCompletion(
+        Task<bool> durability,
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
+    {
+        var prior = _massCancelTerminalTail;
+        if (prior.IsCompletedSuccessfully
+            && durability.IsCompletedSuccessfully
+            && deferred.All(static task => task.IsCompletedSuccessfully))
+        {
+            bool deferredFailure = deferred.Any(
+                static task => !task.Result.IsCommitted);
+            if (!durability.Result || deferredFailure)
+            {
+                outcome = MassCancelOutcome.SystemBusy;
+            }
+            if (deferredFailure && !reportFailureAlreadyObserved)
+                _metrics?.IncMassCancelReportFailure();
+            if (_cts.IsCancellationRequested)
+                outcome = MassCancelOutcome.SystemBusy;
+            CompleteMassCancel(completion, outcome);
+            return;
+        }
+
+        _massCancelTerminalTail = CompleteMassCancelTerminalAsync(
+            prior,
+            durability,
+            deferred,
+            completion,
+            outcome,
+            reportFailureAlreadyObserved);
+    }
+
+    private async Task CompleteMassCancelTerminalAsync(
+        Task prior,
+        Task<bool> durability,
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
+    {
+        Task<OrderedStreamWriteResult[]>? deferredCompletion = deferred.Length > 0
+            ? Task.WhenAll(deferred)
+            : null;
+
+        try
+        {
+            await prior.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: prior mass-cancel terminal completion failed",
+                ChannelNumber);
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        try
+        {
+            bool durable = await durability.ConfigureAwait(false);
+            if (!durable)
+                outcome = MassCancelOutcome.SystemBusy;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel durability completion failed",
+                ChannelNumber);
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        if (deferredCompletion is not null)
+        {
+            try
+            {
+                var results = await deferredCompletion.WaitAsync(_cts.Token).ConfigureAwait(false);
+                if (results.Any(static result => !result.IsCommitted))
+                {
+                    if (!reportFailureAlreadyObserved)
+                        _metrics?.IncMassCancelReportFailure();
+                    outcome = MassCancelOutcome.SystemBusy;
+                }
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                ObserveFault(deferredCompletion);
+                CompleteMassCancel(completion, MassCancelOutcome.SystemBusy);
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (!reportFailureAlreadyObserved)
+                    _metrics?.IncMassCancelReportFailure();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: deferred passive cancellation ExecutionReport commitment failed during solicited mass-cancel",
+                    ChannelNumber);
+                outcome = MassCancelOutcome.SystemBusy;
+            }
+        }
+        if (_cts.IsCancellationRequested)
+            outcome = MassCancelOutcome.SystemBusy;
+        CompleteMassCancel(completion, outcome);
+    }
+
+    private static void ObserveFault(Task task)
+    {
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously
+                | TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -625,10 +917,32 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private bool WouldExceedOpenOrderLimit(uint enteringFirm, int requiredSlots = 1)
+    private static int RequiredOpenOrderSlots(in WorkItem item)
     {
-        int current = _openOrdersByFirm.TryGetValue(enteringFirm, out int count) ? count : 0;
-        return current + requiredSlots > _maxOpenOrdersPerFirm;
+        return item.Kind switch
+        {
+            WorkKind.New => CanRest(item.NewOrder!) ? 1 : 0,
+            // Cross legs execute serially at one cross price. The prioritized
+            // leg may rest before the other leg consumes it, but both legs
+            // cannot remain open simultaneously; at most one residual rests.
+            WorkKind.Cross => CanRest(item.Cross!.Buy) || CanRest(item.Cross.Sell) ? 1 : 0,
+            _ => 0,
+        };
+    }
+
+    private static bool CanRest(NewOrderCommand order)
+    {
+        if (order.PreTradeRejectReason is not null || order.UnsupportedOrderCharacteristic)
+            return false;
+        return order.Tif is not (B3.Exchange.Matching.TimeInForce.IOC or B3.Exchange.Matching.TimeInForce.FOK);
+    }
+
+    private void ReleaseUnusedOpenOrderReservation()
+    {
+        if (_reservedOpenOrderSlots > 0)
+            _openOrderTracker.Release(_reservedOpenOrderFirm, _reservedOpenOrderSlots);
+        _reservedOpenOrderFirm = 0;
+        _reservedOpenOrderSlots = 0;
     }
 
     private void EmitOpenOrderLimitReject(NewOrderCommand order)

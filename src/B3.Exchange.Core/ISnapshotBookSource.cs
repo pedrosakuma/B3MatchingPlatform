@@ -17,13 +17,14 @@ public interface ISnapshotBookSource
     IReadOnlyList<long> SecurityIds { get; }
 
     /// <summary>
-    /// The last <c>RptSeq</c> value emitted on the incremental channel.
+    /// The last <c>RptSeq</c> value emitted for
+    /// <paramref name="securityId"/> on the incremental channel.
     /// A value of <c>0</c> indicates no incremental traffic has been
     /// published yet (the engine has not produced any MBO / Trade event)
     /// and the rotator should publish an "illiquid" snapshot header per
     /// B3 §7.4 (i.e. <c>lastRptSeq</c> absent).
     /// </summary>
-    uint CurrentRptSeq { get; }
+    uint GetCurrentRptSeq(long securityId);
 
     /// <summary>
     /// Iterates the resting orders for <paramref name="securityId"/> on the
@@ -52,7 +53,7 @@ public sealed class MatchingEngineSnapshotSource : ISnapshotBookSource
         SecurityIds = securityIds;
     }
 
-    public uint CurrentRptSeq => _engine.CurrentRptSeq;
+    public uint GetCurrentRptSeq(long securityId) => _engine.GetCurrentRptSeq(securityId);
 
     public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
         => _engine.EnumerateBook(securityId, side);

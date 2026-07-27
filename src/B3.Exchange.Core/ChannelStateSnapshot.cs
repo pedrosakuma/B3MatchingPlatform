@@ -39,9 +39,10 @@ public sealed record OrderOwnerSnapshot(
 ///
 /// <para><b>Out of scope (v1):</b> the UMDF retransmit ring, snapshot
 /// rotator cursor, and any in-flight buffered packet are NOT persisted
-/// — restored channels emit fresh packets at <c>SequenceNumber+1</c> with
-/// the previous <c>SequenceVersion</c>; consumers that miss the gap
-/// recover via the snapshot feed.</para>
+/// — after restore the dispatcher durably prepares a new incremental
+/// <c>SequenceVersion</c>, resets <c>SequenceNumber</c>, and publishes
+/// <c>ChannelReset_11</c>. Consumers rebuild the preserved authoritative
+/// book through the snapshot feed.</para>
 /// </summary>
 public sealed record ChannelStateSnapshot(
     /// <summary>Snapshot schema version. Bumped on incompatible layout
@@ -53,7 +54,7 @@ public sealed record ChannelStateSnapshot(
     EngineStateSnapshot Engine,
     IReadOnlyList<OrderOwnerSnapshot> Owners)
 {
-    public const int CurrentVersion = 6;
+    public const int CurrentVersion = 7;
 
     /// <summary>
     /// Issue #269: monotonic counter of commands the dispatcher has
@@ -88,6 +89,30 @@ public interface IChannelStatePersister
     /// + fsync + rename so a crash mid-write never leaves a partial file
     /// on disk.</summary>
     long Save(ChannelStateSnapshot snapshot);
+
+    /// <summary>
+    /// Captures the current administrative-reset generation for an
+    /// asynchronous snapshot submission. Implementations that do not need a
+    /// reset fence may keep the default generation. This method runs on the
+    /// dispatcher thread and MUST be non-blocking; implementations should use
+    /// an atomic/volatile generation read rather than their snapshot I/O lock.
+    /// </summary>
+    long CaptureSaveGeneration(byte channelNumber) => 0;
+
+    /// <summary>
+    /// Persists an asynchronously submitted snapshot only when
+    /// <paramref name="saveGeneration"/> still matches the channel's current
+    /// reset generation. Returns <c>false</c> when an intervening
+    /// <see cref="DeleteAll"/> invalidated the submission.
+    /// </summary>
+    bool TrySave(
+        ChannelStateSnapshot snapshot,
+        long saveGeneration,
+        out long bytesWritten)
+    {
+        bytesWritten = Save(snapshot);
+        return true;
+    }
 
     /// <summary>
     /// Issue #271: deletes every on-disk snapshot artifact for the

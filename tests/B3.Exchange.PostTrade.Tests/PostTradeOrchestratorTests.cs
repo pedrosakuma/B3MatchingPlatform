@@ -100,6 +100,24 @@ public class PostTradeOrchestratorTests : IDisposable
     }
 
     [Fact]
+    public void Accept_PrecommitFailure_WritesNeitherAuditNorDedup()
+    {
+        SeedFill(108u);
+        var sink = new RecordingSink();
+        var dedup = new BustDedupIndex();
+        var orch = new PostTradeOrchestrator(sink, dedup, _auditRoot, _dropRoot);
+
+        Assert.Throws<RptSeqExhaustedException>(() => orch.ProcessBust(
+            Req(108u, corr: 23UL, echo: SecId),
+            Channel,
+            tradeDateDaysSinceEpoch: 1234,
+            beforeAcceptCommit: securityId => throw new RptSeqExhaustedException(securityId)));
+
+        Assert.Empty(sink.Busts);
+        Assert.False(dedup.TryGet(108u, out _));
+    }
+
+    [Fact]
     public void Accept_PostEod_RoutesToToday_AndSignalsForDeferredPublish()
     {
         SeedFill(101u);

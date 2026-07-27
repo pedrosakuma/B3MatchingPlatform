@@ -32,7 +32,8 @@ namespace B3.Exchange.Core;
 /// Empty / illiquid handling: per B3 §7.4 a symbol with no incremental
 /// history publishes a snapshot header with <c>LastRptSeq</c> absent and an
 /// empty Orders_71 group. The rotator emits exactly that when the book has
-/// no resting orders AND <see cref="ISnapshotBookSource.CurrentRptSeq"/> is
+/// no resting orders AND its <see cref="ISnapshotBookSource.GetCurrentRptSeq"/>
+/// watermark is
 /// 0.
 /// </para>
 /// </summary>
@@ -51,6 +52,21 @@ public sealed class SnapshotRotator
     public ushort SequenceVersion { get; private set; } = 1;
     public uint SequenceNumber { get; private set; }
     public int RotationIndex => _rotationIndex;
+
+    public TestProbe CreateTestProbe() => new(this);
+
+    public sealed class TestProbe
+    {
+        private readonly SnapshotRotator _rotator;
+
+        internal TestProbe(SnapshotRotator rotator) => _rotator = rotator;
+
+        public void SetSequence(ushort version, uint number)
+        {
+            _rotator.SequenceVersion = version;
+            _rotator.SequenceNumber = number;
+        }
+    }
 
     public SnapshotRotator(
         byte channelNumber,
@@ -83,7 +99,9 @@ public sealed class SnapshotRotator
     /// </summary>
     public void BumpSequenceVersion()
     {
-        SequenceVersion = (ushort)(SequenceVersion + 1);
+        SequenceVersion = UmdfSequenceVersion.NextOrThrow(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} epoch");
         SequenceNumber = 0;
     }
 
@@ -94,14 +112,16 @@ public sealed class SnapshotRotator
     /// least 1, since even an empty book emits the header packet. Caller MUST
     /// invoke from the dispatcher thread so that
     /// <see cref="ISnapshotBookSource.EnumerateBook"/> observes a stable book.
+    /// <paramref name="incrementalSequenceVersion"/> must be captured from the
+    /// dispatcher in the same turn as the book and RptSeq watermark.
     /// </summary>
-    public int PublishNext()
+    public int PublishNext(ushort incrementalSequenceVersion)
     {
         var ids = _source.SecurityIds;
         if (ids.Count == 0) return 0;
         long securityId = ids[_rotationIndex % ids.Count];
         _rotationIndex = (_rotationIndex + 1) % ids.Count;
-        return PublishFor(securityId);
+        return PublishFor(securityId, incrementalSequenceVersion);
     }
 
     /// <summary>
@@ -109,8 +129,12 @@ public sealed class SnapshotRotator
     /// without advancing the rotation cursor. Useful for tests and for
     /// targeted re-publishes.
     /// </summary>
-    public int PublishFor(long securityId)
+    public int PublishFor(long securityId, ushort incrementalSequenceVersion)
     {
+        UmdfSequenceVersion.EnsureCanBeginLiveWork(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} work-item boundary");
+
         // Materialise the book sides into lists. Snapshot ticks are
         // low-frequency (typically every few seconds per instrument) so a
         // per-tick allocation is acceptable; the alternative — caching
@@ -129,9 +153,16 @@ public sealed class SnapshotRotator
         // always stamp the live RptSeq, even if the book is empty (e.g. all
         // orders matched and no new ones have arrived). A zero RptSeq is
         // therefore treated as "illiquid" only when the book is also empty.
-        uint currentRptSeq = _source.CurrentRptSeq;
+        uint currentRptSeq = _source.GetCurrentRptSeq(securityId);
         bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
         uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
+
+        int requiredPackets = SnapshotPacketBuilder.GetPacketCount(
+            _packetBuf.Length,
+            bidsList.Count,
+            asksList.Count,
+            _maxEntriesPerChunk);
+        EnsurePacketSequenceCapacity(requiredPackets);
 
         ushort version = SequenceVersion;
         uint firstSeq = SequenceNumber + 1;
@@ -142,17 +173,36 @@ public sealed class SnapshotRotator
         int packetsEmitted = SnapshotPacketBuilder.WriteSnapshot(
             buffer: _packetBuf,
             channelNumber: channel,
-            sequenceVersion: version,
+            snapshotSequenceVersion: version,
             firstSequenceNumber: firstSeq,
             sendingTimeNanos: nowNanos,
             securityId: securityId,
             lastRptSeq: lastRptSeq,
+            incrementalSequenceVersion: incrementalSequenceVersion,
             bids: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bidsList),
             asks: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(asksList),
             onPacket: pkt => sink.Publish(channel, pkt),
             maxEntriesPerChunk: _maxEntriesPerChunk);
 
-        SequenceNumber += (uint)packetsEmitted;
+        if (packetsEmitted != requiredPackets)
+        {
+            throw new InvalidOperationException(
+                $"snapshot packet count changed during encode: reserved {requiredPackets}, emitted {packetsEmitted}");
+        }
+        SequenceNumber = (uint)((ulong)SequenceNumber + (uint)packetsEmitted);
         return packetsEmitted;
+    }
+
+    private void EnsurePacketSequenceCapacity(int requiredPackets)
+    {
+        if (requiredPackets < 1)
+            throw new ArgumentOutOfRangeException(nameof(requiredPackets));
+        if ((ulong)SequenceNumber + (uint)requiredPackets <= uint.MaxValue)
+            return;
+
+        SequenceVersion = UmdfSequenceVersion.NextOrThrow(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} automatic epoch rollover");
+        SequenceNumber = 0;
     }
 }

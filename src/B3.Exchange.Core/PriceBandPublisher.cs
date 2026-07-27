@@ -36,10 +36,18 @@ public sealed class PriceBandPublisher
         _entries = entries.ToArray();
     }
 
-    public int PublishOnce(IUmdfFrameSink sink, Func<uint> nextRptSeq, ulong mdEntryTimestampNanos)
+    public int PublishOnce(
+        IUmdfFrameSink sink,
+        Action<long> ensureRptSeqCapacity,
+        Func<long, uint> nextRptSeq,
+        ulong mdEntryTimestampNanos)
     {
+        ArgumentNullException.ThrowIfNull(ensureRptSeqCapacity);
         ArgumentNullException.ThrowIfNull(nextRptSeq);
         if (_entries.Length == 0) return 0;
+
+        foreach (ref readonly var entry in _entries.AsSpan())
+            ensureRptSeqCapacity(entry.SecurityId);
 
         foreach (ref readonly var entry in _entries.AsSpan())
         {
@@ -49,7 +57,7 @@ public sealed class PriceBandPublisher
                 lowLimitPriceMantissa: entry.LowLimitPriceMantissa,
                 highLimitPriceMantissa: entry.HighLimitPriceMantissa,
                 mdEntryTimestampNanos: mdEntryTimestampNanos,
-                rptSeq: nextRptSeq());
+                rptSeq: nextRptSeq(entry.SecurityId));
         }
 
         return _entries.Length;

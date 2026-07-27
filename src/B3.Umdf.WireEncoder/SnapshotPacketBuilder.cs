@@ -35,6 +35,38 @@ public static class SnapshotPacketBuilder
     public delegate void PacketHandler(ReadOnlySpan<byte> packet);
 
     /// <summary>
+    /// Calculates exactly how many packet sequence numbers
+    /// <see cref="WriteSnapshot"/> will consume for the supplied layout.
+    /// </summary>
+    public static int GetPacketCount(
+        int bufferSize,
+        int bidCount,
+        int askCount,
+        int maxEntriesPerChunk = MaxEntriesPerChunk)
+    {
+        if (bidCount < 0) throw new ArgumentOutOfRangeException(nameof(bidCount));
+        if (askCount < 0) throw new ArgumentOutOfRangeException(nameof(askCount));
+        ValidateLayout(bufferSize, bidCount, askCount, maxEntriesPerChunk);
+
+        long remaining = (long)bidCount + askCount;
+        int packetCount = 1;
+        ConsumeEntriesThatFit(
+            ref remaining,
+            bufferSize - WireOffsets.PacketHeaderSize - SnapshotHeaderFrameSize,
+            maxEntriesPerChunk);
+
+        while (remaining > 0)
+        {
+            packetCount = checked(packetCount + 1);
+            ConsumeEntriesThatFit(
+                ref remaining,
+                bufferSize - WireOffsets.PacketHeaderSize,
+                maxEntriesPerChunk);
+        }
+        return packetCount;
+    }
+
+    /// <summary>
     /// Writes a complete snapshot for <paramref name="securityId"/>. Returns
     /// the number of packets emitted.
     /// </summary>
@@ -43,7 +75,8 @@ public static class SnapshotPacketBuilder
     /// <see cref="DefaultPacketBufferSize"/> handles a full 255-entry chunk
     /// with margin.</param>
     /// <param name="channelNumber">UMDF snapshot channel number.</param>
-    /// <param name="sequenceVersion">Current snapshot sequence version.</param>
+    /// <param name="snapshotSequenceVersion">Current snapshot-loop sequence
+    /// version written to each packet header.</param>
     /// <param name="firstSequenceNumber">Sequence number for the first packet
     /// of this snapshot. Subsequent packets within the same snapshot use
     /// successive numbers.</param>
@@ -54,6 +87,10 @@ public static class SnapshotPacketBuilder
     /// <param name="lastRptSeq">Last incremental RptSeq published before this
     /// snapshot was taken; consumers gate snapshot acceptance on this value.
     /// Pass <c>null</c> for an empty illiquid snapshot (per B3 §7.4).</param>
+    /// <param name="incrementalSequenceVersion">Incremental-channel sequence
+    /// version represented by the captured book and watermarks. Written as
+    /// <c>LastSequenceVersion</c> in Header_30; independent from
+    /// <paramref name="snapshotSequenceVersion"/>.</param>
     /// <param name="bids">Resting bid orders in price-time priority (best
     /// price first within a side).</param>
     /// <param name="asks">Resting ask orders in price-time priority.</param>
@@ -62,19 +99,19 @@ public static class SnapshotPacketBuilder
     public static int WriteSnapshot(
         Span<byte> buffer,
         byte channelNumber,
-        ushort sequenceVersion,
+        ushort snapshotSequenceVersion,
         uint firstSequenceNumber,
         ulong sendingTimeNanos,
         long securityId,
         uint? lastRptSeq,
+        ushort incrementalSequenceVersion,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
         PacketHandler onPacket,
         int maxEntriesPerChunk = MaxEntriesPerChunk)
     {
         ArgumentNullException.ThrowIfNull(onPacket);
-        if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
-            throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
+        ValidateLayout(buffer.Length, bids.Length, asks.Length, maxEntriesPerChunk);
 
         // Header_30 stamps total counts so consumers can size their buffers
         // and detect a complete refresh once they accumulate that many entries.
@@ -86,19 +123,21 @@ public static class SnapshotPacketBuilder
         int packetCount = 0;
 
         // ------------------------- Packet 1: header --------------------------
-        int p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, sequenceVersion, seqNum, sendingTimeNanos);
+        int p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
         int headerLen = UmdfWireEncoder.WriteSnapshotHeaderFrame(buffer.Slice(p),
-            securityId, totReports, totBids, totOffers, totNumStats: 0, lastRptSeq: lastRptSeq);
+            securityId, totReports, totBids, totOffers, totNumStats: 0,
+            lastRptSeq: lastRptSeq, lastSequenceVersion: incrementalSequenceVersion);
         p += headerLen;
 
         // Pack as many Orders_71 chunks as fit in the remaining space.
         int bidIdx = 0, askIdx = 0;
         while (true)
         {
-            int chunkSize = NextChunkSize(bids, asks, ref bidIdx, ref askIdx, maxEntriesPerChunk);
+            int chunkSize = NextChunkSize(
+                bids, asks, bidIdx, askIdx,
+                Math.Min(maxEntriesPerChunk, MaxOrdersEntriesThatFit(buffer.Length - p)));
             if (chunkSize == 0) break;
             int frameSize = OrdersFrameSize(chunkSize);
-            if (p + frameSize > buffer.Length) break; // doesn't fit → emit current packet first
             WriteOrdersChunk(buffer.Slice(p), securityId, bids, asks, ref bidIdx, ref askIdx, chunkSize);
             p += frameSize;
         }
@@ -109,25 +148,15 @@ public static class SnapshotPacketBuilder
         while (bidIdx < bids.Length || askIdx < asks.Length)
         {
             seqNum++;
-            p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, sequenceVersion, seqNum, sendingTimeNanos);
+            p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
             // Pack up to buffer capacity.
             while (true)
             {
-                int chunkSize = NextChunkSize(bids, asks, ref bidIdx, ref askIdx, maxEntriesPerChunk);
+                int chunkSize = NextChunkSize(
+                    bids, asks, bidIdx, askIdx,
+                    Math.Min(maxEntriesPerChunk, MaxOrdersEntriesThatFit(buffer.Length - p)));
                 if (chunkSize == 0) break;
                 int frameSize = OrdersFrameSize(chunkSize);
-                if (p + frameSize > buffer.Length)
-                {
-                    // Edge case: even one entry doesn't fit. Caller passed too
-                    // small a buffer.
-                    if (chunkSize == 1)
-                        throw new ArgumentException(
-                            $"buffer too small ({buffer.Length} bytes) for a single Orders_71 entry frame ({frameSize} bytes); increase buffer size.",
-                            nameof(buffer));
-                    // Otherwise loop will retry with a smaller chunk.
-                    maxEntriesPerChunk = Math.Min(maxEntriesPerChunk, chunkSize - 1);
-                    continue;
-                }
                 WriteOrdersChunk(buffer.Slice(p), securityId, bids, asks, ref bidIdx, ref askIdx, chunkSize);
                 p += frameSize;
             }
@@ -144,11 +173,65 @@ public static class SnapshotPacketBuilder
          + WireOffsets.SnapOrdersGroupSizeEncodingSize
          + WireOffsets.SnapOrdersEntrySize * entries;
 
+    private static int SnapshotHeaderFrameSize
+        => WireOffsets.FramingHeaderSize
+         + WireOffsets.SbeMessageHeaderSize
+         + WireOffsets.SnapHeaderBlockLength;
+
+    private static void ValidateLayout(
+        int bufferSize,
+        int bidCount,
+        int askCount,
+        int maxEntriesPerChunk)
+    {
+        if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
+            throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
+        if (bufferSize < WireOffsets.PacketHeaderSize + SnapshotHeaderFrameSize)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({bufferSize} bytes) for SnapshotFullRefresh_Header_30.",
+                nameof(bufferSize));
+        }
+        if ((bidCount != 0 || askCount != 0)
+            && MaxOrdersEntriesThatFit(bufferSize - WireOffsets.PacketHeaderSize) == 0)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({bufferSize} bytes) for a single Orders_71 entry frame ({OrdersFrameSize(1)} bytes); increase buffer size.",
+                nameof(bufferSize));
+        }
+    }
+
+    private static void ConsumeEntriesThatFit(
+        ref long remaining,
+        int availableBytes,
+        int maxEntriesPerChunk)
+    {
+        while (remaining > 0)
+        {
+            int capacity = Math.Min(
+                maxEntriesPerChunk,
+                MaxOrdersEntriesThatFit(availableBytes));
+            if (capacity == 0) return;
+            int chunkSize = (int)Math.Min(remaining, capacity);
+            availableBytes -= OrdersFrameSize(chunkSize);
+            remaining -= chunkSize;
+        }
+    }
+
+    private static int MaxOrdersEntriesThatFit(int availableBytes)
+    {
+        int fixedBytes = OrdersFrameSize(0);
+        return availableBytes <= fixedBytes
+            ? 0
+            : (availableBytes - fixedBytes) / WireOffsets.SnapOrdersEntrySize;
+    }
+
     private static int NextChunkSize(
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
-        ref int bidIdx, ref int askIdx, int cap)
+        int bidIdx, int askIdx, int cap)
     {
+        if (cap <= 0) return 0;
         int remaining = (bids.Length - bidIdx) + (asks.Length - askIdx);
         return Math.Min(remaining, cap);
     }

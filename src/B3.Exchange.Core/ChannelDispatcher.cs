@@ -132,8 +132,12 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private readonly ChannelMetrics? _metrics;
     private readonly BoundedSessionFirmCounters? _sessionFirmCounters;
     private readonly OpenOrderMetrics? _openOrderMetrics;
-    private readonly int _maxOpenOrdersPerFirm;
+    private readonly FirmOpenOrderTracker _openOrderTracker;
     private readonly Dictionary<uint, int> _openOrdersByFirm = new();
+    private readonly Dictionary<long, uint> _openOrderFirmByOrderId = new();
+    private readonly Dictionary<long, uint> _triggeredOpenOrderReservations = new();
+    private uint _reservedOpenOrderFirm;
+    private int _reservedOpenOrderSlots;
     private readonly OrderRegistry _orders = new();
     /// <summary>Issue #216 (Onda L · L3a): per-channel UMDF retransmit
     /// ring. Populated on each <c>FlushPacket</c> for the incremental
@@ -156,6 +160,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// the ctor; immutable for the dispatcher's lifetime.
     /// </summary>
     private readonly WalAppendFailurePolicy _walAppendFailurePolicy;
+    private readonly TimeSpan _massCancelDurabilityTimeout;
     /// <summary>
     /// Issue #286: sticky flag set on the first WAL append failure when
     /// the policy is <see cref="WalAppendFailurePolicy.Halt"/>. Read from
@@ -269,6 +274,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _hasCurrentSession;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
+    private bool _currentMassCancelReportsCommitted;
+    private bool _trackMassCancelReports;
+    private List<Task<OrderedStreamWriteResult>>? _currentMassCancelReportCompletions;
+    private WorkKind? _currentWorkKind;
+    private Action? _openOrderTransitionHookForTesting;
     /// <summary>
     /// Ingress timestamp of the inbound command currently being dispatched
     /// (#GAP-11 / #49). Captured from the command's <c>EnteredAtNanos</c> at
@@ -373,8 +383,20 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private AuctionPrintInfo? _pendingAuctionPrint;
 
     private readonly CancellationTokenSource _cts = new();
+    private Task _massCancelTerminalTail = Task.CompletedTask;
     private int _drainOnCancellation;
+    private int _startCalled;
+    private int _activationCalled;
+    private int _channelFatal;
     private Task? _loopTask;
+    private readonly TaskCompletionSource<bool> _startupCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _activationRequested =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _activationCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _startupEpochPrepared;
+    private ushort _startupRestoredVersion;
     // Single-thread invariant (ADR 0009 / issues #138, #169, #384).
     // Captured on entry to RunLoop; used by AssertOnLoopThread() to enforce
     // the dispatch-thread invariant in DEBUG builds. Backed by the shared
@@ -429,13 +451,20 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _metrics = options.Metrics;
         _sessionFirmCounters = options.SessionFirmCounters;
         _openOrderMetrics = options.OpenOrders;
-        _maxOpenOrdersPerFirm = options.MaxOpenOrdersPerFirm;
-        if (_maxOpenOrdersPerFirm < 1)
+        if (options.MaxOpenOrdersPerFirm < 1)
             throw new ArgumentOutOfRangeException(nameof(options.MaxOpenOrdersPerFirm), "max open orders per firm must be at least 1");
+        _openOrderTracker = options.OpenOrderTracker ?? new FirmOpenOrderTracker(options.MaxOpenOrdersPerFirm);
+        if (_openOrderTracker.MaximumPerFirm != options.MaxOpenOrdersPerFirm)
+            throw new ArgumentException("shared open-order tracker limit must match MaxOpenOrdersPerFirm", nameof(options));
         _retxBuffer = options.RetxBuffer;
         _persister = options.Persister;
         _wal = options.Wal;
         _walAppendFailurePolicy = options.WalAppendFailurePolicy;
+        if (options.MassCancelDurabilityTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "MassCancelDurabilityTimeout must be positive");
+        _massCancelDurabilityTimeout = options.MassCancelDurabilityTimeout;
         _sessionExists = options.SessionExists;
         _orphanPolicy = options.OrphanPolicy;
         _postTradeSink = options.PostTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;

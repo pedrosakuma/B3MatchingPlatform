@@ -14,9 +14,11 @@ namespace B3.Exchange.Persistence.Tests;
 /// Property-style determinism test for issue #287.
 ///
 /// <para>Invariant under test: starting from a snapshot at sequence
-/// <c>K</c> and replaying the WAL tail <c>(K, N]</c> must yield byte-for-byte
-/// the same channel state as applying commands <c>[1..N]</c> from a clean
-/// engine. This is the safety net behind the snapshot-fallback recovery
+/// <c>K</c> and replaying the WAL tail <c>(K, N]</c> must yield the same
+/// authoritative engine/ownership state as applying commands <c>[1..N]</c>
+/// from a clean engine. The incremental SequenceVersion/SequenceNumber tuple
+/// is excluded because issue #571 deliberately starts a new UMDF epoch after
+/// recovery. This is the safety net behind the snapshot-fallback recovery
 /// path: if a fresher snapshot fails to land (or is found corrupt at boot),
 /// the dispatcher loads an older snapshot and replays the WAL — that path
 /// must be guaranteed convergent for any (snapshot, WAL-tail) split.</para>
@@ -35,7 +37,7 @@ namespace B3.Exchange.Persistence.Tests;
 ///         containing only the records with <c>Seq &gt; K</c>. Boot a
 ///         brand-new dispatcher pointed at that snapshot+WAL pair, let
 ///         it run its replay, then force a persist and compare the
-///         encoded snapshot bytes to the baseline.</item>
+///         encoded authoritative state to the baseline.</item>
 /// </list>
 ///
 /// <para>Comparison uses
@@ -75,7 +77,7 @@ public class WalReplayIdempotencyTests
         public bool WriteExecutionReportNew(SessionId s, uint f, ulong c, in OrderAcceptedEvent e, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default) => true;
     }
@@ -111,6 +113,13 @@ public class WalReplayIdempotencyTests
 
     private static SnapshotThrottlePolicy NeverAuto =>
         new() { EveryNCommands = int.MaxValue, MinIntervalMs = 0 };
+
+    private static byte[] EncodeAuthoritativeState(ChannelStateSnapshot snapshot)
+        => BinaryChannelStateSnapshotCodec.Encode(snapshot with
+        {
+            SequenceNumber = 0,
+            SequenceVersion = 0,
+        });
 
     private static ChannelDispatcher BuildDispatcher(
         IChannelStatePersister? persister,
@@ -367,7 +376,7 @@ public class WalReplayIdempotencyTests
         Assert.NotNull(persister.Last);
         Assert.Equal((long)records.Count, persister.Last!.LastAppliedSeq);
 
-        var bytes = BinaryChannelStateSnapshotCodec.Encode(persister.Last);
+        var bytes = EncodeAuthoritativeState(persister.Last);
         wal.Dispose();
         await disp.DisposeAsync();
         return (bytes, records);
@@ -461,7 +470,7 @@ public class WalReplayIdempotencyTests
             "operator persist did not complete within timeout");
 
         var snap = Volatile.Read(ref persister.Last)!;
-        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+        var bytes = EncodeAuthoritativeState(snap);
 
         await disp.DisposeAsync();
         wal.Dispose();
@@ -545,7 +554,7 @@ public class WalReplayIdempotencyTests
         }
         Assert.True(Volatile.Read(ref persister.SaveCount) > savesBefore);
 
-        var bytes = BinaryChannelStateSnapshotCodec.Encode(
+        var bytes = EncodeAuthoritativeState(
             Volatile.Read(ref persister.Last)!);
 
         await disp.DisposeAsync();
@@ -630,7 +639,7 @@ public class WalReplayIdempotencyTests
             "operator persist did not complete within timeout");
 
         var snap = Volatile.Read(ref persister.Last)!;
-        var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
+        var bytes = EncodeAuthoritativeState(snap);
 
         await disp.DisposeAsync();
         wal.Dispose();

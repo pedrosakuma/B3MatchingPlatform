@@ -38,7 +38,7 @@ public class TradingPhaseTests
         Assert.Equal(TradingPhase.Close, ev.Phase);
         Assert.Equal(5000ul, ev.TransactTimeNanos);
         Assert.Equal(1u, ev.RptSeq);
-        Assert.Equal(1u, eng.CurrentRptSeq);
+        Assert.Equal(1u, eng.GetCurrentRptSeq(PetrSecId));
         Assert.Equal(TradingPhase.Close, eng.GetTradingPhase(PetrSecId));
     }
 
@@ -51,7 +51,7 @@ public class TradingPhaseTests
 
         Assert.False(changed);
         Assert.Empty(sink.PhaseChanges);
-        Assert.Equal(0u, eng.CurrentRptSeq);
+        Assert.Equal(0u, eng.GetCurrentRptSeq(PetrSecId));
     }
 
     [Fact]

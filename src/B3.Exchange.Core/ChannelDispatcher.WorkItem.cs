@@ -85,7 +85,8 @@ public sealed partial class ChannelDispatcher
         OperatorExpireDay? ExpireDay = null,
         TaskCompletionSource<ExpireDayOutcome>? ExpireDayCompletion = null,
         long EnqueueTicks = 0,
-        System.Diagnostics.ActivityContext ParentContext = default);
+        System.Diagnostics.ActivityContext ParentContext = default,
+        Action<MassCancelOutcome>? MassCancelCompletion = null);
 
     /// <summary>
     /// Per-channel mass-cancel payload after gateway-side resolution: a

@@ -20,6 +20,7 @@
   "auth": {
     "devMode": true
   },
+  "maxOpenOrdersPerFirm": 100000,
   "firms": [
     { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 }
   ],

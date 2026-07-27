@@ -47,6 +47,7 @@
   "auth": {
     "devMode": true
   },
+  "maxOpenOrdersPerFirm": {{ .Values.maxOpenOrdersPerFirm }},
   "firms": [
     { "id": "FIRM01", "name": "Alpha Corretora", "enteringFirmCode": 100 },
     // Q4.2 (#302). FIRM02 / FIRM03 added so the compose default can wire

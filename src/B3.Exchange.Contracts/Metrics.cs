@@ -135,12 +135,15 @@ public sealed class RetransmitMetrics
 {
     private long _bufferEvictions;
     private long _passiveErBuffered;
+    private long _outboundCommitFailures;
 
     public long BufferEvictions => Interlocked.Read(ref _bufferEvictions);
     public long PassiveErBuffered => Interlocked.Read(ref _passiveErBuffered);
+    public long OutboundCommitFailures => Interlocked.Read(ref _outboundCommitFailures);
 
     public void IncBufferEvictions() => Interlocked.Increment(ref _bufferEvictions);
     public void IncPassiveErBuffered() => Interlocked.Increment(ref _passiveErBuffered);
+    public void IncOutboundCommitFailure() => Interlocked.Increment(ref _outboundCommitFailures);
 }
 
 /// <summary>

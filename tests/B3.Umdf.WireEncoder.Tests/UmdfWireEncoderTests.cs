@@ -171,10 +171,16 @@ public class UmdfWireEncoderTests
     {
         var buf = new byte[80];
         int n = UmdfWireEncoder.WriteSnapshotHeaderFrame(buf, securityId: 7L,
-            totNumReports: 3, totNumBids: 2, totNumOffers: 1, totNumStats: 0, lastRptSeq: 42);
+            totNumReports: 3, totNumBids: 2, totNumOffers: 1, totNumStats: 0,
+            lastRptSeq: 42, lastSequenceVersion: 9);
         Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength, n);
 
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        ref readonly var messageHeader = ref MemoryMarshal.AsRef<MessageHeader>(
+            buf.AsSpan(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
+        Assert.Equal((ushort)SnapshotFullRefresh_Header_30Data.BLOCK_LENGTH, messageHeader.BlockLength);
+        Assert.Equal((ushort)16, messageHeader.Version);
+
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var rdr));
         Assert.Equal(7L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(3u, rdr.Data.TotNumReports);
@@ -182,16 +188,19 @@ public class UmdfWireEncoderTests
         Assert.Equal(1u, rdr.Data.TotNumOffers);
         Assert.Equal((ushort)0, rdr.Data.TotNumStats);
         Assert.Equal(42u, rdr.Data.LastRptSeq);
+        Assert.Equal((ushort)9, rdr.Data.LastSequenceVersion);
     }
 
     [Fact]
     public void SnapshotHeader_NullLastRptSeq()
     {
         var buf = new byte[80];
-        UmdfWireEncoder.WriteSnapshotHeaderFrame(buf, 7L, 0, 0, 0, 0, lastRptSeq: null);
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.TryParse(
+        UmdfWireEncoder.WriteSnapshotHeaderFrame(
+            buf, 7L, 0, 0, 0, 0, lastRptSeq: null, lastSequenceVersion: 1);
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var rdr));
         Assert.Null(rdr.Data.LastRptSeq);
+        Assert.Equal((ushort)1, rdr.Data.LastSequenceVersion);
     }
 
     [Fact]

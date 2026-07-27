@@ -58,6 +58,7 @@ public sealed class ChannelMetrics
     private long _dispatchQueueFull;
     private long _decodeErrors;
     private long _dispatcherCrashes;
+    private long _massCancelReportFailures;
     private long _publishErrors;
     private long _publishErrorsHostUnreachable;
     private long _publishErrorsMessageTooLarge;
@@ -139,6 +140,7 @@ public sealed class ChannelMetrics
     public long DispatchQueueFull => Interlocked.Read(ref _dispatchQueueFull);
     public long DecodeErrors => Interlocked.Read(ref _decodeErrors);
     public long DispatcherCrashes => Interlocked.Read(ref _dispatcherCrashes);
+    public long MassCancelReportFailures => Interlocked.Read(ref _massCancelReportFailures);
     public long PublishErrors => Interlocked.Read(ref _publishErrors);
     public long PublishErrorsHostUnreachable => Interlocked.Read(ref _publishErrorsHostUnreachable);
     public long PublishErrorsMessageTooLarge => Interlocked.Read(ref _publishErrorsMessageTooLarge);
@@ -153,6 +155,7 @@ public sealed class ChannelMetrics
     public void IncDispatchQueueFull() => Interlocked.Increment(ref _dispatchQueueFull);
     public void IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
     public void IncDispatcherCrashes() => Interlocked.Increment(ref _dispatcherCrashes);
+    public void IncMassCancelReportFailure() => Interlocked.Increment(ref _massCancelReportFailures);
     public void IncPublishErrorSocketError() => Interlocked.Increment(ref _publishErrors);
     public void IncPublishErrorHostUnreachable() => Interlocked.Increment(ref _publishErrorsHostUnreachable);
     public void IncPublishErrorMessageTooLarge() => Interlocked.Increment(ref _publishErrorsMessageTooLarge);
@@ -182,6 +185,7 @@ public sealed class ChannelMetrics
     private long _walReplays;
     private long _walRecordCorruptions;
     private long _walRecordsLegacy;
+    private long _walReplayFailures;
     /// <summary>
     /// Issue #286: cumulative count of WAL <c>Append</c> calls that
     /// threw. Bumped from <c>WalAppendIfEnabled</c> regardless of the
@@ -219,6 +223,10 @@ public sealed class ChannelMetrics
     /// (i.e. written by a pre-#285 host). Tracks the migration tail
     /// after upgrading.</summary>
     public long WalRecordsLegacy => Interlocked.Read(ref _walRecordsLegacy);
+    /// <summary>Issue #571: boot-time WAL read, validation, or replay
+    /// failures. Distinct from append failures so operators can separate
+    /// recovery faults from live write-path durability faults.</summary>
+    public long WalReplayFailures => Interlocked.Read(ref _walReplayFailures);
     /// <summary>Issue #286: WAL <c>Append</c> calls that threw.
     /// Counted under both <see cref="WalAppendFailurePolicy.Continue"/>
     /// and <see cref="WalAppendFailurePolicy.Halt"/> so the metric is
@@ -261,6 +269,7 @@ public sealed class ChannelMetrics
         if (count > 0) Interlocked.Add(ref _walRecordsLegacy, count);
     }
     public void IncWalAppendFailure() => Interlocked.Increment(ref _walAppendFailures);
+    public void IncWalReplayFailure() => Interlocked.Increment(ref _walReplayFailures);
     public void IncWalHaltReject() => Interlocked.Increment(ref _walHaltRejects);
     /// <summary>Issue #329 PR-4: bumped from <c>ChannelDispatcher</c>'s WAL
     /// truncation gate when the audit watermark is behind the snapshot seq
@@ -419,6 +428,7 @@ public readonly record struct FirmInfo(string Id, string Name, uint EnteringFirm
 public sealed class OpenOrderMetrics
 {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(byte Channel, uint Firm), long> _byFirmChannel = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, long> _limitRejectedByFirm = new();
 
     public void Set(byte channelNumber, uint firm, long count)
         => _byFirmChannel[(channelNumber, firm)] = Math.Max(0, count);
@@ -435,6 +445,12 @@ public sealed class OpenOrderMetrics
         }
         return totals;
     }
+
+    public void IncLimitRejected(uint firm)
+        => _limitRejectedByFirm.AddOrUpdate(firm, 1, static (_, current) => current + 1);
+
+    public KeyValuePair<uint, long>[] LimitRejectedByFirmSnapshot()
+        => _limitRejectedByFirm.ToArray();
 }
 
 /// <summary>
@@ -702,6 +718,9 @@ public sealed class MetricsRegistry
         EmitProcessCounter(sb, "exch_fixp_passive_er_buffered_total",
             "Total outbound FIXP business frames appended to a per-session RetransmitBuffer while the session was Suspended (the issue #217 path: passive ExecutionReports keep being encoded after the transport drops, awaiting a reattach + RetransmitRequest). Quantifies how much reattach traffic is post-disconnect catch-up (issue #288).",
             _retransmit.PassiveErBuffered);
+        EmitProcessCounter(sb, "exch_fixp_outbound_commit_failures_total",
+            "Total FIXP outbound retransmit/journal append failures. The business MsgSeqNum is rolled back and the ordered write reports NotCommitted; a non-zero rate indicates degraded private-stream durability.",
+            _retransmit.OutboundCommitFailures);
         if (EmitFixpSessionLabels && sessionSnap.Length > 0)
         {
             EmitSessionRetransmitUtilizationPercent(sb, sessionSnap);
@@ -771,6 +790,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_snapshot_dropped_by_backpressure_total",
             "Total snapshots that the BackgroundSnapshotWriter (issue #268) discarded because a newer snapshot was submitted before the previous one had been written. Last-write-wins semantics preserve correctness — each snapshot is a complete state image — but a high rate indicates the writer cannot keep up with the loop and RPO is degraded.",
             channels, c => c.SnapshotDroppedByBackpressure);
+        EmitCounter(sb, "exch_mass_cancel_report_failures_total",
+            "Total solicited mass-cancel channel batches whose passive cancellation ExecutionReports did not all commit to their ordered FIXP streams. The batch still publishes UMDF for applied cancellations and completes with SystemBusy.",
+            channels, c => c.MassCancelReportFailures);
 
         // Issue #269: Write-Ahead Log counters. Append rate equals the
         // accepted state-mutating command rate when the WAL is enabled;
@@ -797,6 +819,9 @@ public sealed class MetricsRegistry
         EmitCounter(sb, "exch_wal_append_failures_total",
             "Issue #286: WAL Append() calls that threw (disk full, EIO, permission flip, etc.). Counted under both the Continue and Halt failure policies — the canonical alert signal that the persistence layer is unhealthy on this channel.",
             channels, c => c.WalAppendFailures);
+        EmitCounter(sb, "exch_wal_replay_failures_total",
+            "Issue #571: boot-time WAL read, validation, or replay failures that abort channel startup. Distinct from live Append() failures so operators can route recovery and write-path alerts independently.",
+            channels, c => c.WalReplayFailures);
         EmitCounter(sb, "exch_wal_halt_rejects_total",
             "Issue #286: producer-side Enqueue* rejections after the channel was WAL-halted. Always 0 unless the channel runs with persistence.wal.onAppendFailure=halt; non-zero means the operator must restart the host after fixing the underlying disk fault.",
             channels, c => c.WalHaltRejects);
@@ -1050,11 +1075,24 @@ public sealed class MetricsRegistry
 
     private void EmitOpenOrdersPerFirm(StringBuilder sb)
     {
-        sb.Append("# HELP open_orders_per_firm Current resting open orders per entering firm across all channels (issue #430 pre-trade risk cap).\n");
+        sb.Append("# HELP open_orders_per_firm Current resting open orders per entering firm across all channels (issue #567 host-wide pre-trade risk cap).\n");
         sb.Append("# TYPE open_orders_per_firm gauge\n");
         foreach (var kv in _openOrders.TotalsByFirm())
         {
             sb.Append("open_orders_per_firm{firm=\"")
+              .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
+              .Append("\"} ")
+              .Append(kv.Value.ToString(CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+
+        sb.Append("# HELP open_order_limit_rejected_total New-order requests rejected because the entering firm reached maxOpenOrdersPerFirm.\n");
+        sb.Append("# TYPE open_order_limit_rejected_total counter\n");
+        var rejects = _openOrders.LimitRejectedByFirmSnapshot();
+        Array.Sort(rejects, static (a, b) => a.Key.CompareTo(b.Key));
+        foreach (var kv in rejects)
+        {
+            sb.Append("open_order_limit_rejected_total{firm=\"")
               .Append(kv.Key.ToString(CultureInfo.InvariantCulture))
               .Append("\"} ")
               .Append(kv.Value.ToString(CultureInfo.InvariantCulture))

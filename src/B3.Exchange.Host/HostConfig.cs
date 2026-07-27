@@ -19,6 +19,10 @@ public sealed class HostConfig
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
     [JsonPropertyName("phaseScheduler")] public PhaseSchedulerConfig? PhaseScheduler { get; set; }
     [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
+    /// <summary>
+    /// Host-wide maximum simultaneously open orders per entering firm across
+    /// every channel. The default preserves the pre-configuration behavior.
+    /// </summary>
     [JsonPropertyName("maxOpenOrdersPerFirm")] public int MaxOpenOrdersPerFirm { get; set; } = 100_000;
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 
@@ -412,9 +416,9 @@ public sealed class ChannelConfig
     /// Optional per-channel persistence (issue #260). When present, the
     /// dispatcher loads any existing snapshot from
     /// <see cref="PersistenceConfig.DataDir"/>/<c>channel-{N}.snapshot</c>
-    /// at boot and persists a fresh snapshot after every command flush so
-    /// a restart resumes with the working order book + RptSeq + counters
-    /// intact. Omit to keep the legacy stateless boot.
+    /// at boot, replays its WAL, then durably starts a new incremental UMDF
+    /// epoch while preserving the working order book + RptSeq + counters.
+    /// Omit to keep the legacy stateless boot.
     /// </summary>
     [JsonPropertyName("persistence")] public PersistenceConfig? Persistence { get; set; }
 

@@ -17,21 +17,21 @@ namespace B3.Exchange.Core;
 /// </summary>
 public sealed partial class ChannelDispatcher
 {
+    private readonly record struct WalReplayOutcome(bool Succeeded, int RecordCount);
+
     /// <summary>
     /// Returns the next sequence number for a state-mutating command
     /// and, when a WAL is wired and we are not currently replaying,
     /// appends the corresponding <see cref="WalRecord"/> before the
     /// engine observes the command. Called from <c>ProcessOne</c>
     /// before each <c>WorkKind.New</c> / <c>Cancel</c> /
-    /// <c>Replace</c> branch.
+    /// <c>Replace</c> / <c>MassCancel</c> branch.
     ///
     /// <para>Returns <c>true</c> when the caller may safely execute
-    /// the command. Returns <c>false</c> only when the configured
-    /// <see cref="WalAppendFailurePolicy"/> is
-    /// <see cref="WalAppendFailurePolicy.Halt"/> AND the append
-    /// threw — the command must be skipped (no engine mutation,
-    /// no UMDF emission, no ExecutionReport) and the channel is
-    /// permanently marked WAL-halted (issue #286).</para>
+    /// the command. Returns <c>false</c> when the append cannot be accepted
+    /// and the command must fail closed: always for MassCancel, and for other
+    /// kinds when <see cref="WalAppendFailurePolicy.Halt"/> is configured.
+    /// The command is skipped and the channel is permanently WAL-halted.</para>
     ///
     /// <para><b>Determinism invariant (issue #287):</b> the engine state
     /// produced by feeding a command stream through this method must be a
@@ -68,6 +68,13 @@ public sealed partial class ChannelDispatcher
                 item.Session.Value ?? string.Empty, item.Firm,
                 item.ClOrdId, item.OrigClOrdId,
                 null, null, item.Replace),
+            WorkKind.MassCancel when item.MassCancel is not null => new WalRecord(
+                _lastAppliedSeq, WalRecordKind.MassCancel,
+                item.Session.Value ?? string.Empty, item.Firm,
+                item.ClOrdId, item.OrigClOrdId,
+                null, null, null,
+                item.MassCancel.Command,
+                item.MassCancel.OrderIds.ToArray()),
             _ => null,
         };
         if (rec is null) return true;
@@ -78,6 +85,19 @@ public sealed partial class ChannelDispatcher
             // *only* to get the byte count, then Append re-serialized — so
             // we return the on-disk bytes from this single call.
             long approxBytes = _wal.Append(rec);
+            if (item.Kind == WorkKind.MassCancel
+                && approxBytes <= 0
+                && _wal.PendingDurableSeqOrZero < _lastAppliedSeq)
+            {
+                _metrics?.IncWalAppendFailure();
+                _metrics?.IncDispatcherCrashes();
+                _metrics?.SetWalDropsOnFull(_wal.DropsOnFullCount);
+                Volatile.Write(ref _walHalted, 1);
+                _logger.LogCritical(
+                    "channel {ChannelNumber}: WAL declined mass-cancel record seq={Seq}; channel marked unhealthy and command refused",
+                    ChannelNumber, _lastAppliedSeq);
+                return false;
+            }
             _metrics?.IncWalAppend(approxBytes);
             if (approxBytes > 0)
                 _metrics?.SetWalLastWriteUnixMs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -108,7 +128,8 @@ public sealed partial class ChannelDispatcher
             // alert routing can target the persistence on-call story.
             _metrics?.IncWalAppendFailure();
             _metrics?.IncDispatcherCrashes();
-            if (_walAppendFailurePolicy == WalAppendFailurePolicy.Halt)
+            if (_walAppendFailurePolicy == WalAppendFailurePolicy.Halt
+                || item.Kind == WorkKind.MassCancel)
             {
                 // Sticky: the first failure flips the channel to
                 // halted; every subsequent producer-side enqueue and
@@ -119,7 +140,7 @@ public sealed partial class ChannelDispatcher
                 // diverge from the live consumer view.
                 Volatile.Write(ref _walHalted, 1);
                 _logger.LogCritical(ex,
-                    "channel {ChannelNumber}: WAL append failed (seq={Seq} kind={Kind}); WAL-halt policy → channel marked unhealthy and command refused; restart the host after resolving the storage fault",
+                    "channel {ChannelNumber}: WAL append failed (seq={Seq} kind={Kind}); durable command policy → channel marked unhealthy and command refused; restart the host after resolving the storage fault",
                     ChannelNumber, _lastAppliedSeq, item.Kind);
                 return false;
             }
@@ -342,9 +363,9 @@ public sealed partial class ChannelDispatcher
     /// sequences and split points; see also the
     /// <see cref="WalAppendIfEnabled"/> determinism contract.</para>
     /// </summary>
-    private void ReplayWalOnLoopThread(long snapshotLastAppliedSeq)
+    private WalReplayOutcome ReplayWalOnLoopThread(long snapshotLastAppliedSeq)
     {
-        if (_wal is null) return;
+        if (_wal is null) return new WalReplayOutcome(Succeeded: true, RecordCount: 0);
         IReadOnlyList<WalRecord> records;
         try { records = _wal.ReadAll(); }
         catch (B3.Exchange.Core.WalCorruptionException ex)
@@ -357,21 +378,24 @@ public sealed partial class ChannelDispatcher
             // instead. Operators see IsWalHealthy=false on /readyz and
             // a CRITICAL log line; the engine remains at the snapshot
             // baseline (no partial replay).
-            _metrics?.IncWalAppendFailure();
+            _metrics?.IncWalReplayFailure();
             _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
             _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
             Volatile.Write(ref _walHalted, 1);
             _logger.LogCritical(ex,
                 "channel {ChannelNumber}: WAL corruption detected at line {RecordNumber} during boot replay; channel marked WAL-halted, engine left at snapshot baseline (LastAppliedSeq={SnapshotSeq})",
                 ChannelNumber, ex.RecordNumber, snapshotLastAppliedSeq);
-            return;
+            return new WalReplayOutcome(Succeeded: false, RecordCount: 0);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex,
-                "channel {ChannelNumber}: WAL ReadAll failed — skipping replay",
+            _metrics?.IncWalReplayFailure();
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: WAL ReadAll failed during boot recovery; channel marked WAL-halted and startup aborted",
                 ChannelNumber);
-            return;
+            throw new IOException(
+                $"channel {ChannelNumber}: failed to read WAL during boot recovery", ex);
         }
         if (records.Count == 0)
         {
@@ -379,7 +403,7 @@ public sealed partial class ChannelDispatcher
             // (e.g. a WAL composed entirely of corrupt records).
             _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
             _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
-            return;
+            return new WalReplayOutcome(Succeeded: true, RecordCount: 0);
         }
         int replayed = 0;
         int skipped = 0;
@@ -415,18 +439,26 @@ public sealed partial class ChannelDispatcher
                     long expected = snapshotLastAppliedSeq + 1;
                     if (rec.Seq != expected)
                     {
-                        _metrics?.IncWalAppendFailure();
+                        _metrics?.IncWalReplayFailure();
                         _metrics?.AddWalRecordCorruptions(_wal.LastReadCorruptCount);
                         _metrics?.AddWalRecordsLegacy(_wal.LastReadLegacyCount);
                         Volatile.Write(ref _walHalted, 1);
                         _logger.LogCritical(
                             "channel {ChannelNumber}: WAL replay aborted — snapshot/WAL boundary gap (snapshotLastAppliedSeq={SnapshotSeq}, firstReplayableSeq={FirstSeq}, expected={Expected}); channel marked WAL-halted, engine left at snapshot baseline",
                             ChannelNumber, snapshotLastAppliedSeq, rec.Seq, expected);
-                        return;
+                        return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
                     }
                 }
                 var item = TryBuildReplayWorkItem(rec);
-                if (item is null) continue;
+                if (item is null)
+                {
+                    _metrics?.IncWalReplayFailure();
+                    Volatile.Write(ref _walHalted, 1);
+                    _logger.LogCritical(
+                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} has no matching payload; channel marked WAL-halted and startup epoch transition suppressed",
+                        ChannelNumber, rec.Seq, rec.Kind);
+                    return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
+                }
                 try
                 {
                     ProcessOne(item);
@@ -434,9 +466,12 @@ public sealed partial class ChannelDispatcher
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex,
-                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} threw; continuing",
+                    _metrics?.IncWalReplayFailure();
+                    Volatile.Write(ref _walHalted, 1);
+                    _logger.LogCritical(ex,
+                        "channel {ChannelNumber}: WAL replay record seq={Seq} kind={Kind} threw; channel marked WAL-halted and startup epoch transition suppressed",
                         ChannelNumber, rec.Seq, rec.Kind);
+                    return new WalReplayOutcome(Succeeded: false, RecordCount: records.Count);
                 }
             }
         }
@@ -464,6 +499,7 @@ public sealed partial class ChannelDispatcher
         _logger.LogInformation(
             "channel {ChannelNumber}: WAL replay complete — replayed={Replayed} skipped={Skipped} corrupt={Corrupt} legacy={Legacy} (snapshotLastAppliedSeq={SnapshotSeq})",
             ChannelNumber, replayed, skipped, _wal.LastReadCorruptCount, _wal.LastReadLegacyCount, snapshotLastAppliedSeq);
+        return new WalReplayOutcome(Succeeded: true, RecordCount: records.Count);
     }
 
     private static WorkItem? TryBuildReplayWorkItem(WalRecord rec)
@@ -480,6 +516,14 @@ public sealed partial class ChannelDispatcher
             WalRecordKind.Replace when rec.Replace is not null => new WorkItem(
                 WorkKind.Replace, session, rec.Firm, HasSession: rec.SessionValue.Length > 0,
                 rec.ClOrdId, rec.OrigClOrdId, null, null, rec.Replace, null),
+            WalRecordKind.MassCancel
+                when rec.MassCancel is not null && rec.MassCancelOrderIds is not null =>
+                new WorkItem(
+                WorkKind.MassCancel, session, rec.Firm,
+                HasSession: rec.SessionValue.Length > 0,
+                rec.ClOrdId, rec.OrigClOrdId,
+                null, null, null, null,
+                new ResolvedMassCancel(rec.MassCancelOrderIds, rec.MassCancel)),
             _ => null,
         };
     }
@@ -512,10 +556,10 @@ public sealed partial class ChannelDispatcher
         public bool WriteExecutionReportPassiveTrade(SessionId ownerSession, ulong ownerClOrdId,
             long restingOrderId, in TradeEvent e, long leavesQty, long cumQty,
             DurabilityHandle durability = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId,
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId ownerSession, ulong ownerClOrdId,
             long orderId, in OrderCanceledEvent e, ulong requesterClOrdIdOrZero,
             ulong receivedTimeNanos = ulong.MaxValue,
-            DurabilityHandle durability = default) => true;
+            DurabilityHandle durability = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId session, long securityId, long orderId,
             ulong clOrdIdValue, ulong origClOrdIdValue,
             MatchingSide side, long newPriceMantissa, long newRemainingQty, ulong transactTimeNanos,

@@ -14,9 +14,44 @@ public sealed partial class ChannelDispatcher
 {
     public void Start()
     {
+        PrepareStartup();
+        Activate();
+    }
+
+    /// <summary>
+    /// Phase 1 startup: starts the owner thread, restores snapshot/WAL state,
+    /// and durably prepares a new startup epoch when recovery found state.
+    /// No ChannelReset or live work is published until <see cref="Activate"/>.
+    /// </summary>
+    public void PrepareStartup()
+    {
+        if (Interlocked.CompareExchange(ref _startCalled, 1, 0) != 0)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber} dispatcher startup has already been prepared");
+
         _logger.LogInformation("channel {ChannelNumber} dispatcher starting", ChannelNumber);
         _loopTask = Task.Factory.StartNew(() => RunLoop(_cts.Token),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // Recovery and durable epoch preparation run on the single-writer
+        // thread. The loop then waits at the activation barrier without
+        // consuming live work.
+        _startupCompleted.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Phase 2 startup: signals the owner thread to publish any prepared
+    /// ChannelReset and begin draining live work. Idempotent after success.
+    /// </summary>
+    public void Activate()
+    {
+        if (Volatile.Read(ref _startCalled) == 0)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber} dispatcher must be prepared before activation");
+
+        _startupCompleted.Task.GetAwaiter().GetResult();
+        if (Interlocked.CompareExchange(ref _activationCalled, 1, 0) == 0)
+            _activationRequested.TrySetResult(true);
+        _activationCompleted.Task.GetAwaiter().GetResult();
     }
 
     // Issue #138 / PR-5: dispatch loop runs synchronously on the LongRunning
@@ -28,14 +63,23 @@ public sealed partial class ChannelDispatcher
     // by the Debug assert and observable as 504 timeouts in E2E tests.
     private void RunLoop(CancellationToken ct)
     {
-        _writerGuard.BindToCurrentThread();
-        _engine.BindToDispatchThread(Thread.CurrentThread);
-        LoadPersistedStateOnLoopThread();
-
-        var reader = _inbound.Reader;
-        var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
         try
         {
+            _writerGuard.BindToCurrentThread();
+            _engine.BindToDispatchThread(Thread.CurrentThread);
+            bool recoveredDurableState = LoadPersistedStateOnLoopThread();
+            if (recoveredDurableState && IsWalHealthy)
+            {
+                PrepareStartupEpochOnLoopThread();
+            }
+            _startupCompleted.TrySetResult(true);
+
+            if (!WaitForActivationRequest(ct)) return;
+            ActivatePreparedStartupEpochOnLoopThread();
+            _activationCompleted.TrySetResult(true);
+
+            var reader = _inbound.Reader;
+            var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
             while (true)
             {
                 RecordHeartbeat();
@@ -63,6 +107,12 @@ public sealed partial class ChannelDispatcher
                         ProcessOne(item);
                     }
                     catch (OperationCanceledException) { throw; }
+                    catch (RptSeqExhaustedException ex)
+                    {
+                        MarkChannelFatal(ex);
+                        throw;
+                    }
+                    catch (Exception) when (Volatile.Read(ref _channelFatal) != 0) { throw; }
                     catch (Exception ex)
                     {
                         _metrics?.IncDispatcherCrashes();
@@ -76,17 +126,40 @@ public sealed partial class ChannelDispatcher
         }
         catch (Exception ex)
         {
+            MarkChannelFatal(ex);
+            _startupCompleted.TrySetException(ex);
+            _activationCompleted.TrySetException(ex);
             _logger.LogError(ex, "channel {ChannelNumber} dispatch loop terminated unexpectedly", ChannelNumber);
         }
         finally
         {
-            FlushPendingSnapshotOnShutdownSafely();
+            // A failed boot must leave the recovered artifacts untouched.
+            // In particular, never persist a snapshot of partially replayed
+            // state after _startupCompleted has been faulted.
+            if (_startupCompleted.Task.IsCompletedSuccessfully
+                && Volatile.Read(ref _channelFatal) == 0)
+                FlushPendingSnapshotOnShutdownSafely();
+            _activationCompleted.TrySetCanceled();
         }
+    }
+
+    private bool WaitForActivationRequest(CancellationToken ct)
+    {
+        AssertOnLoopThread();
+        var heartbeatMs = (int)Math.Max(1, HeartbeatInterval.TotalMilliseconds);
+        while (!_activationRequested.Task.Wait(heartbeatMs))
+        {
+            RecordHeartbeat();
+            if (ct.IsCancellationRequested) return false;
+        }
+        _activationRequested.Task.GetAwaiter().GetResult();
+        return true;
     }
 
     private async Task DrainInboundBeforeStoppingSnapshotWriterAsync()
     {
-        if (_loopTask is null) return;
+        if (_loopTask is null || _loopTask.IsCompleted || _startupCompleted.Task.IsFaulted
+            || !_activationCompleted.Task.IsCompletedSuccessfully) return;
         var drained = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var item = new WorkItem(WorkKind.ShutdownBarrier, default, 0, false,
             0, 0, null, null, null, null, ShutdownBarrier: drained);
@@ -190,6 +263,30 @@ public sealed partial class ChannelDispatcher
         /// the loop and so must trigger the shutdown hook explicitly.
         /// </summary>
         public void FlushPendingSnapshotOnShutdown() => _disp.FlushPendingSnapshotOnShutdown();
+
+        /// <summary>
+        /// Installs a synchronous callback invoked after a Replace/Cross
+        /// terminal event transfers an existing firm slot into the current
+        /// command's successor reservation. Tests use it to interleave a
+        /// second dispatcher at the exact transition boundary.
+        /// </summary>
+        public void SetOpenOrderTransitionHook(Action? hook)
+            => _disp._openOrderTransitionHookForTesting = hook;
+
+        /// <summary>Completes when the background dispatch loop exits.</summary>
+        public Task LoopCompletion => _disp._loopTask ?? Task.CompletedTask;
+
+        /// <summary>
+        /// Fast-forwards the incremental sequence tuple while quiescent.
+        /// Used only by rollover/exhaustion tests before startup.
+        /// </summary>
+        public void SetSequence(ushort version, uint number)
+        {
+            if (_disp._loopTask is not null)
+                throw new InvalidOperationException("sequence test seam requires a quiescent dispatcher");
+            _disp.TestSetSequenceVersion(version);
+            _disp.TestSetSequenceNumber(number);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -224,6 +321,13 @@ public sealed partial class ChannelDispatcher
         }
         _inbound.Writer.TryComplete();
         if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
+        try { await _massCancelTerminalTail.ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel terminal pipeline shutdown failed",
+                ChannelNumber);
+        }
         // Issue #269: release the WAL file handle so the underlying
         // file can be deleted by tests / operator tooling. The
         // dispatcher loop has already flushed its final snapshot

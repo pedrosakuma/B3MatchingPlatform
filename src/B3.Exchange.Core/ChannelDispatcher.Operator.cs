@@ -17,7 +17,7 @@ public sealed partial class ChannelDispatcher
     private void ProcessBumpVersion()
     {
         // Atomic operator-initiated channel reset (issue #6). Order matters:
-        //   1. Wipe per-instrument books and reset RptSeq on the engine.
+        //   1. Wipe per-instrument books and reset every per-security RptSeq.
         //   2. Bump incremental SequenceVersion + reset SequenceNumber.
         //   3. Bump snapshot rotator's SequenceVersion (if attached).
         //   4. Emit one ChannelReset_11 frame, flushed as a single-message
@@ -27,17 +27,43 @@ public sealed partial class ChannelDispatcher
         // invariant — ProcessOne is the sole caller and is invoked only
         // from the dispatch loop.
         AssertOnLoopThread();
+        ushort nextIncrementalVersion;
+        try
+        {
+            nextIncrementalVersion = UmdfSequenceVersion.NextLiveOrThrow(
+                _sequenceVersion,
+                $"channel {ChannelNumber} operator incremental epoch");
+            if (_snapshotRotator is { } snapshotRotator)
+            {
+                _ = UmdfSequenceVersion.NextLiveOrThrow(
+                    snapshotRotator.SequenceVersion,
+                    $"channel {ChannelNumber} operator snapshot epoch");
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw CreateSequenceFatal(ex);
+        }
+
         _engine.ResetForChannelReset();
         _orders.Clear();
         RecordAllBookCounts();
         ClearOpenOrderCounts();
-        Volatile.Write(ref _sequenceVersion, (ushort)(_sequenceVersion + 1));
+        Volatile.Write(ref _sequenceVersion, nextIncrementalVersion);
         Volatile.Write(ref _sequenceNumber, 0u);
         _snapshotRotator?.BumpSequenceVersion();
 
-        // Force-write the ChannelReset_11 frame using the standard
-        // ReserveOrFlush/Commit path so the packet header reflects the
-        // NEW SequenceVersion.
+        EmitChannelResetPacket();
+    }
+
+    /// <summary>
+    /// Emits one <c>ChannelReset_11</c> packet under the dispatcher's current
+    /// sequence version. The caller is responsible for establishing the
+    /// desired epoch and any engine-state semantics before invoking it.
+    /// </summary>
+    private void EmitChannelResetPacket()
+    {
+        AssertOnLoopThread();
         _packetWritten = 0;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
@@ -58,7 +84,7 @@ public sealed partial class ChannelDispatcher
     private void ProcessTradeBust(OperatorTradeBust bust)
     {
         AssertOnLoopThread();
-        uint rptSeq = _engine.AllocateNextRptSeq();
+        uint rptSeq = _engine.AllocateNextRptSeq(bust.SecurityId);
         _packetWritten = 0;
         var dst = ReserveOrFlush(B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
             + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
@@ -148,7 +174,7 @@ public sealed partial class ChannelDispatcher
     /// Operator command (issue #6): atomically (a) bumps the incremental
     /// channel's <see cref="SequenceVersion"/> + the attached snapshot
     /// rotator's <c>SequenceVersion</c>, (b) clears every per-instrument
-    /// order book, (c) resets the engine's <c>RptSeq</c> counter to 0, and
+    /// order book, (c) resets every per-security <c>RptSeq</c> counter to 0, and
     /// (d) emits a single <c>ChannelReset_11</c> frame on the incremental
     /// channel under the NEW <see cref="SequenceVersion"/>. The next
     /// snapshot publish (whether scheduled or operator-forced) will reflect
@@ -168,8 +194,9 @@ public sealed partial class ChannelDispatcher
     /// (<paramref name="securityId"/>, <paramref name="tradeId"/>). The
     /// price/size/date echo fields are caller-supplied — the simulator
     /// does not retain a per-trade audit log. The bust frame is stamped
-    /// with the next available <c>RptSeq</c> from the channel's matching
-    /// engine and emitted under the current <c>SequenceVersion</c>.
+    /// with the next available <c>RptSeq</c> for
+    /// <paramref name="securityId"/> and emitted under the current
+    /// <c>SequenceVersion</c>.
     /// Returns <c>false</c> if the inbound queue is full. Safe to call
     /// from any thread.
     /// </summary>
@@ -252,14 +279,18 @@ public sealed partial class ChannelDispatcher
             // amendments republish are owned by the orchestrator. The
             // dispatcher only owns the wire-emission half (TradeBust_57
             // frame on Accept).
-            var outcome = _postTradeOrch!.ProcessBust(request, ChannelNumber, tradeDateDaysSinceEpoch);
+            var outcome = _postTradeOrch!.ProcessBust(
+                request,
+                ChannelNumber,
+                tradeDateDaysSinceEpoch,
+                _engine.EnsureRptSeqCapacityForSynthetic);
 
             if (outcome.Kind == B3.Exchange.PostTrade.BustValidationKind.Accept)
             {
                 // Emit TradeBust_57 frame; price/size echo come from the
                 // matched fill so consumers see the same data the
                 // original Trade_53 carried.
-                uint rptSeq = _engine.AllocateNextRptSeq();
+                uint rptSeq = _engine.AllocateNextRptSeq(outcome.MatchedFill.SecurityId);
                 _packetWritten = 0;
                 int frameSize = B3.Umdf.WireEncoder.WireOffsets.FramingHeaderSize
                     + B3.Umdf.WireEncoder.WireOffsets.SbeMessageHeaderSize
@@ -394,6 +425,10 @@ public sealed partial class ChannelDispatcher
             {
                 applied = _engine.SetTradingPhase(op.SecurityId, op.Phase, _timeSource.NowNanos());
             }
+            catch (B3.Exchange.Matching.RptSeqExhaustedException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 completion?.TrySetException(ex);
@@ -441,6 +476,10 @@ public sealed partial class ChannelDispatcher
             try
             {
                 _engine.UncrossAuction(op.SecurityId, op.TargetPhase, _timeSource.NowNanos());
+            }
+            catch (B3.Exchange.Matching.RptSeqExhaustedException)
+            {
+                throw;
             }
             catch (InvalidOperationException ex)
             {
@@ -529,6 +568,10 @@ public sealed partial class ChannelDispatcher
             {
                 stateChanged = _engine.HaltInstrument(op.SecurityId, op.Reason, op.Note, _timeSource.NowNanos());
             }
+            catch (B3.Exchange.Matching.RptSeqExhaustedException)
+            {
+                throw;
+            }
             catch (KeyNotFoundException ex)
             {
                 completion?.TrySetException(ex);
@@ -586,6 +629,10 @@ public sealed partial class ChannelDispatcher
             try
             {
                 stateChanged = _engine.ResumeInstrument(op.SecurityId, _timeSource.NowNanos());
+            }
+            catch (B3.Exchange.Matching.RptSeqExhaustedException)
+            {
+                throw;
             }
             catch (KeyNotFoundException ex)
             {

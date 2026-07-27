@@ -199,6 +199,135 @@ public class MatchingTests
         Assert.Equal(1u, sink.Accepted[0].RptSeq);
         Assert.Equal(2u, sink.Trades[0].RptSeq);
         Assert.Equal(3u, sink.Filled[0].RptSeq);
-        Assert.Equal(3u, eng.CurrentRptSeq);
+        Assert.Equal(3u, eng.GetCurrentRptSeq(PetrSecId));
+    }
+
+    [Fact]
+    public void RptSeq_IsContiguousPerSecurityAcrossInterleavedTraffic()
+    {
+        var eng = NewThreeSecurityEngine(out var sink);
+
+        eng.Submit(new NewOrderCommand("P-S", PetrSecId, Side.Sell, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 11, 1_000));
+        eng.Submit(new NewOrderCommand("V-B1", ValeSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(20m), 100, 22, 2_000));
+        eng.Submit(new NewOrderCommand("I-B", ItubSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(30m), 100, 33, 3_000));
+        eng.Submit(new NewOrderCommand("V-B2", ValeSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(19m), 100, 22, 4_000));
+        eng.SetTradingPhase(ItubSecId, TradingPhase.Pause, 5_000);
+
+        sink.Clear();
+        eng.Submit(new NewOrderCommand("P-B", PetrSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 44, 6_000));
+
+        Assert.Equal(2u, Assert.Single(sink.Trades).RptSeq);
+        Assert.Equal(3u, Assert.Single(sink.Filled).RptSeq);
+        Assert.Equal(3u, eng.GetCurrentRptSeq(PetrSecId));
+        Assert.Equal(2u, eng.GetCurrentRptSeq(ValeSecId));
+        Assert.Equal(2u, eng.GetCurrentRptSeq(ItubSecId));
+    }
+
+    [Fact]
+    public void RptSeq_UnknownSecurityInitializesAndOverflowFailsClosed()
+    {
+        const long unknown = 999_999_999_999L;
+        var eng = NewEngine(out _);
+        var snapshot = eng.CaptureState() with
+        {
+            RptSeqBySecurity =
+            [
+                new EngineStateSnapshot.RptSeqEntry(PetrSecId, uint.MaxValue),
+            ],
+        };
+
+        var restored = NewEngine(out var restoredSink);
+        restored.RestoreState(snapshot);
+
+        var error = Assert.Throws<RptSeqExhaustedException>(() =>
+            restored.Submit(new NewOrderCommand(
+                "OVERFLOW",
+                PetrSecId,
+                Side.Buy,
+                OrderType.Limit,
+                TimeInForce.Day,
+                Px(10m),
+                100,
+                11,
+                1_000)));
+        Assert.Contains("channel reset required", error.Message);
+        Assert.Equal(uint.MaxValue, restored.GetCurrentRptSeq(PetrSecId));
+        Assert.Equal(0, restored.OrderCount(PetrSecId));
+        Assert.Empty(restoredSink.Accepted);
+        Assert.Equal(1u, restored.AllocateNextRptSeq(unknown));
+        Assert.Contains(restored.CaptureState().RptSeqBySecurity,
+            entry => entry.SecurityId == unknown && entry.RptSeq == 1);
+    }
+
+    [Fact]
+    public void RptSeq_PrivateStopAndUnmatchedIocEventsDoNotCreateGaps()
+    {
+        var eng = NewEngine(out var sink);
+        eng.Submit(new NewOrderCommand("STOP", PetrSecId, Side.Buy, OrderType.StopLoss,
+            TimeInForce.Day, 0, 100, 11, 1_000)
+        {
+            StopPxMantissa = Px(11m),
+        });
+        var stop = Assert.Single(sink.StopAccepted);
+        Assert.Equal(0u, stop.RptSeq);
+        Assert.Equal(0u, eng.GetCurrentRptSeq(PetrSecId));
+
+        eng.Cancel(new CancelOrderCommand("STOP-C", PetrSecId, stop.OrderId, 2_000));
+        Assert.Equal(0u, Assert.Single(sink.StopCanceled).RptSeq);
+        Assert.Equal(0u, eng.GetCurrentRptSeq(PetrSecId));
+
+        eng.Submit(new NewOrderCommand("IOC", PetrSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.IOC, Px(10m), 100, 11, 3_000));
+        Assert.Equal(0u, sink.Canceled.Single(e => e.Reason == CancelReason.IocUnmatched).RptSeq);
+        Assert.Equal(0u, eng.GetCurrentRptSeq(PetrSecId));
+
+        eng.Submit(new NewOrderCommand("DAY", PetrSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 11, 4_000));
+        Assert.Equal(1u, sink.Accepted.Last().RptSeq);
+    }
+
+    [Fact]
+    public void RptSeq_AuctionTopPairConsumesOneValuePerIncrementalFrame()
+    {
+        var eng = NewEngine(out var sink);
+        eng.SetTradingPhase(PetrSecId, TradingPhase.Reserved, 1_000);
+        eng.Submit(new NewOrderCommand("GFA", PetrSecId, Side.Buy, OrderType.Limit,
+            TimeInForce.GoodForAuction, Px(10m), 100, 11, 2_000));
+
+        var auctionTop = Assert.Single(sink.AuctionTops);
+        Assert.Equal(3u, auctionTop.TopRptSeq);
+        Assert.Equal(4u, auctionTop.ImbalanceRptSeq);
+        Assert.Equal(4u, eng.GetCurrentRptSeq(PetrSecId));
+    }
+
+    [Fact]
+    public void RptSeq_MultiFrameCommandPreflightsCapacityBeforeTradeSideEffects()
+    {
+        var source = NewEngine(out _);
+        source.Submit(new NewOrderCommand("SELL", PetrSecId, Side.Sell, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 22, 1_000));
+        var snapshot = source.CaptureState() with
+        {
+            RptSeqBySecurity =
+            [
+                new EngineStateSnapshot.RptSeqEntry(PetrSecId, uint.MaxValue - 1),
+            ],
+        };
+        var restored = NewEngine(out var sink);
+        restored.RestoreState(snapshot);
+
+        Assert.Throws<RptSeqExhaustedException>(() =>
+            restored.Submit(new NewOrderCommand("BUY", PetrSecId, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10m), 100, 11, 2_000)));
+
+        Assert.Equal(1, restored.OrderCount(PetrSecId));
+        Assert.Empty(sink.Trades);
+        Assert.Empty(sink.Filled);
+        Assert.Equal(uint.MaxValue - 1, restored.GetCurrentRptSeq(PetrSecId));
     }
 }

@@ -145,15 +145,34 @@ public sealed partial class ChannelDispatcher
 
     public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
         MassCancelCommand command)
+        => EnqueueResolvedMassCancel(orderIds, session, enteringFirm, command, completion: null);
+
+    /// <summary>
+    /// Enqueues a resolved batch with terminal completion ownership.
+    /// A <c>true</c> return transfers ownership of
+    /// <paramref name="completion"/> to the dispatcher, which invokes it
+    /// exactly once after the batch's cancellation reports and durability
+    /// work finish. A <c>false</c> return means producer-side rejection
+    /// (queue full or already WAL-halted); the callback was not retained and
+    /// will not run. A WAL failure after an accepted enqueue completes the
+    /// callback with <see cref="MassCancelOutcome.SystemBusy"/>.
+    /// </summary>
+    public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
+        MassCancelCommand command, Action<MassCancelOutcome>? completion)
     {
-        if (orderIds == null || orderIds.Count == 0) return true;
+        if (orderIds == null || orderIds.Count == 0)
+        {
+            completion?.Invoke(MassCancelOutcome.Completed(0));
+            return true;
+        }
         if (RejectIfWalHalted(WorkKind.MassCancel)) return false;
         var mc = new ResolvedMassCancel(orderIds, command);
         using var act = StartEnqueueSpan(WorkKind.MassCancel, session, enteringFirm, 0, securityId: 0);
         var parent = act?.Context ?? System.Diagnostics.Activity.Current?.Context ?? default;
         if (_inbound.Writer.TryWrite(new WorkItem(WorkKind.MassCancel, session, enteringFirm, true,
             0, 0, null, null, null, null, mc,
-            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent)))
+            EnqueueTicks: System.Diagnostics.Stopwatch.GetTimestamp(), ParentContext: parent,
+            MassCancelCompletion: completion)))
         { _metrics?.IncInboundMessage(InboundMessageKind.MassCancel); _sessionFirmCounters?.Inc(enteringFirm, session.Value); return true; }
         _metrics?.IncDispatchQueueFull(); LogQueueFull(ChannelNumber, WorkKind.MassCancel);
         act?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, "queue_full");

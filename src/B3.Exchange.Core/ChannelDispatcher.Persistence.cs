@@ -11,7 +11,7 @@ namespace B3.Exchange.Core;
 /// Owns the snapshot/restore plumbing wired through
 /// <see cref="IChannelStatePersister"/>; integrates with
 /// <c>ProcessOne</c> via <see cref="OnAfterCommandFlushed"/> and with
-/// <c>RunLoopAsync</c> via <see cref="LoadPersistedStateOnLoopThread"/>.
+/// <c>RunLoop</c> via <see cref="LoadPersistedStateOnLoopThread"/>.
 ///
 /// <para>All state mutation paths assume single-threaded invocation on
 /// the dispatch loop thread (mirrors the engine's invariant). The
@@ -157,6 +157,13 @@ public sealed partial class ChannelDispatcher
         // appends keep increasing monotonically across the restart.
         _lastAppliedSeq = snapshot.LastAppliedSeq;
 
+        foreach (var book in snapshot.Engine.Books)
+            foreach (var order in book.Orders)
+                TrackOpenOrder(order.OrderId, order.EnteringFirm);
+        if (snapshot.Engine.Stops is { } restoredStops)
+            foreach (var stop in restoredStops)
+                TrackOpenOrder(stop.OrderId, stop.EnteringFirm);
+
         long droppedOrphans = 0;
 
         // Issue #319: build a (orderId -> remainingQty) lookup from the
@@ -208,7 +215,6 @@ public sealed partial class ChannelDispatcher
             }
             _orders.Register(o.OrderId, new SessionId(o.SessionValue), o.ClOrdId, o.Firm, o.Side, o.SecurityId,
                 originalQty: origQty, cumQty: o.CumQty);
-            IncrementOpenOrders(o.Firm);
         }
         if (droppedOrphans > 0) _metrics?.AddOwnerOrphansDropped(droppedOrphans);
         RecordAllBookCounts();
@@ -301,12 +307,44 @@ public sealed partial class ChannelDispatcher
                 throw new InvalidOperationException(
                     $"snapshot owner refers to orderId {owner.OrderId} which is not present in any restored book or stop");
         }
+
+        var rptSeqSecurityIds = new HashSet<long>();
+        foreach (var entry in snapshot.Engine.RptSeqBySecurity)
+        {
+            if (!rptSeqSecurityIds.Add(entry.SecurityId))
+                throw new InvalidOperationException(
+                    $"snapshot contains duplicate RptSeq counter for securityId {entry.SecurityId}");
+        }
+
+        var representedSecurityIds = new HashSet<long>();
+        foreach (var phase in snapshot.Engine.Phases)
+            representedSecurityIds.Add(phase.SecurityId);
+        foreach (var book in snapshot.Engine.Books)
+            representedSecurityIds.Add(book.SecurityId);
+        if (snapshot.Engine.Stops is { } representedStops)
+        {
+            foreach (var stop in representedStops)
+                representedSecurityIds.Add(stop.SecurityId);
+        }
+        if (snapshot.Engine.Halts is { } halts)
+        {
+            foreach (var halt in halts)
+                representedSecurityIds.Add(halt.SecurityId);
+        }
+        foreach (var owner in snapshot.Owners)
+            representedSecurityIds.Add(owner.SecurityId);
+        foreach (long securityId in representedSecurityIds)
+        {
+            if (!rptSeqSecurityIds.Contains(securityId))
+                throw new InvalidOperationException(
+                    $"snapshot securityId {securityId} has no persisted RptSeq counter");
+        }
     }
 
     /// <summary>
     /// Loads the persisted snapshot (when a persister is wired) and
     /// applies it on the dispatch thread. Called from
-    /// <see cref="RunLoopAsync"/> immediately after
+    /// <c>RunLoop</c> immediately after
     /// <c>BindToDispatchThread</c>, so the engine's owner thread is the
     /// loop thread for both the restore and every subsequent dispatch.
     ///
@@ -320,7 +358,7 @@ public sealed partial class ChannelDispatcher
     /// flag) before restarting. <c>TryLoad</c>-time IO failures are
     /// also fatal for the same reason.</para>
     /// </summary>
-    private void LoadPersistedStateOnLoopThread()
+    private bool LoadPersistedStateOnLoopThread()
     {
         if (_persister is null)
         {
@@ -328,8 +366,9 @@ public sealed partial class ChannelDispatcher
             // (e.g. tests with WAL-only configs). Replay against the
             // empty engine so a crash before the very first snapshot is
             // recoverable.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return;
+            _engine.BeginLegacyRptSeqMigration(0);
+            ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
+            return false;
         }
         ChannelStateSnapshot? snapshot;
         var loadStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -351,17 +390,14 @@ public sealed partial class ChannelDispatcher
             // Issue #269: no snapshot but possibly WAL records from a
             // crash before the first snapshot ever ran. Replay rebuilds
             // the engine from scratch.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: 0);
-            return;
+            _engine.BeginLegacyRptSeqMigration(0);
+            var walReplay = ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
+            return walReplay.RecordCount > 0;
         }
         try
         {
             RestoreChannelState(snapshot);
             _metrics?.SnapshotLoad.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - loadStart);
-            // Issue #269: replay any WAL records that were appended
-            // after the snapshot was taken — closes the gap between
-            // the most-recent snapshot and the moment of the crash.
-            ReplayWalOnLoopThread(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
         }
         catch (InvalidOperationException ex)
         {
@@ -382,6 +418,100 @@ public sealed partial class ChannelDispatcher
                 ChannelNumber);
             throw;
         }
+        // Issue #269: replay any WAL records that were appended after the
+        // snapshot was taken. Keep this outside the snapshot restore catch
+        // block so WAL I/O failures retain their own fatal classification.
+        ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: snapshot.LastAppliedSeq);
+        return true;
+    }
+
+    private WalReplayOutcome ReplayWalForStartupOrThrow(long snapshotLastAppliedSeq)
+    {
+        var outcome = ReplayWalOnLoopThread(snapshotLastAppliedSeq);
+        if (!outcome.Succeeded)
+        {
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: WAL replay failed during boot recovery; startup aborted");
+        }
+        _engine.CompleteLegacyRptSeqMigration();
+        return outcome;
+    }
+
+    /// <summary>
+    /// Durably prepares a new incremental UMDF epoch after successful
+    /// snapshot/WAL recovery without mutating the restored matching state
+    /// (issue #571). Publication is deliberately deferred to
+    /// <see cref="ActivatePreparedStartupEpochOnLoopThread"/> so a
+    /// multi-channel host can finish recovery for every channel before any
+    /// external feed output escapes.
+    /// </summary>
+    private void PrepareStartupEpochOnLoopThread()
+    {
+        AssertOnLoopThread();
+        if (_persister is null)
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: startup epoch transition requires a state persister");
+
+        ushort restoredVersion = _sequenceVersion;
+        ushort preparedVersion = UmdfSequenceVersion.NextLiveOrThrow(
+            restoredVersion,
+            $"channel {ChannelNumber} startup incremental epoch");
+        Volatile.Write(ref _sequenceVersion, preparedVersion);
+        Volatile.Write(ref _sequenceNumber, 0u);
+        _retxBuffer?.Reset();
+
+        var snapshot = CaptureChannelState();
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            long bytes = _persister.Save(snapshot);
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            if (_metrics is { } metrics)
+            {
+                metrics.SnapshotWrite.ObserveTicks(elapsed);
+                metrics.IncSnapshotSaveOk();
+                if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
+                metrics.SetSnapshotLastSuccessUnixMs(nowMs);
+            }
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncSnapshotSaveFailure();
+            _metrics?.IncDispatcherCrashes();
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: failed to durably prepare startup UMDF epoch {SequenceVersion}; reset will not be published",
+                ChannelNumber, preparedVersion);
+            throw new InvalidOperationException(
+                $"channel {ChannelNumber}: failed to durably prepare startup UMDF epoch {preparedVersion}", ex);
+        }
+
+        _commandsSincePersist = 0;
+        _lastPersistUnixMs = nowMs;
+        _pendingDirty = false;
+        TruncateWalAfterSyncSave(snapshot.LastAppliedSeq);
+
+        _startupRestoredVersion = restoredVersion;
+        _startupEpochPrepared = true;
+        _logger.LogInformation(
+            "channel {ChannelNumber}: startup UMDF epoch durably prepared {RestoredVersion}->{PreparedVersion}; awaiting activation",
+            ChannelNumber, restoredVersion, preparedVersion);
+    }
+
+    /// <summary>
+    /// Publishes the phase-1 prepared startup reset. Must run on the owner
+    /// thread; the host only signals activation from its startup thread.
+    /// </summary>
+    private void ActivatePreparedStartupEpochOnLoopThread()
+    {
+        AssertOnLoopThread();
+        if (!_startupEpochPrepared) return;
+
+        EmitChannelResetPacket();
+        _startupEpochPrepared = false;
+        _logger.LogInformation(
+            "channel {ChannelNumber}: startup UMDF epoch advanced {RestoredVersion}->{PreparedVersion}; restored state preserved and ChannelReset_11 published at packet sequence 1",
+            ChannelNumber, _startupRestoredVersion, _sequenceVersion);
     }
 
     /// <summary>
@@ -398,13 +528,22 @@ public sealed partial class ChannelDispatcher
     /// to <c>true</c> so SequenceVersion bumps, TradeBust replays and
     /// trading-phase changes always persist immediately.</para>
     /// </summary>
-    private void OnAfterCommandFlushed(bool force = false)
+    private void OnAfterCommandFlushed(
+        bool force = false,
+        bool recordCommandBoundary = true)
     {
         // Issue #329 PR-4: tag the command boundary on the audit sink so
         // the durability watermark can advance on the next Checkpoint.
         // Done before any early-return so the sink sees boundaries even
         // when no persister is wired (cheap when the sink is the no-op).
-        _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
+        if (recordCommandBoundary)
+            _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
+        // WAL replay reconstructs state from an already-durable command log.
+        // Persisting each replay turn is both unnecessary and unsafe with the
+        // async writer: an old-epoch snapshot could land after the startup
+        // epoch has been durably prepared. The single synchronous save in
+        // PrepareStartupEpochOnLoopThread absorbs the full replay.
+        if (_replayMode) return;
         if (_persister is null) return;
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (!force)
@@ -464,6 +603,81 @@ public sealed partial class ChannelDispatcher
             _metrics?.IncSnapshotSaveFailure();
             _metrics?.IncDispatcherCrashes();
             _logger.LogError(ex, "channel {ChannelNumber}: persister Save failed", ChannelNumber);
+        }
+    }
+
+    private Task<bool> BeginMassCancelDurability(long commandSeq)
+    {
+        _postTradeSink.OnCommandBoundary(commandSeq);
+        if (_replayMode)
+            return Task.FromResult(true);
+
+        if (_wal is not null)
+        {
+            OnAfterCommandFlushed(recordCommandBoundary: false);
+            if (_wal.DurableSeqOrZero >= commandSeq)
+                return Task.FromResult(true);
+
+            var wal = _wal;
+            return Task.Run(() => WaitForMassCancelWalDurability(
+                wal, commandSeq));
+        }
+
+        if (_persister is null)
+            return Task.FromResult(true);
+
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var snapshot = CaptureChannelState();
+        var persister = _persister;
+        return Task.Run(() =>
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                long bytes = persister.Save(snapshot);
+                long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                if (_metrics is { } metrics)
+                {
+                    metrics.SnapshotWrite.ObserveTicks(elapsed);
+                    metrics.IncSnapshotSaveOk();
+                    if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
+                    metrics.SetSnapshotLastSuccessUnixMs(nowMs);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _metrics?.IncSnapshotSaveFailure();
+                _metrics?.IncDispatcherCrashes();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: asynchronous mass-cancel snapshot failed; terminal ACCEPTED suppressed",
+                    ChannelNumber);
+                return false;
+            }
+        });
+    }
+
+    private bool WaitForMassCancelWalDurability(
+        IChannelWriteAheadLog wal,
+        long commandSeq)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                _cts.Token);
+            timeout.CancelAfter(_massCancelDurabilityTimeout);
+            wal.WaitForDurable(commandSeq, timeout.Token);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncWalAppendFailure();
+            _metrics?.IncDispatcherCrashes();
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: mass-cancel WAL durability failed at seq={Seq}; channel marked unhealthy and terminal ACCEPTED suppressed",
+                ChannelNumber, commandSeq);
+            return false;
         }
     }
 

@@ -46,7 +46,7 @@ public class ChannelDispatcherAuditWatermarkTests
         public bool WriteExecutionReportNew(SessionId s, uint f, ulong c, in OrderAcceptedEvent e, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong rc, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong rc, ulong r = ulong.MaxValue, DurabilityHandle d = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId s, long sid, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rs, ulong r = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId s, in B3.Exchange.Matching.RejectEvent e, ulong c, DurabilityHandle d = default) => true;
     }
@@ -418,10 +418,8 @@ public class ChannelDispatcherAuditWatermarkTests
 
         disp2.Start();
         // Quiescence: AddWalReplays runs AFTER the entire WAL replay
-        // foreach completes. SaveCount bumps mid-replay (each command's
-        // OnAfterCommandFlushed under the AlwaysPersist throttle) so it
-        // is NOT a reliable post-replay barrier. Poll WalReplays
-        // directly.
+        // foreach completes. Poll it directly rather than coupling this
+        // audit test to startup snapshot-save behavior.
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (metrics2.WalReplays < 2 && DateTime.UtcNow < deadline)
             Thread.Sleep(10);

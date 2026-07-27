@@ -85,7 +85,10 @@ public sealed partial class FixpSession
                     $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
             }
             // Issue #485: update Identity to stable FIXP SessionId (legacy path).
-            UpdateIdentityAfterNegotiate(req.SessionId);
+            UpdateIdentityAfterNegotiate(
+                req.SessionId,
+                replaceRetired: true,
+                out _);
             SessionId = req.SessionId;
             EnteringFirm = req.EnteringFirm;
             SessionVerId = req.SessionVerId;
@@ -125,29 +128,41 @@ public sealed partial class FixpSession
         // Atomic claim. If another live transport already holds this
         // sessionID (or the version is stale by the time we commit), we
         // must reject — spec §4.5.2.
-        var claim = _claims.TryClaim(req.SessionId, req.SessionVerId, this);
+        var claim = _claims.TryClaim(
+            req.SessionId,
+            req.SessionVerId,
+            this,
+            out var claimRollback);
         // Issue #488: track a stale session evicted by TryForceTakeOver. The
         // close is deferred until AFTER TrySaveStateSnapshot succeeds so that
         // a persistence rollback does not leave order ownership orphaned with
         // no live session to own it — the old session's TCP will time out
         // naturally and call OnSessionClosed via the TransportError path.
         FixpSession? evictedByTakeOver = null;
-        ulong evictedVerId = 0UL;
+        SessionClaimRegistry.TakeOverRollback takeOverRollback = default;
         if (claim == SessionClaimRegistry.ClaimResult.DuplicateConnection)
         {
             // Session takeover — the peer crashed and reconnected before our
             // idle-timeout detected the dead TCP. If the new sessionVerId is
             // strictly greater, atomically evict the stale claim and continue
             // to the accept path.
-            claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
-                out var evicted);
+            bool activeClaimIsCommitted =
+                _sessionRegistry is null
+                || !_claims.TryGetActiveClaim(req.SessionId, out var activeHolder, out _)
+                || activeHolder is not FixpSession activeSession
+                || _sessionRegistry.IsCurrent(activeSession);
+            object? evicted = null;
+            if (activeClaimIsCommitted)
+            {
+                claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
+                    out evicted, out takeOverRollback);
+            }
             if (claim == SessionClaimRegistry.ClaimResult.Accepted && evicted is FixpSession oldSession)
             {
                 _logger.LogInformation(
                     "session {ConnectionId} taking over sessionId={SessionId} from {OldConnectionId} (new verId={NewVerId})",
                     ConnectionId, req.SessionId, oldSession.ConnectionId, req.SessionVerId);
                 evictedByTakeOver = oldSession;
-                evictedVerId = oldSession.SessionVerId;
             }
         }
         if (claim != SessionClaimRegistry.ClaimResult.Accepted)
@@ -168,21 +183,103 @@ public sealed partial class FixpSession
         }
 
         _claimedSessionId = req.SessionId;
+        if (!TryApplyPendingNegotiateState(req.SessionId))
+        {
+            if (evictedByTakeOver is not null)
+            {
+                _claims.TryRestoreTakeOver(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    evictedByTakeOver,
+                    takeOverRollback);
+            }
+            else
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
+            }
+            _claims.Release(req.SessionId, this);
+            _claimedSessionId = 0;
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                "negotiate-reject (UNSPECIFIED: persisted outbound state reconcile failed)");
+        }
         _ = ApplyTransition(FixpEvent.Negotiate);
-        // Issue #485: update Identity to the stable FIXP SessionId and notify
-        // the registry to re-index. Capture the old identity for rollback.
-        var pendingIdentity = UpdateIdentityAfterNegotiate(req.SessionId);
         SessionId = req.SessionId;
         EnteringFirm = outcome.Firm!.EnteringFirmCode;
         SessionVerId = req.SessionVerId;
         ConfigureOrderRateLimit(outcome.Credential!.Policy.MaxOrderRatePerSecond);
+        // Issue #485: update Identity to the stable FIXP SessionId and notify
+        // the registry to re-index. Capture the old identity for rollback.
+        var pendingIdentity = UpdateIdentityAfterNegotiate(
+            req.SessionId,
+            replaceRetired: evictedByTakeOver is null,
+            out var identityUpdated);
+        if (!identityUpdated)
+        {
+            if (evictedByTakeOver is not null)
+            {
+                _claims.TryRestoreTakeOver(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    evictedByTakeOver,
+                    takeOverRollback);
+            }
+            else
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
+            }
+            _claims.Release(req.SessionId, this);
+            _claimedSessionId = 0;
+            SessionId = _acceptedSessionId;
+            SessionVerId = 0;
+            EnteringFirm = _acceptedEnteringFirm;
+            RollbackPendingNegotiateState();
+            RollbackIdentity(pendingIdentity);
+
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                "negotiate-reject (UNSPECIFIED: session claim/route handoff lost)");
+        }
         // Issue #405 (review finding): commit the new SessionVerID to
         // disk BEFORE acking the Negotiate. If persistence fails, abort
         // the handshake — without this, a transient disk error would
         // leak an accepted SessionVerID into the peer's view that no
         // post-restart boot would honor, allowing a stale-version
         // Negotiate to be replayed against a clean SessionClaimRegistry.
-        if (!TrySaveStateSnapshot())
+        SessionClaimRegistry.TakeOverFinalizeResult? takeOverFinalize = null;
+        bool committed;
+        if (evictedByTakeOver is not null && _sessionRegistry is not null)
+        {
+            takeOverFinalize = _sessionRegistry.TryCommitTakeOver(
+                evictedByTakeOver,
+                this,
+                _claims,
+                takeOverRollback);
+            committed = takeOverFinalize == SessionClaimRegistry.TakeOverFinalizeResult.Committed;
+        }
+        else
+        {
+            committed = TrySaveStateSnapshot();
+        }
+        if (!committed)
         {
             // Roll back the in-memory claim taken above so the session
             // can be retried by the peer (same SessionVerID, same TCP
@@ -195,17 +292,30 @@ public sealed partial class FixpSession
             // no-op (returns false) if a concurrent racing takeover has
             // already won the registry in the window between
             // TryForceTakeOver and here.
-            var takeOverRolledBack = false;
+            var takeOverRolledBack =
+                takeOverFinalize == SessionClaimRegistry.TakeOverFinalizeResult.RolledBack;
             if (evictedByTakeOver is not null)
             {
-                takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
-                    this, evictedByTakeOver, evictedVerId);
+                if (takeOverFinalize is null)
+                {
+                    takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
+                        req.SessionVerId, this, evictedByTakeOver, takeOverRollback);
+                }
+            }
+            if (evictedByTakeOver is null)
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
-            SessionId = 0;
+            SessionId = _acceptedSessionId;
             SessionVerId = 0;
-            EnteringFirm = 0;
+            EnteringFirm = _acceptedEnteringFirm;
+            RollbackPendingNegotiateState();
             // Issue #485: roll back Identity to the pending format so
             // OnSessionClosed doesn't evict ownership for a real session.
             RollbackIdentity(pendingIdentity);
@@ -216,7 +326,9 @@ public sealed partial class FixpSession
             // rollback so routing is restored — but only when the claim was
             // actually handed back (takeOverRolledBack), to stay in lock-step
             // with the claim registry and avoid clobbering a racing takeover.
-            if (takeOverRolledBack && evictedByTakeOver is not null)
+            if (takeOverRolledBack
+                && evictedByTakeOver is not null
+                && _sessionRegistry is null)
             {
                 _onTakeOverRollback?.Invoke(evictedByTakeOver);
             }
@@ -230,14 +342,19 @@ public sealed partial class FixpSession
             return NegotiateStep.Rejected(rejectFrame,
                 "negotiate-reject (UNSPECIFIED: state snapshot persist failed)");
         }
+        _onPersistedStateClaimed?.Invoke(req.SessionId);
 
         var responseFrame = new byte[NegotiateResponseEncoder.Total];
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,
             req.TimestampNanos, outcome.Firm.EnteringFirmCode,
             semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
-        // Issue #488: persistence committed — safe to evict the stale session now.
-        // Its Release() call is a no-op (registry already holds this session's token).
-        evictedByTakeOver?.Close("session-takeover:evicted-by-newer-verId", CloseKind.SessionTakeOver);
+        // With a SessionRegistry, TryCommitTakeOver atomically persisted the
+        // reconciled outbound state, switched the logical route, and closed the
+        // victim. Directly-constructed legacy sessions retain the old fallback.
+        if (evictedByTakeOver is not null && _sessionRegistry is null)
+            evictedByTakeOver.Close(
+                "session-takeover:evicted-by-newer-verId",
+                CloseKind.SessionTakeOver);
         return NegotiateStep.Accepted(responseFrame,
             $"negotiate-accept (sid={req.SessionId} firm={outcome.Firm.Id})");
     }
@@ -256,6 +373,7 @@ public sealed partial class FixpSession
             _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
             if (!_transport.TryEnqueueFrame(step.ResponseFrame!))
             {
+                AbortBusinessAdmission();
                 _logger.LogWarning("session {ConnectionId} could not enqueue NegotiateResponse — closing",
                     ConnectionId);
                 Close("send-queue-full:NegotiateResponse");

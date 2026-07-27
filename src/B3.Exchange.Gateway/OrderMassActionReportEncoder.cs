@@ -8,9 +8,7 @@ namespace B3.Exchange.Gateway;
 /// Byte-level encoder for the EntryPoint <c>OrderMassActionReport</c>
 /// (templateId=702, schema V6). Used to acknowledge — or reject — an
 /// inbound <c>OrderMassActionRequest</c> (template 701, spec §4.8 /
-/// #GAP-19) on the same TCP session, ahead of the per-order
-/// <c>ExecutionReport_Cancel</c> messages that the engine emits for the
-/// matching resting orders.
+/// #GAP-19) on the same TCP session.
 ///
 /// Layout (V6, BlockLength=70):
 ///   header(12) | OutboundBusinessHeader(18 @0)

@@ -187,7 +187,7 @@ public static class UmdfWireEncoder
     }
 
     /// <summary>
-    /// Writes <c>SnapshotFullRefresh_Header_30</c> (V6 — accepted by V16 reader).
+    /// Writes <c>SnapshotFullRefresh_Header_30</c> using the current V16 layout.
     /// </summary>
     public static int WriteSnapshotHeaderFrame(
         Span<byte> dst,
@@ -196,13 +196,14 @@ public static class UmdfWireEncoder
         uint totNumBids,
         uint totNumOffers,
         ushort totNumStats,
-        uint? lastRptSeq)
+        uint? lastRptSeq,
+        ushort lastSequenceVersion)
     {
         const int total = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -218,6 +219,7 @@ public static class UmdfWireEncoder
         MemoryMarshal.Write(body.Slice(WireOffsets.SnapHeaderBodyTotNumStatsOffset, 2), in totNumStats);
         uint rpt = lastRptSeq ?? 0u;
         MemoryMarshal.Write(body.Slice(WireOffsets.SnapHeaderBodyLastRptSeqOffset, 4), in rpt);
+        MemoryMarshal.Write(body.Slice(WireOffsets.SnapHeaderBodyLastSequenceVersionOffset, 2), in lastSequenceVersion);
 
         return total;
     }
