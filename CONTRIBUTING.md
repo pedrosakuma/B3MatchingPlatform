@@ -109,3 +109,24 @@ Do not hand-edit files under `schemas/`. When upgrading B3 EntryPoint
 or UMDF, regenerate the SBE bindings in `B3.*.Sbe` and mirror the
 change in the companion `SbeB3UmdfConsumer` repo. The two repos must
 agree on the schema version.
+
+### Protocol contract evidence gate
+
+Any issue or PR that changes, adds, or consumes an EntryPoint/UMDF field,
+enum value, or template must cite:
+
+- the vendored schema file and version;
+- the exact template name and ID;
+- the field names and enum values used;
+- the implemented upstream PR or commit when the dependency is cross-repo.
+
+An upstream issue proposal is not evidence that a wire contract exists.
+If the requested template or field is absent, stop at a research/blocker
+issue until B3 publishes it. Do not create a proprietary SBE template or
+write an out-of-domain raw enum value to approximate the missing contract.
+
+When implementation differs from an issue proposal, the PR and closing
+comment must state what was actually delivered so downstream work does not
+inherit the abandoned design. Wire tests should use generated schema types
+or constants and assert the emitted template ID, block length, and enum
+values.

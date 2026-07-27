@@ -174,6 +174,26 @@ Quick reminders (the full rule list is in `CONTRIBUTING.md`):
 - `TreatWarningsAsErrors=true` is global — a new warning is a build
   break.
 
+### 9. Prove protocol contracts before implementing them
+
+For any EntryPoint/UMDF request, inspect the vendored XML before accepting
+the issue wording as fact. Record the schema version, template name/ID,
+fields, and enum values in the issue or PR.
+
+- Cross-repo dependencies must cite the merged PR/commit that implements
+  the wire shape, not only the upstream issue that proposed it.
+- If the template or field is absent, report the work as blocked/research.
+  Never invent a proprietary SBE message or hand-edit the vendored schema.
+- Do not encode raw literals for schema enums merely because a consumer
+  needs distinct values. Use generated enum members/constants and pin them
+  in wire tests.
+- If implementation diverges from the issue proposal, correct the issue or
+  leave an explicit closing comment before downstream work is filed.
+
+PR #582 / issue #581 is the canonical failure mode: a proposed
+`InstrumentStatus_NN` was treated as an implemented contract even though
+the merged code emitted `SecurityStatus_3`.
+
 ## What belongs in prompts, not here
 
 This file holds conventions that apply to **every contributor and

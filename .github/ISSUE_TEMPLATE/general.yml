@@ -1,0 +1,35 @@
+name: General issue
+description: Report a bug or request work that does not change EntryPoint/UMDF contracts
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For EntryPoint/UMDF templates, fields, enums, or schema changes, use a Protocol form instead.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Describe the problem, evidence, and affected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Expected outcome
+      description: Describe the result without prescribing unsupported protocol contracts.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: checkboxes
+    id: protocol
+    attributes:
+      label: Protocol scope
+      options:
+        - label: This issue does not add or change an EntryPoint/UMDF template, field, enum value, or schema.
+          required: true

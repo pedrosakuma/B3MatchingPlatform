@@ -116,6 +116,12 @@ Layered projects under `src/` (build order roughly bottom-up):
 - **Schemas are vendored.** Do not hand-edit files under `schemas/`; regenerate
   the SBE bindings in `B3.*.Sbe` when upgrading and mirror the change in
   `SbeB3UmdfConsumer`.
+- **Protocol claims require schema evidence.** Before implementing an
+  EntryPoint/UMDF field, enum, or template, cite its vendored schema version,
+  template ID, and exact members. Cross-repo dependencies must cite the merged
+  implementation, not only an issue proposal. If the contract is absent,
+  stop at research/blocker status; do not invent proprietary SBE messages or
+  raw enum values.
 
 ## Configuration
 
