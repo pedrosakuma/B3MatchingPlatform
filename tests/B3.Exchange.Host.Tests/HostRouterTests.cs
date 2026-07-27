@@ -225,7 +225,11 @@ public class HostRouterTests
         Assert.True(router.EnqueueMassCancel(
             new MassCancelCommand(inst.SecurityId, null, 2),
             owner, enteringFirm: 7,
-            outcome => terminal.TrySetResult(outcome)));
+            outcome =>
+            {
+                outbound.Events.Add(outcome.Succeeded ? "accepted" : "system-busy");
+                terminal.TrySetResult(outcome);
+            }));
         Assert.True(router.EnqueueNewOrder(
             new NewOrderCommand("2", inst.SecurityId, Side.Buy,
                 OrderType.Limit, TimeInForce.Day, Px(9m), 100, 8, 3),
@@ -242,6 +246,60 @@ public class HostRouterTests
         var outcome = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(3));
         Assert.Equal(commitDeferredReport, outcome.Succeeded);
         Assert.Equal(commitDeferredReport ? 1 : 0, outcome.TotalAffectedOrders);
+        Assert.Equal(
+            new[] { "cancel", "new", commitDeferredReport ? "accepted" : "system-busy" },
+            outbound.Events);
+    }
+
+    [Fact]
+    public async Task SolicitedMassCancel_DisposeCancelsNeverCompletingDeferredReport()
+    {
+        var inst = CreateInstrument();
+        var deferred = new TaskCompletionSource<OrderedStreamWriteResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var outbound = new RecordingOutbound
+        {
+            CancelWriteResult = OrderedStreamWriteResult.Deferred(deferred.Task),
+        };
+        var disp = CreateDispatcher(inst, outbound);
+        var router = new HostRouter(
+            new Dictionary<long, ChannelDispatcher> { [inst.SecurityId] = disp },
+            outbound, NullLogger<HostRouter>.Instance);
+        var probe = disp.CreateTestProbe();
+        var owner = new SessionId("owner");
+
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("1", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1),
+            owner, enteringFirm: 7, clOrdIdValue: 1));
+        probe.DrainInbound();
+        outbound.Events.Clear();
+
+        var terminal = new TaskCompletionSource<MassCancelOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        int callbackCount = 0;
+        Assert.True(router.EnqueueMassCancel(
+            new MassCancelCommand(inst.SecurityId, null, 2),
+            owner, enteringFirm: 7,
+            outcome =>
+            {
+                Interlocked.Increment(ref callbackCount);
+                outbound.Events.Add(outcome.Succeeded ? "accepted" : "system-busy");
+                terminal.TrySetResult(outcome);
+            }));
+        probe.DrainInbound();
+
+        Assert.False(terminal.Task.IsCompleted);
+        Assert.Equal(new[] { "cancel" }, outbound.Events);
+
+        await disp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+
+        var outcome = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.False(outcome.Succeeded);
+        Assert.Equal(1, Volatile.Read(ref callbackCount));
+        Assert.Equal(new[] { "cancel", "system-busy" }, outbound.Events);
+        Assert.DoesNotContain("accepted", outbound.Events);
+        Assert.False(deferred.Task.IsCompleted);
     }
 
     [Fact]
