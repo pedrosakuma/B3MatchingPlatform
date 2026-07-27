@@ -51,6 +51,7 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
 
     steps:
       - name: Checkout
@@ -97,6 +98,7 @@ jobs:
     name: Build & Test (Debug)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
     # Debug builds enforce single-thread invariants (MatchingEngine /
     # ChannelDispatcher) via Debug.Assert, which compiles out in
     # Release. Two latent bugs (#374 dispatcher async-loop continuation
@@ -151,6 +153,7 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
 
     steps:
       - name: Checkout
