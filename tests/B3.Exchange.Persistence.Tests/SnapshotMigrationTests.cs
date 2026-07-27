@@ -49,9 +49,7 @@ public class SnapshotMigrationTests
             var p = new FileChannelStatePersister(dir, NullLogger<FileChannelStatePersister>.Instance);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            // GAP-23 / #499: chain now upgrades to v6, the new
-            // CurrentVersion (was v5 in #455).
-            Assert.Equal(6, loaded!.Version);
+            Assert.Equal(ChannelStateSnapshot.CurrentVersion, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -82,10 +80,7 @@ public class SnapshotMigrationTests
                 migrations: migrations);
             var loaded = p.TryLoad(7);
             Assert.NotNull(loaded);
-            // Issue #455 / GAP-23 #499: chain is 0→1 (registered here)
-            // followed by 1→2 … 5→6 (registered by BuildDefault), so the
-            // loaded version reflects CurrentVersion = 6.
-            Assert.Equal(6, loaded!.Version);
+            Assert.Equal(ChannelStateSnapshot.CurrentVersion, loaded!.Version);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -148,6 +143,73 @@ public class SnapshotMigrationTests
         Assert.Equal(2, obj["Version"]!.GetValue<int>());
         Assert.Equal("first", obj["AddedAtV1"]!.GetValue<string>());
         Assert.Equal("second", obj["AddedAtV2"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void V6ToV7_MapsLegacyGlobalRptSeqToEveryKnownSecurity()
+    {
+        var root = JsonNode.Parse(
+            """
+            {
+              "Version": 6,
+              "Engine": {
+                "NextOrderId": 1,
+                "NextTradeId": 1,
+                "RptSeq": 42,
+                "Phases": [
+                  { "SecurityId": 33, "Phase": "Open" },
+                  { "SecurityId": 11, "Phase": "Open" },
+                  { "SecurityId": 22, "Phase": "Open" }
+                ],
+                "Books": [
+                  { "SecurityId": 11, "Orders": [] }
+                ],
+                "Stops": [],
+                "Halts": []
+              },
+              "Owners": []
+            }
+            """)!;
+
+        var migrated = SnapshotMigrationSet.BuildDefault()
+            .MigrateToCurrent(root, ChannelStateSnapshot.CurrentVersion);
+
+        var engine = (JsonObject)((JsonObject)migrated)["Engine"]!;
+        Assert.False(engine.ContainsKey("RptSeq"));
+        var entries = (JsonArray)engine["RptSeqBySecurity"]!;
+        Assert.Equal(3, entries.Count);
+        Assert.Equal(
+            new long[] { 11, 22, 33 },
+            entries.Select(entry => entry!["SecurityId"]!.GetValue<long>()));
+        Assert.All(entries, entry => Assert.Equal(42u, entry!["RptSeq"]!.GetValue<uint>()));
+        Assert.Equal(42u, engine["LegacyGlobalRptSeq"]!.GetValue<uint>());
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("\"not-a-number\"")]
+    [InlineData("4294967296")]
+    public void V6ToV7_RejectsMissingOrMalformedLegacyRptSeq(string rptSeqJson)
+    {
+        var root = JsonNode.Parse(
+            $$"""
+            {
+              "Version": 6,
+              "Engine": {
+                "NextOrderId": 1,
+                "NextTradeId": 1,
+                "RptSeq": {{rptSeqJson}},
+                "Phases": [],
+                "Books": []
+              },
+              "Owners": []
+            }
+            """)!;
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            SnapshotMigrationSet.BuildDefault()
+                .MigrateToCurrent(root, ChannelStateSnapshot.CurrentVersion));
+        Assert.Contains("Engine.RptSeq", error.Message);
     }
 
     [Fact]

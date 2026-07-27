@@ -28,7 +28,7 @@ public class SingleThreadInvariantTests
         var engine = TestFactory.NewEngine(out _);
         engine.BindToDispatchThread(Thread.CurrentThread);
         // Should not throw.
-        _ = engine.AllocateNextRptSeq();
+        _ = engine.AllocateNextRptSeq(TestFactory.PetrSecId);
     }
 
     [Fact]
@@ -36,12 +36,12 @@ public class SingleThreadInvariantTests
     {
         var engine = TestFactory.NewEngine(out _);
         // First call (no explicit binding) latches current thread.
-        _ = engine.AllocateNextRptSeq();
+        _ = engine.AllocateNextRptSeq(TestFactory.PetrSecId);
         // Second call from another thread must trigger the assert.
         Exception? captured = null;
         var t = new Thread(() =>
         {
-            try { _ = engine.AllocateNextRptSeq(); }
+            try { _ = engine.AllocateNextRptSeq(TestFactory.PetrSecId); }
             catch (Exception ex) { captured = ex; }
         });
         t.Start();
@@ -64,7 +64,7 @@ public class SingleThreadInvariantTests
         Exception? captured = null;
         var t = new Thread(() =>
         {
-            try { _ = engine.AllocateNextRptSeq(); }
+            try { _ = engine.AllocateNextRptSeq(TestFactory.PetrSecId); }
             catch (Exception ex) { captured = ex; }
         });
         t.Start();

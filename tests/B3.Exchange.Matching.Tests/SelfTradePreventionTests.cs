@@ -38,7 +38,7 @@ public class SelfTradePreventionTests
         var eng = NewEngine(SelfTradePrevention.CancelAggressor, out var sink);
         eng.Submit(new NewOrderCommand("s1", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, FirmA, 1000));
         sink.Clear();
-        uint baseRpt = eng.CurrentRptSeq;
+        uint baseRpt = eng.GetCurrentRptSeq(PetrSecId);
         long expectedAggressorOrderId = eng.PeekNextOrderId;
 
         eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, FirmA, 2000));
@@ -52,7 +52,7 @@ public class SelfTradePreventionTests
         Assert.Equal(RejectReason.SelfTradePrevention, rej.Reason);
         Assert.Equal(expectedAggressorOrderId, rej.OrderIdOrZero);
         Assert.Equal(1, eng.OrderCount(PetrSecId));   // s1 still resting, untouched
-        Assert.Equal(baseRpt, eng.CurrentRptSeq);     // Reject does NOT bump RptSeq
+        Assert.Equal(baseRpt, eng.GetCurrentRptSeq(PetrSecId));     // Reject does NOT bump RptSeq
     }
 
     [Fact]
@@ -205,7 +205,7 @@ public class SelfTradePreventionTests
         eng.Submit(new NewOrderCommand("sA", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, FirmA, 1000));
         eng.Submit(new NewOrderCommand("sB", PetrSecId, Side.Sell, OrderType.Limit, TimeInForce.Day, Px(10m), 100, FirmB, 1100));
         // Two Accepted events so far → RptSeq=2, no trades emitted.
-        Assert.Equal(2u, eng.CurrentRptSeq);
+        Assert.Equal(2u, eng.GetCurrentRptSeq(PetrSecId));
         sink.Clear();
 
         eng.Submit(new NewOrderCommand("b1", PetrSecId, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, FirmA, 2000));
@@ -214,7 +214,7 @@ public class SelfTradePreventionTests
         Assert.Equal(3u, sink.Canceled[0].RptSeq);
         Assert.Equal(4u, sink.Trades[0].RptSeq);
         Assert.Equal(5u, sink.Filled[0].RptSeq);
-        Assert.Equal(5u, eng.CurrentRptSeq);
+        Assert.Equal(5u, eng.GetCurrentRptSeq(PetrSecId));
         Assert.Equal(1u, sink.Trades[0].TradeId);
     }
 }

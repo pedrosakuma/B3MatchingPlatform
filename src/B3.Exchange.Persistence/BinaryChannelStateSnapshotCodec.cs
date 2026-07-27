@@ -20,7 +20,11 @@ namespace B3.Exchange.Persistence;
 ///   <item>int64 LastAppliedSeq (issue #269 WAL anchor).</item>
 ///   <item>EngineStateSnapshot block:
 ///     <list type="number">
-///       <item>int64 NextOrderId, uint32 NextTradeId, uint32 RptSeq.</item>
+///       <item>int64 NextOrderId, uint32 NextTradeId.</item>
+///       <item>Codec v7+: uvarint per-security RptSeq count, then
+///       (int64 securityId + uint32 RptSeq) per entry. Codec v1-v6 stored
+///       one uint32 channel-global RptSeq in this position; decode migrates
+///       that high-water mark to every SecurityID known by the snapshot.</item>
 ///       <item>uvarint phase count, then (int64 securityId + byte phase)
 ///       per entry.</item>
 ///       <item>uvarint book count, then per book: int64 securityId +
@@ -98,7 +102,24 @@ public static class BinaryChannelStateSnapshotCodec
         var engine = snapshot.Engine;
         w.WriteInt64(engine.NextOrderId);
         w.WriteUInt32(engine.NextTradeId);
-        w.WriteUInt32(engine.RptSeq);
+        if (snapshot.Version >= 7)
+        {
+            w.WriteUVarInt((ulong)engine.RptSeqBySecurity.Count);
+            foreach (var entry in engine.RptSeqBySecurity)
+            {
+                w.WriteInt64(entry.SecurityId);
+                w.WriteUInt32(entry.RptSeq);
+            }
+        }
+        else
+        {
+            uint legacyRptSeq = 0;
+            foreach (var entry in engine.RptSeqBySecurity)
+            {
+                if (entry.RptSeq > legacyRptSeq) legacyRptSeq = entry.RptSeq;
+            }
+            w.WriteUInt32(legacyRptSeq);
+        }
 
         w.WriteUVarInt((ulong)engine.Phases.Count);
         foreach (var p in engine.Phases)
@@ -217,7 +238,24 @@ public static class BinaryChannelStateSnapshotCodec
 
         long nextOrderId = r.ReadInt64();
         uint nextTradeId = r.ReadUInt32();
-        uint rptSeq = r.ReadUInt32();
+        IReadOnlyList<EngineStateSnapshot.RptSeqEntry>? rptSeqBySecurity = null;
+        uint legacyRptSeq = 0;
+        if (version >= 7)
+        {
+            ulong rptSeqCount = ReadBoundedCount(ref r, bytes.Length, "RptSeq");
+            var entries = new EngineStateSnapshot.RptSeqEntry[rptSeqCount];
+            for (ulong i = 0; i < rptSeqCount; i++)
+            {
+                entries[i] = new EngineStateSnapshot.RptSeqEntry(
+                    r.ReadInt64(),
+                    r.ReadUInt32());
+            }
+            rptSeqBySecurity = entries;
+        }
+        else
+        {
+            legacyRptSeq = r.ReadUInt32();
+        }
 
         ulong phaseCount = ReadBoundedCount(ref r, bytes.Length, "phase");
         var phases = new EngineStateSnapshot.PhaseEntry[phaseCount];
@@ -326,7 +364,22 @@ public static class BinaryChannelStateSnapshotCodec
             }
         }
 
-        var engine = new EngineStateSnapshot(nextOrderId, nextTradeId, rptSeq, phases, books, stops, halts);
+        rptSeqBySecurity ??= MigrateLegacyRptSeq(
+            legacyRptSeq,
+            phases,
+            books,
+            stops,
+            halts,
+            owners);
+        var engine = new EngineStateSnapshot(
+            nextOrderId,
+            nextTradeId,
+            rptSeqBySecurity,
+            phases,
+            books,
+            stops,
+            halts,
+            LegacyGlobalRptSeq: version < 7 ? legacyRptSeq : null);
         // Issue #319: a v1 file is wire-compatible with v2 except every
         // owner record is missing the trailing OriginalQty/CumQty pair —
         // ReadOwner handles that by defaulting both to 0, and the
@@ -349,11 +402,43 @@ public static class BinaryChannelStateSnapshotCodec
         // Issue #499: v5 → v6 is also a clean migration — v5 files have
         // no per-resting-order ExpireDate trailer, and ReadRestingOrder
         // defaults it to 0 (no GTD expiry) for older versions.
-        int effectiveVersion = (version == 1 || version == 2 || version == 3 || version == 4 || version == 5) ? ChannelStateSnapshot.CurrentVersion : version;
+        // Issue #576: v6 → v7 maps the legacy channel-global RptSeq
+        // high-water mark to every SecurityID carried by the snapshot.
+        int effectiveVersion = version is >= 1 and <= 6
+            ? ChannelStateSnapshot.CurrentVersion
+            : version;
         return new ChannelStateSnapshot(effectiveVersion, channelNumber, sequenceNumber, sequenceVersion, engine, owners)
         {
             LastAppliedSeq = lastAppliedSeq,
         };
+    }
+
+    private static IReadOnlyList<EngineStateSnapshot.RptSeqEntry> MigrateLegacyRptSeq(
+        uint legacyRptSeq,
+        IReadOnlyList<EngineStateSnapshot.PhaseEntry> phases,
+        IReadOnlyList<EngineStateSnapshot.BookSnapshot> books,
+        IReadOnlyList<RestingStopRecord>? stops,
+        IReadOnlyList<EngineStateSnapshot.HaltEntry>? halts,
+        IReadOnlyList<OrderOwnerSnapshot> owners)
+    {
+        var securityIds = new SortedSet<long>();
+        foreach (var phase in phases) securityIds.Add(phase.SecurityId);
+        foreach (var book in books) securityIds.Add(book.SecurityId);
+        if (stops is not null)
+        {
+            foreach (var stop in stops) securityIds.Add(stop.SecurityId);
+        }
+        if (halts is not null)
+        {
+            foreach (var halt in halts) securityIds.Add(halt.SecurityId);
+        }
+        foreach (var owner in owners) securityIds.Add(owner.SecurityId);
+
+        var migrated = new EngineStateSnapshot.RptSeqEntry[securityIds.Count];
+        int index = 0;
+        foreach (long securityId in securityIds)
+            migrated[index++] = new EngineStateSnapshot.RptSeqEntry(securityId, legacyRptSeq);
+        return migrated;
     }
 
     private static void WriteRestingOrder(BinaryBufferWriter w, RestingOrderRecord o, int version)

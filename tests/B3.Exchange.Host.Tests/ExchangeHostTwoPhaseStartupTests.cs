@@ -194,7 +194,7 @@ public sealed class ExchangeHostTwoPhaseStartupTests
         var engine = new EngineStateSnapshot(
             NextOrderId: 1,
             NextTradeId: 1,
-            RptSeq: 0,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(securityId, 0)],
             Phases: [new EngineStateSnapshot.PhaseEntry(securityId, TradingPhase.Open)],
             Books: [new EngineStateSnapshot.BookSnapshot(securityId, [])]);
         IReadOnlyList<OrderOwnerSnapshot> owners = invalidOwner

@@ -6,6 +6,8 @@ namespace B3.Exchange.Matching.Tests;
 internal static class TestFactory
 {
     public const long PetrSecId = 900_000_000_001L;
+    public const long ValeSecId = 900_000_000_002L;
+    public const long ItubSecId = 900_000_000_003L;
 
     public static Instrument Petr4 => new()
     {
@@ -20,13 +22,35 @@ internal static class TestFactory
         SecurityType = "EQUITY",
     };
 
+    public static Instrument Vale3 => CreateInstrument("VALE3", ValeSecId, "BRVALEACNOR0");
+    public static Instrument Itub4 => CreateInstrument("ITUB4", ItubSecId, "BRITUBACNPR1");
+
     public static MatchingEngine NewEngine(out RecordingSink sink)
     {
         sink = new RecordingSink();
         return new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance);
     }
 
+    public static MatchingEngine NewThreeSecurityEngine(out RecordingSink sink)
+    {
+        sink = new RecordingSink();
+        return new MatchingEngine([Petr4, Vale3, Itub4], sink, NullLogger<MatchingEngine>.Instance);
+    }
+
     public static long Px(decimal p) => (long)(p * 10_000m);
+
+    private static Instrument CreateInstrument(string symbol, long securityId, string isin) => new()
+    {
+        Symbol = symbol,
+        SecurityId = securityId,
+        TickSize = 0.01m,
+        LotSize = 100,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000.00m,
+        Currency = "BRL",
+        Isin = isin,
+        SecurityType = "EQUITY",
+    };
 }
 
 internal sealed class RecordingSink : IMatchingEventSink
