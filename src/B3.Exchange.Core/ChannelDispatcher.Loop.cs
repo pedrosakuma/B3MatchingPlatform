@@ -249,7 +249,7 @@ public sealed partial class ChannelDispatcher
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
-        // observes it. Only New/Cancel/Replace are durable today;
+        // observes it. New/Cancel/Replace/MassCancel are WAL-durable;
         // operator commands force-snapshot post-flush so the
         // resulting state is captured directly. _lastAppliedSeq is
         // advanced by WalAppendIfEnabled regardless, including in
@@ -270,14 +270,17 @@ public sealed partial class ChannelDispatcher
             EmitOpenOrderLimitReject(item.Cross!);
             return;
         }
-        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
+        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace or WorkKind.MassCancel)
         {
             if (!WalAppendIfEnabled(in item))
             {
                 _metrics?.IncWalHaltReject();
+                if (item.Kind == WorkKind.MassCancel)
+                    CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
                 return;
             }
         }
+        MassCancelOutcome? pendingMassCancelOutcome = null;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -483,10 +486,9 @@ public sealed partial class ChannelDispatcher
                             CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
                             throw;
                         }
-                        CompleteMassCancel(item.MassCancelCompletion,
-                            _currentMassCancelReportsCommitted
-                                ? MassCancelOutcome.Completed(affected)
-                                : MassCancelOutcome.SystemBusy);
+                        pendingMassCancelOutcome = _currentMassCancelReportsCommitted
+                            ? MassCancelOutcome.Completed(affected)
+                            : MassCancelOutcome.SystemBusy;
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -543,11 +545,22 @@ public sealed partial class ChannelDispatcher
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
-                // Issue #260: persist post-flush so any consumer-visible
-                // event corresponds to a durable snapshot on disk before
-                // the next command is observed. Best-effort: failures are
-                // logged and swallowed by the helper.
-                OnAfterCommandFlushed();
+                if (item.Kind == WorkKind.MassCancel)
+                {
+                    var terminalOutcome = pendingMassCancelOutcome
+                        ?? MassCancelOutcome.SystemBusy;
+                    if (!TryCompleteMassCancelDurability())
+                        terminalOutcome = MassCancelOutcome.SystemBusy;
+                    CompleteMassCancel(item.MassCancelCompletion, terminalOutcome);
+                }
+                else
+                {
+                    // Issue #260: persist post-flush so any consumer-visible
+                    // event corresponds to a durable snapshot on disk before
+                    // the next command is observed. Best-effort: failures are
+                    // logged and swallowed by the helper.
+                    OnAfterCommandFlushed();
+                }
             }
             else
             {

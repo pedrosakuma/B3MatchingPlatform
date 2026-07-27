@@ -263,17 +263,51 @@ public class WalAppendFailurePolicyTests
     }
 
     [Fact]
+    public async Task Continue_MassCancelWalFailure_IsFailClosedAndCompletesSystemBusy()
+    {
+        var wal = new FailingWal();
+        var disp = BuildDispatcher(
+            wal, WalAppendFailurePolicy.Continue, out _);
+        try
+        {
+            disp.Start();
+            Assert.True(EnqueueOrder(disp, clOrdIdValue: 1));
+            await WaitForAsync(() =>
+                disp.TryResolveByClOrdId(700, 1, out _, out _));
+            Assert.True(disp.TryResolveByClOrdId(
+                700, 1, out var orderId, out _));
+
+            var completion = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(disp.EnqueueResolvedMassCancel(
+                [orderId],
+                new SessionId("S1"),
+                enteringFirm: 700,
+                new MassCancelCommand(Sec, null, 2),
+                outcome => completion.TrySetResult(outcome)));
+
+            var outcome = await completion.Task.WaitAsync(
+                TimeSpan.FromSeconds(5));
+            Assert.False(outcome.Succeeded);
+            Assert.False(disp.IsWalHealthy);
+            Assert.True(disp.TryResolveByClOrdId(700, 1, out _, out _));
+            Assert.Equal(2, wal.AppendCalls);
+        }
+        finally
+        {
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task Halt_DropsAlreadyQueuedWork_OnDispatchLoop()
     {
         // gpt-5.5 round-2 review (PR #299): the original version of
         // this test queued only New orders, all of which are gated by
         // WalAppendIfEnabled in ProcessOne — so it did not actually
-        // exercise the new top-of-loop _walHalted gate. Cross and
-        // (resolved) MassCancel are state-mutating but bypass
-        // WalAppendIfEnabled (only New/Cancel/Replace are durable),
-        // so without the loop-gate a queued Cross would mutate the
-        // engine after halt. Queue both so the gate is the only
-        // thing keeping the engine clean.
+        // exercise the new top-of-loop _walHalted gate. Queue Cross and
+        // resolved MassCancel behind the failing New so that gate must
+        // reject both before either engine mutation or another WAL append.
         var wal = new FailingWal();
         var metrics = new ChannelMetrics(84);
         var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);

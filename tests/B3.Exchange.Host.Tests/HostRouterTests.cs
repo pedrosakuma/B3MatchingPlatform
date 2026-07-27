@@ -182,6 +182,67 @@ public class HostRouterTests
     }
 
     [Fact]
+    public void SolicitedMassCancel_PartialEnqueueDefersSystemBusyUntilAcceptedReports()
+    {
+        var inst1 = CreateInstrument(42, "TEST1");
+        var inst2 = CreateInstrument(43, "TEST2");
+        var outbound = new RecordingOutbound();
+        var disp1 = CreateDispatcher(inst1, outbound, channelNumber: 1);
+        var disp2 = CreateDispatcher(inst2, outbound, channelNumber: 2, inboundCapacity: 1);
+        var router = new HostRouter(
+            new Dictionary<long, ChannelDispatcher>
+            {
+                [inst1.SecurityId] = disp1,
+                [inst2.SecurityId] = disp2,
+            },
+            outbound, NullLogger<HostRouter>.Instance);
+        var session = new SessionId("s1");
+        var probe1 = disp1.CreateTestProbe();
+        var probe2 = disp2.CreateTestProbe();
+
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("1", inst1.SecurityId, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10m), 100, 7, 1),
+            session, enteringFirm: 7, clOrdIdValue: 1));
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("2", inst2.SecurityId, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(9m), 100, 7, 2),
+            session, enteringFirm: 7, clOrdIdValue: 2));
+        probe1.DrainInbound();
+        probe2.DrainInbound();
+        outbound.Events.Clear();
+
+        // Fill only the later dispatcher's queue. Dictionary insertion order
+        // makes channel 1 accept before channel 2 rejects deterministically.
+        Assert.True(disp2.EnqueueNewOrder(
+            new NewOrderCommand("queue-filler", inst2.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3),
+            session, enteringFirm: 7, clOrdIdValue: 3));
+
+        MassCancelOutcome? outcome = null;
+        int completions = 0;
+        Assert.True(router.EnqueueMassCancel(
+            new MassCancelCommand(0, null, 4),
+            session, enteringFirm: 7,
+            completed =>
+            {
+                completions++;
+                outbound.Events.Add("system-busy");
+                outcome = completed;
+            }));
+
+        Assert.Null(outcome);
+        Assert.Empty(outbound.Events);
+
+        probe1.DrainInbound();
+
+        Assert.Equal(new[] { "cancel", "system-busy" }, outbound.Events);
+        Assert.False(outcome?.Succeeded);
+        Assert.Equal(0, outcome?.TotalAffectedOrders);
+        Assert.Equal(1, completions);
+    }
+
+    [Fact]
     public void SolicitedMassCancel_BufferedCancelReportCompletesAccepted()
     {
         var inst = CreateInstrument();
@@ -249,7 +310,7 @@ public class HostRouterTests
     };
 
     private static ChannelDispatcher CreateDispatcher(Instrument inst, RecordingOutbound outbound,
-        byte channelNumber = 1)
+        byte channelNumber = 1, int inboundCapacity = 4096)
         => new(channelNumber: channelNumber,
             engineFactory: s => new MatchingEngine(new[] { inst }, s, NullLogger<MatchingEngine>.Instance),
             options: new ChannelDispatcherOptions
@@ -258,6 +319,7 @@ public class HostRouterTests
                 Outbound = outbound,
                 Logger = NullLogger<ChannelDispatcher>.Instance,
                 TimeSource = new FakeNanosTimeSource(1_000UL),
+                InboundCapacity = inboundCapacity,
             });
 
     private static long Px(decimal p) => (long)(p * 10_000m);

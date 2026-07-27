@@ -78,6 +78,7 @@ public class ChannelDispatcherWalTests
             {
                 return Last.TryGetValue(n, out var s) ? s : null;
             }
+
         }
         public long Save(ChannelStateSnapshot s)
         {
@@ -86,6 +87,22 @@ public class ChannelDispatcherWalTests
             {
                 Last[s.ChannelNumber] = s;
             }
+            return 1;
+        }
+    }
+
+    private sealed class TogglePersister : IChannelStatePersister
+    {
+        public bool FailSaves { get; set; }
+        public ChannelStateSnapshot? Last { get; private set; }
+
+        public ChannelStateSnapshot? TryLoad(byte channelNumber) => Last;
+
+        public long Save(ChannelStateSnapshot snapshot)
+        {
+            if (FailSaves)
+                throw new IOException("simulated snapshot failure");
+            Last = snapshot;
             return 1;
         }
     }
@@ -109,6 +126,56 @@ public class ChannelDispatcherWalTests
             => _records.RemoveAll(record => record.Seq <= throughSeq);
         public long PendingDurableSeqOrZero => _records.Count == 0 ? 0 : _records[^1].Seq;
         public void WaitForDurable(long seq, CancellationToken cancellationToken = default) { }
+    }
+
+    private sealed class BlockingWal : IChannelWriteAheadLog, IDisposable
+    {
+        private readonly List<WalRecord> _records = new();
+        private readonly ManualResetEventSlim _release = new(false);
+
+        public TaskCompletionSource<bool> WaitEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int Append(WalRecord record)
+        {
+            lock (_records) _records.Add(record);
+            return 1;
+        }
+
+        public IReadOnlyList<WalRecord> ReadAll()
+        {
+            lock (_records) return _records.ToArray();
+        }
+
+        public void Truncate()
+        {
+            lock (_records) _records.Clear();
+        }
+
+        public void TruncateThrough(long throughSeq)
+        {
+            lock (_records)
+                _records.RemoveAll(record => record.Seq <= throughSeq);
+        }
+
+        public long PendingDurableSeqOrZero
+        {
+            get
+            {
+                lock (_records)
+                    return _records.Count == 0 ? 0 : _records[^1].Seq;
+            }
+        }
+
+        public void WaitForDurable(
+            long seq, CancellationToken cancellationToken = default)
+        {
+            WaitEntered.TrySetResult(true);
+            _release.Wait(cancellationToken);
+        }
+
+        public void Release() => _release.Set();
+        public void Dispose() => _release.Dispose();
     }
 
     private sealed class TempDir : IDisposable
@@ -242,6 +309,7 @@ public class ChannelDispatcherWalTests
                 Cancel: null, Replace: null);
             wal.Append(rec);
         }
+
         using (var wal = new FileChannelWriteAheadLog(dir.Path, channelNumber: 7,
             NullLogger<FileChannelWriteAheadLog>.Instance, fsyncPerWrite: false))
         {
@@ -252,6 +320,122 @@ public class ChannelDispatcherWalTests
             Assert.NotNull(all[0].NewOrder);
             Assert.Equal("CL-1", all[0].NewOrder!.ClOrdId);
         }
+    }
+
+    [Fact]
+    public async Task MassCancel_WalReplay_DoesNotResurrectOrdersAfterAcceptedCompletion()
+    {
+        using var dir = new TempDir();
+        var session = new SessionId("S1");
+
+        using (var wal = new FileChannelWriteAheadLog(
+            dir.Path, channelNumber: 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance,
+            fsyncPerWrite: true))
+        {
+            var live = BuildDispatcher(
+                persister: null, wal, out _, out _);
+            var probe = live.CreateTestProbe();
+
+            Assert.True(EnqueueOrder(live, session, "CL-1", 1, nanos: 1));
+            probe.DrainInbound();
+            Assert.True(live.TryResolveByClOrdId(700, 1, out var orderId, out _));
+
+            MassCancelOutcome? terminal = null;
+            Assert.True(live.EnqueueResolvedMassCancel(
+                [orderId], session, enteringFirm: 700,
+                new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+                outcome => terminal = outcome));
+            probe.DrainInbound();
+
+            Assert.True(terminal?.Succeeded);
+            Assert.False(live.TryResolveByClOrdId(700, 1, out _, out _));
+            Assert.Equal(
+                [WalRecordKind.NewOrder, WalRecordKind.MassCancel],
+                wal.ReadAll().Select(record => record.Kind));
+
+            await live.DisposeAsync();
+        }
+
+        using var replayWal = new FileChannelWriteAheadLog(
+            dir.Path, channelNumber: 84,
+            NullLogger<FileChannelWriteAheadLog>.Instance,
+            fsyncPerWrite: true);
+        var recovered = BuildDispatcher(
+            persister: null, replayWal, out _, out _);
+        try
+        {
+            recovered.Start();
+            Assert.False(recovered.TryResolveByClOrdId(700, 1, out _, out _));
+        }
+        finally
+        {
+            await recovered.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MassCancel_TerminalCompletionWaitsForWalDurability()
+    {
+        using var wal = new BlockingWal();
+        var session = new SessionId("S1");
+        var disp = BuildDispatcher(
+            persister: null, wal, out _, out _);
+        try
+        {
+            disp.Start();
+            Assert.True(EnqueueOrder(disp, session, "CL-1", 1, nanos: 1));
+            Assert.True(await WaitForAsync(
+                () => disp.TryResolveByClOrdId(700, 1, out _, out _),
+                ReadyTimeout));
+            Assert.True(disp.TryResolveByClOrdId(
+                700, 1, out var orderId, out _));
+
+            var completion = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(disp.EnqueueResolvedMassCancel(
+                [orderId], session, enteringFirm: 700,
+                new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+                outcome => completion.TrySetResult(outcome)));
+
+            await wal.WaitEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(completion.Task.IsCompleted);
+            Assert.False(disp.TryResolveByClOrdId(700, 1, out _, out _));
+
+            wal.Release();
+            var terminal = await completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(terminal.Succeeded);
+        }
+        finally
+        {
+            wal.Release();
+            await disp.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public void MassCancel_SnapshotFailure_CompletesSystemBusyWithoutAcceptedOutcome()
+    {
+        var persister = new TogglePersister();
+        var session = new SessionId("S1");
+        var disp = BuildDispatcher(
+            persister, wal: null, out _, out _);
+        var probe = disp.CreateTestProbe();
+
+        Assert.True(EnqueueOrder(disp, session, "CL-1", 1, nanos: 1));
+        probe.DrainInbound();
+        Assert.True(disp.TryResolveByClOrdId(700, 1, out var orderId, out _));
+
+        persister.FailSaves = true;
+        MassCancelOutcome? terminal = null;
+        Assert.True(disp.EnqueueResolvedMassCancel(
+            [orderId], session, enteringFirm: 700,
+            new MassCancelCommand(Sec, null, EnteredAtNanos: 2),
+            outcome => terminal = outcome));
+        probe.DrainInbound();
+
+        Assert.False(terminal?.Succeeded);
+        Assert.False(disp.TryResolveByClOrdId(700, 1, out _, out _));
     }
 
     [Fact]

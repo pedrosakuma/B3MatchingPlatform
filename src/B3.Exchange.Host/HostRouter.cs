@@ -135,25 +135,42 @@ public sealed class HostRouter : IInboundCommandSink
 
         MassCancelFanoutCompletion? fanout = completion is null
             ? null
-            : new MassCancelFanoutCompletion(perChannel.Count, completion);
+            : new MassCancelFanoutCompletion(completion);
 
-        // Fan-out: report backpressure if any targeted channel rejected the
-        // resolved batch. Partial execution is preserved (whatever made it
-        // onto a queue stays there), but a solicited request is fail-closed:
-        // suppress its terminal callback so the gateway emits SystemBusy and
-        // never emits ACCEPTED.
+        // A dispatcher false means producer-side rejection (queue full or an
+        // already WAL-halted channel) and guarantees that it did not retain
+        // the callback. Once a dispatcher returns true, callback ownership
+        // transfers to it; even a later WAL append/durability failure completes
+        // that accepted batch with SystemBusy.
         bool allOk = true;
+        int acceptedChannels = 0;
         foreach (var (disp, ids) in perChannel)
         {
+            fanout?.ReserveChannel();
             if (!disp.EnqueueResolvedMassCancel(ids, session, enteringFirm, cmd,
                 fanout is null ? null : fanout.OnChannelCompleted))
+            {
                 allOk = false;
+                fanout?.RejectReservedChannel();
+            }
+            else
+            {
+                acceptedChannels++;
+            }
         }
-        if (!allOk)
+
+        // Returning false makes FixpSession emit SystemBusy immediately, so it
+        // is safe only when no channel accepted work. For a partial fanout,
+        // retain terminal ownership and defer failed completion until every
+        // accepted batch has emitted its cancellation ERs.
+        if (acceptedChannels == 0)
+        {
             fanout?.Suppress();
-        else
-            fanout?.Arm();
-        return allOk;
+            return false;
+        }
+
+        fanout?.Arm(failed: !allOk);
+        return true;
     }
 
     public void OnDecodeError(SessionId session, string error)
@@ -232,15 +249,25 @@ public sealed class HostRouter : IInboundCommandSink
     private sealed class MassCancelFanoutCompletion
     {
         private readonly Action<MassCancelOutcome> _completion;
-        private int _remaining;
+        // Registration sentinel prevents a fast channel callback from
+        // completing the fanout while later channels are still being enqueued.
+        private int _remaining = 1;
         private int _totalAffected;
         private int _failed;
         private int _state;
 
-        public MassCancelFanoutCompletion(int channelCount, Action<MassCancelOutcome> completion)
+        public MassCancelFanoutCompletion(Action<MassCancelOutcome> completion)
         {
-            _remaining = channelCount;
             _completion = completion;
+        }
+
+        public void ReserveChannel() => Interlocked.Increment(ref _remaining);
+
+        public void RejectReservedChannel()
+        {
+            Interlocked.Exchange(ref _failed, 1);
+            if (Interlocked.Decrement(ref _remaining) == 0)
+                TryComplete();
         }
 
         public void OnChannelCompleted(MassCancelOutcome outcome)
@@ -252,10 +279,12 @@ public sealed class HostRouter : IInboundCommandSink
                 TryComplete();
         }
 
-        public void Arm()
+        public void Arm(bool failed)
         {
+            if (failed)
+                Interlocked.Exchange(ref _failed, 1);
             if (Interlocked.CompareExchange(ref _state, 1, 0) == 0
-                && Volatile.Read(ref _remaining) == 0)
+                && Interlocked.Decrement(ref _remaining) == 0)
                 TryComplete();
         }
 

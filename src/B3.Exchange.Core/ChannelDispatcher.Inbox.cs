@@ -147,6 +147,16 @@ public sealed partial class ChannelDispatcher
         MassCancelCommand command)
         => EnqueueResolvedMassCancel(orderIds, session, enteringFirm, command, completion: null);
 
+    /// <summary>
+    /// Enqueues a resolved batch with terminal completion ownership.
+    /// A <c>true</c> return transfers ownership of
+    /// <paramref name="completion"/> to the dispatcher, which invokes it
+    /// exactly once after the batch's cancellation reports and durability
+    /// work finish. A <c>false</c> return means producer-side rejection
+    /// (queue full or already WAL-halted); the callback was not retained and
+    /// will not run. A WAL failure after an accepted enqueue completes the
+    /// callback with <see cref="MassCancelOutcome.SystemBusy"/>.
+    /// </summary>
     public bool EnqueueResolvedMassCancel(IReadOnlyList<long> orderIds, SessionId session, uint enteringFirm,
         MassCancelCommand command, Action<MassCancelOutcome>? completion)
     {
