@@ -4,9 +4,10 @@ namespace B3.Exchange.Core;
 
 /// <summary>
 /// Minimal read-only view that <see cref="SnapshotRotator"/> needs over a
-/// matching engine to materialise a per-symbol UMDF snapshot. Abstracted so
-/// the rotator can be unit-tested with a hand-rolled book without spinning
-/// a real <see cref="MatchingEngine"/>.
+/// matching engine to materialise a per-symbol UMDF snapshot plus the
+/// current <c>SecurityStatus_3</c> recovery frame. Abstracted so the
+/// rotator can be unit-tested with a hand-rolled book without spinning a
+/// real <see cref="MatchingEngine"/>.
 ///
 /// All members are invoked on the owning <see cref="ChannelDispatcher"/>'s
 /// dispatch thread — implementations need not be thread-safe.
@@ -32,6 +33,13 @@ public interface ISnapshotBookSource
     /// enumerator before mutating the book.
     /// </summary>
     IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side);
+
+    /// <summary>
+    /// Returns the current <c>SecurityStatus_3</c> pair for
+    /// <paramref name="securityId"/> without mutating engine state or
+    /// advancing the incremental <c>RptSeq</c>.
+    /// </summary>
+    (byte SecurityTradingStatus, byte SecurityTradingEvent) GetCurrentSecurityStatus(long securityId);
 }
 
 /// <summary>
@@ -57,4 +65,16 @@ public sealed class MatchingEngineSnapshotSource : ISnapshotBookSource
 
     public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
         => _engine.EnumerateBook(securityId, side);
+
+    public (byte SecurityTradingStatus, byte SecurityTradingEvent) GetCurrentSecurityStatus(long securityId)
+    {
+        if (_engine.IsHalted(securityId, out _))
+        {
+            return (
+                (byte)TradingPhase.Forbidden,
+                (byte)B3.Umdf.Mbo.Sbe.V16.SecurityTradingEvent.SECURITY_STATUS_CHANGE);
+        }
+
+        return ((byte)_engine.GetTradingPhase(securityId), byte.MaxValue);
+    }
 }

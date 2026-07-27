@@ -9,6 +9,7 @@ using B3.Exchange.Instruments;
 using B3.Exchange.Core;
 using B3.Exchange.TestSupport;
 using B3.Exchange.Matching;
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -50,6 +51,15 @@ public partial class ChannelDispatcherTests
     };
 
     private static long Px(decimal p) => (long)(p * 10_000m);
+
+    private static SecurityStatus_3DataReader ReadSecurityStatus(byte[] packet)
+    {
+        Assert.True(SecurityStatus_3Data.TryParse(
+            packet.AsSpan(WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+                WireOffsets.SecurityStatusBlockLength),
+            out var status));
+        return status;
+    }
 
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
@@ -2259,6 +2269,44 @@ public partial class ChannelDispatcherTests
         DrainInbound(disp);
         Assert.Empty(session.Rejects);
         Assert.Single(session.News);
+    }
+
+    [Fact]
+    public void Issue583_OperatorHalt_EmitsForbiddenWithOfficialSecurityStatusChangeEvent()
+    {
+        var (disp, pkt, _) = NewDispatcher();
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, TradingPhase.Reserved));
+        DrainInbound(disp);
+        pkt.Packets.Clear();
+
+        Assert.True(disp.EnqueueOperatorHalt(Petr, HaltReason.RegulatoryHalt, null));
+        DrainInbound(disp);
+
+        var status = ReadSecurityStatus(Assert.Single(pkt.Packets));
+        Assert.Equal(SecurityTradingStatus.FORBIDDEN, status.Data.SecurityTradingStatus);
+        Assert.Equal(SecurityTradingEvent.SECURITY_STATUS_CHANGE, status.Data.SecurityTradingEvent);
+        Assert.Equal(2u, status.Data.RptSeq);
+    }
+
+    [Fact]
+    public void Issue583_OperatorResume_EmitsRestoredPhaseWithOfficialRejoinEvent()
+    {
+        var (disp, pkt, _) = NewDispatcher();
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, TradingPhase.Reserved));
+        DrainInbound(disp);
+        Assert.True(disp.EnqueueOperatorHalt(Petr, HaltReason.NewsHold, null));
+        DrainInbound(disp);
+        pkt.Packets.Clear();
+
+        Assert.True(disp.EnqueueOperatorResume(Petr));
+        DrainInbound(disp);
+
+        var status = ReadSecurityStatus(Assert.Single(pkt.Packets));
+        Assert.Equal(SecurityTradingStatus.RESERVED, status.Data.SecurityTradingStatus);
+        Assert.Equal(SecurityTradingEvent.SECURITY_REJOINS_SECURITY_GROUP_STATUS, status.Data.SecurityTradingEvent);
+        Assert.Equal(3u, status.Data.RptSeq);
     }
 
     [Fact]

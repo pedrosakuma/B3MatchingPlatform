@@ -11,7 +11,9 @@ namespace B3.Exchange.Core;
 /// <c>SnapshotFullRefresh_Header_30</c> + as many
 /// <c>SnapshotFullRefresh_Orders_MBO_71</c> chunks as the book requires (each
 /// chunk capped at <see cref="SnapshotPacketBuilder.MaxEntriesPerChunk"/> or
-/// the caller-supplied per-chunk cap, whichever is smaller).
+/// the caller-supplied per-chunk cap, whichever is smaller), followed by one
+/// standalone <c>SecurityStatus_3</c> recovery packet for that instrument's
+/// current status.
 ///
 /// <para>
 /// Threading: <see cref="PublishNext"/> reads the matching engine's resting
@@ -45,6 +47,10 @@ public sealed class SnapshotRotator
     private readonly INanosTimeSource _timeSource;
     private readonly int _maxEntriesPerChunk;
     private readonly byte[] _packetBuf;
+    private const int SecurityStatusPacketSize = WireOffsets.PacketHeaderSize
+        + WireOffsets.FramingHeaderSize
+        + WireOffsets.SbeMessageHeaderSize
+        + WireOffsets.SecurityStatusBlockLength;
 
     private int _rotationIndex;
 
@@ -109,8 +115,9 @@ public sealed class SnapshotRotator
     /// Publishes a complete snapshot for the next instrument in the rotation.
     /// Returns the number of UDP packets emitted: 0 when
     /// <see cref="ISnapshotBookSource.SecurityIds"/> is empty; otherwise at
-    /// least 1, since even an empty book emits the header packet. Caller MUST
-    /// invoke from the dispatcher thread so that
+    /// least 2, since even an empty book emits the header packet plus a
+    /// <c>SecurityStatus_3</c> packet. Caller MUST invoke from the dispatcher
+    /// thread so that
     /// <see cref="ISnapshotBookSource.EnumerateBook"/> observes a stable book.
     /// <paramref name="incrementalSequenceVersion"/> must be captured from the
     /// dispatcher in the same turn as the book and RptSeq watermark.
@@ -157,11 +164,13 @@ public sealed class SnapshotRotator
         bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
         uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
 
-        int requiredPackets = SnapshotPacketBuilder.GetPacketCount(
+        int requiredSnapshotPackets = SnapshotPacketBuilder.GetPacketCount(
             _packetBuf.Length,
             bidsList.Count,
             asksList.Count,
             _maxEntriesPerChunk);
+        const int statusPackets = 1;
+        int requiredPackets = checked(requiredSnapshotPackets + statusPackets);
         EnsurePacketSequenceCapacity(requiredPackets);
 
         ushort version = SequenceVersion;
@@ -169,8 +178,9 @@ public sealed class SnapshotRotator
         ulong nowNanos = _timeSource.NowNanos();
         byte channel = _channelNumber;
         var sink = _sink;
+        var (securityTradingStatus, securityTradingEvent) = _source.GetCurrentSecurityStatus(securityId);
 
-        int packetsEmitted = SnapshotPacketBuilder.WriteSnapshot(
+        int snapshotPacketsEmitted = SnapshotPacketBuilder.WriteSnapshot(
             buffer: _packetBuf,
             channelNumber: channel,
             snapshotSequenceVersion: version,
@@ -184,13 +194,27 @@ public sealed class SnapshotRotator
             onPacket: pkt => sink.Publish(channel, pkt),
             maxEntriesPerChunk: _maxEntriesPerChunk);
 
-        if (packetsEmitted != requiredPackets)
+        if (snapshotPacketsEmitted != requiredSnapshotPackets)
         {
             throw new InvalidOperationException(
-                $"snapshot packet count changed during encode: reserved {requiredPackets}, emitted {packetsEmitted}");
+                $"snapshot packet count changed during encode: reserved {requiredSnapshotPackets}, emitted {snapshotPacketsEmitted}");
         }
-        SequenceNumber = (uint)((ulong)SequenceNumber + (uint)packetsEmitted);
-        return packetsEmitted;
+
+        int statusPacketLength = WriteSecurityStatusPacket(
+            dst: _packetBuf,
+            channelNumber: channel,
+            sequenceVersion: version,
+            sequenceNumber: firstSeq + (uint)snapshotPacketsEmitted,
+            sendingTimeNanos: nowNanos,
+            securityId: securityId,
+            securityTradingStatus: securityTradingStatus,
+            securityTradingEvent: securityTradingEvent,
+            transactTimeNanos: nowNanos,
+            rptSeq: currentRptSeq);
+        sink.Publish(channel, _packetBuf.AsSpan(0, statusPacketLength));
+
+        SequenceNumber = (uint)((ulong)SequenceNumber + (uint)requiredPackets);
+        return requiredPackets;
     }
 
     private void EnsurePacketSequenceCapacity(int requiredPackets)
@@ -204,5 +228,39 @@ public sealed class SnapshotRotator
             SequenceVersion,
             $"snapshot channel {_channelNumber} automatic epoch rollover");
         SequenceNumber = 0;
+    }
+
+    private static int WriteSecurityStatusPacket(
+        Span<byte> dst,
+        byte channelNumber,
+        ushort sequenceVersion,
+        uint sequenceNumber,
+        ulong sendingTimeNanos,
+        long securityId,
+        byte securityTradingStatus,
+        byte securityTradingEvent,
+        ulong transactTimeNanos,
+        uint rptSeq)
+    {
+        if (dst.Length < SecurityStatusPacketSize)
+            throw new ArgumentException("buffer too small for SecurityStatus_3 packet", nameof(dst));
+
+        int packetHeaderLength = UmdfWireEncoder.WritePacketHeader(
+            dst,
+            channelNumber: channelNumber,
+            sequenceVersion: sequenceVersion,
+            sequenceNumber: sequenceNumber,
+            sendingTimeNanos: sendingTimeNanos);
+        int frameLength = UmdfWireEncoder.WriteSecurityStatusFrame(
+            dst.Slice(packetHeaderLength),
+            securityId: securityId,
+            tradingSessionId: 0,
+            securityTradingStatus: securityTradingStatus,
+            securityTradingEvent: securityTradingEvent,
+            tradeDate: 0,
+            tradSesOpenTimeNanos: 0,
+            transactTimeNanos: transactTimeNanos,
+            rptSeq: rptSeq);
+        return packetHeaderLength + frameLength;
     }
 }

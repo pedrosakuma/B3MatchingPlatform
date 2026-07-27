@@ -115,11 +115,10 @@ public enum RejectReason : byte
 
 /// <summary>
 /// Reason an instrument was placed into administrative halt by the
-/// operator halt/resume API (issue #322). Carried on the outbound
-/// <c>SecurityStatus_3</c> frame's <c>securityTradingEvent</c> byte
-/// (best-effort mapping to FIX SecurityTradingEvent values) and on
-/// the engine-level <c>InstrumentHaltedEvent</c> for downstream
-/// observability.
+/// operator halt/resume API (issue #322). Carried on the engine-level
+/// <c>InstrumentHaltedEvent</c> for downstream observability. The vendored
+/// UMDF 2.2.0 schema does not expose a field for this detail, so the wire
+/// encoder publishes only the official halt/resume status semantics.
 /// </summary>
 public enum HaltReason : byte
 {
