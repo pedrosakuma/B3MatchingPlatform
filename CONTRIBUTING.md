@@ -107,8 +107,15 @@ Both must pass before merge.
 
 Do not hand-edit files under `schemas/`. When upgrading B3 EntryPoint
 or UMDF, regenerate the SBE bindings in `B3.*.Sbe` and mirror the
-change in the companion `SbeB3UmdfConsumer` repo. The two repos must
-agree on the schema version.
+change in the companion repo (`B3MarketDataPlatform` for UMDF,
+`B3EntryPointClient` for EntryPoint). The repos must agree on the
+schema version.
+
+This is enforced by the **Vendored schema guard** CI job
+(`.github/workflows/ci.yml`), which fails any PR touching `schemas/`
+unless it carries the `schema-upgrade` label. The rules below are
+review-time discipline for evidence and scope; the CI job is the
+deterministic backstop against unreviewed hand-edits.
 
 ### Protocol contract evidence gate
 

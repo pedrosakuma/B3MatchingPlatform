@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 concurrency:
@@ -14,6 +15,99 @@ permissions:
   contents: read
 
 jobs:
+  schema-guard:
+    name: Vendored schema guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Block hand-edits to vendored schemas
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          flagged=0
+
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- schemas/)"
+          if [ -n "$changed" ]; then
+            flagged=1
+            echo "PR modifies vendored schema file(s):"
+            echo "$changed"
+          fi
+
+          # Best-effort cross-check against the companion repo that vendors
+          # the same schema file, kept in lock-step per README.md/
+          # CONTRIBUTING.md: b3-market-data-messages-*.xml against
+          # B3MarketDataPlatform, b3-entrypoint-messages-*.xml against
+          # B3EntryPointClient. Network/availability issues here only warn
+          # (they must not make an unrelated outage block every PR); a
+          # file with no known companion also just warns. An actual
+          # content mismatch on a shared file is treated the same as a
+          # local edit.
+          # Scoped to files this PR actually touched under schemas/ — PRs
+          # that don't touch schemas/ must not be blocked by pre-existing
+          # drift between the two repos that predates this PR. Iterated
+          # line-by-line (not word-split) so filenames with spaces
+          # survive.
+          #
+          # NOTE: because this only runs for files already in $changed, it
+          # can never independently flip flagged from 0 to 1 — flagged is
+          # already 1 whenever the loop has anything to iterate. Its value
+          # is diagnostic: confirming, for a change a maintainer is about
+          # to label schema-upgrade, whether the new content is byte-
+          # identical to the trusted upstream copy (vs. an edit that
+          # merely resembles the official schema). It intentionally does
+          # not gate PRs that leave schemas/ untouched, even if drift
+          # exists there already.
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in schemas/*.xml) ;; *) continue ;; esac
+            if [ ! -f "$f" ]; then
+              # Deleted by this PR; already caught by the local diff check
+              # above (flagged=1), nothing to cross-check against upstream.
+              continue
+            fi
+            name="$(basename "$f")"
+            case "$name" in
+              b3-market-data-messages-*.xml) companion_repo="B3MarketDataPlatform" ;;
+              b3-entrypoint-messages-*.xml) companion_repo="B3EntryPointClient" ;;
+              *) companion_repo="" ;;
+            esac
+            if [ -z "$companion_repo" ]; then
+              echo "::warning::No known companion repo for $name; skipping cross-repo check."
+              continue
+            fi
+            url="https://raw.githubusercontent.com/pedrosakuma/$companion_repo/main/schemas/$name"
+            if remote_sha="$(curl -fsSL --connect-timeout 5 --max-time 15 "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
+              local_sha="$(sha256sum "$f" | awk '{print $1}')"
+              if [ "$remote_sha" != "$local_sha" ]; then
+                flagged=1
+                echo "$f (sha256 $local_sha) diverges from $companion_repo's vendored copy (sha256 $remote_sha)."
+              fi
+            else
+              echo "::warning::Could not fetch $url to cross-check vendored schema fidelity; skipping cross-repo check for $name."
+            fi
+          done <<< "$changed"
+
+          if [ "$flagged" = 0 ]; then
+            echo "No changes under schemas/ and no drift from the companion repo. OK."
+            exit 0
+          fi
+
+          has_label="$(jq -r '([.pull_request.labels[].name] | index("schema-upgrade")) != null' "$GITHUB_EVENT_PATH")"
+          if [ "$has_label" != "true" ]; then
+            echo "::error::Files under schemas/ are vendored (see CONTRIBUTING.md) and must not be hand-edited. If this is an intentional, reviewed schema upgrade, add the 'schema-upgrade' label to this PR to acknowledge and unblock this check."
+            exit 1
+          fi
+          echo "PR is labeled 'schema-upgrade' — allowing vendored schema change."
+
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest

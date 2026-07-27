@@ -714,7 +714,7 @@ Three test surfaces, mirroring the component split.
   client speaking SBE + SOFH against it.
 - Scenarios: full session lifecycle, gap recovery, CoD trigger, daily
   reset mid-session, throttle reject.
-- Use `SbeB3UmdfConsumer` style decoder to verify multicast output.
+- Use a `B3MarketDataPlatform` style decoder to verify multicast output.
 
 ---
 
@@ -806,7 +806,7 @@ is on so they are inspectable).
 
 **EntryPoint and UMDF version independently.** Each schema is bumped on
 its own cadence; you do not need to upgrade both at once. The companion
-[`SbeB3UmdfConsumer`](https://github.com/pedrosakuma/SbeB3UmdfConsumer)
+[`B3MarketDataPlatform`](https://github.com/pedrosakuma/B3MarketDataPlatform)
 repo vendors the same UMDF schema and must be kept in lock-step when the
 UMDF version moves.
 
@@ -843,7 +843,7 @@ UMDF version moves.
    the version we target and per-template gap status; bump the version
    and audit any newly added or removed templates.
 8. **Mirror UMDF changes** in
-   [`SbeB3UmdfConsumer`](https://github.com/pedrosakuma/SbeB3UmdfConsumer)
+   [`B3MarketDataPlatform`](https://github.com/pedrosakuma/B3MarketDataPlatform)
    when bumping the market-data schema; the consumer is what proves the
    wire is end-to-end correct.
 
