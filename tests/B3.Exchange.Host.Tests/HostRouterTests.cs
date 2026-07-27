@@ -243,6 +243,51 @@ public class HostRouterTests
     }
 
     [Fact]
+    public void UnsolicitedMassCancel_PartialEnqueueReturnsFalse()
+    {
+        var inst1 = CreateInstrument(42, "TEST1");
+        var inst2 = CreateInstrument(43, "TEST2");
+        var outbound = new RecordingOutbound();
+        var disp1 = CreateDispatcher(inst1, outbound, channelNumber: 1);
+        var disp2 = CreateDispatcher(
+            inst2, outbound, channelNumber: 2, inboundCapacity: 1);
+        var router = new HostRouter(
+            new Dictionary<long, ChannelDispatcher>
+            {
+                [inst1.SecurityId] = disp1,
+                [inst2.SecurityId] = disp2,
+            },
+            outbound, NullLogger<HostRouter>.Instance);
+        var session = new SessionId("s1");
+        var probe1 = disp1.CreateTestProbe();
+        var probe2 = disp2.CreateTestProbe();
+
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("1", inst1.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1),
+            session, enteringFirm: 7, clOrdIdValue: 1));
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("2", inst2.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(9m), 100, 7, 2),
+            session, enteringFirm: 7, clOrdIdValue: 2));
+        probe1.DrainInbound();
+        probe2.DrainInbound();
+        outbound.Events.Clear();
+
+        Assert.True(disp2.EnqueueNewOrder(
+            new NewOrderCommand("queue-filler", inst2.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3),
+            session, enteringFirm: 7, clOrdIdValue: 3));
+
+        Assert.False(router.EnqueueMassCancel(
+            new MassCancelCommand(0, null, 4),
+            session, enteringFirm: 7));
+
+        probe1.DrainInbound();
+        Assert.Equal(new[] { "cancel" }, outbound.Events);
+    }
+
+    [Fact]
     public void SolicitedMassCancel_BufferedCancelReportCompletesAccepted()
     {
         var inst = CreateInstrument();

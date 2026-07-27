@@ -41,7 +41,13 @@ public sealed partial class FixpSession
     private void OnTransportClosed(string reason, TcpTransport? originatingTransport)
     {
         if (Volatile.Read(ref _isOpen) == 0) return;
-        if (State != FixpState.Established)
+        // SuspendLocked closes the transport before publishing !IsAttached.
+        // Its late recv-loop callback can therefore observe Suspended while
+        // teardown still owns the generation. Do not abort the admission gate
+        // in that window; the locked generation/attachment checks below will
+        // discard the re-entrant callback.
+        if (State != FixpState.Established
+            && Volatile.Read(ref _suspendInProgress) == 0)
         {
             MarkCloseRequested();
             AbortBusinessAdmission();
@@ -113,9 +119,18 @@ public sealed partial class FixpSession
     {
         ExecuteLogicalSessionExclusive(() =>
         {
-            lock (_attachLock)
+            lock (_outboundLock)
             {
-                SuspendLocked(reason, armCancelOnDisconnect: false);
+                lock (_attachLock)
+                {
+                    if (Volatile.Read(ref _isOpen) != 0
+                        && Volatile.Read(ref _isAttached) != 0
+                        && State == FixpState.Established)
+                    {
+                        ResetBusinessAdmissionLocked();
+                    }
+                    SuspendLocked(reason, armCancelOnDisconnect: false);
+                }
             }
         });
     }

@@ -159,6 +159,13 @@ public sealed class HostRouter : IInboundCommandSink
             }
         }
 
+        // Unsolicited callers (notably cancel-on-disconnect) have no deferred
+        // completion channel. Preserve their interface contract: any refused
+        // target makes the aggregate enqueue fail, even if earlier channels
+        // already accepted their batches.
+        if (fanout is null)
+            return allOk;
+
         // Returning false makes FixpSession emit SystemBusy immediately, so it
         // is safe only when no channel accepted work. For a partial fanout,
         // retain terminal ownership and defer failed completion until every

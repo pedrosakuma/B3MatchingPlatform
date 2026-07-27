@@ -1,4 +1,6 @@
 using B3.Exchange.Contracts;
+using B3.EntryPoint.Wire;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.Gateway;
@@ -188,6 +190,114 @@ public class FixpSessionReattachTests
             client0.Close();
             session.Close("test-cleanup");
             await session.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task SuspendForTakeover_blocks_business_until_successor_EstablishAck()
+    {
+        var (tcp0, serverStream0, client0) = await ConnectPairAsync();
+        var session = new FixpSession(
+            connectionId: 2, enteringFirm: 7, sessionId: 100,
+            stream: serverStream0, sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance);
+        try
+        {
+            session.Start();
+            session.ApplyTransition(FixpEvent.Negotiate);
+            session.ApplyTransition(FixpEvent.Establish);
+
+            session.SuspendForTakeover("establish-takeover:admission-test");
+            Assert.Equal(FixpState.Suspended, session.State);
+
+            var canceled = new OrderCanceledEvent(
+                SecurityId: 1001,
+                OrderId: 999,
+                Side: Side.Sell,
+                PriceMantissa: 101_0000,
+                RemainingQuantityAtCancel: 25,
+                TransactTimeNanos: 1_700_000_000_000_000_000UL,
+                Reason: CancelReason.MassCancel,
+                RptSeq: 2);
+            var routed = Task.Run(() => session.WriteExecutionReportCancel(
+                canceled, clOrdIdValue: 5555, origClOrdIdValue: 0));
+
+            Assert.True(await TestUtil.WaitUntilAsync(
+                () => session.BusinessAdmissionWaiterCount == 1,
+                TimeSpan.FromSeconds(3)));
+            Assert.False(routed.IsCompleted);
+            Assert.Equal(0u, session.OutboundSeq);
+            Assert.Equal(0, session.RetxBufferDepth);
+
+            var (tcp1, serverStream1, client1) = await ConnectPairAsync();
+            try
+            {
+                Assert.True(session.TryReattach(serverStream1));
+                Assert.False(routed.IsCompleted);
+
+                var establish = new byte[256];
+                int length = EntryPointFixpFrameCodec.EncodeEstablish(
+                    establish,
+                    sessionId: 100,
+                    sessionVerId: 0,
+                    timestampNanos: 1,
+                    keepAliveIntervalMillis: 10_000,
+                    nextSeqNo: 1,
+                    cancelOnDisconnectType: 0,
+                    codTimeoutWindowMillis: 0,
+                    credentials: ReadOnlySpan<byte>.Empty);
+                var stream = client1.GetStream();
+                await stream.WriteAsync(establish.AsMemory(0, length));
+
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+                    await ReadTemplateIdAsync(stream));
+                Assert.True((await routed.WaitAsync(
+                    TimeSpan.FromSeconds(3))).IsTransportEnqueued);
+                Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel,
+                    await ReadTemplateIdAsync(stream));
+            }
+            finally
+            {
+                client1.Close();
+                tcp1.Stop();
+            }
+        }
+        finally
+        {
+            client0.Close();
+            tcp0.Stop();
+            session.Close("test-cleanup");
+            await session.DisposeAsync();
+        }
+    }
+
+    private static async Task<ushort> ReadTemplateIdAsync(NetworkStream stream)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var header = new byte[EntryPointFrameReader.WireHeaderSize];
+        await ReadExactAsync(stream, header, timeout.Token);
+        ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(
+            header.AsSpan(0, 2));
+        ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(
+            header.AsSpan(EntryPointFrameReader.SofhSize + 2, 2));
+        var body = new byte[messageLength - EntryPointFrameReader.WireHeaderSize];
+        await ReadExactAsync(stream, body, timeout.Token);
+        return templateId;
+    }
+
+    private static async Task ReadExactAsync(
+        NetworkStream stream,
+        byte[] buffer,
+        CancellationToken cancellationToken)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int count = await stream.ReadAsync(
+                buffer.AsMemory(read), cancellationToken);
+            if (count <= 0)
+                throw new EndOfStreamException();
+            read += count;
         }
     }
 }
