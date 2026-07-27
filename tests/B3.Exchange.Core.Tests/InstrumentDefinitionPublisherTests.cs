@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 using B3.Exchange.Instruments;
 using B3.Exchange.Core;
 using B3.Exchange.TestSupport;
-using B3.Umdf.Mbo.Sbe.V17;
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Core.Tests;
@@ -123,7 +123,7 @@ public class InstrumentDefinitionPublisherTests
         var packet = sink.Packets[0];
         var bodySpan = packet.AsSpan(WireOffsets.PacketHeaderSize + FrameOffset, WireOffsets.SecDefBlockLength);
 
-        Assert.True(B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.TryParse(bodySpan, out var rdr));
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodySpan, out var rdr));
         Assert.Equal(900_000_000_001L, (long)rdr.Data.SecurityID.Value);
     }
 
@@ -233,14 +233,14 @@ public class InstrumentDefinitionPublisherTests
         var sbeMessage = packet.AsSpan(
             WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize);
         var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
-        Assert.True(B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(
             bodyAndTail, blockLength: WireOffsets.SecDefBlockLength, out var rdr));
 
         Assert.Equal(900_111_111_111L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(285_000L, rdr.Data.StrikePrice.Mantissa);
         Assert.Equal(100L * 100_000_000L, rdr.Data.ContractMultiplier.Mantissa);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.PutOrCall.CALL, rdr.Data.PutOrCall);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.ExerciseStyle.AMERICAN, rdr.Data.ExerciseStyle);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V16.PutOrCall.CALL, rdr.Data.PutOrCall);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.AMERICAN, rdr.Data.ExerciseStyle);
         Assert.Equal((ushort)2025, rdr.Data.MaturityMonthYear.Year);
         Assert.Equal((byte)12, rdr.Data.MaturityMonthYear.Month);
         Assert.Equal((byte)19, rdr.Data.MaturityMonthYear.Day);
@@ -248,14 +248,14 @@ public class InstrumentDefinitionPublisherTests
         int underlyingCount = 0;
         long underlyingId = 0L;
         rdr.ReadGroups(
-            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoUnderlyingsData u) =>
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoUnderlyingsData u) =>
             {
                 underlyingCount++;
                 underlyingId = (long)(ulong)u.UnderlyingSecurityID.Value;
             },
-            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoLegsData _) => { },
-            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
-            (B3.Umdf.Mbo.Sbe.V17.TextEncoding _) => { });
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V16.TextEncoding _) => { });
         Assert.Equal(1, underlyingCount);
         Assert.Equal(900_000_000_001L, underlyingId);
 

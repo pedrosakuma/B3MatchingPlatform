@@ -8,7 +8,7 @@ using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
 using B3.Exchange.TestSupport;
-using B3.Umdf.Mbo.Sbe.V17;
+using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -196,7 +196,7 @@ public class ExchangeHostE2ETests
         var addFrame = Assert.Single(addFrames);
         Assert.Equal((ushort)50, addFrame.TemplateId);
         Assert.Equal((ushort)WireOffsets.OrderBlockLength, addFrame.BlockLength);
-        Assert.True(B3.Umdf.Mbo.Sbe.V17.V6.Order_MBO_50Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data.TryParse(
             addFrame.Body.Span, out var orderAdd));
         Assert.Equal(Petr, (long)(ulong)orderAdd.Data.SecurityID.Value);
         Assert.Equal(MDUpdateAction.NEW, orderAdd.Data.MDUpdateAction);
@@ -478,7 +478,7 @@ public class ExchangeHostE2ETests
                 p += FrameSize;
 
                 // Every emitted frame should also be SBE-decodable.
-                Assert.True(B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.TryParse(bodySpan, out _));
+                Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodySpan, out _));
             }
         }
 
