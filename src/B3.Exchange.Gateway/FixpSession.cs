@@ -851,8 +851,6 @@ public sealed partial class FixpSession : IAsyncDisposable
                 }
 
                 Volatile.Write(ref _msgSeqNum, maxSeq);
-                _outboundEncoder.AdvanceMassActionReportSeqTo(
-                    previous._outboundEncoder.MassActionReportSeq);
                 // Publish the replacement route only after its replay state is
                 // adopted and its business admission gate is closed. A routed
                 // passive ER or deferred completion that linearizes after the

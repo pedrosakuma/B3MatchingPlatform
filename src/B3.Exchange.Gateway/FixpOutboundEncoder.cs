@@ -37,21 +37,6 @@ internal sealed class FixpOutboundEncoder
     private readonly Func<bool> _isOpen;
     private readonly Action _close;
 
-    /// <summary>Per-session monotonic counter sourcing
-    /// <c>OrderMassActionReport.MassActionReportID</c> (template 702).
-    /// Spec requires an engine-assigned unique id; deriving it from a
-    /// per-session counter is sufficient because the (sessionId, id)
-    /// pair is globally unique.</summary>
-    private long _massActionReportSeq;
-
-    internal long MassActionReportSeq => Volatile.Read(ref _massActionReportSeq);
-
-    internal void AdvanceMassActionReportSeqTo(long value)
-    {
-        if (value > Volatile.Read(ref _massActionReportSeq))
-            Volatile.Write(ref _massActionReportSeq, value);
-    }
-
     public FixpOutboundEncoder(
         Func<uint> sessionId,
         Func<ulong> sessionVerId,
@@ -244,7 +229,6 @@ internal sealed class FixpOutboundEncoder
         string? text = null)
     {
         if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
-        ulong reportId = (ulong)Interlocked.Increment(ref _massActionReportSeq);
         int textLen = string.IsNullOrEmpty(text) ? 0 : Math.Min(text!.Length, OrderMassActionReportEncoder.MaxTextLength);
         var exact = PooledOutboundFrame.Rent(OrderMassActionReportEncoder.TotalSize(textLen));
         try
@@ -252,8 +236,14 @@ internal sealed class FixpOutboundEncoder
             lock (_outboundLock)
             {
                 if (!_isOpen()) return OrderedStreamWriteResult.NotCommitted;
+                // MassActionReportID is uint64 on the wire. Pack the durable
+                // uint32 SessionID + outbound MsgSeqNum tuple into it: the
+                // result is collision-free across recoverable sessions and
+                // monotonic within a session without a second state counter.
+                uint msgSeqNum = _nextMsgSeqNum();
+                ulong reportId = ((ulong)_sessionId() << 32) | msgSeqNum;
                 OrderMassActionReportEncoder.EncodeOrderMassActionReportWithText(exact.Span,
-                    _sessionId(), _nextMsgSeqNum(), transactTimeNanos,
+                    _sessionId(), msgSeqNum, transactTimeNanos,
                     clOrdIdValue, reportId, transactTimeNanos,
                     massActionResponse, massActionRejectReason, side, securityId, text);
                 return AppendAndEnqueueLocked(exact);

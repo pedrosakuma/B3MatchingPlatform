@@ -12,16 +12,19 @@ namespace B3.Exchange.Persistence;
 /// <see cref="IChannelStatePersister"/> (issue #260) with N rolling
 /// generations (issue #264). Snapshots are written to round-robin slots
 /// <c>channel-{N}.snapshot.{slot}</c> where <c>slot</c> is in
-/// <c>0..Generations-1</c>; the persister picks the newest valid slot
-/// on load and writes to <c>(lastUsed + 1) mod Generations</c> on save.
+/// <c>0..Generations-1</c>; the persister picks the valid slot with the
+/// greatest <see cref="ChannelStateSnapshot.LastAppliedSeq"/> on load and
+/// writes to <c>(lastUsed + 1) mod Generations</c> on save.
 ///
-/// <para>Load semantics: enumerate all per-channel files, sort by
-/// modification time descending, return the first that deserializes.
-/// A corrupted newest file therefore falls back transparently to the
-/// previous generation. <c>ValidateSnapshotStructure</c> failures still
-/// fail-closed in the dispatcher — generations defend against I/O-level
-/// corruption (truncated writes, bad JSON), not against semantically
-/// inconsistent snapshots.</para>
+/// <para>Load semantics: enumerate and deserialize every per-channel file,
+/// then return the valid snapshot with the greatest
+/// <c>LastAppliedSeq</c> (modification time breaks ties). This monotonic
+/// ordering prevents a delayed asynchronous save from superseding a newer
+/// synchronous durability save merely because it landed later. A corrupted
+/// file falls back transparently to the best remaining generation.
+/// <c>ValidateSnapshotStructure</c> failures still fail-closed in the
+/// dispatcher — generations defend against I/O-level corruption (truncated
+/// writes, bad JSON), not against semantically inconsistent snapshots.</para>
 ///
 /// <para>Atomicity per slot remains the PR #261 contract: write to
 /// <c>.tmp</c>, fsync the data, rename, fsync the directory entry. The
@@ -56,10 +59,15 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     private readonly SnapshotMigrationSet _migrations;
     private readonly SnapshotFileFormat _writeFormat;
 
-    // Per-channel last-used slot, -1 = unknown (derive from filesystem).
-    // Mutated only inside Save under the per-channel lock.
-    private readonly Dictionary<byte, int> _lastUsedSlot = new();
-    private readonly object _slotLock = new();
+    private sealed class ChannelPersistenceState
+    {
+        public object Gate { get; } = new();
+        public bool Initialized { get; set; }
+        public long HighestSavedSeq { get; set; }
+        public int LastUsedSlot { get; set; } = -1;
+    }
+
+    private readonly ChannelPersistenceState[] _channelStates = CreateChannelStates();
 
     public string DataDirectory => _dataDir;
     public int Generations => _generations;
@@ -88,122 +96,80 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
 
     public ChannelStateSnapshot? TryLoad(byte channelNumber)
     {
-        // Enumerate every generation slot + legacy file for this channel,
-        // newest mtime first, returning the first that deserializes
-        // successfully. This makes a corrupted newest slot transparently
-        // fall back to the previous generation.
-        var candidates = EnumerateCandidateFiles(channelNumber);
-        if (candidates.Count == 0) return null;
-
-        foreach (var (path, _) in candidates)
+        var state = _channelStates[channelNumber];
+        lock (state.Gate)
         {
-            try
-            {
-                // Issue #266: sniff the leading bytes to pick the
-                // right decoder. Both formats are recognised on load
-                // regardless of WriteFormat — that's how a deployment
-                // can roll between binary and JSON without a one-shot
-                // conversion (the next save rewrites in the new
-                // format; old slots in the previous format remain
-                // loadable until the rolling generations evict them).
-                byte[] payload = File.ReadAllBytes(path);
-                ChannelStateSnapshot? snapshot;
-                if (BinaryChannelStateSnapshotCodec.LooksLikeBinarySnapshot(payload))
-                {
-                    snapshot = BinaryChannelStateSnapshotCodec.Decode(payload);
-                }
-                else
-                {
-                    // Issue #272: parse to a JsonNode first so older
-                    // payloads can be migrated up to the current schema
-                    // before the strongly-typed deserializer runs.
-                    // Forward compat is delegated to STJ (unknown
-                    // fields ignored by default); backward compat goes
-                    // through the migration chain.
-                    var root = JsonNode.Parse(payload);
-                    if (root is null)
-                    {
-                        _logger.LogWarning(
-                            "channel {ChannelNumber}: snapshot at {Path} parsed to null; trying older generation",
-                            channelNumber, path);
-                        continue;
-                    }
-                    var migrated = _migrations.MigrateToCurrent(root, ChannelStateSnapshot.CurrentVersion);
-                    snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(migrated.ToJsonString(), JsonOptions);
-                }
-                if (snapshot is null)
-                {
-                    _logger.LogWarning(
-                        "channel {ChannelNumber}: snapshot deserialized to null at {Path}; trying older generation",
-                        channelNumber, path);
-                    continue;
-                }
-                _logger.LogInformation(
-                    "channel {ChannelNumber}: loaded snapshot from {Path} (seq={SequenceNumber}/{SequenceVersion}, owners={OwnerCount})",
-                    channelNumber, path, snapshot.SequenceNumber, snapshot.SequenceVersion, snapshot.Owners.Count);
-                return snapshot;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "channel {ChannelNumber}: failed to load snapshot at {Path}; trying older generation",
-                    channelNumber, path);
-            }
+            return TryLoadCore(channelNumber, state, logLoaded: true);
         }
-        _logger.LogError(
-            "channel {ChannelNumber}: all {Count} candidate snapshot files failed to load",
-            channelNumber, candidates.Count);
-        return null;
     }
 
     public long Save(ChannelStateSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        int slot = NextSlot(snapshot.ChannelNumber);
-        var path = SlotPath(snapshot.ChannelNumber, slot);
-        var tmp = TempPath(snapshot.ChannelNumber, slot);
-        long bytesWritten;
-        try
+        var state = _channelStates[snapshot.ChannelNumber];
+        lock (state.Gate)
         {
-            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            if (!state.Initialized)
+                _ = TryLoadCore(snapshot.ChannelNumber, state, logLoaded: false);
+
+            if (snapshot.LastAppliedSeq < state.HighestSavedSeq)
             {
-                if (_writeFormat == SnapshotFileFormat.Binary)
-                {
-                    var bytes = BinaryChannelStateSnapshotCodec.Encode(snapshot);
-                    fs.Write(bytes, 0, bytes.Length);
-                }
-                else
-                {
-                    JsonSerializer.Serialize(fs, snapshot, JsonOptions);
-                }
-                fs.Flush(flushToDisk: true);
-                bytesWritten = fs.Length;
+                _logger.LogWarning(
+                    "channel {ChannelNumber}: skipped stale snapshot save at LastAppliedSeq={SnapshotSeq}; durable high-water mark is {DurableSeq}",
+                    snapshot.ChannelNumber, snapshot.LastAppliedSeq, state.HighestSavedSeq);
+                return 0;
             }
-            File.Move(tmp, path, overwrite: true);
-            FsyncDirectory(_dataDir);
+
+            int slot = (state.LastUsedSlot + 1) % _generations;
+            var path = SlotPath(snapshot.ChannelNumber, slot);
+            var tmp = TempPath(snapshot.ChannelNumber, slot);
+            long bytesWritten;
+            try
+            {
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    if (_writeFormat == SnapshotFileFormat.Binary)
+                    {
+                        var bytes = BinaryChannelStateSnapshotCodec.Encode(snapshot);
+                        fs.Write(bytes, 0, bytes.Length);
+                    }
+                    else
+                    {
+                        JsonSerializer.Serialize(fs, snapshot, JsonOptions);
+                    }
+                    fs.Flush(flushToDisk: true);
+                    bytesWritten = fs.Length;
+                }
+                File.Move(tmp, path, overwrite: true);
+                FsyncDirectory(_dataDir);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: failed to persist snapshot slot {Slot} to {Path}",
+                    snapshot.ChannelNumber, slot, path);
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+                throw;
+            }
+
+            state.LastUsedSlot = slot;
+            state.HighestSavedSeq = Math.Max(
+                state.HighestSavedSeq, snapshot.LastAppliedSeq);
+            // Best-effort: drop the legacy single-file once a generational
+            // write succeeded, so future loads stop considering it.
+            try
+            {
+                var legacy = LegacyPath(snapshot.ChannelNumber);
+                if (File.Exists(legacy)) File.Delete(legacy);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "channel {ChannelNumber}: failed to remove legacy snapshot file (non-fatal)",
+                    snapshot.ChannelNumber);
+            }
+            return bytesWritten;
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex,
-                "channel {ChannelNumber}: failed to persist snapshot slot {Slot} to {Path}",
-                snapshot.ChannelNumber, slot, path);
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
-            throw;
-        }
-        // Best-effort: drop the legacy single-file once a generational
-        // write succeeded, so future loads stop considering it.
-        try
-        {
-            var legacy = LegacyPath(snapshot.ChannelNumber);
-            if (File.Exists(legacy)) File.Delete(legacy);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex,
-                "channel {ChannelNumber}: failed to remove legacy snapshot file (non-fatal)",
-                snapshot.ChannelNumber);
-        }
-        return bytesWritten;
     }
 
     /// <summary>
@@ -215,26 +181,29 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     /// </summary>
     public int DeleteAll(byte channelNumber)
     {
-        int removed = 0;
-        for (int i = 0; i < _generations; i++)
+        var state = _channelStates[channelNumber];
+        lock (state.Gate)
         {
-            removed += TryDelete(SlotPath(channelNumber, i));
-            removed += TryDelete(TempPath(channelNumber, i));
+            int removed = 0;
+            for (int i = 0; i < _generations; i++)
+            {
+                removed += TryDelete(SlotPath(channelNumber, i));
+                removed += TryDelete(TempPath(channelNumber, i));
+            }
+            removed += TryDelete(LegacyPath(channelNumber));
+            state.Initialized = true;
+            state.HighestSavedSeq = 0;
+            state.LastUsedSlot = -1;
+            if (removed > 0)
+            {
+                try { FsyncDirectory(_dataDir); }
+                catch { /* best effort */ }
+                _logger.LogInformation(
+                    "channel {ChannelNumber}: admin DeleteAll removed {Removed} snapshot file(s)",
+                    channelNumber, removed);
+            }
+            return removed;
         }
-        removed += TryDelete(LegacyPath(channelNumber));
-        lock (_slotLock)
-        {
-            _lastUsedSlot.Remove(channelNumber);
-        }
-        if (removed > 0)
-        {
-            try { FsyncDirectory(_dataDir); }
-            catch { /* best effort */ }
-            _logger.LogInformation(
-                "channel {ChannelNumber}: admin DeleteAll removed {Removed} snapshot file(s)",
-                channelNumber, removed);
-        }
-        return removed;
     }
 
     private static int TryDelete(string path)
@@ -251,62 +220,135 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         return 0;
     }
 
-    /// <summary>
-    /// Picks the next round-robin slot for the channel, lazily deriving
-    /// the starting point from the on-disk newest file the first time
-    /// a channel is observed (so a host restart does not reuse the slot
-    /// that already contains the most recent snapshot).
-    /// </summary>
-    private int NextSlot(byte channelNumber)
+    private ChannelStateSnapshot? TryLoadCore(
+        byte channelNumber,
+        ChannelPersistenceState state,
+        bool logLoaded)
     {
-        lock (_slotLock)
+        var candidates = EnumerateCandidateFiles(channelNumber);
+        if (candidates.Count == 0)
         {
-            if (!_lastUsedSlot.TryGetValue(channelNumber, out var last))
-            {
-                last = DiscoverNewestSlot(channelNumber);
-                _lastUsedSlot[channelNumber] = last;
-            }
-            int next = (last + 1) % _generations;
-            _lastUsedSlot[channelNumber] = next;
-            return next;
+            state.Initialized = true;
+            state.HighestSavedSeq = 0;
+            state.LastUsedSlot = -1;
+            return null;
         }
+
+        ChannelStateSnapshot? bestSnapshot = null;
+        SnapshotCandidate bestCandidate = default;
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                byte[] payload = File.ReadAllBytes(candidate.Path);
+                ChannelStateSnapshot? snapshot;
+                if (BinaryChannelStateSnapshotCodec.LooksLikeBinarySnapshot(payload))
+                {
+                    snapshot = BinaryChannelStateSnapshotCodec.Decode(payload);
+                }
+                else
+                {
+                    var root = JsonNode.Parse(payload);
+                    if (root is null)
+                    {
+                        _logger.LogWarning(
+                            "channel {ChannelNumber}: snapshot at {Path} parsed to null; ignoring generation",
+                            channelNumber, candidate.Path);
+                        continue;
+                    }
+                    var migrated = _migrations.MigrateToCurrent(
+                        root, ChannelStateSnapshot.CurrentVersion);
+                    snapshot = JsonSerializer.Deserialize<ChannelStateSnapshot>(
+                        migrated.ToJsonString(), JsonOptions);
+                }
+                if (snapshot is null)
+                {
+                    _logger.LogWarning(
+                        "channel {ChannelNumber}: snapshot deserialized to null at {Path}; ignoring generation",
+                        channelNumber, candidate.Path);
+                    continue;
+                }
+                if (bestSnapshot is null
+                    || snapshot.LastAppliedSeq > bestSnapshot.LastAppliedSeq
+                    || (snapshot.LastAppliedSeq == bestSnapshot.LastAppliedSeq
+                        && candidate.Mtime > bestCandidate.Mtime))
+                {
+                    bestSnapshot = snapshot;
+                    bestCandidate = candidate;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "channel {ChannelNumber}: failed to load snapshot at {Path}; ignoring generation",
+                    channelNumber, candidate.Path);
+            }
+        }
+
+        state.Initialized = true;
+        if (bestSnapshot is null)
+        {
+            state.HighestSavedSeq = 0;
+            state.LastUsedSlot = -1;
+            foreach (var candidate in candidates)
+            {
+                if (candidate.Slot < 0) continue;
+                state.LastUsedSlot = candidate.Slot;
+                break;
+            }
+            _logger.LogError(
+                "channel {ChannelNumber}: all {Count} candidate snapshot files failed to load",
+                channelNumber, candidates.Count);
+            return null;
+        }
+
+        state.HighestSavedSeq = bestSnapshot.LastAppliedSeq;
+        state.LastUsedSlot = bestCandidate.Slot;
+        if (logLoaded)
+        {
+            _logger.LogInformation(
+                "channel {ChannelNumber}: loaded snapshot from {Path} (lastAppliedSeq={LastAppliedSeq}, seq={SequenceNumber}/{SequenceVersion}, owners={OwnerCount})",
+                channelNumber, bestCandidate.Path, bestSnapshot.LastAppliedSeq,
+                bestSnapshot.SequenceNumber, bestSnapshot.SequenceVersion,
+                bestSnapshot.Owners.Count);
+        }
+        return bestSnapshot;
     }
 
-    private int DiscoverNewestSlot(byte channelNumber)
+    /// <summary>
+    /// Returns existing snapshot files for the channel (slot files +
+    /// legacy single-file if present), sorted by mtime descending for
+    /// deterministic tie-breaking.
+    /// </summary>
+    private List<SnapshotCandidate> EnumerateCandidateFiles(byte channelNumber)
     {
-        int newest = -1;
-        DateTime newestMtime = DateTime.MinValue;
+        var list = new List<SnapshotCandidate>(_generations + 1);
         for (int i = 0; i < _generations; i++)
         {
             var p = SlotPath(channelNumber, i);
-            if (!File.Exists(p)) continue;
-            var mt = File.GetLastWriteTimeUtc(p);
-            if (mt > newestMtime)
-            {
-                newestMtime = mt;
-                newest = i;
-            }
-        }
-        return newest;
-    }
-
-    /// <summary>
-    /// Returns existing snapshot file paths for the channel (slot files
-    /// + legacy single-file if present), sorted by mtime descending.
-    /// </summary>
-    private List<(string Path, DateTime Mtime)> EnumerateCandidateFiles(byte channelNumber)
-    {
-        var list = new List<(string, DateTime)>(_generations + 1);
-        for (int i = 0; i < _generations; i++)
-        {
-            var p = SlotPath(channelNumber, i);
-            if (File.Exists(p)) list.Add((p, File.GetLastWriteTimeUtc(p)));
+            if (File.Exists(p))
+                list.Add(new SnapshotCandidate(p, File.GetLastWriteTimeUtc(p), i));
         }
         var legacy = LegacyPath(channelNumber);
-        if (File.Exists(legacy)) list.Add((legacy, File.GetLastWriteTimeUtc(legacy)));
-        list.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        if (File.Exists(legacy))
+            list.Add(new SnapshotCandidate(
+                legacy, File.GetLastWriteTimeUtc(legacy), Slot: -1));
+        list.Sort((a, b) => b.Mtime.CompareTo(a.Mtime));
         return list;
     }
+
+    private static ChannelPersistenceState[] CreateChannelStates()
+    {
+        var states = new ChannelPersistenceState[byte.MaxValue + 1];
+        for (int i = 0; i < states.Length; i++)
+            states[i] = new ChannelPersistenceState();
+        return states;
+    }
+
+    private readonly record struct SnapshotCandidate(
+        string Path,
+        DateTime Mtime,
+        int Slot);
 
     private string LegacyPath(byte channelNumber)
         => Path.Combine(_dataDir,
