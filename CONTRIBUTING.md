@@ -110,3 +110,30 @@ or UMDF, regenerate the SBE bindings in `B3.*.Sbe` and mirror the
 change in the companion repo (`B3MarketDataPlatform` for UMDF,
 `B3EntryPointClient` for EntryPoint). The repos must agree on the
 schema version.
+
+This is enforced by the **Vendored schema guard** CI job
+(`.github/workflows/ci.yml`), which fails any PR touching `schemas/`
+unless it carries the `schema-upgrade` label. The rules below are
+review-time discipline for evidence and scope; the CI job is the
+deterministic backstop against unreviewed hand-edits.
+
+### Protocol contract evidence gate
+
+Any issue or PR that changes, adds, or consumes an EntryPoint/UMDF field,
+enum value, or template must cite:
+
+- the vendored schema file and version;
+- the exact template name and ID;
+- the field names and enum values used;
+- the implemented upstream PR or commit when the dependency is cross-repo.
+
+An upstream issue proposal is not evidence that a wire contract exists.
+If the requested template or field is absent, stop at a research/blocker
+issue until B3 publishes it. Do not create a proprietary SBE template or
+write an out-of-domain raw enum value to approximate the missing contract.
+
+When implementation differs from an issue proposal, the PR and closing
+comment must state what was actually delivered so downstream work does not
+inherit the abandoned design. Wire tests should use generated schema types
+or constants and assert the emitted template ID, block length, and enum
+values.

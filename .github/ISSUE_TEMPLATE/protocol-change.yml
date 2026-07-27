@@ -1,0 +1,59 @@
+name: Protocol implementation
+description: Implement an EntryPoint/UMDF contract proven in a published B3 schema
+title: "protocol: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is only for contracts that already exist in a published B3 schema.
+        If the requested template or field is absent, use the Protocol research form.
+  - type: dropdown
+    id: source
+    attributes:
+      label: Contract source
+      options:
+        - Existing vendored B3 schema
+        - Published B3 schema upgrade
+    validations:
+      required: true
+  - type: input
+    id: schema
+    attributes:
+      label: Schema file and version
+      placeholder: schemas/b3-market-data-messages-2.2.0.xml, schema version 16
+    validations:
+      required: true
+  - type: input
+    id: template
+    attributes:
+      label: Template name and ID
+      placeholder: SecurityStatus_3, template ID 3
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Field and enum evidence
+      description: Cite exact schema fields, enum members, generated types, and source links.
+    validations:
+      required: true
+  - type: textarea
+    id: dependency
+    attributes:
+      label: Cross-repo implementation evidence
+      description: Link the merged upstream PR/commit. An upstream issue proposal is insufficient.
+      placeholder: Not applicable, or link to merged implementation
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Contract checks
+      options:
+        - label: I verified that the requested template, fields, and enum values exist in the cited schema.
+          required: true
+        - label: I will not hand-edit a vendored schema or invent a proprietary SBE contract.
+          required: true
+        - label: If implementation differs from this proposal, I will correct the issue before downstream work depends on it.
+          required: true

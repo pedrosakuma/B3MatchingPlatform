@@ -1,0 +1,47 @@
+name: Protocol research
+description: Investigate a contract that is absent or uncertain in current B3 schemas
+title: "research(protocol): "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Research issues do not authorize implementation. They must end with either
+        published schema evidence or a documented blocked/not-planned conclusion.
+  - type: textarea
+    id: need
+    attributes:
+      label: Product need
+      description: Describe the behavior needed without prescribing a new wire message.
+    validations:
+      required: true
+  - type: textarea
+    id: current-schema
+    attributes:
+      label: Current schema evidence
+      description: Cite the vendored schema version and the closest existing templates/fields.
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Published-source investigation
+      description: List B3 schema releases, changelogs, and specifications that must be checked.
+    validations:
+      required: true
+  - type: textarea
+    id: trigger
+    attributes:
+      label: Implementation trigger
+      description: State the exact published template/field evidence required before implementation can begin.
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Research boundary
+      options:
+        - label: This issue will not create a proprietary SBE template or modify a vendored schema.
+          required: true
+        - label: Any later implementation issue will cite the published schema and exact contract members.
+          required: true

@@ -117,7 +117,15 @@ Layered projects under `src/` (build order roughly bottom-up):
   per-session firm assignment is not implemented.
 - **Schemas are vendored.** Do not hand-edit files under `schemas/`; regenerate
   the SBE bindings in `B3.*.Sbe` when upgrading and mirror the change in
-  `B3MarketDataPlatform` (UMDF) / `B3EntryPointClient` (EntryPoint).
+  `B3MarketDataPlatform` (UMDF) or `B3EntryPointClient` (EntryPoint). This is
+  enforced by the "Vendored schema guard" CI job, which requires the
+  `schema-upgrade` label on any PR touching `schemas/`.
+- **Protocol claims require schema evidence.** Before implementing an
+  EntryPoint/UMDF field, enum, or template, cite its vendored schema version,
+  template ID, and exact members. Cross-repo dependencies must cite the merged
+  implementation, not only an issue proposal. If the contract is absent,
+  stop at research/blocker status; do not invent proprietary SBE messages or
+  raw enum values.
 
 ## Configuration
 
