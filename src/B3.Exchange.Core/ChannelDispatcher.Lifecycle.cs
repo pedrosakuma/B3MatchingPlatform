@@ -107,6 +107,11 @@ public sealed partial class ChannelDispatcher
                         ProcessOne(item);
                     }
                     catch (OperationCanceledException) { throw; }
+                    catch (RptSeqExhaustedException ex)
+                    {
+                        MarkChannelFatal(ex);
+                        throw;
+                    }
                     catch (Exception) when (Volatile.Read(ref _channelFatal) != 0) { throw; }
                     catch (Exception ex)
                     {
@@ -131,7 +136,8 @@ public sealed partial class ChannelDispatcher
             // A failed boot must leave the recovered artifacts untouched.
             // In particular, never persist a snapshot of partially replayed
             // state after _startupCompleted has been faulted.
-            if (_startupCompleted.Task.IsCompletedSuccessfully)
+            if (_startupCompleted.Task.IsCompletedSuccessfully
+                && Volatile.Read(ref _channelFatal) == 0)
                 FlushPendingSnapshotOnShutdownSafely();
             _activationCompleted.TrySetCanceled();
         }

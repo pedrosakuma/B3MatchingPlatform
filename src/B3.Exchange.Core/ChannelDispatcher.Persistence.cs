@@ -307,6 +307,38 @@ public sealed partial class ChannelDispatcher
                 throw new InvalidOperationException(
                     $"snapshot owner refers to orderId {owner.OrderId} which is not present in any restored book or stop");
         }
+
+        var rptSeqSecurityIds = new HashSet<long>();
+        foreach (var entry in snapshot.Engine.RptSeqBySecurity)
+        {
+            if (!rptSeqSecurityIds.Add(entry.SecurityId))
+                throw new InvalidOperationException(
+                    $"snapshot contains duplicate RptSeq counter for securityId {entry.SecurityId}");
+        }
+
+        var representedSecurityIds = new HashSet<long>();
+        foreach (var phase in snapshot.Engine.Phases)
+            representedSecurityIds.Add(phase.SecurityId);
+        foreach (var book in snapshot.Engine.Books)
+            representedSecurityIds.Add(book.SecurityId);
+        if (snapshot.Engine.Stops is { } representedStops)
+        {
+            foreach (var stop in representedStops)
+                representedSecurityIds.Add(stop.SecurityId);
+        }
+        if (snapshot.Engine.Halts is { } halts)
+        {
+            foreach (var halt in halts)
+                representedSecurityIds.Add(halt.SecurityId);
+        }
+        foreach (var owner in snapshot.Owners)
+            representedSecurityIds.Add(owner.SecurityId);
+        foreach (long securityId in representedSecurityIds)
+        {
+            if (!rptSeqSecurityIds.Contains(securityId))
+                throw new InvalidOperationException(
+                    $"snapshot securityId {securityId} has no persisted RptSeq counter");
+        }
     }
 
     /// <summary>
@@ -334,6 +366,7 @@ public sealed partial class ChannelDispatcher
             // (e.g. tests with WAL-only configs). Replay against the
             // empty engine so a crash before the very first snapshot is
             // recoverable.
+            _engine.BeginLegacyRptSeqMigration(0);
             ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
             return false;
         }
@@ -357,6 +390,7 @@ public sealed partial class ChannelDispatcher
             // Issue #269: no snapshot but possibly WAL records from a
             // crash before the first snapshot ever ran. Replay rebuilds
             // the engine from scratch.
+            _engine.BeginLegacyRptSeqMigration(0);
             var walReplay = ReplayWalForStartupOrThrow(snapshotLastAppliedSeq: 0);
             return walReplay.RecordCount > 0;
         }
@@ -399,6 +433,7 @@ public sealed partial class ChannelDispatcher
             throw new InvalidOperationException(
                 $"channel {ChannelNumber}: WAL replay failed during boot recovery; startup aborted");
         }
+        _engine.CompleteLegacyRptSeqMigration();
         return outcome;
     }
 

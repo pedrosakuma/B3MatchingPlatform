@@ -44,7 +44,11 @@ public sealed partial class ChannelDispatcher
                 return;
             }
 
-            if (_priceBandPublisher?.PublishOnce(FrameSink, _engine.AllocateNextRptSeq, _timeSource.NowNanos()) > 0)
+            if (_priceBandPublisher?.PublishOnce(
+                    FrameSink,
+                    _engine.EnsureRptSeqCapacityForSynthetic,
+                    _engine.AllocateNextRptSeq,
+                    _timeSource.NowNanos()) > 0)
             {
                 FlushPacket();
                 // PriceBand_22 republish consumes engine RptSeq values, so persist
@@ -389,6 +393,29 @@ public sealed partial class ChannelDispatcher
                         ulong prioClOrd = buyFirst ? cross.BuyClOrdIdValue : cross.SellClOrdIdValue;
                         var otherLeg = buyFirst ? cross.Sell : cross.Buy;
                         ulong otherClOrd = buyFirst ? cross.SellClOrdIdValue : cross.BuyClOrdIdValue;
+
+                        if (prioLeg.PreTradeRejectReason is not null || otherLeg.PreTradeRejectReason is not null)
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                prioLeg.PreTradeRejectReason is null ? prioLeg.Quantity : 0,
+                                otherLeg.PreTradeRejectReason is null ? otherLeg.Quantity : 0);
+                        }
+                        else if (cross.CrossType == CrossType.AgainstBook && cross.MaxSweepQty > 0)
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                Math.Min(cross.MaxSweepQty, prioLeg.Quantity),
+                                prioLeg.Quantity,
+                                otherLeg.Quantity);
+                        }
+                        else
+                        {
+                            _engine.EnsureRptSeqCapacityForCross(
+                                prioLeg.SecurityId,
+                                prioLeg.Quantity,
+                                otherLeg.Quantity);
+                        }
 
                         if (prioLeg.PreTradeRejectReason is not null || otherLeg.PreTradeRejectReason is not null)
                         {

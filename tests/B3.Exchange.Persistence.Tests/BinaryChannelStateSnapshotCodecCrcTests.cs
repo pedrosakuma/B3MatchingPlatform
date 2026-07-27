@@ -19,7 +19,7 @@ public class BinaryChannelStateSnapshotCodecCrcTests
         var engine = new EngineStateSnapshot(
             NextOrderId: 100,
             NextTradeId: 7,
-            RptSeq: 3,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(900_000_000_001L, 3)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: Array.Empty<EngineStateSnapshot.BookSnapshot>(),
             Stops: null);
@@ -112,14 +112,16 @@ public class BinaryChannelStateSnapshotCodecCrcTests
         var snap = MakeMinimalSnapshot();
         var bytes = BinaryChannelStateSnapshotCodec.Encode(snap);
 
-        // The phase count is the first uvarint after a fixed-size
+        // The phase count follows the fixed header and the one v7
+        // per-security RptSeq entry:
         // header (magic 4 + version 2 + channel 1 + seqNum 4 +
-        // seqVer 2 + lastApplied 8 + nextOrder 8 + nextTrade 4 +
-        // rptSeq 4 = 37). In the minimal snapshot phase count == 0
+        // seqVer 2 + lastApplied 8 + nextOrder 8 + nextTrade 4 = 33),
+        // RptSeq count (1), and entry (securityId 8 + rptSeq 4) = 46.
+        // In the minimal snapshot phase count == 0
         // (single byte 0x00). Replace it with a 5-byte uvarint
         // encoding ulong.MaxValue and strip the footer so the
         // decoder takes the legacy path.
-        const int phaseCountOffset = 4 + 2 + 1 + 4 + 2 + 8 + 8 + 4 + 4;
+        const int phaseCountOffset = 4 + 2 + 1 + 4 + 2 + 8 + 8 + 4 + 1 + 8 + 4;
         Assert.Equal((byte)0, bytes[phaseCountOffset]);
         // 5-byte uvarint encoding of a value with all top bits set
         // (decodes to a count >> bytes.Length).

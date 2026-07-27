@@ -30,8 +30,11 @@ public class SnapshotRotatorTests
     private sealed class FakeSource : ISnapshotBookSource
     {
         public IReadOnlyList<long> SecurityIds { get; init; } = Array.Empty<long>();
-        public uint CurrentRptSeq { get; set; }
+        public Dictionary<long, uint> RptSeqBySecurity { get; } = new();
         public Dictionary<(long, Side), List<RestingOrderView>> Books { get; } = new();
+
+        public uint GetCurrentRptSeq(long securityId)
+            => RptSeqBySecurity.TryGetValue(securityId, out uint rptSeq) ? rptSeq : 0;
 
         public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
             => Books.TryGetValue((securityId, side), out var l) ? l : Enumerable.Empty<RestingOrderView>();
@@ -77,11 +80,8 @@ public class SnapshotRotatorTests
     [Fact]
     public void NonEmptyBook_BuildsHeaderPlusOrdersFrame_WithLastRptSeq()
     {
-        var src = new FakeSource
-        {
-            SecurityIds = new[] { 42L },
-            CurrentRptSeq = 17,
-        };
+        var src = new FakeSource { SecurityIds = new[] { 42L } };
+        src.RptSeqBySecurity[42L] = 17;
         src.Books[(42L, Side.Buy)] = new()
         {
             Order(1, Side.Buy, 100_0000, 500),
@@ -143,9 +143,34 @@ public class SnapshotRotatorTests
     }
 
     [Fact]
+    public void PublishFor_UsesExactTargetSecurityRptSeq()
+    {
+        var src = new FakeSource { SecurityIds = new[] { 11L, 22L, 33L } };
+        src.RptSeqBySecurity[11] = 7;
+        src.RptSeqBySecurity[22] = 2;
+        src.RptSeqBySecurity[33] = 11;
+        var sink = new CapturingSink();
+        var rot = new SnapshotRotator(channelNumber: 5, source: src, sink: sink);
+
+        rot.PublishFor(22, incrementalSequenceVersion: 4);
+        rot.PublishFor(11, incrementalSequenceVersion: 4);
+        rot.PublishFor(33, incrementalSequenceVersion: 4);
+
+        uint[] expected = [2, 7, 11];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+                sink.Packets[i].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength),
+                out var header));
+            Assert.Equal(expected[i], header.Data.LastRptSeq);
+        }
+    }
+
+    [Fact]
     public void LargeBookAboveLegacyBufferLimit_PublishesCompleteSnapshotAndStepsSequence()
     {
-        var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
+        var src = new FakeSource { SecurityIds = new[] { 7L } };
+        src.RptSeqBySecurity[7L] = 99;
         var bids = new List<RestingOrderView>();
         for (int i = 0; i < 20_000; i++) bids.Add(Order(i + 1, Side.Buy, 100_0000 - i, 100));
         var asks = new List<RestingOrderView>();
@@ -203,7 +228,8 @@ public class SnapshotRotatorTests
     [Fact]
     public void MultiPacketAtSequenceBoundary_UsesMaxThenBumpsEpochWithoutWrapping()
     {
-        var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
+        var src = new FakeSource { SecurityIds = new[] { 7L } };
+        src.RptSeqBySecurity[7L] = 99;
         src.Books[(7L, Side.Buy)] = Enumerable.Range(1, 700)
             .Select(i => Order(i, Side.Buy, 100_0000 - i, 100))
             .ToList();
@@ -255,7 +281,8 @@ public class SnapshotRotatorTests
     [Fact]
     public void MultiPacketAtTerminalEpoch_FailsBeforePublishingAnyFragment()
     {
-        var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
+        var src = new FakeSource { SecurityIds = new[] { 7L } };
+        src.RptSeqBySecurity[7L] = 99;
         src.Books[(7L, Side.Buy)] = Enumerable.Range(1, 1_000)
             .Select(i => Order(i, Side.Buy, 100_0000 - i, 100))
             .ToList();
@@ -305,7 +332,8 @@ public class SnapshotRotatorTests
         // Liquid history but currently empty book (e.g. all orders matched).
         // Per scope: only the no-history case is illiquid; otherwise stamp
         // the live RptSeq.
-        var src = new FakeSource { SecurityIds = new[] { 42L }, CurrentRptSeq = 5 };
+        var src = new FakeSource { SecurityIds = new[] { 42L } };
+        src.RptSeqBySecurity[42L] = 5;
         var sink = new CapturingSink();
         var rot = new SnapshotRotator(channelNumber: 1, source: src, sink: sink);
 

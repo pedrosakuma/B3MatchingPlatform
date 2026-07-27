@@ -91,6 +91,14 @@ public sealed class SnapshotMigrationSet
         // STJ's missing-property tolerance leaves ExpireDate at its record
         // default (0 == no GTD expiry) on deserialise.
         set.Register(5, MigrateV5ToV6);
+        // Issue #576: v7 replaces the channel-global Engine.RptSeq scalar
+        // with one RptSeqBySecurity entry per instrument. The old scalar
+        // cannot reveal each symbol's exact historical watermark, so the
+        // conservative migration assigns the global high-water mark to every
+        // SecurityID known by the snapshot. This prevents sequence reuse;
+        // startup's new epoch + snapshots establish those baselines before
+        // live incrementals resume.
+        set.Register(6, MigrateV6ToV7);
         return set;
     }
 
@@ -127,6 +135,65 @@ public sealed class SnapshotMigrationSet
         if (previous is JsonObject obj)
             obj["Version"] = 6;
         return previous;
+    }
+
+    private static JsonNode MigrateV6ToV7(JsonNode previous)
+    {
+        if (previous is not JsonObject root)
+            return previous;
+
+        root["Version"] = 7;
+        if (root["Engine"] is not JsonObject engine)
+            return previous;
+
+        if (engine["RptSeq"] is not JsonValue rptSeqValue)
+            throw new InvalidOperationException(
+                "snapshot v6 Engine.RptSeq is missing; cannot migrate per-security counters safely");
+        uint legacyRptSeq;
+        try
+        {
+            legacyRptSeq = rptSeqValue.GetValue<uint>();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException or OverflowException)
+        {
+            throw new InvalidOperationException(
+                "snapshot v6 Engine.RptSeq is not a valid uint; cannot migrate per-security counters safely",
+                ex);
+        }
+
+        var securityIds = new SortedSet<long>();
+        AddSecurityIds(engine["Phases"], securityIds);
+        AddSecurityIds(engine["Books"], securityIds);
+        AddSecurityIds(engine["Stops"], securityIds);
+        AddSecurityIds(engine["Halts"], securityIds);
+        AddSecurityIds(root["Owners"], securityIds);
+
+        var rptSeqBySecurity = new JsonArray();
+        foreach (long securityId in securityIds)
+        {
+            rptSeqBySecurity.Add(new JsonObject
+            {
+                ["SecurityId"] = securityId,
+                ["RptSeq"] = legacyRptSeq,
+            });
+        }
+
+        engine.Remove("RptSeq");
+        engine["RptSeqBySecurity"] = rptSeqBySecurity;
+        engine["LegacyGlobalRptSeq"] = legacyRptSeq;
+        return previous;
+    }
+
+    private static void AddSecurityIds(JsonNode? entries, SortedSet<long> securityIds)
+    {
+        if (entries is not JsonArray array) return;
+        foreach (var entry in array)
+        {
+            if (entry is not JsonObject obj || obj["SecurityId"] is not JsonValue value)
+                continue;
+            try { securityIds.Add(value.GetValue<long>()); }
+            catch { }
+        }
     }
 
     /// <summary>

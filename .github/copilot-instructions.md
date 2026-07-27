@@ -76,8 +76,9 @@ Layered projects under `src/` (build order roughly bottom-up):
 3. `B3.Exchange.Instruments` — JSON instrument loader.
 4. `B3.Exchange.Matching` — single-thread per-symbol limit order book.
    `MatchingEngine` owns one `LimitOrderBook` per `SecurityId`, monotonic
-   order/trade-id allocators, and an `RptSeq` incremented on every emitted
-   event. **Not thread-safe by design.**
+   order/trade-id allocators, and one `RptSeq` counter per SecurityID shared
+   across all incremental templates for that security. **Not thread-safe by
+   design.**
 5. `B3.Exchange.Gateway` — TCP listener, framed SBE inbound decoder,
    ExecutionReport encoder. Each TCP session implements
    `IEntryPointResponseChannel`.

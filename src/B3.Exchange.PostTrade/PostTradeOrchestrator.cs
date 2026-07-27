@@ -49,7 +49,11 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
     public object RoutingLock { get; } = new();
 
     /// <inheritdoc />
-    public BustProcessOutcome ProcessBust(in BustRequest request, byte channel, int tradeDateDaysSinceEpoch)
+    public BustProcessOutcome ProcessBust(
+        in BustRequest request,
+        byte channel,
+        int tradeDateDaysSinceEpoch,
+        Action<long>? beforeAcceptCommit = null)
     {
         var result = BustValidator.Validate(_auditRootDir, channel, request, _dedup);
 
@@ -57,6 +61,7 @@ public sealed class PostTradeOrchestrator : IPostTradeOrchestrator
         {
             case BustValidationKind.Accept:
                 {
+                    beforeAcceptCommit?.Invoke(result.MatchedFill.SecurityId);
                     var bust = new BustRecord(
                         request.TradeId, request.AttemptTransactTimeNanos,
                         result.MatchedFill.SecurityId, request.ReasonCode, request.BusterFirm,

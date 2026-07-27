@@ -19,6 +19,8 @@ namespace B3.Exchange.Persistence.Tests;
 public class ChannelDispatcherWalTests
 {
     private const long Sec = 900_000_000_002L;
+    private const long Vale = 900_000_000_003L;
+    private const long Itub = 900_000_000_004L;
 
     private static Instrument Petr4 => new()
     {
@@ -30,6 +32,22 @@ public class ChannelDispatcherWalTests
         MaxPrice = 1_000m,
         Currency = "BRL",
         Isin = "BRPETRACNPR6",
+        SecurityType = "EQUITY",
+    };
+
+    private static Instrument Vale3 => CreateInstrument("VALE3", Vale, "BRVALEACNOR0");
+    private static Instrument Itub4 => CreateInstrument("ITUB4", Itub, "BRITUBACNPR1");
+
+    private static Instrument CreateInstrument(string symbol, long securityId, string isin) => new()
+    {
+        Symbol = symbol,
+        SecurityId = securityId,
+        TickSize = 0.01m,
+        LotSize = 100,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000m,
+        Currency = "BRL",
+        Isin = isin,
         SecurityType = "EQUITY",
     };
 
@@ -221,13 +239,14 @@ public class ChannelDispatcherWalTests
         SnapshotThrottlePolicy? throttle = null,
         bool useAsyncSnapshotWriter = false,
         B3.Exchange.PostTrade.IPostTradeSink? postTradeSink = null,
-        TimeSpan? massCancelDurabilityTimeout = null)
+        TimeSpan? massCancelDurabilityTimeout = null,
+        IReadOnlyList<Instrument>? instruments = null)
     {
         var localSink = sink = new NoOpPacketSink();
         var localOutbound = outbound = new CountingOutbound();
         return new ChannelDispatcher(
             channelNumber: 84,
-            engineFactory: s => new MatchingEngine(new[] { Petr4 }, s,
+            engineFactory: s => new MatchingEngine(instruments ?? [Petr4], s,
                 NullLogger<MatchingEngine>.Instance),
             options: new ChannelDispatcherOptions
             {
@@ -288,7 +307,7 @@ public class ChannelDispatcherWalTests
             Engine: new EngineStateSnapshot(
                 NextOrderId: restingOrderCount + 1,
                 NextTradeId: 1,
-                RptSeq: 0,
+                RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(Sec, 0)],
                 Phases: [new EngineStateSnapshot.PhaseEntry(Sec, TradingPhase.Open)],
                 Books: [new EngineStateSnapshot.BookSnapshot(Sec, orders)],
                 Stops: []),
@@ -623,6 +642,138 @@ public class ChannelDispatcherWalTests
     }
 
     [Fact]
+    public async Task WalOnlyRestore_ConservativelyMigratesUnversionedRecordsFromGlobalRptSeq()
+    {
+        var wal = new RecordingWal();
+        WalRecord[] records =
+        [
+            NewOrderRecord(1, "P-S", Sec, Side.Sell, Px(10m), 1_000),
+            NewOrderRecord(2, "V-B1", Vale, Side.Buy, Px(20m), 2_000),
+            NewOrderRecord(3, "I-B", Itub, Side.Buy, Px(30m), 3_000),
+            NewOrderRecord(4, "V-B2", Vale, Side.Buy, Px(19m), 4_000),
+            NewOrderRecord(5, "P-B", Sec, Side.Buy, Px(10m), 5_000),
+        ];
+        foreach (var record in records) wal.Append(record);
+        var persister = new InMemoryPersister();
+        var metrics = new ChannelMetrics(84);
+        var dispatcher = BuildDispatcher(
+            persister,
+            wal,
+            out _,
+            out _,
+            metrics: metrics,
+            instruments: [Petr4, Vale3, Itub4]);
+
+        dispatcher.Start();
+        Assert.True(await WaitForAsync(
+            () => metrics.WalReplays >= records.Length && persister.SaveCount >= 1,
+            ReadyTimeout));
+
+        var rptSeqs = persister.TryLoad(84)!.Engine.RptSeqBySecurity;
+        Assert.Equal(6u, rptSeqs.Single(entry => entry.SecurityId == Sec).RptSeq);
+        Assert.Equal(6u, rptSeqs.Single(entry => entry.SecurityId == Vale).RptSeq);
+        Assert.Equal(6u, rptSeqs.Single(entry => entry.SecurityId == Itub).RptSeq);
+
+        await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task MigratedV6Snapshot_WithWalTail_PreservesLegacyGlobalHighWater()
+    {
+        var persister = new InMemoryPersister();
+        persister.Last[84] = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 10,
+            SequenceVersion: 3,
+            Engine: new EngineStateSnapshot(
+                NextOrderId: 1,
+                NextTradeId: 1,
+                RptSeqBySecurity:
+                [
+                    new EngineStateSnapshot.RptSeqEntry(Sec, 10),
+                    new EngineStateSnapshot.RptSeqEntry(Vale, 10),
+                ],
+                Phases:
+                [
+                    new EngineStateSnapshot.PhaseEntry(Sec, TradingPhase.Open),
+                    new EngineStateSnapshot.PhaseEntry(Vale, TradingPhase.Open),
+                ],
+                Books:
+                [
+                    new EngineStateSnapshot.BookSnapshot(Sec, []),
+                    new EngineStateSnapshot.BookSnapshot(Vale, []),
+                ],
+                LegacyGlobalRptSeq: 10),
+            Owners: [])
+        {
+            LastAppliedSeq = 0,
+        };
+        var wal = new RecordingWal();
+        wal.Append(NewOrderRecord(1, "V-B", Vale, Side.Buy, Px(20m), 1_000));
+        wal.Append(NewOrderRecord(2, "P-B", Sec, Side.Buy, Px(10m), 2_000));
+        var metrics = new ChannelMetrics(84);
+        var dispatcher = BuildDispatcher(
+            persister,
+            wal,
+            out _,
+            out _,
+            metrics: metrics,
+            instruments: [Petr4, Vale3]);
+
+        dispatcher.Start();
+        Assert.True(await WaitForAsync(
+            () => metrics.WalReplays >= 2 && persister.SaveCount >= 1,
+            ReadyTimeout));
+
+        var prepared = persister.TryLoad(84)!.Engine;
+        Assert.Null(prepared.LegacyGlobalRptSeq);
+        Assert.Equal(12u, prepared.RptSeqBySecurity.Single(entry => entry.SecurityId == Sec).RptSeq);
+        Assert.Equal(12u, prepared.RptSeqBySecurity.Single(entry => entry.SecurityId == Vale).RptSeq);
+
+        Assert.True(dispatcher.EnqueueNewOrder(
+            new NewOrderCommand("P-LIVE", Sec, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(9m), 100, 700, 3_000),
+            new SessionId("live"),
+            enteringFirm: 700,
+            clOrdIdValue: 3));
+        Assert.True(await WaitForAsync(
+            () => persister.SaveCount >= 2
+                && persister.TryLoad(84)!.Engine.RptSeqBySecurity
+                    .Single(entry => entry.SecurityId == Sec).RptSeq == 13,
+            ReadyTimeout));
+
+        await dispatcher.DisposeAsync();
+    }
+
+    private static WalRecord NewOrderRecord(
+        long seq,
+        string clOrdId,
+        long securityId,
+        Side side,
+        long price,
+        ulong enteredAtNanos)
+        => new(
+            Seq: seq,
+            Kind: WalRecordKind.NewOrder,
+            SessionValue: $"S-{seq}",
+            Firm: (uint)(100 + seq),
+            ClOrdId: (ulong)seq,
+            OrigClOrdId: 0,
+            NewOrder: new NewOrderCommand(
+                clOrdId,
+                securityId,
+                side,
+                OrderType.Limit,
+                TimeInForce.Day,
+                price,
+                100,
+                (uint)(100 + seq),
+                enteredAtNanos),
+            Cancel: null,
+            Replace: null);
+
+    [Fact]
     public async Task PenultimateEpoch_MultiPacketCommandCompletesInTerminalEpoch()
     {
         var dispatcher = BuildDispatcher(
@@ -689,7 +840,7 @@ public class ChannelDispatcherWalTests
         Assert.Equal(ushort.MaxValue, dispatcher.SequenceVersion);
         Assert.Equal(uint.MaxValue - 1, dispatcher.SequenceNumber);
         Assert.Equal(33L, engine!.PeekNextOrderId);
-        Assert.Equal(0u, engine.CurrentRptSeq);
+        Assert.Equal(0u, engine.GetCurrentRptSeq(Sec));
         Assert.Equal(32, engine.OrderCount(Sec));
         Assert.Equal(32, dispatcher.OrderRegistryCount);
         Assert.Equal(0, wal.AppendCount);

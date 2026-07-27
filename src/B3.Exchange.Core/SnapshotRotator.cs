@@ -32,7 +32,8 @@ namespace B3.Exchange.Core;
 /// Empty / illiquid handling: per B3 §7.4 a symbol with no incremental
 /// history publishes a snapshot header with <c>LastRptSeq</c> absent and an
 /// empty Orders_71 group. The rotator emits exactly that when the book has
-/// no resting orders AND <see cref="ISnapshotBookSource.CurrentRptSeq"/> is
+/// no resting orders AND its <see cref="ISnapshotBookSource.GetCurrentRptSeq"/>
+/// watermark is
 /// 0.
 /// </para>
 /// </summary>
@@ -152,7 +153,7 @@ public sealed class SnapshotRotator
         // always stamp the live RptSeq, even if the book is empty (e.g. all
         // orders matched and no new ones have arrived). A zero RptSeq is
         // therefore treated as "illiquid" only when the book is also empty.
-        uint currentRptSeq = _source.CurrentRptSeq;
+        uint currentRptSeq = _source.GetCurrentRptSeq(securityId);
         bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
         uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
 

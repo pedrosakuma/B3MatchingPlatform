@@ -171,7 +171,7 @@ public sealed partial class ChannelDispatcher
             quantity: e.TopQuantity,
             tradeDate: _tradeDate,
             mdEntryTimestampNanos: e.TransactTimeNanos,
-            rptSeq: e.RptSeq);
+            rptSeq: e.TopRptSeq);
 
         ushort cond = e.HasImbalance
             ? (e.ImbalanceSide == Side.Buy
@@ -184,7 +184,7 @@ public sealed partial class ChannelDispatcher
             imbalanceCondition: cond,
             imbalanceQty: e.ImbalanceQuantity,
             mdEntryTimestampNanos: e.TransactTimeNanos,
-            rptSeq: e.RptSeq);
+            rptSeq: e.ImbalanceRptSeq);
     }
 
     /// <summary>

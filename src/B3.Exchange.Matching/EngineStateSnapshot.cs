@@ -19,16 +19,28 @@ namespace B3.Exchange.Matching;
 /// carries every untriggered stop. Old snapshots that pre-date #262
 /// deserialise with <see cref="Stops"/> null → treated as empty, so the
 /// schema remains backward compatible without a version bump.</para>
+///
+/// <para><see cref="LegacyGlobalRptSeq"/> is a transient v6 migration marker.
+/// It is populated only while an old snapshot's WAL tail is replayed, then
+/// cleared before the upgraded v7 state is persisted.</para>
 /// </summary>
 public sealed record EngineStateSnapshot(
     long NextOrderId,
     uint NextTradeId,
-    uint RptSeq,
+    IReadOnlyList<EngineStateSnapshot.RptSeqEntry> RptSeqBySecurity,
     IReadOnlyList<EngineStateSnapshot.PhaseEntry> Phases,
     IReadOnlyList<EngineStateSnapshot.BookSnapshot> Books,
     IReadOnlyList<RestingStopRecord>? Stops = null,
-    IReadOnlyList<EngineStateSnapshot.HaltEntry>? Halts = null)
+    IReadOnlyList<EngineStateSnapshot.HaltEntry>? Halts = null,
+    uint? LegacyGlobalRptSeq = null)
 {
+    /// <summary>
+    /// Per-instrument incremental watermark. B3 UMDF uses one
+    /// <c>RptSeq</c> counter per SecurityID shared across every incremental
+    /// template for that instrument.
+    /// </summary>
+    public sealed record RptSeqEntry(long SecurityId, uint RptSeq);
+
     public sealed record PhaseEntry(long SecurityId, TradingPhase Phase);
 
     public sealed record BookSnapshot(long SecurityId, IReadOnlyList<RestingOrderRecord> Orders);

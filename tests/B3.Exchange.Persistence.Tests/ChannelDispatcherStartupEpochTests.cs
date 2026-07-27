@@ -191,7 +191,11 @@ public sealed class ChannelDispatcherStartupEpochTests
         var engine = new EngineStateSnapshot(
             NextOrderId: 4,
             NextTradeId: 17,
-            RptSeq: 29,
+            RptSeqBySecurity:
+            [
+                new EngineStateSnapshot.RptSeqEntry(Petr, 29),
+                new EngineStateSnapshot.RptSeqEntry(Vale, 29),
+            ],
             Phases:
             [
                 new EngineStateSnapshot.PhaseEntry(Petr, TradingPhase.Open),
@@ -295,7 +299,8 @@ public sealed class ChannelDispatcherStartupEpochTests
         Assert.Equal(4L, prepared.LastAppliedSeq);
         Assert.Equal(5L, prepared.Engine.NextOrderId);
         Assert.Equal(17u, prepared.Engine.NextTradeId);
-        Assert.Equal(30u, prepared.Engine.RptSeq);
+        Assert.Equal(30u, prepared.Engine.RptSeqBySecurity.Single(entry => entry.SecurityId == Petr).RptSeq);
+        Assert.Equal(29u, prepared.Engine.RptSeqBySecurity.Single(entry => entry.SecurityId == Vale).RptSeq);
         Assert.Equal(3, prepared.Engine.Books.Single(book => book.SecurityId == Petr).Orders.Count);
         Assert.Single(prepared.Engine.Stops!);
         Assert.Equal(4, prepared.Owners.Count);
