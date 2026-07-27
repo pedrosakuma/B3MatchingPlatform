@@ -179,6 +179,34 @@ public class ExchangeHostE2ETests
     }
 
     [Fact]
+    public async Task MaxOpenOrdersPerFirm_ProducesBusinessLevelOrderReject()
+    {
+        var (cfg, sink) = BuildConfig();
+        cfg.MaxOpenOrdersPerFirm = 1;
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        await stream.WriteAsync(BuildSimpleNewOrder(
+            clOrdId: 1001, secId: Petr, side: '1', ordType: '2', tif: '0',
+            qty: 100, priceMantissa: 123_400));
+        var accepted = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, accepted.TemplateId);
+
+        await stream.WriteAsync(BuildSimpleNewOrder(
+            clOrdId: 1002, secId: Petr, side: '1', ordType: '2', tif: '0',
+            qty: 100, priceMantissa: 123_300));
+        var rejected = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportReject, rejected.TemplateId);
+        Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(rejected.Body.AsSpan(44, 4)));
+    }
+
+    [Fact]
     public async Task CancelByOrigClOrdId_RoundTripsExecutionReportCancel_WithBothClOrdIdAndOrigClOrdId()
     {
         var (cfg, sink) = BuildConfig();

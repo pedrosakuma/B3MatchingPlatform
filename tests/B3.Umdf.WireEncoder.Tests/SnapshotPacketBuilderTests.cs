@@ -99,21 +99,17 @@ public class SnapshotPacketBuilderTests
     }
 
     [Fact]
-    public void LargeBook_ChunksAcrossPacketsWithSequentialSeqNums()
+    public void BookLargerThanPacketBuffer_ChunksAcrossPacketsWithSequentialSeqNums()
     {
         var sink = new CapturingHandler();
         var buf = new byte[SnapshotPacketBuilder.DefaultPacketBufferSize];
 
-        // 600 entries at maxEntriesPerChunk=255 → chunks of (255, 255, 90).
-        // Each 255-entry chunk frame = 23 + 255*42 = 10733 bytes; the trailing
-        // 90-entry chunk = 23 + 90*42 = 3803 bytes. Packet 1 (16 KB buffer)
-        // fits PacketHeader + Header_30 + ONE 255-entry chunk (16+46+10733 ≈
-        // 10795 bytes; second chunk would push to 21 KB and overflow). Packet
-        // 2 fits the second 255-entry chunk PLUS the 90-entry chunk
-        // (16+10733+3803 = 14552 bytes). So we expect exactly 2 packets.
-        var bids = new UmdfWireEncoder.SnapshotEntry[400];
+        // 1,000 entries regress the old loop that repeatedly shrank a second
+        // Orders_71 chunk until it reached one entry, then threw instead of
+        // emitting the already-populated packet.
+        var bids = new UmdfWireEncoder.SnapshotEntry[700];
         for (int i = 0; i < bids.Length; i++) bids[i] = Bid(100_0000L - i, 100L, i + 1);
-        var asks = new UmdfWireEncoder.SnapshotEntry[200];
+        var asks = new UmdfWireEncoder.SnapshotEntry[300];
         for (int i = 0; i < asks.Length; i++) asks[i] = Ask(101_0000L + i, 100L, 10_000 + i);
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0,
@@ -121,8 +117,11 @@ public class SnapshotPacketBuilderTests
             incrementalSequenceVersion: 11,
             bids, asks, sink.OnPacket);
 
-        Assert.Equal(2, packets);
-        Assert.Equal(2, sink.Packets.Count);
+        Assert.Equal(
+            SnapshotPacketBuilder.GetPacketCount(buf.Length, bids.Length, asks.Length),
+            packets);
+        Assert.True(packets >= 3);
+        Assert.Equal(packets, sink.Packets.Count);
 
         for (int i = 0; i < packets; i++)
         {
@@ -134,9 +133,9 @@ public class SnapshotPacketBuilderTests
 
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             sink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
-        Assert.Equal(600u, hdr.Data.TotNumReports);
-        Assert.Equal(400u, hdr.Data.TotNumBids);
-        Assert.Equal(200u, hdr.Data.TotNumOffers);
+        Assert.Equal(1_000u, hdr.Data.TotNumReports);
+        Assert.Equal(700u, hdr.Data.TotNumBids);
+        Assert.Equal(300u, hdr.Data.TotNumOffers);
 
         // Walk both packets summing NumInGroup across every Orders_71 frame.
         int totalEntries = 0;
@@ -155,7 +154,8 @@ public class SnapshotPacketBuilderTests
                 p += frameLen;
             }
         }
-        Assert.Equal(600, totalEntries);
+        Assert.Equal(1_000, totalEntries);
+        Assert.All(sink.Packets, packet => Assert.InRange(packet.Length, 1, buf.Length));
     }
 
     [Fact]

@@ -282,6 +282,7 @@ public sealed class ExchangeHost : IAsyncDisposable
         // option series at end-of-trading-day.
         var instrumentDispatcherPairs = new List<(Instrument Instrument, ChannelDispatcher Dispatcher)>();
         var publisherStarts = new List<Action>();
+        var openOrderTracker = new FirmOpenOrderTracker(_config.MaxOpenOrdersPerFirm);
         foreach (var ch in _config.Channels)
         {
             var instruments = InstrumentLoader.LoadFromFile(ch.InstrumentsFile);
@@ -394,6 +395,7 @@ public sealed class ExchangeHost : IAsyncDisposable
                     SessionFirmCounters = _metrics.SessionFirmMessages,
                     OpenOrders = _metrics.OpenOrders,
                     MaxOpenOrdersPerFirm = _config.MaxOpenOrdersPerFirm,
+                    OpenOrderTracker = openOrderTracker,
                     RetxBuffer = retxBuffer,
                     Persister = persister,
                     SnapshotThrottle = ch.Persistence?.Throttle?.ToPolicy(),

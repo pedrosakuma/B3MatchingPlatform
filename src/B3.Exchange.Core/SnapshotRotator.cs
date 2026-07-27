@@ -52,6 +52,21 @@ public sealed class SnapshotRotator
     public uint SequenceNumber { get; private set; }
     public int RotationIndex => _rotationIndex;
 
+    public TestProbe CreateTestProbe() => new(this);
+
+    public sealed class TestProbe
+    {
+        private readonly SnapshotRotator _rotator;
+
+        internal TestProbe(SnapshotRotator rotator) => _rotator = rotator;
+
+        public void SetSequence(ushort version, uint number)
+        {
+            _rotator.SequenceVersion = version;
+            _rotator.SequenceNumber = number;
+        }
+    }
+
     public SnapshotRotator(
         byte channelNumber,
         ISnapshotBookSource source,
@@ -115,6 +130,10 @@ public sealed class SnapshotRotator
     /// </summary>
     public int PublishFor(long securityId, ushort incrementalSequenceVersion)
     {
+        UmdfSequenceVersion.EnsureCanBeginLiveWork(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} work-item boundary");
+
         // Materialise the book sides into lists. Snapshot ticks are
         // low-frequency (typically every few seconds per instrument) so a
         // per-tick allocation is acceptable; the alternative — caching
@@ -137,6 +156,13 @@ public sealed class SnapshotRotator
         bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
         uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
 
+        int requiredPackets = SnapshotPacketBuilder.GetPacketCount(
+            _packetBuf.Length,
+            bidsList.Count,
+            asksList.Count,
+            _maxEntriesPerChunk);
+        EnsurePacketSequenceCapacity(requiredPackets);
+
         ushort version = SequenceVersion;
         uint firstSeq = SequenceNumber + 1;
         ulong nowNanos = _timeSource.NowNanos();
@@ -157,7 +183,25 @@ public sealed class SnapshotRotator
             onPacket: pkt => sink.Publish(channel, pkt),
             maxEntriesPerChunk: _maxEntriesPerChunk);
 
-        SequenceNumber += (uint)packetsEmitted;
+        if (packetsEmitted != requiredPackets)
+        {
+            throw new InvalidOperationException(
+                $"snapshot packet count changed during encode: reserved {requiredPackets}, emitted {packetsEmitted}");
+        }
+        SequenceNumber = (uint)((ulong)SequenceNumber + (uint)packetsEmitted);
         return packetsEmitted;
+    }
+
+    private void EnsurePacketSequenceCapacity(int requiredPackets)
+    {
+        if (requiredPackets < 1)
+            throw new ArgumentOutOfRangeException(nameof(requiredPackets));
+        if ((ulong)SequenceNumber + (uint)requiredPackets <= uint.MaxValue)
+            return;
+
+        SequenceVersion = UmdfSequenceVersion.NextOrThrow(
+            SequenceVersion,
+            $"snapshot channel {_channelNumber} automatic epoch rollover");
+        SequenceNumber = 0;
     }
 }

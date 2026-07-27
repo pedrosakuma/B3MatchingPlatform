@@ -19,6 +19,10 @@ public sealed class HostConfig
     [JsonPropertyName("dailyReset")] public DailyResetConfig? DailyReset { get; set; }
     [JsonPropertyName("phaseScheduler")] public PhaseSchedulerConfig? PhaseScheduler { get; set; }
     [JsonPropertyName("shutdown")] public ShutdownConfig Shutdown { get; set; } = new();
+    /// <summary>
+    /// Host-wide maximum simultaneously open orders per entering firm across
+    /// every channel. The default preserves the pre-configuration behavior.
+    /// </summary>
     [JsonPropertyName("maxOpenOrdersPerFirm")] public int MaxOpenOrdersPerFirm { get; set; } = 100_000;
     [JsonPropertyName("channels")] public List<ChannelConfig> Channels { get; set; } = new();
 

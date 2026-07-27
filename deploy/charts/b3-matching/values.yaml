@@ -23,6 +23,10 @@ replicas: 1
 # -- Config file the ExchangeHost boots from (mounted from the ConfigMap).
 configFileName: exchange-simulator.bridge.json
 
+# -- Maximum simultaneously open orders per entering firm across all channels.
+#    Preserves the host default; lower it per environment to bound runaway quoting.
+maxOpenOrdersPerFirm: 100000
+
 # -- Unicast UMDF target. matching resolves this DNS name at startup and
 #    ABORTS if it misses; it emits unicast UDP here (no multicast, no LB in
 #    the UDP path). Injected into the bridge config's channel groups.

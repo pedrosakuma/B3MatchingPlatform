@@ -253,26 +253,6 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
-        if (item.Kind == WorkKind.New && WouldExceedOpenOrderLimit(item.Firm))
-        {
-            _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.NewOrder!);
-            return;
-        }
-        if (item.Kind == WorkKind.Cross && WouldExceedOpenOrderLimit(item.Firm, requiredSlots: 2))
-        {
-            _metrics?.IncOrdersIn();
-            EmitOpenOrderLimitReject(item.Cross!);
-            return;
-        }
-        if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
-        {
-            if (!WalAppendIfEnabled(in item))
-            {
-                _metrics?.IncWalHaltReject();
-                return;
-            }
-        }
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -281,22 +261,48 @@ public sealed partial class ChannelDispatcher
         // Fast path: skip the virtual StartActivity call when no listeners
         // are attached (round-2 perf #11).
         System.Diagnostics.Activity? engineSpan = null;
-        if (ExchangeTelemetry.Source.HasListeners())
-        {
-            engineSpan = ExchangeTelemetry.Source.StartActivity(
-                ExchangeTelemetry.SpanEngineProcess,
-                System.Diagnostics.ActivityKind.Internal,
-                item.ParentContext);
-            if (engineSpan is not null)
-            {
-                engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
-                engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
-                if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
-                if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
-            }
-        }
         try
         {
+            int requiredOpenOrderSlots = _replayMode ? 0 : RequiredOpenOrderSlots(in item);
+            if (requiredOpenOrderSlots > 0
+                && !_openOrderTracker.TryReserve(item.Firm, requiredOpenOrderSlots))
+            {
+                _metrics?.IncOrdersIn();
+                _openOrderMetrics?.IncLimitRejected(item.Firm);
+                if (item.Kind == WorkKind.New)
+                    EmitOpenOrderLimitReject(item.NewOrder!);
+                else
+                    EmitOpenOrderLimitReject(item.Cross!);
+                return;
+            }
+            _reservedOpenOrderFirm = item.Firm;
+            _reservedOpenOrderSlots = requiredOpenOrderSlots;
+
+            if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
+            {
+                if (!WalAppendIfEnabled(in item))
+                {
+                    _metrics?.IncWalHaltReject();
+                    return;
+                }
+            }
+
+            _currentWorkKind = item.Kind;
+            if (ExchangeTelemetry.Source.HasListeners())
+            {
+                engineSpan = ExchangeTelemetry.Source.StartActivity(
+                    ExchangeTelemetry.SpanEngineProcess,
+                    System.Diagnostics.ActivityKind.Internal,
+                    item.ParentContext);
+                if (engineSpan is not null)
+                {
+                    engineSpan.SetTag(ExchangeTelemetry.TagChannel, (int)ChannelNumber);
+                    engineSpan.SetTag(ExchangeTelemetry.TagWorkKind, WorkKindName(item.Kind));
+                    if (item.HasSession) engineSpan.SetTag(ExchangeTelemetry.TagSession, item.Session.Value);
+                    if (item.ClOrdId != 0) engineSpan.SetTag(ExchangeTelemetry.TagClOrdId, (long)item.ClOrdId);
+                }
+            }
+
             switch (item.Kind)
             {
                 case WorkKind.New:
@@ -489,6 +495,8 @@ public sealed partial class ChannelDispatcher
         }
         finally
         {
+            ReleaseUnusedOpenOrderReservation();
+            ReleaseTerminalTriggeredOpenOrders();
             // Issue #173: engine_process = engine entry → engine exit
             // (regardless of crash/success). outbound_emit measured
             // separately around FlushPacket so the two phases are
@@ -539,6 +547,7 @@ public sealed partial class ChannelDispatcher
             _hasCurrentSession = false;
             _currentClOrdId = 0;
             _currentOrigClOrdId = 0;
+            _currentWorkKind = null;
             _currentReceivedTimeNanos = ulong.MaxValue;
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
@@ -706,10 +715,32 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private bool WouldExceedOpenOrderLimit(uint enteringFirm, int requiredSlots = 1)
+    private static int RequiredOpenOrderSlots(in WorkItem item)
     {
-        int current = _openOrdersByFirm.TryGetValue(enteringFirm, out int count) ? count : 0;
-        return current + requiredSlots > _maxOpenOrdersPerFirm;
+        return item.Kind switch
+        {
+            WorkKind.New => CanRest(item.NewOrder!) ? 1 : 0,
+            // Cross legs execute serially at one cross price. The prioritized
+            // leg may rest before the other leg consumes it, but both legs
+            // cannot remain open simultaneously; at most one residual rests.
+            WorkKind.Cross => CanRest(item.Cross!.Buy) || CanRest(item.Cross.Sell) ? 1 : 0,
+            _ => 0,
+        };
+    }
+
+    private static bool CanRest(NewOrderCommand order)
+    {
+        if (order.PreTradeRejectReason is not null || order.UnsupportedOrderCharacteristic)
+            return false;
+        return order.Tif is not (B3.Exchange.Matching.TimeInForce.IOC or B3.Exchange.Matching.TimeInForce.FOK);
+    }
+
+    private void ReleaseUnusedOpenOrderReservation()
+    {
+        if (_reservedOpenOrderSlots > 0)
+            _openOrderTracker.Release(_reservedOpenOrderFirm, _reservedOpenOrderSlots);
+        _reservedOpenOrderFirm = 0;
+        _reservedOpenOrderSlots = 0;
     }
 
     private void EmitOpenOrderLimitReject(NewOrderCommand order)

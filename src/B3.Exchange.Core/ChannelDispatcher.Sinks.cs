@@ -20,6 +20,7 @@ public sealed partial class ChannelDispatcher
     public void OnOrderAccepted(in OrderAcceptedEvent e)
     {
         AssertOnLoopThread();
+        TrackOpenOrder(e.OrderId, e.EnteringFirm);
         var entryType = e.Side == Side.Buy
             ? B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeBid
             : B3.Umdf.WireEncoder.UmdfWireEncoder.MdEntryTypeOffer;
@@ -46,7 +47,6 @@ public sealed partial class ChannelDispatcher
                 _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
                     originalQty: _aggressorOrigQty > 0 ? _aggressorOrigQty : e.RemainingQuantity,
                     cumQty: _aggressorCumQty);
-                IncrementOpenOrders(_currentFirm);
             }
             _outbound.WriteExecutionReportNew(_currentSession, _currentFirm, _currentClOrdId, e, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.New);
@@ -250,13 +250,13 @@ public sealed partial class ChannelDispatcher
         UmdfFrameBuilder.WriteOrderDeleted(FrameSink,
             e.SecurityId, e.OrderId, entryType, e.RemainingQuantityAtCancel, e.RptSeq, e.TransactTimeNanos, e.PriceMantissa);
 
+        UntrackOpenOrder(e.OrderId);
         // Issue #167: resolve owner locally on the dispatch thread, then
         // evict the canonical entry. Pass the active session's ClOrdId (if
         // any) so the wire ER carries the requester's id while
         // OrigClOrdID points to the owner's original ClOrdID.
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
-            DecrementOpenOrders(owner.Firm);
             _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
@@ -292,8 +292,8 @@ public sealed partial class ChannelDispatcher
         // Tell the canonical registry the order has reached terminal state
         // — no wire ER here (the per-trade ER_Trade frames have already
         // covered the fills).
-        if (_orders.TryEvict(e.OrderId, out var owner))
-            DecrementOpenOrders(owner.Firm);
+        _orders.TryEvict(e.OrderId, out _);
+        UntrackOpenOrder(e.OrderId);
     }
 
     public void OnTrade(in TradeEvent e)
@@ -467,14 +467,59 @@ public sealed partial class ChannelDispatcher
         }
     }
 
-    private void IncrementOpenOrders(uint firm)
+    private void TrackOpenOrder(long orderId, uint firm)
+    {
+        if (_openOrderFirmByOrderId.ContainsKey(orderId)) return;
+        _openOrderFirmByOrderId.Add(orderId, firm);
+        if (_triggeredOpenOrderReservations.Remove(orderId, out uint triggeredFirm))
+        {
+            if (triggeredFirm != firm)
+                throw new InvalidOperationException(
+                    $"triggered order {orderId} changed firm from {triggeredFirm} to {firm}");
+        }
+        else if (_reservedOpenOrderSlots > 0 && _reservedOpenOrderFirm == firm)
+            _reservedOpenOrderSlots--;
+        else
+            _openOrderTracker.AddExisting(firm, 1);
+
+        IncrementLocalOpenOrderCount(firm);
+    }
+
+    private void IncrementLocalOpenOrderCount(uint firm)
     {
         int next = _openOrdersByFirm.TryGetValue(firm, out int current) ? current + 1 : 1;
         _openOrdersByFirm[firm] = next;
         _openOrderMetrics?.Set(ChannelNumber, firm, next);
     }
 
-    private void DecrementOpenOrders(uint firm)
+    private void UntrackOpenOrder(long orderId)
+    {
+        if (!_openOrderFirmByOrderId.Remove(orderId, out uint firm)) return;
+        bool retained = RetainReleasedOpenOrderSlot(firm);
+        if (!retained)
+            _openOrderTracker.Release(firm, 1);
+        DecrementLocalOpenOrderCount(firm);
+        if (retained)
+            _openOrderTransitionHookForTesting?.Invoke();
+    }
+
+    private bool RetainReleasedOpenOrderSlot(uint firm)
+    {
+        if (_currentWorkKind is not (WorkKind.Replace or WorkKind.Cross)
+            || firm != _currentFirm)
+        {
+            return false;
+        }
+
+        if (_reservedOpenOrderSlots == 0)
+            _reservedOpenOrderFirm = firm;
+        else if (_reservedOpenOrderFirm != firm)
+            return false;
+        _reservedOpenOrderSlots++;
+        return true;
+    }
+
+    private void DecrementLocalOpenOrderCount(uint firm)
     {
         if (!_openOrdersByFirm.TryGetValue(firm, out int current) || current <= 0)
             return;
@@ -486,12 +531,36 @@ public sealed partial class ChannelDispatcher
         _openOrderMetrics?.Set(ChannelNumber, firm, next);
     }
 
+    private void TransitionTriggeredOpenOrder(long orderId)
+    {
+        if (!_openOrderFirmByOrderId.Remove(orderId, out uint firm)) return;
+        _triggeredOpenOrderReservations.Add(orderId, firm);
+        DecrementLocalOpenOrderCount(firm);
+    }
+
+    private void ReleaseTerminalTriggeredOpenOrders()
+    {
+        if (_triggeredOpenOrderReservations.Count == 0) return;
+        foreach (var (orderId, firm) in _triggeredOpenOrderReservations)
+        {
+            _openOrderTracker.Release(firm, 1);
+            _orders.TryEvict(orderId, out _);
+        }
+        _triggeredOpenOrderReservations.Clear();
+    }
+
     private void ClearOpenOrderCounts()
     {
+        ReleaseUnusedOpenOrderReservation();
+        ReleaseTerminalTriggeredOpenOrders();
         if (_openOrdersByFirm.Count == 0) return;
         foreach (uint firm in _openOrdersByFirm.Keys.ToArray())
+        {
+            _openOrderTracker.Release(firm, _openOrdersByFirm[firm]);
             _openOrderMetrics?.Set(ChannelNumber, firm, 0);
+        }
         _openOrdersByFirm.Clear();
+        _openOrderFirmByOrderId.Clear();
     }
 
     public void OnIcebergReplenished(in IcebergReplenishedEvent e)
@@ -532,11 +601,11 @@ public sealed partial class ChannelDispatcher
     public void OnStopOrderAccepted(in StopOrderAcceptedEvent e)
     {
         AssertOnLoopThread();
+        TrackOpenOrder(e.OrderId, e.EnteringFirm);
         if (_hasCurrentSession)
         {
             _orders.Register(e.OrderId, _currentSession, _currentClOrdId, _currentFirm, e.Side, e.SecurityId,
                 originalQty: e.Quantity);
-            IncrementOpenOrders(_currentFirm);
             var accepted = new OrderAcceptedEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,
@@ -562,9 +631,9 @@ public sealed partial class ChannelDispatcher
     public void OnStopOrderCanceled(in StopOrderCanceledEvent e)
     {
         AssertOnLoopThread();
+        UntrackOpenOrder(e.OrderId);
         if (_orders.TryEvict(e.OrderId, out var owner))
         {
-            DecrementOpenOrders(owner.Firm);
             var canceled = new OrderCanceledEvent(
                 SecurityId: e.SecurityId,
                 OrderId: e.OrderId,
@@ -593,5 +662,6 @@ public sealed partial class ChannelDispatcher
     public void OnStopOrderTriggered(in StopOrderTriggeredEvent e)
     {
         AssertOnLoopThread();
+        TransitionTriggeredOpenOrder(e.OrderId);
     }
 }
