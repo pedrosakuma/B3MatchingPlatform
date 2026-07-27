@@ -3,6 +3,7 @@ using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
 using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
+using B3.Exchange.Contracts.Time;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Buffers.Binary;
 using System.Net;
@@ -79,6 +80,31 @@ public class FixpSessionResyncBootRehydrationTests
             lock (_lock) return _sessions.Keys.ToArray();
         }
         public void Dispose() { }
+    }
+
+    private sealed class FailOnceMaxSeqJournal : IFixpOutboundJournal
+    {
+        private readonly StrictJournal _inner = new();
+        private int _failuresRemaining = 1;
+
+        public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
+            => _inner.Append(sessionId, seq, timestampNanos, frame);
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq)
+            => _inner.ConfirmPeerAck(sessionId, uptoSeq);
+        public void PruneUpTo(uint sessionId, uint uptoSeq)
+            => _inner.PruneUpTo(sessionId, uptoSeq);
+        public IReadOnlyList<OutboundJournalEntry> ReadRange(uint sessionId, uint fromSeq, int count)
+            => _inner.ReadRange(sessionId, fromSeq, count);
+        public uint MaxSeq(uint sessionId)
+        {
+            if (Interlocked.Exchange(ref _failuresRemaining, 0) == 1)
+                throw new IOException("simulated journal reconciliation failure");
+            return _inner.MaxSeq(sessionId);
+        }
+        public long EntryCount(uint sessionId) => _inner.EntryCount(sessionId);
+        public void Remove(uint sessionId) => _inner.Remove(sessionId);
+        public IReadOnlyCollection<uint> ListSessions() => _inner.ListSessions();
+        public void Dispose() => _inner.Dispose();
     }
 
     private sealed class MemoryStatePersister : IFixpSessionStatePersister
@@ -173,6 +199,25 @@ public class FixpSessionResyncBootRehydrationTests
         public void Dispose() => _release.Dispose();
     }
 
+    private sealed class BlockingNanosTimeSource : INanosTimeSource, IDisposable
+    {
+        private readonly ManualResetEventSlim _release = new(false);
+
+        public TaskCompletionSource<bool> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ulong NowNanos()
+        {
+            Entered.TrySetResult(true);
+            _release.Wait(TimeSpan.FromSeconds(5));
+            return 1;
+        }
+
+        public void Release() => _release.Set();
+
+        public void Dispose() => _release.Dispose();
+    }
+
     private static byte[] BuildFixedBlock(uint sessionId, uint msgSeqNum, ulong clOrdId)
     {
         var fb = new byte[82];
@@ -201,14 +246,18 @@ public class FixpSessionResyncBootRehydrationTests
         return buffer.AsSpan(0, length).ToArray();
     }
 
-    private static byte[] BuildEstablish(uint sessionId, ulong sessionVerId, uint nextSeqNo)
+    private static byte[] BuildEstablish(
+        uint sessionId,
+        ulong sessionVerId,
+        uint nextSeqNo,
+        ulong timestampNanos = 0)
     {
         var buffer = new byte[256];
         int length = EntryPointFixpFrameCodec.EncodeEstablish(
             buffer,
             sessionId,
             sessionVerId,
-            timestampNanos: 0,
+            timestampNanos,
             keepAliveIntervalMillis: 60_000,
             nextSeqNo: nextSeqNo,
             cancelOnDisconnectType: 0,
@@ -217,7 +266,30 @@ public class FixpSessionResyncBootRehydrationTests
         return buffer.AsSpan(0, length).ToArray();
     }
 
-    private readonly record struct ReadFrame(ushort TemplateId, uint MsgSeqNum);
+    private static byte[] BuildRetransmitRequest(
+        uint sessionId,
+        ulong timestampNanos,
+        uint fromSeqNo,
+        uint count)
+    {
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 20];
+        EntryPointFrameReader.WriteHeader(frame,
+            messageLength: (ushort)frame.Length,
+            blockLength: 20,
+            templateId: EntryPointFrameReader.TidRetransmitRequest,
+            version: 0);
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(4, 8), timestampNanos);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(12, 4), fromSeqNo);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(16, 4), count);
+        return frame;
+    }
+
+    private readonly record struct ReadFrame(
+        ushort TemplateId,
+        uint MsgSeqNum,
+        byte[] Body);
 
     private static async Task<ReadFrame> ReadFrameAsync(NetworkStream stream)
     {
@@ -232,7 +304,15 @@ public class FixpSessionResyncBootRehydrationTests
         uint msgSeqNum = body.Length >= 8
             ? BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4, 4))
             : 0u;
-        return new ReadFrame(templateId, msgSeqNum);
+        return new ReadFrame(templateId, msgSeqNum, body);
+    }
+
+    private static async Task AssertNoFrameAsync(NetworkStream stream)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        var oneByte = new byte[1];
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await stream.ReadExactlyAsync(oneByte, cts.Token));
     }
 
     [Fact]
@@ -254,6 +334,7 @@ public class FixpSessionResyncBootRehydrationTests
                 journal.Append(sessionId: 1, seq: seq, timestampNanos: 1_000L * seq,
                     frame: new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, (byte)seq });
             }
+
             statePersister.Save(new FixpSessionStateSnapshot(
                 SessionId: 1,
                 SessionVerId: 100UL,
@@ -433,6 +514,7 @@ public class FixpSessionResyncBootRehydrationTests
                 journal.Append(sessionId: 1, seq: seq, timestampNanos: 1_000L * seq,
                     frame: new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, (byte)seq });
             }
+
             statePersister.Save(new FixpSessionStateSnapshot(
                 SessionId: 1,
                 SessionVerId: 100UL,
@@ -799,17 +881,373 @@ public class FixpSessionResyncBootRehydrationTests
         Assert.Equal(expectedRejected, metrics.Rejected);
     }
 
+    [Fact]
+    public async Task ReconnectingNegotiate_BuffersRoutedPassiveReportUntilEstablishAck()
+    {
+        var journal = new StrictJournal();
+        var statePersister = new MemoryStatePersister();
+        var snapshot = new FixpSessionStateSnapshot(
+            SessionId: 1,
+            SessionVerId: 100UL,
+            OutboundMsgSeqNum: 3u,
+            LastIncomingSeqNo: 2u,
+            EnteringFirm: 42u,
+            UpdatedAtNanos: 1_000_000L);
+        for (uint seq = 1; seq <= 3; seq++)
+            journal.Append(1, seq, seq, new byte[] { (byte)seq });
+        statePersister.Save(snapshot);
+        var persistedStates = statePersister.LoadAll().ToDictionary(s => s.SessionId, s => s);
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[]
+            {
+                new SessionCredential(
+                    SessionId: "1",
+                    FirmId: "F1",
+                    AccessKey: "",
+                    AllowedSourceCidrs: null,
+                    Policy: SessionPolicy.Default),
+            });
+        var claims = new SessionClaimRegistry();
+        claims.SeedLastVersion(snapshot.SessionId, snapshot.SessionVerId);
+        var registry = new SessionRegistry();
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            registry,
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
+            {
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+            },
+            negotiationValidator: new NegotiationValidator(
+                firms, claims, devMode: true, timestampSkewToleranceNs: 0),
+            sessionClaims: claims,
+            establishValidator: new EstablishValidator(timestampSkewToleranceNs: 0),
+            outboundJournal: journal,
+            statePersister: statePersister,
+            persistedSessionStates: persistedStates);
+        listener.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var stream = client.GetStream();
+        await stream.WriteAsync(BuildNegotiate(sessionId: 1, sessionVerId: 101UL));
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadFrameAsync(stream)).TemplateId);
+
+        var canceled = new OrderCanceledEvent(
+            SecurityId: 123,
+            OrderId: 55,
+            Side: Side.Buy,
+            PriceMantissa: 100_000,
+            RemainingQuantityAtCancel: 100,
+            TransactTimeNanos: 2,
+            Reason: CancelReason.MassCancel,
+            RptSeq: 1);
+        var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
+        var result = gateway.WriteExecutionReportPassiveCancel(
+            new B3.Exchange.Contracts.SessionId("1"),
+            ownerClOrdId: 5001,
+            orderId: canceled.OrderId,
+            canceled,
+            requesterClOrdIdOrZero: 7001);
+        Assert.True(result.IsCommitted);
+        Assert.False(result.IsTransportEnqueued);
+        Assert.Equal(4u, journal.MaxSeq(1));
+        await AssertNoFrameAsync(stream);
+
+        await stream.WriteAsync(BuildEstablish(
+            sessionId: 1, sessionVerId: 101UL, nextSeqNo: 3u));
+        var ack = await ReadFrameAsync(stream);
+        Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
+        Assert.Equal(5u,
+            BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
+
+        await stream.WriteAsync(BuildRetransmitRequest(
+            sessionId: 1, timestampNanos: 2, fromSeqNo: 4, count: 1));
+        Assert.Equal(EntryPointFrameReader.TidRetransmission,
+            (await ReadFrameAsync(stream)).TemplateId);
+        var replay = await ReadFrameAsync(stream);
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, replay.TemplateId);
+        Assert.Equal(4u, replay.MsgSeqNum);
+        Assert.Equal(EntryPointFrameReader.TidSequence,
+            (await ReadFrameAsync(stream)).TemplateId);
+    }
+
+    [Fact]
+    public async Task ReconnectingEstablish_BuffersRoutedPassiveReportUntilEstablishAck()
+    {
+        var journal = new StrictJournal();
+        var statePersister = new MemoryStatePersister();
+        using var establishClock = new BlockingNanosTimeSource();
+        var snapshot = new FixpSessionStateSnapshot(
+            SessionId: 1,
+            SessionVerId: 100UL,
+            OutboundMsgSeqNum: 3u,
+            LastIncomingSeqNo: 2u,
+            EnteringFirm: 42u,
+            UpdatedAtNanos: 1_000_000L);
+        for (uint seq = 1; seq <= 3; seq++)
+            journal.Append(1, seq, seq, new byte[] { (byte)seq });
+        statePersister.Save(snapshot);
+        var persistedStates = statePersister.LoadAll().ToDictionary(s => s.SessionId, s => s);
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[]
+            {
+                new SessionCredential(
+                    SessionId: "1",
+                    FirmId: "F1",
+                    AccessKey: "",
+                    AllowedSourceCidrs: null,
+                    Policy: SessionPolicy.Default),
+            });
+        var claims = new SessionClaimRegistry();
+        claims.SeedLastVersion(snapshot.SessionId, snapshot.SessionVerId);
+        var registry = new SessionRegistry();
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            registry,
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
+            {
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+            },
+            negotiationValidator: new NegotiationValidator(
+                firms, claims, devMode: true, timestampSkewToleranceNs: 0),
+            sessionClaims: claims,
+            establishValidator: new EstablishValidator(
+                establishClock, timestampSkewToleranceNs: ulong.MaxValue),
+            outboundJournal: journal,
+            statePersister: statePersister,
+            persistedSessionStates: persistedStates);
+        listener.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var stream = client.GetStream();
+        await stream.WriteAsync(BuildEstablish(
+            sessionId: 1,
+            sessionVerId: 100UL,
+            nextSeqNo: 3u,
+            timestampNanos: 1));
+        await establishClock.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var canceled = new OrderCanceledEvent(
+            SecurityId: 123,
+            OrderId: 56,
+            Side: Side.Buy,
+            PriceMantissa: 100_000,
+            RemainingQuantityAtCancel: 100,
+            TransactTimeNanos: 2,
+            Reason: CancelReason.MassCancel,
+            RptSeq: 2);
+        var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
+        var result = gateway.WriteExecutionReportPassiveCancel(
+            new B3.Exchange.Contracts.SessionId("1"),
+            ownerClOrdId: 5002,
+            orderId: canceled.OrderId,
+            canceled,
+            requesterClOrdIdOrZero: 7002);
+        Assert.True(result.IsCommitted);
+        Assert.False(result.IsTransportEnqueued);
+        Assert.Equal(4u, journal.MaxSeq(1));
+        await AssertNoFrameAsync(stream);
+
+        establishClock.Release();
+        var ack = await ReadFrameAsync(stream);
+        Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
+        Assert.Equal(5u,
+            BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
+
+        await stream.WriteAsync(BuildRetransmitRequest(
+            sessionId: 1, timestampNanos: 2, fromSeqNo: 4, count: 1));
+        Assert.Equal(EntryPointFrameReader.TidRetransmission,
+            (await ReadFrameAsync(stream)).TemplateId);
+        var replay = await ReadFrameAsync(stream);
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, replay.TemplateId);
+        Assert.Equal(4u, replay.MsgSeqNum);
+        Assert.Equal(EntryPointFrameReader.TidSequence,
+            (await ReadFrameAsync(stream)).TemplateId);
+    }
+
+    [Fact]
+    public async Task Negotiate_PendingJournalReconcileFails_RestoresWatermarkAndAllowsRetry()
+    {
+        using var journal = new FailOnceMaxSeqJournal();
+        var statePersister = new MemoryStatePersister();
+        var snapshot = new FixpSessionStateSnapshot(
+            SessionId: 1,
+            SessionVerId: 100UL,
+            OutboundMsgSeqNum: 3u,
+            LastIncomingSeqNo: 2u,
+            EnteringFirm: 42u,
+            UpdatedAtNanos: 1_000_000L);
+        statePersister.Save(snapshot);
+        var persistedStates = statePersister.LoadAll().ToDictionary(s => s.SessionId, s => s);
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[]
+            {
+                new SessionCredential(
+                    SessionId: "1",
+                    FirmId: "F1",
+                    AccessKey: "",
+                    AllowedSourceCidrs: null,
+                    Policy: SessionPolicy.Default),
+            });
+        var claims = new SessionClaimRegistry();
+        claims.SeedLastVersion(snapshot.SessionId, snapshot.SessionVerId);
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            new SessionRegistry(),
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
+            {
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+            },
+            negotiationValidator: new NegotiationValidator(
+                firms, claims, devMode: true, timestampSkewToleranceNs: 0),
+            sessionClaims: claims,
+            establishValidator: new EstablishValidator(timestampSkewToleranceNs: 0),
+            outboundJournal: journal,
+            statePersister: statePersister,
+            persistedSessionStates: persistedStates);
+        listener.Start();
+
+        using (var failedClient = new TcpClient())
+        {
+            await failedClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+            await failedClient.GetStream().WriteAsync(BuildNegotiate(
+                sessionId: 1, sessionVerId: 101UL));
+            Assert.Equal(EntryPointFrameReader.TidNegotiateReject,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
+            Assert.Equal(EntryPointFrameReader.TidTerminate,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
+        }
+
+        Assert.False(claims.TryGetActiveClaim(1, out _, out _));
+        Assert.Equal(100UL, claims.CurrentSessionVerId(1));
+
+        using var retryClient = new TcpClient();
+        await retryClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint.Port);
+        await retryClient.GetStream().WriteAsync(BuildNegotiate(
+            sessionId: 1, sessionVerId: 101UL));
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadFrameAsync(retryClient.GetStream())).TemplateId);
+        Assert.Equal(101UL, claims.CurrentSessionVerId(1));
+    }
+
+    [Fact]
+    public async Task Negotiate_RouteHandoffFails_RestoresWatermarkAndAllowsRetry()
+    {
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[]
+            {
+                new SessionCredential(
+                    SessionId: "1",
+                    FirmId: "F1",
+                    AccessKey: "",
+                    AllowedSourceCidrs: null,
+                    Policy: SessionPolicy.Default),
+            });
+        var claims = new SessionClaimRegistry();
+        var registry = new SessionRegistry();
+        await using var blocker = new FixpSession(
+            connectionId: 900,
+            enteringFirm: 42,
+            sessionId: 1,
+            stream: new MemoryStream(),
+            sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance);
+        registry.Register(blocker);
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            registry,
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
+            {
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+            },
+            negotiationValidator: new NegotiationValidator(
+                firms, claims, devMode: true, timestampSkewToleranceNs: 0),
+            sessionClaims: claims,
+            establishValidator: new EstablishValidator(timestampSkewToleranceNs: 0));
+        listener.Start();
+
+        using (var failedClient = new TcpClient())
+        {
+            await failedClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+            await failedClient.GetStream().WriteAsync(BuildNegotiate(
+                sessionId: 1, sessionVerId: 100UL));
+            Assert.Equal(EntryPointFrameReader.TidNegotiateReject,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
+            Assert.Equal(EntryPointFrameReader.TidTerminate,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
+        }
+
+        Assert.False(claims.TryGetActiveClaim(1, out _, out _));
+        Assert.Equal(0UL, claims.CurrentSessionVerId(1));
+        Assert.True(registry.TryGet(
+            new B3.Exchange.Contracts.SessionId("1"), out var current));
+        Assert.Same(blocker, current);
+
+        registry.Deregister(blocker);
+        using var retryClient = new TcpClient();
+        await retryClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint.Port);
+        await retryClient.GetStream().WriteAsync(BuildNegotiate(
+            sessionId: 1, sessionVerId: 100UL));
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadFrameAsync(retryClient.GetStream())).TemplateId);
+        Assert.Equal(100UL, claims.CurrentSessionVerId(1));
+    }
+
     private sealed class FaultingStatePersister : IFixpSessionStatePersister
     {
         public int SaveCount;
+        public bool FailSaves { get; set; } = true;
+        public FixpSessionStateSnapshot? LastSaved { get; private set; }
+
         public void Save(in FixpSessionStateSnapshot snapshot)
         {
             Interlocked.Increment(ref SaveCount);
-            throw new IOException("simulated disk failure");
+            if (FailSaves)
+                throw new IOException("simulated disk failure");
+            LastSaved = snapshot;
         }
-        public FixpSessionStateSnapshot? Load(uint sessionId) => null;
+        public FixpSessionStateSnapshot? Load(uint sessionId)
+            => LastSaved is { } snapshot && snapshot.SessionId == sessionId
+                ? snapshot
+                : null;
         public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
-            => Array.Empty<FixpSessionStateSnapshot>();
+            => LastSaved is { } snapshot
+                ? new[] { snapshot }
+                : Array.Empty<FixpSessionStateSnapshot>();
         public void Remove(uint sessionId) { }
         public void Dispose() { }
     }
@@ -826,76 +1264,57 @@ public class FixpSessionResyncBootRehydrationTests
         // immediately retry on a fresh socket without colliding with
         // DUPLICATE_SESSION_CONNECTION.
         var faulting = new FaultingStatePersister();
-        using var journal = new FileFixpOutboundJournal(
-            Path.Combine(Path.GetTempPath(), "fixp-fault-" + Guid.NewGuid().ToString("n")),
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<FileFixpOutboundJournal>.Instance);
-        try
-        {
-            var firms = new FirmRegistry(
-                new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
-                new[] { new SessionCredential(SessionId: "1", FirmId: "F1", AccessKey: "", AllowedSourceCidrs: null, Policy: SessionPolicy.Default) });
-            var claims = new SessionClaimRegistry();
-            var negValidator = new NegotiationValidator(firms, claims, devMode: true, timestampSkewToleranceNs: 0);
-            var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
+        using var journal = new StrictJournal();
+        var firms = new FirmRegistry(
+            new[] { new Firm(Id: "F1", Name: "Firm 1", EnteringFirmCode: 42u) },
+            new[] { new SessionCredential(SessionId: "1", FirmId: "F1", AccessKey: "", AllowedSourceCidrs: null, Policy: SessionPolicy.Default) });
+        var claims = new SessionClaimRegistry();
+        var negValidator = new NegotiationValidator(firms, claims, devMode: true, timestampSkewToleranceNs: 0);
+        var estValidator = new EstablishValidator(timestampSkewToleranceNs: 0);
 
-            await using var listener = new EntryPointListener(
-                new IPEndPoint(IPAddress.Loopback, 0),
-                new NoOpEngineSink(),
-                new SessionRegistry(),
-                NullLoggerFactory.Instance,
-                sessionOptions: new FixpSessionOptions
-                {
-                    HeartbeatIntervalMs = 60_000,
-                    IdleTimeoutMs = 60_000,
-                    TestRequestGraceMs = 60_000,
-                    SuspendedTimeoutMs = 0,
-                    FirstFrameTimeoutMs = 5_000,
-                },
-                negotiationValidator: negValidator,
-                sessionClaims: claims,
-                establishValidator: estValidator,
-                outboundJournal: journal,
-                statePersister: faulting,
-                persistedSessionStates: null);
-            listener.Start();
-
-            using var client = new TcpClient();
-            await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
-            var creds = Encoding.UTF8.GetBytes("{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
-            var buf = new byte[256];
-            int len = EntryPointFixpFrameCodec.EncodeNegotiate(buf,
-                sessionId: 1, sessionVerId: 100UL,
-                timestampNanos: 0UL, enteringFirm: 42u, onBehalfFirm: null,
-                credentials: creds,
-                clientIp: ReadOnlySpan<byte>.Empty,
-                clientAppName: ReadOnlySpan<byte>.Empty,
-                clientAppVersion: ReadOnlySpan<byte>.Empty);
-            await client.GetStream().WriteAsync(buf.AsMemory(0, len));
-
-            // Wait for the listener to: (a) call the faulting persister,
-            // (b) reject the session, (c) deregister it from
-            // ActiveSessions (which the reject path drives via Close →
-            // onClosed callback).
-            var rejected = await TestUtil.WaitUntilAsync(
-                () => Volatile.Read(ref faulting.SaveCount) >= 1
-                    && listener.ActiveSessions.All(s => s.SessionId != 1),
-                TimeSpan.FromSeconds(5));
-            Assert.True(rejected,
-                $"expected reject + deregister; SaveCount={faulting.SaveCount}, " +
-                $"active=[{string.Join(",", listener.ActiveSessions.Select(s => $"{s.SessionId}:{s.State}"))}]");
-
-            // The claim registry must be empty so the peer can retry
-            // with the same SessionVerID without hitting
-            // DUPLICATE_SESSION_CONNECTION.
-            Assert.False(claims.TryGetActiveClaim(1u, out _, out _));
-        }
-        finally
-        {
-            try
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new NoOpEngineSink(),
+            new SessionRegistry(),
+            NullLoggerFactory.Instance,
+            sessionOptions: new FixpSessionOptions
             {
-                if (journal is IDisposable d) d.Dispose();
-            }
-            catch { }
+                HeartbeatIntervalMs = 60_000,
+                IdleTimeoutMs = 60_000,
+                TestRequestGraceMs = 60_000,
+                SuspendedTimeoutMs = 0,
+                FirstFrameTimeoutMs = 5_000,
+            },
+            negotiationValidator: negValidator,
+            sessionClaims: claims,
+            establishValidator: estValidator,
+            outboundJournal: journal,
+            statePersister: faulting,
+            persistedSessionStates: null);
+        listener.Start();
+
+        using (var failedClient = new TcpClient())
+        {
+            await failedClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+            await failedClient.GetStream().WriteAsync(BuildNegotiate(
+                sessionId: 1, sessionVerId: 100UL));
+            Assert.Equal(EntryPointFrameReader.TidNegotiateReject,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
+            Assert.Equal(EntryPointFrameReader.TidTerminate,
+                (await ReadFrameAsync(failedClient.GetStream())).TemplateId);
         }
+
+        Assert.False(claims.TryGetActiveClaim(1u, out _, out _));
+        Assert.Equal(0UL, claims.CurrentSessionVerId(1));
+
+        faulting.FailSaves = false;
+        using var retryClient = new TcpClient();
+        await retryClient.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint.Port);
+        await retryClient.GetStream().WriteAsync(BuildNegotiate(
+            sessionId: 1, sessionVerId: 100UL));
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadFrameAsync(retryClient.GetStream())).TemplateId);
+        Assert.Equal(100UL, claims.CurrentSessionVerId(1));
+        Assert.Equal(100UL, faulting.LastSaved?.SessionVerId);
     }
 }

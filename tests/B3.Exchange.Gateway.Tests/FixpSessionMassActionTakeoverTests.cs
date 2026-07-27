@@ -119,7 +119,7 @@ public class FixpSessionMassActionTakeoverTests
     }
 
     [Fact]
-    public async Task TakeoverDuringMassCancel_RoutesTerminalReportToReplacementAfterCancelEr()
+    public async Task TakeoverDuringMassCancel_BuffersRoutedOutputUntilEstablishAck()
     {
         var sink = new ControlledSink();
         var registry = new SessionRegistry();
@@ -131,7 +131,11 @@ public class FixpSessionMassActionTakeoverTests
         await oldClient.GetStream().WriteAsync(BuildMassActionRequest(clOrdId: 7001));
         var complete = await sink.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        using var replacementClient = await ConnectAndEstablishAsync(listener, sessionVerId: 3);
+        using var replacementClient = await ConnectAndSendNegotiateAsync(listener, sessionVerId: 3);
+        var replacementStream = replacementClient.GetStream();
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadOneFrameAsync(replacementStream)).TemplateId);
+
         var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
         var canceled = new OrderCanceledEvent(
             SecurityId: 123,
@@ -143,20 +147,54 @@ public class FixpSessionMassActionTakeoverTests
             Reason: CancelReason.MassCancel,
             RptSeq: 1);
 
-        Assert.True(gateway.WriteExecutionReportPassiveCancel(
+        var cancelResult = gateway.WriteExecutionReportPassiveCancel(
             new SessionId("1"),
             ownerClOrdId: 5001,
             orderId: canceled.OrderId,
             canceled,
-            requesterClOrdIdOrZero: 7001).IsCommitted);
+            requesterClOrdIdOrZero: 7001);
+        Assert.True(cancelResult.IsCommitted);
+        Assert.False(cancelResult.IsTransportEnqueued);
         complete(MassCancelOutcome.Completed(1));
+        Assert.Equal(2u, listener.ActiveSessions.Single(
+            session => session.SessionVerId == 3).OutboundSeq);
+        await AssertNoFrameAsync(replacementStream);
 
-        var cancel = await ReadOneFrameAsync(replacementClient.GetStream());
+        var establish = new byte[256];
+        int establishLength = EntryPointFixpFrameCodec.EncodeEstablish(
+            establish,
+            sessionId: 1,
+            sessionVerId: 3,
+            timestampNanos: 0,
+            keepAliveIntervalMillis: 10_000,
+            nextSeqNo: 1,
+            cancelOnDisconnectType: 0,
+            codTimeoutWindowMillis: 0,
+            credentials: ReadOnlySpan<byte>.Empty);
+        await replacementStream.WriteAsync(establish.AsMemory(0, establishLength));
+
+        var ack = await ReadOneFrameAsync(replacementStream);
+        Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
+        Assert.Equal(3u,
+            BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
+
+        await replacementStream.WriteAsync(BuildRetransmitRequest(
+            sessionId: 1, timestampNanos: 2, fromSeqNo: 1, count: 2));
+        Assert.Equal(EntryPointFrameReader.TidRetransmission,
+            (await ReadOneFrameAsync(replacementStream)).TemplateId);
+
+        var cancel = await ReadOneFrameAsync(replacementStream);
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel.TemplateId);
-        var report = await ReadOneFrameAsync(replacementClient.GetStream());
+        Assert.Equal(1u,
+            BinaryPrimitives.ReadUInt32LittleEndian(cancel.Body.AsSpan(4, 4)));
+        var report = await ReadOneFrameAsync(replacementStream);
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal(2u,
+            BinaryPrimitives.ReadUInt32LittleEndian(report.Body.AsSpan(4, 4)));
         Assert.Equal(7001UL,
             BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8)));
+        Assert.Equal(EntryPointFrameReader.TidSequence,
+            (await ReadOneFrameAsync(replacementStream)).TemplateId);
     }
 
     [Fact]
@@ -435,6 +473,26 @@ public class FixpSessionMassActionTakeoverTests
         body[47] = (byte)'V';
         body[48] = (byte)'M';
         body[49] = (byte)'F';
+        return frame;
+    }
+
+    private static byte[] BuildRetransmitRequest(
+        uint sessionId,
+        ulong timestampNanos,
+        uint fromSeqNo,
+        uint count)
+    {
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 20];
+        EntryPointFrameReader.WriteHeader(frame,
+            messageLength: (ushort)frame.Length,
+            blockLength: 20,
+            templateId: EntryPointFrameReader.TidRetransmitRequest,
+            version: 0);
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(4, 8), timestampNanos);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(12, 4), fromSeqNo);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(16, 4), count);
         return frame;
     }
 

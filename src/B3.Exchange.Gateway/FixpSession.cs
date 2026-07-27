@@ -68,11 +68,12 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     private readonly object _outboundLock = new();
     /// <summary>
-    /// Guards transport admission during the reattach handshake. Business
-    /// frames continue to consume sequence numbers and enter the retransmit
-    /// buffer while this is false, but they cannot enter the newly attached
-    /// transport until its EstablishAck has been enqueued. Access only while
-    /// holding <see cref="_outboundLock"/>.
+    /// Guards transport admission while an existing logical session is being
+    /// acquired by reattach, takeover, or cold recovery. Business frames
+    /// continue to consume sequence numbers and enter the retransmit
+    /// buffer/journal while this is false, but they cannot enter the transport
+    /// until its EstablishAck has been enqueued. Access only while holding
+    /// <see cref="_outboundLock"/>.
     /// </summary>
     private bool _transportReadyForBusiness = true;
     /// <summary>
@@ -462,6 +463,8 @@ public sealed partial class FixpSession : IAsyncDisposable
         _pendingNegotiateState = deferPersistedStateUntilNegotiate
             ? persistedState
             : null;
+        _transportReadyForBusiness =
+            !resumeAsNegotiated && !deferPersistedStateUntilNegotiate;
         // Issue #405 rehydration: when a state snapshot survives a
         // host restart, seed identity (SessionId / SessionVerId /
         // EnteringFirm) and seq counters BEFORE wiring the buffer
@@ -763,6 +766,12 @@ public sealed partial class FixpSession : IAsyncDisposable
                 Volatile.Write(ref _msgSeqNum, maxSeq);
                 _outboundEncoder.AdvanceMassActionReportSeqTo(
                     previous._outboundEncoder.MassActionReportSeq);
+                // Publish the replacement route only after its replay state is
+                // adopted and its business admission gate is closed. A routed
+                // passive ER or deferred completion that linearizes after the
+                // commit is therefore journaled but cannot overtake the
+                // replacement transport's NegotiateResponse/EstablishAck.
+                _transportReadyForBusiness = false;
                 return commit();
             }
         }

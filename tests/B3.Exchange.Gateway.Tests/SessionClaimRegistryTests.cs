@@ -53,6 +53,68 @@ public class SessionClaimRegistryTests
     }
 
     [Fact]
+    public void Failed_transactional_claim_restores_watermark_and_allows_same_version_retry()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(10101, 4);
+        var failed = new object();
+
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(10101, 5, failed, out var rollback));
+        Assert.Equal(4UL, rollback.PreviousSessionVerId);
+        Assert.True(r.TryRollbackClaim(10101, 5, failed, rollback));
+        Assert.Equal(4UL, r.CurrentSessionVerId(10101));
+        Assert.False(r.TryGetActiveClaim(10101, out _, out _));
+
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(10101, 5, new object()));
+    }
+
+    [Fact]
+    public void Released_transactional_claim_can_still_restore_its_watermark()
+    {
+        var r = new SessionClaimRegistry();
+        r.SeedLastVersion(10101, 4);
+        var failed = new object();
+
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(10101, 5, failed, out var rollback));
+        r.Release(10101, failed);
+
+        Assert.True(r.TryRollbackClaim(10101, 5, failed, rollback));
+        Assert.Equal(4UL, r.CurrentSessionVerId(10101));
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(10101, 5, new object()));
+    }
+
+    [Fact]
+    public void Transactional_claim_rollback_cannot_cross_same_version_ABA()
+    {
+        var r = new SessionClaimRegistry();
+        var failed = new object();
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(10101, 5, failed, out var rollback));
+        r.Release(10101, failed);
+
+        var newer = new object();
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryReclaim(10101, 5, newer));
+        r.Release(10101, newer);
+
+        Assert.False(r.TryRollbackClaim(10101, 5, failed, rollback));
+        Assert.Equal(5UL, r.CurrentSessionVerId(10101));
+        Assert.Equal(
+            SessionClaimRegistry.ClaimResult.StaleVersion,
+            r.TryClaim(10101, 5, new object()));
+    }
+
+    [Fact]
     public void Release_by_non_owner_is_noop()
     {
         var r = new SessionClaimRegistry();

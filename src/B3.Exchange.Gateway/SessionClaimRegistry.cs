@@ -20,6 +20,7 @@ public sealed class SessionClaimRegistry
     private readonly object _lock = new();
     private readonly Dictionary<uint, ulong> _lastSessionVerId = new();
     private readonly Dictionary<uint, object> _activeClaims = new();
+    private readonly Dictionary<uint, object> _claimGenerations = new();
 
     /// <summary>Number of currently-claimed sessionIDs.</summary>
     public int ActiveCount
@@ -93,6 +94,7 @@ public sealed class SessionClaimRegistry
                 return ClaimResult.StaleVersion;
 
             _activeClaims[sessionId] = claimToken;
+            _claimGenerations[sessionId] = new object();
             return ClaimResult.Accepted;
         }
     }
@@ -124,6 +126,25 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Opaque receipt for rolling back one accepted, uncommitted
+    /// <see cref="TryClaim(uint, ulong, object, out ClaimRollback)"/> call.
+    /// </summary>
+    public readonly struct ClaimRollback
+    {
+        private readonly object? _generation;
+
+        internal ClaimRollback(ulong previousSessionVerId, object generation)
+        {
+            PreviousSessionVerId = previousSessionVerId;
+            _generation = generation;
+        }
+
+        public ulong PreviousSessionVerId { get; }
+
+        internal object? Generation => _generation;
+    }
+
+    /// <summary>
     /// Atomically validate <paramref name="sessionVerId"/> against the
     /// monotonic-per-process rule and (on success) register
     /// <paramref name="claimToken"/> as the live owner of
@@ -133,20 +154,76 @@ public sealed class SessionClaimRegistry
     /// <see cref="FixpSession"/>) used to scope <see cref="Release"/>
     /// so a stale teardown of an already-replaced claim is a no-op.</param>
     public ClaimResult TryClaim(uint sessionId, ulong sessionVerId, object claimToken)
+        => TryClaim(sessionId, sessionVerId, claimToken, out _);
+
+    /// <summary>
+    /// Transactional form of <see cref="TryClaim(uint, ulong, object)"/>.
+    /// On success, <paramref name="rollback"/> captures the previous watermark
+    /// and this exact claim generation so the caller can abort without rolling
+    /// back over a later claimant.
+    /// </summary>
+    public ClaimResult TryClaim(uint sessionId, ulong sessionVerId, object claimToken,
+        out ClaimRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(claimToken);
+        rollback = default;
         if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
 
         lock (_lock)
         {
+            _lastSessionVerId.TryGetValue(sessionId, out var previousSessionVerId);
             if (_activeClaims.ContainsKey(sessionId))
                 return ClaimResult.DuplicateConnection;
-            if (_lastSessionVerId.TryGetValue(sessionId, out var last) && sessionVerId <= last)
+            if (previousSessionVerId != 0UL && sessionVerId <= previousSessionVerId)
                 return ClaimResult.StaleVersion;
 
+            var generation = new object();
             _activeClaims[sessionId] = claimToken;
             _lastSessionVerId[sessionId] = sessionVerId;
+            _claimGenerations[sessionId] = generation;
+            rollback = new ClaimRollback(previousSessionVerId, generation);
             return ClaimResult.Accepted;
+        }
+    }
+
+    /// <summary>
+    /// Rolls back an uncommitted successful
+    /// <see cref="TryClaim(uint, ulong, object, out ClaimRollback)"/>.
+    /// The rollback is conditional on the receipt's unique claim generation,
+    /// so a later claimant that acquired and released the same version cannot
+    /// create an ABA window that restores an obsolete watermark.
+    /// </summary>
+    public bool TryRollbackClaim(
+        uint sessionId,
+        ulong claimedSessionVerId,
+        object claimToken,
+        in ClaimRollback rollback)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        lock (_lock)
+        {
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation))
+                return false;
+
+            if (!_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != claimedSessionVerId)
+                return false;
+
+            if (_activeClaims.TryGetValue(sessionId, out var currentOwner))
+            {
+                if (!ReferenceEquals(currentOwner, claimToken))
+                    return false;
+                _activeClaims.Remove(sessionId);
+            }
+
+            if (rollback.PreviousSessionVerId == 0UL)
+                _lastSessionVerId.Remove(sessionId);
+            else
+                _lastSessionVerId[sessionId] = rollback.PreviousSessionVerId;
+            _claimGenerations.Remove(sessionId);
+            return true;
         }
     }
 
@@ -189,6 +266,7 @@ public sealed class SessionClaimRegistry
             _activeClaims.TryGetValue(sessionId, out evictedToken);
             _activeClaims[sessionId] = newToken;
             _lastSessionVerId[sessionId] = sessionVerId;
+            _claimGenerations[sessionId] = new object();
             return ClaimResult.Accepted;
         }
     }
@@ -268,6 +346,7 @@ public sealed class SessionClaimRegistry
             if (forgetLastVersion)
             {
                 _lastSessionVerId.Remove(sessionId);
+                _claimGenerations.Remove(sessionId);
             }
         }
     }
@@ -298,6 +377,7 @@ public sealed class SessionClaimRegistry
             {
                 _activeClaims[sessionId] = oldToken;
                 _lastSessionVerId[sessionId] = oldVerId;
+                _claimGenerations[sessionId] = new object();
                 return true;
             }
         }
@@ -353,12 +433,14 @@ public sealed class SessionClaimRegistry
                 {
                     _activeClaims[sessionId] = oldToken;
                     _lastSessionVerId[sessionId] = oldVerId;
+                    _claimGenerations[sessionId] = new object();
                     throw;
                 }
             }
 
             _activeClaims[sessionId] = oldToken;
             _lastSessionVerId[sessionId] = oldVerId;
+            _claimGenerations[sessionId] = new object();
             return TakeOverFinalizeResult.RolledBack;
         }
     }

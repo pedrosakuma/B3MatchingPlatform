@@ -128,7 +128,11 @@ public sealed partial class FixpSession
         // Atomic claim. If another live transport already holds this
         // sessionID (or the version is stale by the time we commit), we
         // must reject — spec §4.5.2.
-        var claim = _claims.TryClaim(req.SessionId, req.SessionVerId, this);
+        var claim = _claims.TryClaim(
+            req.SessionId,
+            req.SessionVerId,
+            this,
+            out var claimRollback);
         // Issue #488: track a stale session evicted by TryForceTakeOver. The
         // close is deferred until AFTER TrySaveStateSnapshot succeeds so that
         // a persistence rollback does not leave order ownership orphaned with
@@ -182,6 +186,22 @@ public sealed partial class FixpSession
         _claimedSessionId = req.SessionId;
         if (!TryApplyPendingNegotiateState(req.SessionId))
         {
+            if (evictedByTakeOver is not null)
+            {
+                _claims.TryRestoreTakeOver(
+                    req.SessionId,
+                    this,
+                    evictedByTakeOver,
+                    evictedVerId);
+            }
+            else
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
+            }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
             var rejectFrame = new byte[NegotiateRejectEncoder.Total];
@@ -212,6 +232,14 @@ public sealed partial class FixpSession
                     this,
                     evictedByTakeOver,
                     evictedVerId);
+            }
+            else
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
@@ -272,6 +300,14 @@ public sealed partial class FixpSession
                     takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
                         this, evictedByTakeOver, evictedVerId);
                 }
+            }
+            if (evictedByTakeOver is null)
+            {
+                _claims.TryRollbackClaim(
+                    req.SessionId,
+                    req.SessionVerId,
+                    this,
+                    claimRollback);
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
