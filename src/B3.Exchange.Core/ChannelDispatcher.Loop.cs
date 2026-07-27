@@ -752,6 +752,8 @@ public sealed partial class ChannelDispatcher
             }
             if (deferredFailure && !reportFailureAlreadyObserved)
                 _metrics?.IncMassCancelReportFailure();
+            if (_cts.IsCancellationRequested)
+                outcome = MassCancelOutcome.SystemBusy;
             CompleteMassCancel(completion, outcome);
             return;
         }
@@ -773,6 +775,10 @@ public sealed partial class ChannelDispatcher
         MassCancelOutcome outcome,
         bool reportFailureAlreadyObserved)
     {
+        Task<OrderedStreamWriteResult[]>? deferredCompletion = deferred.Length > 0
+            ? Task.WhenAll(deferred)
+            : null;
+
         try
         {
             await prior.ConfigureAwait(false);
@@ -799,17 +805,23 @@ public sealed partial class ChannelDispatcher
             outcome = MassCancelOutcome.SystemBusy;
         }
 
-        if (deferred.Length > 0)
+        if (deferredCompletion is not null)
         {
             try
             {
-                var results = await Task.WhenAll(deferred).ConfigureAwait(false);
+                var results = await deferredCompletion.WaitAsync(_cts.Token).ConfigureAwait(false);
                 if (results.Any(static result => !result.IsCommitted))
                 {
                     if (!reportFailureAlreadyObserved)
                         _metrics?.IncMassCancelReportFailure();
                     outcome = MassCancelOutcome.SystemBusy;
                 }
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                ObserveFault(deferredCompletion);
+                CompleteMassCancel(completion, MassCancelOutcome.SystemBusy);
+                return;
             }
             catch (Exception ex)
             {
@@ -821,7 +833,19 @@ public sealed partial class ChannelDispatcher
                 outcome = MassCancelOutcome.SystemBusy;
             }
         }
+        if (_cts.IsCancellationRequested)
+            outcome = MassCancelOutcome.SystemBusy;
         CompleteMassCancel(completion, outcome);
+    }
+
+    private static void ObserveFault(Task task)
+    {
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously
+                | TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
     }
 
     /// <summary>
