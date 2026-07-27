@@ -5,7 +5,7 @@ namespace B3.Exchange.Core;
 /// <summary>
 /// <see cref="IUmdfPacketSink"/> decorator that injects controlled packet loss,
 /// duplication, and reordering into an inner sink. Designed for testing the
-/// companion <c>SbeB3UmdfConsumer</c>'s recovery paths (snapshot bootstrap,
+/// companion <c>B3MarketDataPlatform</c>'s recovery paths (snapshot bootstrap,
 /// gap detection) without external network-shaping tools.
 ///
 /// <para>NOT thread-safe; like the inner sinks it expects to be called from a

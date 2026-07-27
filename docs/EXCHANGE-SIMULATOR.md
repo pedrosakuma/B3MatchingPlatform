@@ -40,7 +40,7 @@ TCP client ──► EntryPointSession ──► HostRouter ──► ChannelDis
 
 ```bash
 # 1. Build
-dotnet build SbeB3UmdfConsumer.slnx
+dotnet build SbeB3Exchange.slnx
 
 # 2. Run with the sample config
 dotnet run --project src/B3.Exchange.Host -- config/exchange-simulator.json

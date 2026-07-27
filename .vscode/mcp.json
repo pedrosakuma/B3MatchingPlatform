@@ -2,7 +2,7 @@
   "servers": {
     "github": {
       "type": "copilot",
-      "description": "GitHub MCP — repos, issues, PRs, Actions, code search (companion repo SbeB3UmdfConsumer)"
+      "description": "GitHub MCP — repos, issues, PRs, Actions, code search (companion repos B3MarketDataPlatform, B3EntryPointClient)"
     },
     "filesystem": {
       "command": "npx",
