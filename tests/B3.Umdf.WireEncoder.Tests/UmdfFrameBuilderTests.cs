@@ -1,3 +1,4 @@
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Umdf.WireEncoder.Tests;
@@ -151,7 +152,7 @@ public class UmdfFrameBuilderTests
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
+            securityId: 1L, rptSeq: 6u, transactTimeNanos: 0ul);
 
         int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBlockLength;
@@ -160,14 +161,18 @@ public class UmdfFrameBuilderTests
     }
 
     [Fact]
-    public void WriteInstrumentHalted_WritesHaltEventByte()
+    public void WriteInstrumentHalted_WritesForbiddenStatusAndOfficialEventByte()
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
+            securityId: 1L, rptSeq: 6u, transactTimeNanos: 0ul);
 
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
+        int statusOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        Assert.Equal((byte)SecurityTradingStatus.FORBIDDEN, sink.Buffer[statusOffset]);
+        Assert.Equal((byte)SecurityTradingEvent.SECURITY_STATUS_CHANGE, UmdfFrameBuilder.SecurityTradingEventHalt);
         Assert.Equal(UmdfFrameBuilder.SecurityTradingEventHalt, sink.Buffer[eventOffset]);
     }
 
@@ -193,6 +198,7 @@ public class UmdfFrameBuilderTests
 
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
+        Assert.Equal((byte)SecurityTradingEvent.SECURITY_REJOINS_SECURITY_GROUP_STATUS, UmdfFrameBuilder.SecurityTradingEventResume);
         Assert.Equal(UmdfFrameBuilder.SecurityTradingEventResume, sink.Buffer[eventOffset]);
     }
 

@@ -11,17 +11,23 @@ public static class UmdfFrameBuilder
 {
     /// <summary>
     /// <c>SecurityTradingEvent</c> byte written for an instrument halt
-    /// (<c>SecurityStatus_3</c>). Matches the B3-aligned value documented
-    /// in issue #322.
+    /// (<c>SecurityStatus_3</c>). The earlier issue #322 implementation
+    /// incorrectly emitted a proprietary out-of-domain value; this constant
+    /// now maps to the vendored UMDF 2.2.0
+    /// <c>SECURITY_STATUS_CHANGE</c> enum member.
     /// </summary>
-    public const byte SecurityTradingEventHalt = 1;
+    public const byte SecurityTradingEventHalt =
+        (byte)B3.Umdf.Mbo.Sbe.V16.SecurityTradingEvent.SECURITY_STATUS_CHANGE;
 
     /// <summary>
     /// <c>SecurityTradingEvent</c> byte written for an instrument resume
-    /// (<c>SecurityStatus_3</c>). Matches the B3-aligned value documented
-    /// in issue #322.
+    /// (<c>SecurityStatus_3</c>). The earlier issue #322 implementation
+    /// incorrectly emitted a proprietary out-of-domain value; this constant
+    /// now maps to the vendored UMDF 2.2.0
+    /// <c>SECURITY_REJOINS_SECURITY_GROUP_STATUS</c> enum member.
     /// </summary>
-    public const byte SecurityTradingEventResume = 2;
+    public const byte SecurityTradingEventResume =
+        (byte)B3.Umdf.Mbo.Sbe.V16.SecurityTradingEvent.SECURITY_REJOINS_SECURITY_GROUP_STATUS;
 
     /// <summary>
     /// Writes an <c>Order_MBO_50</c> NEW frame (action=NEW).
@@ -164,14 +170,16 @@ public static class UmdfFrameBuilder
     }
 
     /// <summary>
-    /// Writes a <c>SecurityStatus_3</c> frame for an instrument halt
-    /// (<c>securityTradingEvent</c> = <see cref="SecurityTradingEventHalt"/>).
+    /// Writes a <c>SecurityStatus_3</c> frame for an instrument halt.
+    /// Administrative halts always encode
+    /// <c>securityTradingStatus=FORBIDDEN</c> and
+    /// <c>securityTradingEvent</c> =
+    /// <see cref="SecurityTradingEventHalt"/>.
     /// Used for <c>OnInstrumentHalted</c>.
     /// </summary>
     public static void WriteInstrumentHalted(
         IUmdfFrameSink sink,
         long securityId,
-        byte securityTradingStatus,
         uint rptSeq,
         ulong transactTimeNanos)
     {
@@ -183,7 +191,7 @@ public static class UmdfFrameBuilder
             dst,
             securityId: securityId,
             tradingSessionId: 0,
-            securityTradingStatus: securityTradingStatus,
+            securityTradingStatus: (byte)B3.Umdf.Mbo.Sbe.V16.SecurityTradingStatus.FORBIDDEN,
             securityTradingEvent: SecurityTradingEventHalt,
             tradeDate: 0,
             tradSesOpenTimeNanos: 0,
