@@ -51,9 +51,16 @@ jobs:
           # file is treated the same as a local edit.
           # Scoped to files this PR actually touched under schemas/ — PRs
           # that don't touch schemas/ must not be blocked by pre-existing
-          # drift between the two repos that predates this PR.
-          for f in $changed; do
+          # drift between the two repos that predates this PR. Iterated
+          # line-by-line (not word-split) so filenames with spaces survive.
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
             case "$f" in schemas/*.xml) ;; *) continue ;; esac
+            if [ ! -f "$f" ]; then
+              # Deleted by this PR; already caught by the local diff check
+              # above (flagged=1), nothing to cross-check against upstream.
+              continue
+            fi
             name="$(basename "$f")"
             url="https://raw.githubusercontent.com/pedrosakuma/SbeB3UmdfConsumer/main/schemas/$name"
             if remote_sha="$(curl -fsSL --connect-timeout 5 --max-time 15 "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
@@ -65,7 +72,7 @@ jobs:
             else
               echo "::warning::Could not fetch $url to cross-check vendored schema fidelity; skipping cross-repo check for $name."
             fi
-          done
+          done <<< "$changed"
 
           if [ "$flagged" = 0 ]; then
             echo "No changes under schemas/ and no drift from the companion repo. OK."
