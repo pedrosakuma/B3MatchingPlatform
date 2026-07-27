@@ -253,20 +253,6 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
-        int requiredOpenOrderSlots = _replayMode ? 0 : RequiredOpenOrderSlots(in item);
-        if (requiredOpenOrderSlots > 0
-            && !_openOrderTracker.TryReserve(item.Firm, requiredOpenOrderSlots))
-        {
-            _metrics?.IncOrdersIn();
-            _openOrderMetrics?.IncLimitRejected(item.Firm);
-            if (item.Kind == WorkKind.New)
-                EmitOpenOrderLimitReject(item.NewOrder!);
-            else
-                EmitOpenOrderLimitReject(item.Cross!);
-            return;
-        }
-        _reservedOpenOrderFirm = item.Firm;
-        _reservedOpenOrderSlots = requiredOpenOrderSlots;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -277,6 +263,21 @@ public sealed partial class ChannelDispatcher
         System.Diagnostics.Activity? engineSpan = null;
         try
         {
+            int requiredOpenOrderSlots = _replayMode ? 0 : RequiredOpenOrderSlots(in item);
+            if (requiredOpenOrderSlots > 0
+                && !_openOrderTracker.TryReserve(item.Firm, requiredOpenOrderSlots))
+            {
+                _metrics?.IncOrdersIn();
+                _openOrderMetrics?.IncLimitRejected(item.Firm);
+                if (item.Kind == WorkKind.New)
+                    EmitOpenOrderLimitReject(item.NewOrder!);
+                else
+                    EmitOpenOrderLimitReject(item.Cross!);
+                return;
+            }
+            _reservedOpenOrderFirm = item.Firm;
+            _reservedOpenOrderSlots = requiredOpenOrderSlots;
+
             if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
             {
                 if (!WalAppendIfEnabled(in item))

@@ -117,6 +117,9 @@ public class SnapshotPacketBuilderTests
             incrementalSequenceVersion: 11,
             bids, asks, sink.OnPacket);
 
+        Assert.Equal(
+            SnapshotPacketBuilder.GetPacketCount(buf.Length, bids.Length, asks.Length),
+            packets);
         Assert.True(packets >= 3);
         Assert.Equal(packets, sink.Packets.Count);
 

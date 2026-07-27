@@ -475,6 +475,43 @@ public partial class ChannelDispatcherTests
     }
 
     [Fact]
+    public void MaxOpenOrdersPerFirm_CapRejectDoesNotLeakSessionIntoOperatorUncross()
+    {
+        var (disp, _, outbound) = NewDispatcher(maxOpenOrdersPerFirm: 1);
+        var seller = new FakeSession(outbound) { EnteringFirm = 7 };
+        var buyer = new FakeSession(outbound) { EnteringFirm = 8 };
+        var capHolder = new FakeSession(outbound) { EnteringFirm = 9 };
+        var rejected = new FakeSession(outbound) { EnteringFirm = 9 };
+
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(
+            Petr, B3.Exchange.Matching.TradingPhase.Reserved));
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("S", Petr, Side.Sell, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 7, 1_000UL),
+            seller.Id, seller.EnteringFirm, clOrdIdValue: 1UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("B", Petr, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(10m), 200, 8, 1_100UL),
+            buyer.Id, buyer.EnteringFirm, clOrdIdValue: 2UL);
+        disp.EnqueueNewOrder(new NewOrderCommand("H", Petr, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(9m), 100, 9, 1_200UL),
+            capHolder.Id, capHolder.EnteringFirm, clOrdIdValue: 3UL);
+        DrainInbound(disp);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("REJECT", Petr, Side.Buy, OrderType.Limit, TimeInForce.GoodForAuction, Px(8m), 100, 9, 1_300UL),
+            rejected.Id, rejected.EnteringFirm, clOrdIdValue: 4UL);
+        DrainInbound(disp);
+        Assert.Equal(RejectReason.OrderExceedsLimit, Assert.Single(rejected.Rejects).Reason);
+
+        var completion = new TaskCompletionSource<PhaseChangeOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(disp.EnqueueOperatorUncrossAuction(
+            Petr, B3.Exchange.Matching.TradingPhase.Open, completion));
+        DrainInbound(disp);
+
+        Assert.True(completion.Task.IsCompletedSuccessfully);
+        Assert.NotEmpty(seller.Trades);
+        Assert.Empty(rejected.Trades);
+    }
+
+    [Fact]
     public void MaxOpenOrdersPerFirm_FullyFilledDayAggressorReleasesReservation()
     {
         var tracker = new FirmOpenOrderTracker(maximumPerFirm: 1);

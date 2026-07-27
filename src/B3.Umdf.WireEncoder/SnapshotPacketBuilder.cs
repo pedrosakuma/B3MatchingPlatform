@@ -35,6 +35,38 @@ public static class SnapshotPacketBuilder
     public delegate void PacketHandler(ReadOnlySpan<byte> packet);
 
     /// <summary>
+    /// Calculates exactly how many packet sequence numbers
+    /// <see cref="WriteSnapshot"/> will consume for the supplied layout.
+    /// </summary>
+    public static int GetPacketCount(
+        int bufferSize,
+        int bidCount,
+        int askCount,
+        int maxEntriesPerChunk = MaxEntriesPerChunk)
+    {
+        if (bidCount < 0) throw new ArgumentOutOfRangeException(nameof(bidCount));
+        if (askCount < 0) throw new ArgumentOutOfRangeException(nameof(askCount));
+        ValidateLayout(bufferSize, bidCount, askCount, maxEntriesPerChunk);
+
+        long remaining = (long)bidCount + askCount;
+        int packetCount = 1;
+        ConsumeEntriesThatFit(
+            ref remaining,
+            bufferSize - WireOffsets.PacketHeaderSize - SnapshotHeaderFrameSize,
+            maxEntriesPerChunk);
+
+        while (remaining > 0)
+        {
+            packetCount = checked(packetCount + 1);
+            ConsumeEntriesThatFit(
+                ref remaining,
+                bufferSize - WireOffsets.PacketHeaderSize,
+                maxEntriesPerChunk);
+        }
+        return packetCount;
+    }
+
+    /// <summary>
     /// Writes a complete snapshot for <paramref name="securityId"/>. Returns
     /// the number of packets emitted.
     /// </summary>
@@ -79,24 +111,7 @@ public static class SnapshotPacketBuilder
         int maxEntriesPerChunk = MaxEntriesPerChunk)
     {
         ArgumentNullException.ThrowIfNull(onPacket);
-        if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
-            throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
-        if (buffer.Length < WireOffsets.PacketHeaderSize
-            + WireOffsets.FramingHeaderSize
-            + WireOffsets.SbeMessageHeaderSize
-            + WireOffsets.SnapHeaderBlockLength)
-        {
-            throw new ArgumentException(
-                $"buffer too small ({buffer.Length} bytes) for SnapshotFullRefresh_Header_30.",
-                nameof(buffer));
-        }
-        if ((bids.Length != 0 || asks.Length != 0)
-            && MaxOrdersEntriesThatFit(buffer.Length - WireOffsets.PacketHeaderSize) == 0)
-        {
-            throw new ArgumentException(
-                $"buffer too small ({buffer.Length} bytes) for a single Orders_71 entry frame ({OrdersFrameSize(1)} bytes); increase buffer size.",
-                nameof(buffer));
-        }
+        ValidateLayout(buffer.Length, bids.Length, asks.Length, maxEntriesPerChunk);
 
         // Header_30 stamps total counts so consumers can size their buffers
         // and detect a complete refresh once they accumulate that many entries.
@@ -157,6 +172,51 @@ public static class SnapshotPacketBuilder
          + WireOffsets.SnapOrdersHeaderBlockLength
          + WireOffsets.SnapOrdersGroupSizeEncodingSize
          + WireOffsets.SnapOrdersEntrySize * entries;
+
+    private static int SnapshotHeaderFrameSize
+        => WireOffsets.FramingHeaderSize
+         + WireOffsets.SbeMessageHeaderSize
+         + WireOffsets.SnapHeaderBlockLength;
+
+    private static void ValidateLayout(
+        int bufferSize,
+        int bidCount,
+        int askCount,
+        int maxEntriesPerChunk)
+    {
+        if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
+            throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
+        if (bufferSize < WireOffsets.PacketHeaderSize + SnapshotHeaderFrameSize)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({bufferSize} bytes) for SnapshotFullRefresh_Header_30.",
+                nameof(bufferSize));
+        }
+        if ((bidCount != 0 || askCount != 0)
+            && MaxOrdersEntriesThatFit(bufferSize - WireOffsets.PacketHeaderSize) == 0)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({bufferSize} bytes) for a single Orders_71 entry frame ({OrdersFrameSize(1)} bytes); increase buffer size.",
+                nameof(bufferSize));
+        }
+    }
+
+    private static void ConsumeEntriesThatFit(
+        ref long remaining,
+        int availableBytes,
+        int maxEntriesPerChunk)
+    {
+        while (remaining > 0)
+        {
+            int capacity = Math.Min(
+                maxEntriesPerChunk,
+                MaxOrdersEntriesThatFit(availableBytes));
+            if (capacity == 0) return;
+            int chunkSize = (int)Math.Min(remaining, capacity);
+            availableBytes -= OrdersFrameSize(chunkSize);
+            remaining -= chunkSize;
+        }
+    }
 
     private static int MaxOrdersEntriesThatFit(int availableBytes)
     {
