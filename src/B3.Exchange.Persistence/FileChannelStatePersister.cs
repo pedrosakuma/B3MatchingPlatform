@@ -65,7 +65,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         public bool Initialized { get; set; }
         public long HighestSavedSeq { get; set; }
         public int LastUsedSlot { get; set; } = -1;
-        public long SaveGeneration { get; set; }
+        public long SaveGeneration;
     }
 
     private readonly ChannelPersistenceState[] _channelStates = CreateChannelStates();
@@ -74,6 +74,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     public int Generations => _generations;
     public SnapshotMigrationSet Migrations => _migrations;
     public SnapshotFileFormat WriteFormat => _writeFormat;
+    internal Action? BeforeSaveForTesting { get; set; }
 
     public FileChannelStatePersister(
         string dataDirectory,
@@ -117,13 +118,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
     }
 
     public long CaptureSaveGeneration(byte channelNumber)
-    {
-        var state = _channelStates[channelNumber];
-        lock (state.Gate)
-        {
-            return state.SaveGeneration;
-        }
-    }
+        => Volatile.Read(ref _channelStates[channelNumber].SaveGeneration);
 
     public bool TrySave(
         ChannelStateSnapshot snapshot,
@@ -134,13 +129,14 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         var state = _channelStates[snapshot.ChannelNumber];
         lock (state.Gate)
         {
-            if (saveGeneration != state.SaveGeneration)
+            long currentGeneration = Volatile.Read(ref state.SaveGeneration);
+            if (saveGeneration != currentGeneration)
             {
                 bytesWritten = 0;
                 _logger.LogWarning(
                     "channel {ChannelNumber}: skipped snapshot from reset generation {SnapshotGeneration}; current generation is {CurrentGeneration}",
                     snapshot.ChannelNumber, saveGeneration,
-                    state.SaveGeneration);
+                    currentGeneration);
                 return false;
             }
             if (!state.Initialized)
@@ -162,7 +158,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         var state = _channelStates[channelNumber];
         lock (state.Gate)
         {
-            state.SaveGeneration = unchecked(state.SaveGeneration + 1);
+            Interlocked.Increment(ref state.SaveGeneration);
             int removed = 0;
             for (int i = 0; i < _generations; i++)
             {
@@ -189,6 +185,7 @@ public sealed class FileChannelStatePersister : IChannelStatePersister
         ChannelStateSnapshot snapshot,
         ChannelPersistenceState state)
     {
+        BeforeSaveForTesting?.Invoke();
         if (snapshot.LastAppliedSeq < state.HighestSavedSeq)
         {
             _logger.LogWarning(

@@ -71,6 +71,7 @@ internal sealed class SessionRoute
     private readonly LinkedList<DeferredWrite> _pending = new();
     private Task<bool>? _observedAdmission;
     private int _drainScheduled;
+    internal Action? AfterDeferredWriteForTesting { get; set; }
 
     public SessionRoute(FixpSession initial)
     {
@@ -97,7 +98,9 @@ internal sealed class SessionRoute
         if (target is null || target.BusinessAdmissionState == 2)
             return OrderedStreamWriteResult.NotCommitted;
 
-        if (target.BusinessAdmissionState == 0)
+        if (target.BusinessAdmissionState == 0
+            || _pending.Count != 0
+            || _drainScheduled != 0)
             return EnqueueOrderedLocked(target, action);
 
         var result = action(target);
@@ -112,7 +115,9 @@ internal sealed class SessionRoute
         if (target is null || target.BusinessAdmissionState == 2)
             return false;
 
-        if (target.BusinessAdmissionState == 0)
+        if (target.BusinessAdmissionState == 0
+            || _pending.Count != 0
+            || _drainScheduled != 0)
             return EnqueueBooleanLocked(target, action);
 
         bool result = action(target);
@@ -200,6 +205,7 @@ internal sealed class SessionRoute
             bool more = Execute(route => route.DrainOneLocked());
             if (!more)
                 return;
+            Resolve().AfterDeferredWriteForTesting?.Invoke();
         }
     }
 

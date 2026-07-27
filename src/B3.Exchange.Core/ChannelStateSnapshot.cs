@@ -93,7 +93,9 @@ public interface IChannelStatePersister
     /// <summary>
     /// Captures the current administrative-reset generation for an
     /// asynchronous snapshot submission. Implementations that do not need a
-    /// reset fence may keep the default generation.
+    /// reset fence may keep the default generation. This method runs on the
+    /// dispatcher thread and MUST be non-blocking; implementations should use
+    /// an atomic/volatile generation read rather than their snapshot I/O lock.
     /// </summary>
     long CaptureSaveGeneration(byte channelNumber) => 0;
 

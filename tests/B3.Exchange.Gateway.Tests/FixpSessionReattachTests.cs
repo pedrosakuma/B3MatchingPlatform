@@ -433,7 +433,124 @@ public class FixpSessionReattachTests
         Assert.Equal(0, registry.PendingWriteCount(session));
     }
 
+    [Fact]
+    public async Task Writes_arriving_during_drain_stay_behind_deferred_FIFO()
+    {
+        var (tcp0, server0, client0) = await ConnectPairAsync();
+        var registry = new SessionRegistry();
+        var session = new FixpSession(
+            connectionId: 5,
+            enteringFirm: 7,
+            sessionId: 100,
+            stream: server0,
+            sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        registry.Register(session);
+        var route = registry.CaptureRoute(session);
+        using var releaseDrain = new ManualResetEventSlim(false);
+        var drainPaused = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        int drainedWrites = 0;
+        route.AfterDeferredWriteForTesting = () =>
+        {
+            if (Interlocked.Increment(ref drainedWrites) != 1)
+                return;
+            drainPaused.TrySetResult(true);
+            releaseDrain.Wait();
+        };
+
+        try
+        {
+            session.Start();
+            session.ApplyTransition(FixpEvent.Negotiate);
+            session.ApplyTransition(FixpEvent.Establish);
+            session.SuspendForTakeover("fifo-drain-test");
+
+            OrderedStreamWriteResult Enqueue(ulong clOrdId) =>
+                route.TryInvoke(target => target.WriteOrderMassActionReport(
+                    clOrdId,
+                    OrderMassActionReportEncoder.MassActionResponseAccepted,
+                    massActionRejectReason: null,
+                    side: null,
+                    securityId: 0,
+                    transactTimeNanos: clOrdId));
+
+            var first = Enqueue(7001);
+            var second = Enqueue(7002);
+            Assert.True(first.IsDeferred);
+            Assert.True(second.IsDeferred);
+
+            var (tcp1, server1, client1) = await ConnectPairAsync();
+            try
+            {
+                Assert.True(session.TryReattach(server1));
+                var establish = new byte[256];
+                int length = EntryPointFixpFrameCodec.EncodeEstablish(
+                    establish,
+                    sessionId: 100,
+                    sessionVerId: 0,
+                    timestampNanos: 1,
+                    keepAliveIntervalMillis: 10_000,
+                    nextSeqNo: 1,
+                    cancelOnDisconnectType: 0,
+                    codTimeoutWindowMillis: 0,
+                    credentials: ReadOnlySpan<byte>.Empty);
+                var stream = client1.GetStream();
+                await stream.WriteAsync(establish.AsMemory(0, length));
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+                    await ReadTemplateIdAsync(stream));
+                await drainPaused.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+                var third = Enqueue(7003);
+                Assert.True(third.IsDeferred);
+                Assert.Equal(2, registry.PendingWriteCount(session));
+
+                releaseDrain.Set();
+                Assert.True((await first.Completion.WaitAsync(
+                    TimeSpan.FromSeconds(3))).IsCommitted);
+                Assert.True((await second.Completion.WaitAsync(
+                    TimeSpan.FromSeconds(3))).IsCommitted);
+                Assert.True((await third.Completion.WaitAsync(
+                    TimeSpan.FromSeconds(3))).IsCommitted);
+
+                var frames = new[]
+                {
+                    await ReadFrameAsync(stream),
+                    await ReadFrameAsync(stream),
+                    await ReadFrameAsync(stream),
+                };
+                Assert.All(frames, frame => Assert.Equal(
+                    EntryPointFrameReader.TidOrderMassActionReport,
+                    frame.TemplateId));
+                Assert.Equal(new uint[] { 1, 2, 3 }, frames.Select(frame =>
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        frame.Body.AsSpan(4, 4))));
+                Assert.Equal(new ulong[] { 7001, 7002, 7003 }, frames.Select(frame =>
+                    BinaryPrimitives.ReadUInt64LittleEndian(
+                        frame.Body.AsSpan(20, 8))));
+            }
+            finally
+            {
+                releaseDrain.Set();
+                client1.Close();
+                tcp1.Stop();
+            }
+        }
+        finally
+        {
+            releaseDrain.Set();
+            client0.Close();
+            tcp0.Stop();
+            session.Close("test-cleanup");
+            await session.DisposeAsync();
+        }
+    }
+
     private static async Task<ushort> ReadTemplateIdAsync(NetworkStream stream)
+        => (await ReadFrameAsync(stream)).TemplateId;
+
+    private static async Task<ReadFrame> ReadFrameAsync(NetworkStream stream)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         var header = new byte[EntryPointFrameReader.WireHeaderSize];
@@ -444,8 +561,10 @@ public class FixpSessionReattachTests
             header.AsSpan(EntryPointFrameReader.SofhSize + 2, 2));
         var body = new byte[messageLength - EntryPointFrameReader.WireHeaderSize];
         await ReadExactAsync(stream, body, timeout.Token);
-        return templateId;
+        return new ReadFrame(templateId, body);
     }
+
+    private readonly record struct ReadFrame(ushort TemplateId, byte[] Body);
 
     private static async Task ReadExactAsync(
         NetworkStream stream,

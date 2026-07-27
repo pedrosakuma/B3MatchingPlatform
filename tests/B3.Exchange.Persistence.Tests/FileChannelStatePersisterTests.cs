@@ -253,6 +253,59 @@ public class FileChannelStatePersisterTests
         Assert.Equal(1, Volatile.Read(ref savedCallbacks));
     }
 
+    [Fact]
+    public async Task Submit_DoesNotWaitForInProgressSave_AndDeleteFencesQueuedGeneration()
+    {
+        using var dir = new TempDir();
+        var inner = new FileChannelStatePersister(
+            dir.Path, NullLogger<FileChannelStatePersister>.Instance);
+        using var releaseSynchronousSave = new ManualResetEventSlim(false);
+        var synchronousSaveEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        int saveHookCalls = 0;
+        inner.BeforeSaveForTesting = () =>
+        {
+            if (Interlocked.Increment(ref saveHookCalls) != 1)
+                return;
+            synchronousSaveEntered.TrySetResult(true);
+            releaseSynchronousSave.Wait();
+        };
+
+        var synchronous = Task.Run(() => inner.Save(
+            MakeRichSnapshot(channel: 84) with { LastAppliedSeq = 1 }));
+        await synchronousSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var blocking = new BlockingGenerationPersister(inner);
+        int savedCallbacks = 0;
+        await using var writer = new BackgroundSnapshotWriter(
+            channelNumber: 84,
+            persister: blocking,
+            logger: NullLogger<BackgroundSnapshotWriter>.Instance,
+            onSaved: _ => Interlocked.Increment(ref savedCallbacks));
+        var queued = MakeRichSnapshot(channel: 84) with
+        {
+            SequenceNumber = 2,
+            LastAppliedSeq = 2,
+        };
+
+        var submit = Task.Run(() => writer.Submit(queued));
+        await submit.WaitAsync(TimeSpan.FromSeconds(1));
+        await blocking.FirstSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var delete = Task.Run(() => blocking.DeleteAll(84));
+        releaseSynchronousSave.Set();
+        await synchronous.WaitAsync(TimeSpan.FromSeconds(5));
+        await delete.WaitAsync(TimeSpan.FromSeconds(5));
+
+        blocking.ReleaseFirstSave();
+        await blocking.FirstSaveCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await writer.StopAsync();
+
+        Assert.Empty(Directory.GetFiles(dir.Path, "channel-84.snapshot*"));
+        Assert.Null(inner.TryLoad(84));
+        Assert.Equal(0, Volatile.Read(ref savedCallbacks));
+    }
+
     private sealed class BlockingGenerationPersister(
         FileChannelStatePersister inner) : IChannelStatePersister
     {
