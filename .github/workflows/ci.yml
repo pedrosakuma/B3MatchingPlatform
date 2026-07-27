@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +33,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- schemas/ || true)"
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- schemas/)"
           if [ -z "$changed" ]; then
             echo "No changes under schemas/. OK."
             exit 0
