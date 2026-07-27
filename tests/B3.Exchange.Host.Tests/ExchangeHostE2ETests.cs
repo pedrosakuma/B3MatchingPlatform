@@ -3,10 +3,12 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
 using B3.Exchange.TestSupport;
+using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -32,9 +34,33 @@ public class ExchangeHostE2ETests
     private sealed class RecordingPacketSink : IUmdfPacketSink
     {
         public List<byte[]> Packets { get; } = new();
+        public List<byte> Channels { get; } = new();
+
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet)
         {
-            lock (Packets) Packets.Add(packet.ToArray());
+            lock (Packets)
+            {
+                Channels.Add(channelNumber);
+                Packets.Add(packet.ToArray());
+            }
+        }
+
+        public int Count
+        {
+            get
+            {
+                lock (Packets) return Packets.Count;
+            }
+        }
+
+        public byte[][] SnapshotPackets()
+        {
+            lock (Packets) return Packets.Select(static packet => (byte[])packet.Clone()).ToArray();
+        }
+
+        public byte[] SnapshotChannels()
+        {
+            lock (Packets) return Channels.ToArray();
         }
     }
 
@@ -62,32 +88,80 @@ public class ExchangeHostE2ETests
 
 
     [Fact]
-    public async Task NewOrder_RoundTripsExecutionReportNew_ThenCrossingOrderProducesTrade()
+    public async Task FixpCross_PublishesDecodedIncrementalTradeFrames_WhileSnapshotsFlow()
     {
-        var (cfg, sink) = BuildConfig();
-        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        const uint sessionId = 553;
+        const ulong sessionVerId = 1;
+        const uint enteringFirm = 7;
+
+        var (cfg, incrementalSink) = BuildConfig();
+        cfg.Auth = new AuthConfig { DevMode = true, RequireFixpHandshake = true };
+        cfg.Tcp.HeartbeatIntervalMs = 60_000;
+        cfg.Tcp.IdleTimeoutMs = 60_000;
+        cfg.Tcp.TestRequestGraceMs = 60_000;
+        cfg.Firms.Add(new FirmConfig
+        {
+            Id = "firm-553",
+            Name = "Issue 553 regression",
+            EnteringFirmCode = enteringFirm,
+        });
+        cfg.Sessions.Add(new SessionConfig
+        {
+            SessionId = sessionId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            FirmId = "firm-553",
+        });
+        cfg.Channels[0].Snapshot = new SnapshotChannelConfig
+        {
+            Group = "239.255.42.85",
+            Port = 30185,
+            Ttl = 0,
+            CadenceMs = 25,
+        };
+
+        var snapshotSink = new RecordingPacketSink();
+        await using var host = new ExchangeHost(cfg,
+            packetSinkFactory: _ => incrementalSink,
+            snapshotSinkFactory: (_, _) => snapshotSink);
         await host.StartAsync();
         var ep = host.TcpEndpoint!;
 
-        // First order: BUY PETR4 100 @ 12.34
         using var client = new TcpClient();
         await client.ConnectAsync(ep.Address, ep.Port);
         var stream = client.GetStream();
 
+        await WriteNegotiateAsync(stream, sessionId, sessionVerId, enteringFirm);
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadFrameAsync(stream, TimeSpan.FromSeconds(5))).TemplateId);
+        await WriteEstablishAsync(stream, sessionId, sessionVerId, nextSeqNo: 1);
+        Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+            (await ReadFrameAsync(stream, TimeSpan.FromSeconds(5))).TemplateId);
+
+        // Reproduce the production observation: snapshot heartbeat is alive
+        // before any order/trade incremental event is submitted.
+        await WaitForPacketCountAsync(snapshotSink, expected: 1, TimeSpan.FromSeconds(2));
+        Assert.Contains(snapshotSink.SnapshotPackets()
+            .SelectMany(DecodeUmdfFrames), frame => frame.TemplateId == 30);
+        Assert.Empty(incrementalSink.SnapshotPackets());
+
+        // First order: BUY PETR4 100 @ 12.34, which rests and must publish
+        // Order_MBO_50(NEW) on the incremental sink.
         var newOrder = BuildSimpleNewOrder(clOrdId: 1001, secId: Petr,
-            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+            side: '1', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400,
+            sessionId: sessionId, msgSeqNum: 1);
         await stream.WriteAsync(newOrder);
 
         var er1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er1.TemplateId);
         Assert.Equal(6, er1.Version);
 
-        // Second order on the SAME session: SELL PETR4 100 @ 12.34 → fully
+        // Second order on the same established FIXP session: SELL PETR4
+        // 100 @ 12.34 → fully
         // crosses the resting BUY. Aggressor session sees ER_Trade (no New —
         // fully filled). Passive owner is the same session, so it also sees
         // a Trade ER (i.e. two ER_Trade frames total).
         var sellOrder = BuildSimpleNewOrder(clOrdId: 2001, secId: Petr,
-            side: '2', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400);
+            side: '2', ordType: '2', tif: '0', qty: 100, priceMantissa: 123_400,
+            sessionId: sessionId, msgSeqNum: 2);
         await stream.WriteAsync(sellOrder);
 
         var er2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
@@ -100,14 +174,74 @@ public class ExchangeHostE2ETests
             er3.TemplateId == EntryPointFrameReader.TidExecutionReportTrade,
             $"expected second ER_Trade(203) but got tid={er3.TemplateId}");
 
-        // Multicast side: at least 2 packets emitted (BUY add + SELL cross
-        // batch). Each packet starts with the 16-byte UMDF PacketHeader.
-        // Poll briefly: FlushPacket runs on the dispatcher thread after the
-        // ER frames are queued, so it may lag the client's ER read slightly.
-        var sinkDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (sink.Packets.Count < 2 && DateTime.UtcNow < sinkDeadline)
-            await Task.Delay(20);
-        Assert.True(sink.Packets.Count >= 2, $"expected >= 2 multicast packets, got {sink.Packets.Count}");
+        await WaitForPacketCountAsync(incrementalSink, expected: 2, TimeSpan.FromSeconds(2));
+        var packets = incrementalSink.SnapshotPackets();
+        Assert.Equal(2, packets.Length);
+        Assert.All(incrementalSink.SnapshotChannels(), channel => Assert.Equal((byte)84, channel));
+
+        ref readonly var addHeader = ref MemoryMarshal.AsRef<PacketHeader>(
+            packets[0].AsSpan(0, WireOffsets.PacketHeaderSize));
+        ref readonly var crossHeader = ref MemoryMarshal.AsRef<PacketHeader>(
+            packets[1].AsSpan(0, WireOffsets.PacketHeaderSize));
+        Assert.Equal((byte)84, addHeader.ChannelNumber);
+        Assert.Equal((byte)84, crossHeader.ChannelNumber);
+        Assert.True(addHeader.SequenceVersion > 0);
+        Assert.Equal(addHeader.SequenceVersion, crossHeader.SequenceVersion);
+        Assert.True(addHeader.SequenceNumber > 0);
+        Assert.Equal(addHeader.SequenceNumber + 1, crossHeader.SequenceNumber);
+        Assert.True(addHeader.SendingTime > 0);
+        Assert.True(crossHeader.SendingTime >= addHeader.SendingTime);
+
+        var addFrames = DecodeUmdfFrames(packets[0]);
+        var addFrame = Assert.Single(addFrames);
+        Assert.Equal((ushort)50, addFrame.TemplateId);
+        Assert.Equal((ushort)WireOffsets.OrderBlockLength, addFrame.BlockLength);
+        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data.TryParse(
+            addFrame.Body.Span, out var orderAdd));
+        Assert.Equal(Petr, (long)(ulong)orderAdd.Data.SecurityID.Value);
+        Assert.Equal(MDUpdateAction.NEW, orderAdd.Data.MDUpdateAction);
+        Assert.Equal(MDEntryType.BID, orderAdd.Data.MDEntryType);
+        Assert.Equal(123_400L, orderAdd.Data.MDEntryPx.Mantissa);
+        Assert.Equal(100L, orderAdd.Data.MDEntrySize.Value);
+        Assert.True((long)orderAdd.Data.SecondaryOrderID.Value > 0);
+        Assert.Equal(1u, orderAdd.Data.RptSeq);
+        long restingOrderId = (long)orderAdd.Data.SecondaryOrderID.Value;
+
+        var crossFrames = DecodeUmdfFrames(packets[1]);
+        Assert.Equal(new ushort[] { 53, 51, 9 }, crossFrames.Select(static frame => frame.TemplateId));
+
+        var tradeFrame = crossFrames[0];
+        Assert.Equal((ushort)WireOffsets.TradeBlockLength, tradeFrame.BlockLength);
+        Assert.True(Trade_53Data.TryParse(tradeFrame.Body.Span, out var trade));
+        Assert.Equal(Petr, (long)(ulong)trade.Data.SecurityID.Value);
+        Assert.Equal(123_400L, trade.Data.MDEntryPx.Mantissa);
+        Assert.Equal(100L, trade.Data.MDEntrySize.Value);
+        Assert.True(trade.Data.TradeID.Value > 0);
+        Assert.Equal(enteringFirm, trade.Data.MDEntryBuyer);
+        Assert.Equal(enteringFirm, trade.Data.MDEntrySeller);
+        Assert.Equal(2u, trade.Data.RptSeq);
+
+        var deleteFrame = crossFrames[1];
+        Assert.Equal((ushort)WireOffsets.DeleteOrderBlockLength, deleteFrame.BlockLength);
+        Assert.True(DeleteOrder_MBO_51Data.TryParse(deleteFrame.Body.Span, out var orderDelete));
+        Assert.Equal(Petr, (long)(ulong)orderDelete.Data.SecurityID.Value);
+        Assert.Equal(MDEntryType.BID, orderDelete.Data.MDEntryType);
+        Assert.Equal(restingOrderId, (long)orderDelete.Data.SecondaryOrderID.Value);
+        Assert.Equal(100L, orderDelete.Data.MDEntrySize.Value);
+        Assert.Equal(123_400L, orderDelete.Data.MDEntryPx.Mantissa);
+        Assert.Equal(3u, orderDelete.Data.RptSeq);
+
+        // EmptyBook_9 is the required terminal marker after the only bid is
+        // fully deleted. Snapshot packets continue on their separate sink.
+        Assert.Equal((ushort)WireOffsets.EmptyBookBlockLength, crossFrames[2].BlockLength);
+        var snapshotTemplateIds = snapshotSink.SnapshotPackets()
+            .SelectMany(DecodeUmdfFrames)
+            .Select(static frame => frame.TemplateId)
+            .ToArray();
+        Assert.Contains((ushort)30, snapshotTemplateIds);
+        Assert.DoesNotContain((ushort)50, snapshotTemplateIds);
+        Assert.DoesNotContain((ushort)51, snapshotTemplateIds);
+        Assert.DoesNotContain((ushort)53, snapshotTemplateIds);
     }
 
     [Fact]
@@ -483,6 +617,98 @@ public class ExchangeHostE2ETests
             BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8)));
     }
 
+    private readonly record struct UmdfFrame(ushort TemplateId, ushort BlockLength, ReadOnlyMemory<byte> Body);
+
+    private static List<UmdfFrame> DecodeUmdfFrames(byte[] packet)
+    {
+        var frames = new List<UmdfFrame>();
+        int cursor = WireOffsets.PacketHeaderSize;
+        while (cursor < packet.Length)
+        {
+            Assert.True(cursor + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize <= packet.Length,
+                $"truncated UMDF frame header at offset {cursor}");
+
+            ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(cursor + WireOffsets.FramingHeaderMessageLengthOffset, 2));
+            ushort encodingType = BinaryPrimitives.ReadUInt16LittleEndian(
+                packet.AsSpan(cursor + WireOffsets.FramingHeaderEncodingTypeOffset, 2));
+            Assert.Equal((ushort)0, encodingType);
+            Assert.True(messageLength >= WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
+                $"invalid UMDF frame length {messageLength} at offset {cursor}");
+            Assert.True(cursor + messageLength <= packet.Length,
+                $"UMDF frame length {messageLength} overruns packet at offset {cursor}");
+
+            int sbeHeader = cursor + WireOffsets.FramingHeaderSize;
+            ushort blockLength = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(sbeHeader, 2));
+            ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(sbeHeader + 2, 2));
+            int bodyOffset = sbeHeader + WireOffsets.SbeMessageHeaderSize;
+            Assert.True(bodyOffset + blockLength <= cursor + messageLength,
+                $"template {templateId} block length {blockLength} overruns frame");
+
+            frames.Add(new UmdfFrame(templateId, blockLength, packet.AsMemory(bodyOffset, blockLength)));
+            cursor += messageLength;
+        }
+
+        Assert.Equal(packet.Length, cursor);
+        return frames;
+    }
+
+    private static async Task WaitForPacketCountAsync(
+        RecordingPacketSink sink,
+        int expected,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (sink.Count < expected && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        Assert.True(sink.Count >= expected,
+            $"expected at least {expected} packets, got {sink.Count}");
+    }
+
+    private static async Task WriteNegotiateAsync(
+        NetworkStream stream,
+        uint sessionId,
+        ulong sessionVerId,
+        uint enteringFirm)
+    {
+        var credentials = Encoding.ASCII.GetBytes(
+            $"{{\"auth_type\":\"basic\",\"username\":\"{sessionId}\",\"access_key\":\"\"}}");
+        var buffer = new byte[EntryPointFrameReader.MaxInboundMessageLength];
+        int length = EntryPointFixpFrameCodec.EncodeNegotiate(
+            buffer,
+            sessionId,
+            sessionVerId,
+            timestampNanos: 0,
+            enteringFirm,
+            onBehalfFirm: null,
+            credentials,
+            clientIp: "127.0.0.1"u8,
+            clientAppName: "issue-553-regression"u8,
+            clientAppVersion: "1"u8);
+        await stream.WriteAsync(buffer.AsMemory(0, length));
+    }
+
+    private static async Task WriteEstablishAsync(
+        NetworkStream stream,
+        uint sessionId,
+        ulong sessionVerId,
+        uint nextSeqNo)
+    {
+        var buffer = new byte[EntryPointFrameReader.MaxInboundMessageLength];
+        int length = EntryPointFixpFrameCodec.EncodeEstablish(
+            buffer,
+            sessionId,
+            sessionVerId,
+            timestampNanos: 0,
+            keepAliveIntervalMillis: 60_000,
+            nextSeqNo,
+            cancelOnDisconnectType: 0,
+            codTimeoutWindowMillis: 0,
+            credentials: ReadOnlySpan<byte>.Empty);
+        await stream.WriteAsync(buffer.AsMemory(0, length));
+    }
+
     private static byte[] BuildOrderCancelRequest(ulong clOrdId, long secId, ulong orderId, ulong origClOrdId, char side)
     {
         // 12-byte composite header (SOFH+SBE) + 76-byte OrderCancelRequest (V6) body.
@@ -569,7 +795,7 @@ public class ExchangeHostE2ETests
     }
 
     private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,
-        char tif, long qty, long priceMantissa)
+        char tif, long qty, long priceMantissa, uint sessionId = 0, uint msgSeqNum = 0)
     {
         // 12-byte composite header + 82-byte SimpleNewOrderV2 body.
         var frame = new byte[EntryPointFrameReader.WireHeaderSize + 82];
@@ -578,6 +804,13 @@ public class ExchangeHostE2ETests
             blockLength: 82, templateId: EntryPointFrameReader.TidSimpleNewOrder, version: 2);
 
         var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(4, 4), msgSeqNum);
+        if (sessionId != 0)
+        {
+            ulong sendingTimeNanos = checked((ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
+            BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(8, 8), sendingTimeNanos);
+        }
         BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
         BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
         body[56] = (byte)side;
