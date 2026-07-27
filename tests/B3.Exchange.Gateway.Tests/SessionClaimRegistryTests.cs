@@ -389,4 +389,32 @@ public class SessionClaimRegistryTests
         Assert.Same(racingToken, holder);
         Assert.Equal(7UL, r.CurrentSessionVerId(42));
     }
+
+    [Fact]
+    public void TryFinalizeTakeOver_FailClosedRotatesGenerationAndRetainsVersionWatermark()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _, out var rollback);
+
+        var result = r.TryFinalizeTakeOver(
+            42,
+            6,
+            newToken,
+            oldToken,
+            rollback,
+            () => SessionClaimRegistry.TakeOverCommitDecision.FailClosed);
+
+        Assert.Equal(SessionClaimRegistry.TakeOverFinalizeResult.FailedClosed, result);
+        Assert.False(r.TryGetActiveClaim(42, out _, out _));
+        Assert.Equal(6UL, r.CurrentSessionVerId(42));
+        Assert.False(r.TryRestoreTakeOver(42, 6, newToken, oldToken, rollback));
+        Assert.Equal(SessionClaimRegistry.ClaimResult.StaleVersion,
+            r.TryClaim(42, 6, new object()));
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryClaim(42, 7, new object()));
+    }
 }

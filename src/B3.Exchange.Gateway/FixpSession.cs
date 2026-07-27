@@ -806,9 +806,15 @@ public sealed partial class FixpSession : IAsyncDisposable
         return state is 0 or 2;
     }
 
+    internal void RollbackTakeOverSeal()
+    {
+        int restoredState = Volatile.Read(ref _closeRequested) == 0 ? 0 : 1;
+        Interlocked.CompareExchange(ref _takeOverCommitFence, restoredState, 2);
+    }
+
     internal bool TryAdoptOutboundStateForTakeOver(
         FixpSession previous,
-        Func<bool> commit)
+        Action commit)
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(commit);
@@ -852,7 +858,8 @@ public sealed partial class FixpSession : IAsyncDisposable
                 // passive ER or deferred completion that linearizes after the
                 // commit blocks before sequence allocation until EstablishAck.
                 ResetBusinessAdmissionLocked();
-                return commit();
+                commit();
+                return true;
             }
         }
     }

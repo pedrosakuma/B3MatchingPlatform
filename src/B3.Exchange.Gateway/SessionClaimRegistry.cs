@@ -122,7 +122,15 @@ public sealed class SessionClaimRegistry
     {
         Committed,
         RolledBack,
+        FailedClosed,
         ClaimLost,
+    }
+
+    internal enum TakeOverCommitDecision
+    {
+        Commit,
+        RollBack,
+        FailClosed,
     }
 
     /// <summary>
@@ -429,8 +437,11 @@ public sealed class SessionClaimRegistry
     /// <summary>
     /// Finalizes a previously accepted forced takeover while holding the claim
     /// lock. The callback therefore observes a stable claim owner. If the
-    /// callback declines or throws, the victim claim and previous version
-    /// watermark are restored before the method returns.
+    /// callback requests rollback, the victim claim and previous version
+    /// watermark are restored before the method returns. A fail-closed
+    /// decision (or an exception with unknown durability) releases the
+    /// replacement claim while retaining its version watermark and rotating
+    /// the generation, so no stale rollback receipt can resurrect the victim.
     ///
     /// A replacement transport can close after <see cref="TryForceTakeOver"/>
     /// and release its claim while persistence is still running. When the
@@ -445,7 +456,7 @@ public sealed class SessionClaimRegistry
         object newToken,
         object oldToken,
         TakeOverRollback rollback,
-        Func<bool> commit)
+        Func<TakeOverCommitDecision> commit)
     {
         ArgumentNullException.ThrowIfNull(newToken);
         ArgumentNullException.ThrowIfNull(oldToken);
@@ -473,14 +484,23 @@ public sealed class SessionClaimRegistry
             {
                 try
                 {
-                    if (commit())
-                        return TakeOverFinalizeResult.Committed;
+                    switch (commit())
+                    {
+                        case TakeOverCommitDecision.Commit:
+                            return TakeOverFinalizeResult.Committed;
+                        case TakeOverCommitDecision.FailClosed:
+                            FailTakeOverClosedLocked(sessionId, newToken);
+                            return TakeOverFinalizeResult.FailedClosed;
+                        case TakeOverCommitDecision.RollBack:
+                            break;
+                        default:
+                            throw new InvalidOperationException("unknown takeover commit decision");
+                    }
                 }
                 catch
                 {
-                    RestoreTakeOverLocked(
-                        sessionId, oldToken, rollback.PreviousSessionVerId);
-                    throw;
+                    FailTakeOverClosedLocked(sessionId, newToken);
+                    return TakeOverFinalizeResult.FailedClosed;
                 }
             }
 
@@ -488,6 +508,16 @@ public sealed class SessionClaimRegistry
                 sessionId, oldToken, rollback.PreviousSessionVerId);
             return TakeOverFinalizeResult.RolledBack;
         }
+    }
+
+    private void FailTakeOverClosedLocked(uint sessionId, object newToken)
+    {
+        if (_activeClaims.TryGetValue(sessionId, out var current)
+            && ReferenceEquals(current, newToken))
+        {
+            _activeClaims.Remove(sessionId);
+        }
+        _claimGenerations[sessionId] = new object();
     }
 
     private void RestoreTakeOverLocked(

@@ -38,11 +38,16 @@ public class FixpSessionMassActionTakeoverTests
     {
         private readonly object _lock = new();
         private readonly SortedDictionary<uint, OutboundJournalEntry> _entries = new();
+        private readonly ManualResetEventSlim _releaseMaxSeq = new(false);
 
         public IReadOnlyList<OutboundJournalEntry> Entries
         {
             get { lock (_lock) return _entries.Values.ToArray(); }
         }
+
+        public bool BlockMaxSeq { get; set; }
+        public TaskCompletionSource<bool> MaxSeqEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
         {
@@ -58,6 +63,11 @@ public class FixpSessionMassActionTakeoverTests
         public void PruneUpTo(uint sessionId, uint uptoSeq) { }
         public uint MaxSeq(uint sessionId)
         {
+            if (BlockMaxSeq)
+            {
+                MaxSeqEntered.TrySetResult(true);
+                _releaseMaxSeq.Wait(TimeSpan.FromSeconds(5));
+            }
             lock (_lock) return _entries.Count == 0 ? 0u : _entries.Keys.Max();
         }
         public long EntryCount(uint sessionId)
@@ -78,8 +88,13 @@ public class FixpSessionMassActionTakeoverTests
         {
             lock (_lock) _entries.Clear();
         }
+        public void ReleaseMaxSeq() => _releaseMaxSeq.Set();
         public IReadOnlyCollection<uint> ListSessions() => new[] { 1u };
-        public void Dispose() { }
+        public void Dispose()
+        {
+            _releaseMaxSeq.Set();
+            _releaseMaxSeq.Dispose();
+        }
     }
 
     private sealed class BlockingStatePersister : IFixpSessionStatePersister
@@ -89,6 +104,7 @@ public class FixpSessionMassActionTakeoverTests
         private FixpSessionStateSnapshot? _lastSaved;
 
         public bool BlockTakeOverSave { get; set; }
+        public bool PersistBeforeBlocking { get; set; }
         public TaskCompletionSource<bool> TakeOverSaveEntered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -101,8 +117,14 @@ public class FixpSessionMassActionTakeoverTests
         {
             if (BlockTakeOverSave && snapshot.SessionVerId == 3)
             {
+                if (PersistBeforeBlocking)
+                {
+                    lock (_lock) _lastSaved = snapshot;
+                }
                 TakeOverSaveEntered.TrySetResult(true);
                 _releaseTakeOverSave.Wait(TimeSpan.FromSeconds(5));
+                if (PersistBeforeBlocking)
+                    return;
             }
             lock (_lock) _lastSaved = snapshot;
         }
@@ -116,6 +138,56 @@ public class FixpSessionMassActionTakeoverTests
             lock (_lock) _lastSaved = null;
         }
         public void Dispose() => _releaseTakeOverSave.Dispose();
+    }
+
+    private sealed class FailingTakeOverStatePersister : IFixpSessionStatePersister
+    {
+        private readonly object _lock = new();
+        private FixpSessionStateSnapshot? _lastSaved;
+        private bool _replacementSaveFailed;
+
+        public bool PersistReplacementBeforeFailure { get; init; }
+        public bool FailRollbackSave { get; init; }
+
+        public FixpSessionStateSnapshot? LastSaved
+        {
+            get { lock (_lock) return _lastSaved; }
+        }
+
+        public void Save(in FixpSessionStateSnapshot snapshot)
+        {
+            lock (_lock)
+            {
+                if (snapshot.SessionVerId == 3 && !_replacementSaveFailed)
+                {
+                    _replacementSaveFailed = true;
+                    if (PersistReplacementBeforeFailure)
+                        _lastSaved = snapshot;
+                    throw new IOException("injected replacement snapshot failure");
+                }
+                if (_replacementSaveFailed
+                    && snapshot.SessionVerId == 2
+                    && FailRollbackSave)
+                {
+                    throw new IOException("injected rollback snapshot failure");
+                }
+                _lastSaved = snapshot;
+            }
+        }
+
+        public FixpSessionStateSnapshot? Load(uint sessionId)
+            => LastSaved is { } saved && saved.SessionId == sessionId ? saved : null;
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
+            => LastSaved is { } saved ? new[] { saved } : Array.Empty<FixpSessionStateSnapshot>();
+        public void Remove(uint sessionId)
+        {
+            lock (_lock)
+            {
+                if (_lastSaved?.SessionId == sessionId)
+                    _lastSaved = null;
+            }
+        }
+        public void Dispose() { }
     }
 
     [Fact]
@@ -270,13 +342,20 @@ public class FixpSessionMassActionTakeoverTests
             session => session.SessionVerId == 3).OutboundSeq);
     }
 
-    [Fact]
-    public async Task ReplacementCloseDuringTakeoverPersistence_RetainsVictim()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReplacementCloseAfterSeal_CommitsDurableVersionAndNeverRestoresVictim(
+        bool persistBeforeBlocking)
     {
         var sink = new ControlledSink();
         var registry = new SessionRegistry();
         var claims = new SessionClaimRegistry();
-        var state = new BlockingStatePersister { BlockTakeOverSave = true };
+        var state = new BlockingStatePersister
+        {
+            BlockTakeOverSave = true,
+            PersistBeforeBlocking = persistBeforeBlocking,
+        };
         await using var listener = BuildListener(
             sink, registry, claims, outboundJournal: null, statePersister: state);
         listener.Start();
@@ -288,6 +367,7 @@ public class FixpSessionMassActionTakeoverTests
         using var replacementClient = await ConnectAndSendNegotiateAsync(
             listener, sessionVerId: 3);
         await state.TakeOverSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(persistBeforeBlocking ? 3UL : 2UL, state.LastSaved?.SessionVerId);
         var replacement = listener.ActiveSessions.Single(
             session => session.SessionVerId == 3);
         var closeTask = Task.Run(() =>
@@ -300,6 +380,50 @@ public class FixpSessionMassActionTakeoverTests
         await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(await TestUtil.WaitUntilAsync(
+            () => !listener.ActiveSessions.Contains(oldSession)
+                && !listener.ActiveSessions.Contains(replacement),
+            TimeSpan.FromSeconds(5)));
+        Assert.False(registry.TryGet(new SessionId("1"), out _));
+        Assert.False(claims.TryGetActiveClaim(1, out _, out _));
+        Assert.Equal(3UL, claims.CurrentSessionVerId(1));
+        Assert.Equal(3UL, state.LastSaved?.SessionVerId);
+        Assert.Equal(CloseKind.SessionTakeOver, oldSession.LastCloseKind);
+        Assert.Equal(CloseKind.TransportError, replacement.LastCloseKind);
+        AssertRestartRejectsVersionAndAcceptsNext(state.LastSaved!.Value);
+    }
+
+    [Fact]
+    public async Task ReplacementCloseBeforeSeal_RestoresVictimWithoutPersistingRejectedVersion()
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        using var journal = new StrictJournal();
+        var state = new BlockingStatePersister();
+        await using var listener = BuildListener(
+            sink, registry, claims, journal, state);
+        listener.Start();
+
+        using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
+        var oldSession = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 2);
+        journal.BlockMaxSeq = true;
+
+        using var replacementClient = await ConnectAndSendNegotiateAsync(
+            listener, sessionVerId: 3);
+        await journal.MaxSeqEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var replacement = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 3);
+        var closeTask = Task.Run(() =>
+            replacement.Close("test-close-before-takeover-seal", CloseKind.TransportError));
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => !replacement.IsLiveTakeOverCandidate,
+            TimeSpan.FromSeconds(5)));
+
+        journal.ReleaseMaxSeq();
+        await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(await TestUtil.WaitUntilAsync(
             () => listener.ActiveSessions.Contains(oldSession)
                 && !listener.ActiveSessions.Contains(replacement),
             TimeSpan.FromSeconds(5)));
@@ -309,14 +433,79 @@ public class FixpSessionMassActionTakeoverTests
         Assert.Same(oldSession, holder);
         Assert.Equal(2UL, version);
         Assert.Equal(2UL, state.LastSaved?.SessionVerId);
+        AssertRestartAcceptsVersion(state.LastSaved!.Value, 3);
+    }
 
-        var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
-        var canceled = CreateMassCancelEvent(orderId: 57, rptSeq: 2);
-        Assert.True(gateway.WriteExecutionReportPassiveCancel(
-            new SessionId("1"), ownerClOrdId: 5003, orderId: canceled.OrderId,
-            canceled, requesterClOrdIdOrZero: 7102).IsCommitted);
-        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel,
-            (await ReadOneFrameAsync(oldClient.GetStream())).TemplateId);
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TakeoverSaveFailure_RestoresVictimOnlyAfterDurableRollback(
+        bool persistReplacementBeforeFailure)
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        var state = new FailingTakeOverStatePersister
+        {
+            PersistReplacementBeforeFailure = persistReplacementBeforeFailure,
+        };
+        await using var listener = BuildListener(
+            sink, registry, claims, outboundJournal: null, statePersister: state);
+        listener.Start();
+
+        using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
+        var oldSession = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 2);
+        using var replacementClient = await ConnectAndSendNegotiateAsync(
+            listener, sessionVerId: 3);
+
+        Assert.Equal(EntryPointFrameReader.TidNegotiateReject,
+            (await ReadOneFrameAsync(replacementClient.GetStream())).TemplateId);
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.Contains(oldSession)
+                && listener.ActiveSessions.All(session => session.SessionVerId != 3),
+            TimeSpan.FromSeconds(5)));
+        Assert.True(registry.TryGet(new SessionId("1"), out var current));
+        Assert.Same(oldSession, current);
+        Assert.True(claims.TryGetActiveClaim(1, out var holder, out var version));
+        Assert.Same(oldSession, holder);
+        Assert.Equal(2UL, version);
+        Assert.Equal(2UL, state.LastSaved?.SessionVerId);
+        AssertRestartAcceptsVersion(state.LastSaved!.Value, 3);
+    }
+
+    [Fact]
+    public async Task TakeoverRollbackSaveFailure_FailsClosedWithReplacementVersionDurable()
+    {
+        var sink = new ControlledSink();
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        var state = new FailingTakeOverStatePersister
+        {
+            PersistReplacementBeforeFailure = true,
+            FailRollbackSave = true,
+        };
+        await using var listener = BuildListener(
+            sink, registry, claims, outboundJournal: null, statePersister: state);
+        listener.Start();
+
+        using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
+        var oldSession = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 2);
+        using var replacementClient = await ConnectAndSendNegotiateAsync(
+            listener, sessionVerId: 3);
+
+        Assert.Equal(EntryPointFrameReader.TidNegotiateReject,
+            (await ReadOneFrameAsync(replacementClient.GetStream())).TemplateId);
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.All(session => session.SessionVerId != 2),
+            TimeSpan.FromSeconds(5)));
+        Assert.False(registry.TryGet(new SessionId("1"), out _));
+        Assert.False(claims.TryGetActiveClaim(1, out _, out _));
+        Assert.Equal(3UL, claims.CurrentSessionVerId(1));
+        Assert.Equal(3UL, state.LastSaved?.SessionVerId);
+        Assert.Equal(CloseKind.SessionTakeOver, oldSession.LastCloseKind);
+        AssertRestartRejectsVersionAndAcceptsNext(state.LastSaved!.Value);
     }
 
     [Fact]
@@ -454,6 +643,27 @@ public class FixpSessionMassActionTakeoverTests
             clientAppVersion: ReadOnlySpan<byte>.Empty);
         await client.GetStream().WriteAsync(buffer.AsMemory(0, length));
         return client;
+    }
+
+    private static void AssertRestartAcceptsVersion(
+        FixpSessionStateSnapshot snapshot,
+        ulong sessionVerId)
+    {
+        var restartedClaims = new SessionClaimRegistry();
+        restartedClaims.SeedLastVersion(snapshot.SessionId, snapshot.SessionVerId);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            restartedClaims.TryClaim(snapshot.SessionId, sessionVerId, new object()));
+    }
+
+    private static void AssertRestartRejectsVersionAndAcceptsNext(
+        FixpSessionStateSnapshot snapshot)
+    {
+        var restartedClaims = new SessionClaimRegistry();
+        restartedClaims.SeedLastVersion(snapshot.SessionId, snapshot.SessionVerId);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.StaleVersion,
+            restartedClaims.TryClaim(snapshot.SessionId, snapshot.SessionVerId, new object()));
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            restartedClaims.TryClaim(snapshot.SessionId, snapshot.SessionVerId + 1, new object()));
     }
 
     private static byte[] BuildMassActionRequest(ulong clOrdId)

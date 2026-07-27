@@ -357,21 +357,27 @@ public sealed class SessionRegistry
                             || !_sessions.TryGetValue(identity, out var registered)
                             || !ReferenceEquals(registered, previous)
                             || !replacement.IsLiveTakeOverCandidate)
-                            return false;
+                            return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
                     }
 
-                    return replacement.TryAdoptOutboundStateForTakeOver(previous, () =>
+                    var decision = SessionClaimRegistry.TakeOverCommitDecision.RollBack;
+                    if (!replacement.TryAdoptOutboundStateForTakeOver(previous, () =>
                     {
-                        if (!replacement.IsLiveTakeOverCandidate)
-                            return false;
-                        if (!replacement.TrySaveStateSnapshot())
-                            return false;
-                        if (!replacement.TrySealTakeOverCandidate())
-                            return false;
-
                         if (!ReferenceEquals(previousRoute.Current, previous)
                             || !ReferenceEquals(replacementRoute.Current, replacement))
-                            return false;
+                            return;
+                        if (!replacement.TrySealTakeOverCandidate())
+                            return;
+
+                        if (!replacement.TrySaveStateSnapshot())
+                        {
+                            bool rollbackPersisted = previous.TrySaveStateSnapshot();
+                            replacement.RollbackTakeOverSeal();
+                            decision = rollbackPersisted
+                                ? SessionClaimRegistry.TakeOverCommitDecision.RollBack
+                                : SessionClaimRegistry.TakeOverCommitDecision.FailClosed;
+                            return;
+                        }
 
                         previousRoute.SetCurrent(replacement);
                         if (!ReferenceEquals(previousRoute, replacementRoute))
@@ -380,20 +386,36 @@ public sealed class SessionRegistry
                         {
                             _sessions[identity] = replacement;
                         }
-                        previous.Close(
-                            "session-takeover:evicted-by-newer-verId",
-                            CloseKind.SessionTakeOver);
-                        return true;
-                    });
+                        decision = SessionClaimRegistry.TakeOverCommitDecision.Commit;
+                    }))
+                    {
+                        return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
+                    }
+                    return decision;
                 });
 
-            if (result == SessionClaimRegistry.TakeOverFinalizeResult.RolledBack)
+            if (result == SessionClaimRegistry.TakeOverFinalizeResult.Committed)
             {
+                previous.Close(
+                    "session-takeover:evicted-by-newer-verId",
+                    CloseKind.SessionTakeOver);
+            }
+            else if (result == SessionClaimRegistry.TakeOverFinalizeResult.FailedClosed)
+            {
+                previousRoute.ClearCurrent(previous);
+                previousRoute.ClearCurrent(replacement);
+                replacementRoute.ClearCurrent(previous);
+                replacementRoute.ClearCurrent(replacement);
                 lock (_mapLock)
                 {
-                    _sessions[identity] = previous;
+                    _sessions.TryRemove(
+                        new KeyValuePair<SessionId, FixpSession>(identity, previous));
+                    _sessions.TryRemove(
+                        new KeyValuePair<SessionId, FixpSession>(identity, replacement));
                 }
-                previous.SaveStateSnapshotSafe();
+                previous.Close(
+                    "session-takeover:durable-rollback-failed",
+                    CloseKind.SessionTakeOver);
             }
             return result;
         });
