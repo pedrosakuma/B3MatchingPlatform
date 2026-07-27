@@ -5,9 +5,9 @@ namespace B3.Umdf.WireEncoder;
 /// the encoder library and the synthetic publisher emit.
 ///
 /// All values come straight from the SBE-generated reader structs in
-/// <c>B3.Umdf.Sbe</c> and reflect the V16 schema (latest). Publishers that
+/// <c>B3.Umdf.Sbe</c> and reflect the V17 schema (latest). Publishers that
 /// claim a lower <c>Version</c> in the SbeMessageHeader but write the V16
-/// physical body still get correctly read by the V16 reader iff the
+/// physical body still get correctly read by the V17 reader iff the
 /// MessageHeader.BlockLength field matches the bytes actually written.
 /// </summary>
 public static class WireOffsets
@@ -15,6 +15,7 @@ public static class WireOffsets
     public const int PacketHeaderSize = 16;
     public const int FramingHeaderSize = 4;
     public const int SbeMessageHeaderSize = 8;
+    public const int SbeMessageHeaderVersionOffset = 6;
 
     // PacketHeader (Pack=1): byte channel, byte reserved, ushort seqVersion,
     // uint sequenceNumber@4, ulong sendingTime@8.
@@ -28,7 +29,7 @@ public static class WireOffsets
     public const int FramingHeaderMessageLengthOffset = 0;
     public const int FramingHeaderEncodingTypeOffset = 2;
 
-    // ---- Order_MBO_50 (V6 body, accepted by V16 reader) ----
+    // ---- Order_MBO_50 (V6 body, accepted by V17 reader) ----
     public const int OrderBlockLength = 56;
     public const int OrderBodySecurityIdOffset = 0;        // long
     public const int OrderBodyMatchEventIndicatorOffset = 8; // byte
@@ -149,6 +150,24 @@ public static class WireOffsets
     public const int SecurityStatusBodyTransactTimeOffset = 24;
     public const int SecurityStatusBodyRptSeqOffset = 32;
 
+    // ---- InstrumentStatus_58 (V17, B3MatchingPlatform extension) ----
+    // Body layout (BLOCK_LENGTH=28): securityID@0 (long); securityExchange@8
+    // shares offset with matchEventIndicator@8 (byte); tradingSessionID@9;
+    // securityTradingStatus@10; administrativeHaltState@11;
+    // administrativeTransitionKind@12 (255 = NULL); haltReason@13
+    // (255 = NULL); pad@14; transactTime@16 (ulong nanos); rptSeq@24
+    // (uint, 0 = NULL/snapshot).
+    public const int InstrumentStatusBlockLength = 28;
+    public const int InstrumentStatusBodySecurityIdOffset = 0;
+    public const int InstrumentStatusBodyMatchEventIndicatorOffset = 8;
+    public const int InstrumentStatusBodyTradingSessionIdOffset = 9;
+    public const int InstrumentStatusBodySecurityTradingStatusOffset = 10;
+    public const int InstrumentStatusBodyAdministrativeHaltStateOffset = 11;
+    public const int InstrumentStatusBodyAdministrativeTransitionKindOffset = 12;
+    public const int InstrumentStatusBodyHaltReasonOffset = 13;
+    public const int InstrumentStatusBodyTransactTimeOffset = 16;
+    public const int InstrumentStatusBodyRptSeqOffset = 24;
+
     // ---- PriceBand_22 (V16) ----
     // Body layout (BLOCK_LENGTH=48): securityID@0 (long); securityExchange@8
     // shares offset with matchEventIndicator@8 (byte); priceBandType@9
@@ -268,7 +287,7 @@ public static class WireOffsets
 
     // ---- SecurityDefinition_12 (V16) ----
     // BlockLength bumped from 230 (V6) to 232 (V16) to make room for
-    // impliedMarketIndicator@230 and optPayoutType@231. The V16 reader is
+    // impliedMarketIndicator@230 and optPayoutType@231. The V17 reader is
     // backwards-compatible — it dispatches on the explicit BlockLength field
     // in the SBE message header.
     public const int SecDefBlockLength = 232;

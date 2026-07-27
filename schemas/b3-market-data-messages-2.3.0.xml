@@ -161,6 +161,8 @@ History
         |               | - mDEntryPositionNo field is replaced by a 4-byte padding in all messages (it was deprecated in version 15).
         |               | - MDEntryPositionNo type removed due to lack of use after related mDEntryPositionNo field removed.
         |               | - Changed behavior for the Trade and ForwardTrade message: if a trade is amended, the value of the transactTime field (tag 60) is set manually by MktOps.
+2.3.0   | 2026-07-27    | - Schema version changed from 16 to 17.
+        |               | - B3MatchingPlatform InstrumentStatus_58 extension added for authoritative administrative halt state, transition kind and reason.
 =================================================================================
 -->
 
@@ -171,8 +173,8 @@ History
 	xmlns:sbe="http://fixprotocol.io/2016/sbe" 
 	package="b3.umdf.mbo.sbe" 
 	id="2"
-	version="16" 
-	semanticVersion="2.2.0"
+	version="17" 
+	semanticVersion="2.3.0"
 	description="B3 Market Data UMDF SBE messages" 
 	byteOrder="littleEndian" 
 	xsi:schemaLocation="http://fixprotocol.io/2016/sbe sbe.xsd">
@@ -420,6 +422,20 @@ History
 			<validValue name="TRADING_SESSION_CHANGE" description="Change of Trading Session.">4</validValue>
 			<validValue name="SECURITY_STATUS_CHANGE" description="Security Status maintained separately from Group Status.">101</validValue>
 			<validValue name="SECURITY_REJOINS_SECURITY_GROUP_STATUS" description="Security Status following Group Status.">102</validValue>
+		</enum>
+		<enum name="AdministrativeHaltState" encodingType="uint8" semanticType="Int" description="Current administrative halt overlay for an instrument.">
+			<validValue name="ACTIVE" description="Instrument is not administratively halted.">0</validValue>
+			<validValue name="HALTED" description="Instrument is administratively halted.">1</validValue>
+		</enum>
+		<enum name="AdministrativeTransitionKind" encodingType="uint8" semanticType="Int" description="Administrative halt transition represented by this update. Null in snapshot state publication.">
+			<validValue name="HALT" description="Instrument entered administrative halt.">1</validValue>
+			<validValue name="RESUME" description="Instrument left administrative halt.">2</validValue>
+		</enum>
+		<enum name="HaltReason" encodingType="uint8" semanticType="Int" description="Detailed reason for the current or newly-entered administrative halt. Null when the instrument is active.">
+			<validValue name="REGULATORY_HALT" description="Regulatory halt.">1</validValue>
+			<validValue name="VOLATILITY_CIRCUIT_BREAKER" description="Volatility circuit breaker.">2</validValue>
+			<validValue name="NEWS_HOLD" description="News hold.">3</validValue>
+			<validValue name="PENDING_DISCLOSURE" description="Pending disclosure.">4</validValue>
 		</enum>
 		<enum name="PriceBandType" encodingType="uint8" semanticType="Int" description="Indicates the type of price banding (tunnel).">
 			<validValue name="HARD_LIMIT" description="Hard Limit.">1</validValue>
@@ -673,6 +689,22 @@ History
 		<field name="tradSesOpenTime" id="342" type="UTCTimestampNanos" presence="optional" offset="16" description="Estimated end of the current auction. Only present when SecurityTradingStatus=21 (Pre-open/Reserved)."/>
 		<field name="transactTime" id="60" type="UTCTimestampNanos" description="Timestamp when status of the security changed."/>
 		<field name="rptSeq" id="83" type="RptSeq" description="Sequence number per instrument update. (Zeroed in snapshot feed)"/>
+	</sbe:message>
+	<!-- B3MatchingPlatform administrative halt status extension (issue #581). -->
+	<sbe:message name="InstrumentStatus_58" id="58" sinceVersion="17" description="Authoritative administrative halt state and transition for an instrument">
+		<field name="messageType" id="35" type="MessageType" presence="constant" valueRef="MessageType.SecurityStatus" sinceVersion="17"/>
+		<field name="applVerID" id="1128" type="ApplVerID" presence="constant" valueRef="ApplVerID.FIX50SP2" sinceVersion="17" description="Specifies the service pack release being applied at message level"/>
+		<field name="securityID" id="48" type="SecurityID" sinceVersion="17" description="Security ID as defined by B3."/>
+		<field name="securityIDSource" id="22" type="SecurityIDSource" presence="constant" valueRef="SecurityIDSource.EXCHANGE_SYMBOL" sinceVersion="17" description="Identifies the class of the SecurityID (Exchange Symbol)."/>
+		<field name="securityExchange" id="207" type="SecurityExchangeBVMF" sinceVersion="17" description="Market to which the symbol belongs."/>
+		<field name="matchEventIndicator" id="37035" type="MatchEventIndicator" sinceVersion="17" description="Set of indicators that identify market data events. RecoveryMsg is set in snapshot publication."/>
+		<field name="tradingSessionID" id="336" type="TradingSessionID" sinceVersion="17" description="Identifier for trading session."/>
+		<field name="securityTradingStatus" id="326" type="SecurityTradingStatus" sinceVersion="17" description="Underlying trading phase preserved across the administrative halt overlay."/>
+		<field name="administrativeHaltState" id="37781" type="AdministrativeHaltState" sinceVersion="17" description="Current administrative halt state after applying this update."/>
+		<field name="administrativeTransitionKind" id="37782" type="AdministrativeTransitionKind" presence="optional" sinceVersion="17" description="Administrative transition carried by an incremental update. Null in snapshot state publication."/>
+		<field name="haltReason" id="37783" type="HaltReason" presence="optional" sinceVersion="17" description="Detailed halt reason while administrativeHaltState=HALTED. Null while ACTIVE."/>
+		<field name="transactTime" id="60" type="UTCTimestampNanos" offset="16" sinceVersion="17" description="Transition timestamp for incremental updates; halt-start timestamp for halted snapshots; zero for active snapshots."/>
+		<field name="rptSeq" id="83" type="RptSeq" sinceVersion="17" description="Sequence number per instrument update. Zeroed in snapshot feed."/>
 	</sbe:message>
 	<!-- Trading Phase for a Security Group (35=f) -->
 	<sbe:message name="SecurityGroupPhase_10" id="10" description="Trading status for security groups">

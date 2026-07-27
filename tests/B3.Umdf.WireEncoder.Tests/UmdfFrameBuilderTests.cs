@@ -18,16 +18,23 @@ public class UmdfFrameBuilderTests
     private sealed class RecordingSink : IUmdfFrameSink
     {
         public readonly byte[] Buffer = new byte[512];
-        public int ReservedSize;
-        public int CommittedBytes;
+        public readonly List<int> ReservedSizes = new();
+        public readonly List<int> CommittedSizes = new();
+        public int Cursor;
+        public int ReservedSize => ReservedSizes[^1];
+        public int CommittedBytes => CommittedSizes[^1];
 
         Span<byte> IUmdfFrameSink.Reserve(int size)
         {
-            ReservedSize = size;
-            return Buffer.AsSpan();
+            ReservedSizes.Add(size);
+            return Buffer.AsSpan(Cursor, size);
         }
 
-        void IUmdfFrameSink.Commit(int written) => CommittedBytes = written;
+        void IUmdfFrameSink.Commit(int written)
+        {
+            CommittedSizes.Add(written);
+            Cursor += written;
+        }
     }
 
     private static RecordingSink MakeSink() => new();
@@ -147,16 +154,19 @@ public class UmdfFrameBuilderTests
     }
 
     [Fact]
-    public void WriteInstrumentHalted_ReservesAndCommitsCorrectSize()
+    public void WriteInstrumentHalted_WritesLegacyAndAuthoritativeFrames()
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
             securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
 
-        int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+        int legacySize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBlockLength;
-        Assert.Equal(expected, sink.ReservedSize);
-        Assert.Equal(expected, sink.CommittedBytes);
+        int authoritativeSize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.InstrumentStatusBlockLength;
+        Assert.Equal(new[] { legacySize, authoritativeSize }, sink.ReservedSizes);
+        Assert.Equal(sink.ReservedSizes, sink.CommittedSizes);
+        Assert.Equal(legacySize + authoritativeSize, sink.Cursor);
     }
 
     [Fact]
@@ -164,24 +174,38 @@ public class UmdfFrameBuilderTests
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
+            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 123ul,
+            haltReason: (byte)B3.Umdf.Mbo.Sbe.V17.HaltReason.NEWS_HOLD);
 
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
         Assert.Equal(UmdfFrameBuilder.SecurityTradingEventHalt, sink.Buffer[eventOffset]);
+
+        int authoritativeBody = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBlockLength
+            + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
+            sink.Buffer.AsSpan(authoritativeBody, WireOffsets.InstrumentStatusBlockLength), out var status));
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.HALT, status.Data.AdministrativeTransitionKind);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.NEWS_HOLD, status.Data.HaltReason);
+        Assert.Equal(123UL, status.Data.TransactTime.Time);
+        Assert.Equal(6u, status.Data.RptSeq);
     }
 
     [Fact]
-    public void WriteInstrumentResumed_ReservesAndCommitsCorrectSize()
+    public void WriteInstrumentResumed_WritesLegacyAndAuthoritativeFrames()
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentResumed(sink,
             securityId: 1L, securityTradingStatus: 2, rptSeq: 7u, transactTimeNanos: 0ul);
 
-        int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+        int legacySize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBlockLength;
-        Assert.Equal(expected, sink.ReservedSize);
-        Assert.Equal(expected, sink.CommittedBytes);
+        int authoritativeSize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.InstrumentStatusBlockLength;
+        Assert.Equal(new[] { legacySize, authoritativeSize }, sink.ReservedSizes);
+        Assert.Equal(sink.ReservedSizes, sink.CommittedSizes);
     }
 
     [Fact]
@@ -194,6 +218,15 @@ public class UmdfFrameBuilderTests
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
         Assert.Equal(UmdfFrameBuilder.SecurityTradingEventResume, sink.Buffer[eventOffset]);
+
+        int authoritativeBody = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBlockLength
+            + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
+            sink.Buffer.AsSpan(authoritativeBody, WireOffsets.InstrumentStatusBlockLength), out var status));
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.ACTIVE, status.Data.AdministrativeHaltState);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.RESUME, status.Data.AdministrativeTransitionKind);
+        Assert.Null(status.Data.HaltReason);
     }
 
     [Fact]

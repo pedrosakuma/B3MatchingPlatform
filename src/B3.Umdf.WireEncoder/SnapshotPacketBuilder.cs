@@ -1,10 +1,25 @@
 namespace B3.Umdf.WireEncoder;
 
 /// <summary>
+/// Current administrative instrument status captured atomically with a book
+/// snapshot. <see cref="HaltReason"/> is populated only while halted.
+/// </summary>
+public readonly record struct InstrumentStatusSnapshot(
+    byte SecurityTradingStatus,
+    bool IsHalted,
+    byte? HaltReason,
+    ulong StateChangedNanos)
+{
+    public static InstrumentStatusSnapshot Active(byte securityTradingStatus)
+        => new(securityTradingStatus, false, null, 0);
+}
+
+/// <summary>
 /// Builds a per-symbol UMDF snapshot as a sequence of UDP-ready packets:
 /// the first packet carries the <c>SnapshotFullRefresh_Header_30</c> frame
-/// followed by as many <c>SnapshotFullRefresh_Orders_MBO_71</c> frames as fit
-/// in the destination buffer; subsequent packets carry only Orders_71 frames.
+/// followed by one recovery-marked <c>InstrumentStatus_58</c> frame and as
+/// many <c>SnapshotFullRefresh_Orders_MBO_71</c> frames as fit in the
+/// destination buffer; subsequent packets carry only Orders_71 frames.
 /// Each packet is written to a caller-supplied <see cref="Span{T}"/> via the
 /// <see cref="PacketHandler"/> delegate so the caller can pool the buffer and
 /// invoke its multicast publisher synchronously.
@@ -52,7 +67,7 @@ public static class SnapshotPacketBuilder
         int packetCount = 1;
         ConsumeEntriesThatFit(
             ref remaining,
-            bufferSize - WireOffsets.PacketHeaderSize - SnapshotHeaderFrameSize,
+            bufferSize - WireOffsets.PacketHeaderSize - SnapshotHeaderFrameSize - InstrumentStatusFrameSize,
             maxEntriesPerChunk);
 
         while (remaining > 0)
@@ -109,6 +124,39 @@ public static class SnapshotPacketBuilder
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
         PacketHandler onPacket,
         int maxEntriesPerChunk = MaxEntriesPerChunk)
+        => WriteSnapshot(
+            buffer,
+            channelNumber,
+            snapshotSequenceVersion,
+            firstSequenceNumber,
+            sendingTimeNanos,
+            securityId,
+            lastRptSeq,
+            incrementalSequenceVersion,
+            bids,
+            asks,
+            InstrumentStatusSnapshot.Active((byte)B3.Umdf.Mbo.Sbe.V17.SecurityTradingStatus.OPEN),
+            onPacket,
+            maxEntriesPerChunk);
+
+    /// <summary>
+    /// Writes a complete snapshot including the authoritative current
+    /// administrative halt state.
+    /// </summary>
+    public static int WriteSnapshot(
+        Span<byte> buffer,
+        byte channelNumber,
+        ushort snapshotSequenceVersion,
+        uint firstSequenceNumber,
+        ulong sendingTimeNanos,
+        long securityId,
+        uint? lastRptSeq,
+        ushort incrementalSequenceVersion,
+        ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
+        ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> asks,
+        InstrumentStatusSnapshot instrumentStatus,
+        PacketHandler onPacket,
+        int maxEntriesPerChunk = MaxEntriesPerChunk)
     {
         ArgumentNullException.ThrowIfNull(onPacket);
         ValidateLayout(buffer.Length, bids.Length, asks.Length, maxEntriesPerChunk);
@@ -125,9 +173,22 @@ public static class SnapshotPacketBuilder
         // ------------------------- Packet 1: header --------------------------
         int p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
         int headerLen = UmdfWireEncoder.WriteSnapshotHeaderFrame(buffer.Slice(p),
-            securityId, totReports, totBids, totOffers, totNumStats: 0,
+            securityId, totReports, totBids, totOffers, totNumStats: 1,
             lastRptSeq: lastRptSeq, lastSequenceVersion: incrementalSequenceVersion);
         p += headerLen;
+        p += UmdfWireEncoder.WriteInstrumentStatusFrame(
+            buffer.Slice(p),
+            securityId,
+            tradingSessionId: 0,
+            instrumentStatus.SecurityTradingStatus,
+            instrumentStatus.IsHalted
+                ? UmdfWireEncoder.AdministrativeHaltStateHalted
+                : UmdfWireEncoder.AdministrativeHaltStateActive,
+            UmdfWireEncoder.OptionalEnumNull,
+            instrumentStatus.HaltReason ?? UmdfWireEncoder.OptionalEnumNull,
+            instrumentStatus.StateChangedNanos,
+            rptSeq: 0,
+            matchEventIndicator: UmdfWireEncoder.MatchEventIndicatorRecovery);
 
         // Pack as many Orders_71 chunks as fit in the remaining space.
         int bidIdx = 0, askIdx = 0;
@@ -178,6 +239,11 @@ public static class SnapshotPacketBuilder
          + WireOffsets.SbeMessageHeaderSize
          + WireOffsets.SnapHeaderBlockLength;
 
+    private static int InstrumentStatusFrameSize
+        => WireOffsets.FramingHeaderSize
+         + WireOffsets.SbeMessageHeaderSize
+         + WireOffsets.InstrumentStatusBlockLength;
+
     private static void ValidateLayout(
         int bufferSize,
         int bidCount,
@@ -186,10 +252,10 @@ public static class SnapshotPacketBuilder
     {
         if (maxEntriesPerChunk < 1 || maxEntriesPerChunk > MaxEntriesPerChunk)
             throw new ArgumentOutOfRangeException(nameof(maxEntriesPerChunk));
-        if (bufferSize < WireOffsets.PacketHeaderSize + SnapshotHeaderFrameSize)
+        if (bufferSize < WireOffsets.PacketHeaderSize + SnapshotHeaderFrameSize + InstrumentStatusFrameSize)
         {
             throw new ArgumentException(
-                $"buffer too small ({bufferSize} bytes) for SnapshotFullRefresh_Header_30.",
+                $"buffer too small ({bufferSize} bytes) for SnapshotFullRefresh_Header_30 and InstrumentStatus_58.",
                 nameof(bufferSize));
         }
         if ((bidCount != 0 || askCount != 0)

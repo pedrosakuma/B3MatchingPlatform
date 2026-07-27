@@ -134,12 +134,9 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
-    /// Issue #322: B3-aligned best-effort wire markers on
-    /// <c>securityTradingEvent</c> for halt and resume. The downstream
-    /// consumer just needs them to be distinct and non-NULL; the
-    /// <c>SecurityStatus_3</c> frame's <c>securityTradingStatus</c> still
-    /// carries the engine's preserved <see cref="TradingPhase"/> so the
-    /// post-resume phase is unambiguous.
+    /// Issue #581: preserve the legacy <c>SecurityStatus_3</c> markers and
+    /// publish the authoritative <c>InstrumentStatus_58</c> transition,
+    /// current administrative state and detailed halt reason alongside them.
     /// </summary>
 
     public void OnInstrumentHalted(in InstrumentHaltedEvent e)
@@ -148,7 +145,8 @@ public sealed partial class ChannelDispatcher
         byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
             ? (byte)phase
             : (byte)TradingPhase.Open;
-        UmdfFrameBuilder.WriteInstrumentHalted(FrameSink, e.SecurityId, phaseByte, e.RptSeq, e.TransactTimeNanos);
+        UmdfFrameBuilder.WriteInstrumentHalted(
+            FrameSink, e.SecurityId, phaseByte, e.RptSeq, e.TransactTimeNanos, (byte)e.Reason);
     }
 
     public void OnInstrumentResumed(in InstrumentResumedEvent e)
