@@ -1,5 +1,5 @@
 using System.Runtime.InteropServices;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Umdf.WireEncoder.Tests;
@@ -54,7 +54,7 @@ public class UmdfWireEncoderTests
         var msgLen = MemoryMarshal.Read<ushort>(buf.AsSpan(0, 2));
         Assert.Equal((ushort)n, msgLen);
 
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.V6.Order_MBO_50Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.OrderBlockLength), out var rdr));
         Assert.Equal(900_000_000_001L, (long)(ulong)rdr.Data.SecurityID.Value);
         Assert.Equal(0x12340000_00000005L, (long)rdr.Data.SecondaryOrderID.Value);
@@ -178,7 +178,7 @@ public class UmdfWireEncoderTests
         ref readonly var messageHeader = ref MemoryMarshal.AsRef<MessageHeader>(
             buf.AsSpan(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
         Assert.Equal((ushort)SnapshotFullRefresh_Header_30Data.BLOCK_LENGTH, messageHeader.BlockLength);
-        Assert.Equal((ushort)16, messageHeader.Version);
+        Assert.Equal((ushort)17, messageHeader.Version);
 
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var rdr));
@@ -277,15 +277,15 @@ public class UmdfWireEncoderTests
         // Skip the SBE message header (8 bytes) — the V6 reader expects
         // the slice to start at the block.
         var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.TryParse(bodyAndTail,
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.TryParse(bodyAndTail,
             blockLength: WireOffsets.SecDefBlockLength, out var rdr));
 
         int descLen = -1;
         rdr.ReadGroups(
-            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoUnderlyingsData _) => { },
-            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoLegsData _) => { },
-            (in B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
-            (B3.Umdf.Mbo.Sbe.V16.TextEncoding desc) => { descLen = desc.VarData.Length; });
+            (in B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.NoUnderlyingsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V17.V6.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V17.TextEncoding desc) => { descLen = desc.VarData.Length; });
         Assert.Equal(0, descLen);
     }
 
@@ -445,7 +445,7 @@ public class UmdfWireEncoderTests
 
         var sbeMessage = buf.AsSpan(WireOffsets.FramingHeaderSize, n - WireOffsets.FramingHeaderSize);
         var bodyAndTail = sbeMessage.Slice(WireOffsets.SbeMessageHeaderSize);
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(bodyAndTail,
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.TryParse(bodyAndTail,
             blockLength: WireOffsets.SecDefBlockLength, out var rdr));
 
         Assert.Equal(285_000L, rdr.Data.StrikePrice.Mantissa);
@@ -460,14 +460,14 @@ public class UmdfWireEncoderTests
         int underlyings = 0;
         long underlyingSecId = 0L;
         rdr.ReadGroups(
-            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoUnderlyingsData u) =>
+            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoUnderlyingsData u) =>
             {
                 underlyings++;
                 underlyingSecId = (long)(ulong)u.UnderlyingSecurityID.Value;
             },
-            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoLegsData _) => { },
-            (in B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
-            (B3.Umdf.Mbo.Sbe.V16.TextEncoding _) => { });
+            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoLegsData _) => { },
+            (in B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.NoInstrAttribsData _) => { },
+            (B3.Umdf.Mbo.Sbe.V17.TextEncoding _) => { });
         Assert.Equal(1, underlyings);
         Assert.Equal(900_000_000_001L, underlyingSecId);
     }
@@ -546,6 +546,64 @@ public class UmdfWireEncoderTests
         Assert.Equal((ushort)9000, rdr.Data.TradeDate.Value);
         Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
         Assert.Equal(42u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void InstrumentStatus_Roundtrip_PinsV17Contract()
+    {
+        var buf = new byte[80];
+        int n = UmdfWireEncoder.WriteInstrumentStatusFrame(
+            buf,
+            securityId: 4242L,
+            tradingSessionId: 1,
+            securityTradingStatus: (byte)SecurityTradingStatus.OPEN,
+            administrativeHaltState: UmdfWireEncoder.AdministrativeHaltStateHalted,
+            administrativeTransitionKind: UmdfWireEncoder.AdministrativeTransitionHalt,
+            haltReason: (byte)HaltReason.VOLATILITY_CIRCUIT_BREAKER,
+            transactTimeNanos: 1_700_000_000_000_000_000UL,
+            rptSeq: 43);
+
+        Assert.Equal(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.InstrumentStatusBlockLength, n);
+        Assert.Equal((ushort)WireOffsets.InstrumentStatusBlockLength,
+            MemoryMarshal.Read<ushort>(buf.AsSpan(WireOffsets.FramingHeaderSize, 2)));
+        Assert.Equal((ushort)58,
+            MemoryMarshal.Read<ushort>(buf.AsSpan(WireOffsets.FramingHeaderSize + 2, 2)));
+        Assert.Equal((ushort)2,
+            MemoryMarshal.Read<ushort>(buf.AsSpan(WireOffsets.FramingHeaderSize + 4, 2)));
+        Assert.Equal((ushort)17,
+            MemoryMarshal.Read<ushort>(buf.AsSpan(
+                WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderVersionOffset, 2)));
+
+        Assert.True(InstrumentStatus_58Data.TryParse(
+            buf.AsSpan(FrameOffset, WireOffsets.InstrumentStatusBlockLength), out var rdr));
+        Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, rdr.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), rdr.Data.TradingSessionID));
+        Assert.Equal(SecurityTradingStatus.OPEN, rdr.Data.SecurityTradingStatus);
+        Assert.Equal(AdministrativeHaltState.HALTED, rdr.Data.AdministrativeHaltState);
+        Assert.Equal(AdministrativeTransitionKind.HALT, rdr.Data.AdministrativeTransitionKind);
+        Assert.Equal(HaltReason.VOLATILITY_CIRCUIT_BREAKER, rdr.Data.HaltReason);
+        Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
+        Assert.Equal(43u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void InstrumentStatus_RejectsUndefinedTradingSession()
+    {
+        var buf = new byte[80];
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            UmdfWireEncoder.WriteInstrumentStatusFrame(
+                buf,
+                securityId: 4242L,
+                tradingSessionId: 0,
+                securityTradingStatus: (byte)SecurityTradingStatus.OPEN,
+                administrativeHaltState: UmdfWireEncoder.AdministrativeHaltStateActive,
+                administrativeTransitionKind: UmdfWireEncoder.OptionalEnumNull,
+                haltReason: UmdfWireEncoder.OptionalEnumNull,
+                transactTimeNanos: 0,
+                rptSeq: 0));
     }
 
     [Fact]

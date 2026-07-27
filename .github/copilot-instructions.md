@@ -69,10 +69,10 @@ Layered projects under `src/` (build order roughly bottom-up):
 
 1. `B3.EntryPoint.Sbe` / `B3.Umdf.Sbe` — generated SBE bindings from
    `schemas/b3-entrypoint-messages-8.4.2.xml` and
-   `schemas/b3-market-data-messages-2.2.0.xml`. Vendored copies; keep in sync
-   with `SbeB3UmdfConsumer` when upgrading.
+   `schemas/b3-market-data-messages-2.3.0.xml`. Keep UMDF schema version 17 in
+   sync with downstream consumers.
 2. `B3.Umdf.WireEncoder` — stateless byte-level encoders for UMDF MBO / Trade /
-   Snapshot frames (V16 schema).
+   Snapshot / InstrumentStatus frames (V17 schema).
 3. `B3.Exchange.Instruments` — JSON instrument loader.
 4. `B3.Exchange.Matching` — single-thread per-symbol limit order book.
    `MatchingEngine` owns one `LimitOrderBook` per `SecurityId`, monotonic

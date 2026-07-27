@@ -115,6 +115,31 @@ public class ChannelDispatcherRetxBufferTests
     }
 
     [Fact]
+    public void HaltPacket_RetransmissionRetainsAuthoritativeReason()
+    {
+        var (disp, pkt, ring) = NewDispatcherWithRing();
+
+        Assert.True(disp.EnqueueOperatorHalt(Petr, HaltReason.VolatilityCircuitBreaker, null));
+        DrainInbound(disp);
+
+        var sentPacket = Assert.Single(pkt.Packets);
+        Assert.True(ring.TryGet(1u, out var recoveredPacket));
+        Assert.Equal(sentPacket, recoveredPacket);
+
+        int legacyFrameSize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBlockLength;
+        int statusBody = WireOffsets.PacketHeaderSize + legacyFrameSize
+            + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
+            recoveredPacket.AsSpan(statusBody, WireOffsets.InstrumentStatusBlockLength),
+            out var status));
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.HALT,
+            status.Data.AdministrativeTransitionKind);
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.VOLATILITY_CIRCUIT_BREAKER,
+            status.Data.HaltReason);
+    }
+
+    [Fact]
     public void FlushPacket_MultiplePackets_RetainedInOrderUntilEviction()
     {
         var (disp, pkt, ring) = NewDispatcherWithRing(capacity: 3);

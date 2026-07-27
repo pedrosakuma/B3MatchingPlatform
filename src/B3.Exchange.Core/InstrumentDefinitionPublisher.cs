@@ -195,22 +195,22 @@ public sealed class InstrumentDefinitionPublisher : IAsyncDisposable
             ExpirationDate = expiry,
             PutOrCallByte = putOrCall switch
             {
-                B3.Exchange.Instruments.PutOrCall.Put => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.PUT,
-                B3.Exchange.Instruments.PutOrCall.Call => (byte)B3.Umdf.Mbo.Sbe.V16.PutOrCall.CALL,
+                B3.Exchange.Instruments.PutOrCall.Put => (byte)B3.Umdf.Mbo.Sbe.V17.PutOrCall.PUT,
+                B3.Exchange.Instruments.PutOrCall.Call => (byte)B3.Umdf.Mbo.Sbe.V17.PutOrCall.CALL,
                 _ => throw new InvalidOperationException($"Unsupported PutOrCall value: {putOrCall}"),
             },
             ExerciseStyleByte = exerciseStyle switch
             {
-                B3.Exchange.Instruments.ExerciseStyle.European => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.EUROPEAN,
-                B3.Exchange.Instruments.ExerciseStyle.American => (byte)B3.Umdf.Mbo.Sbe.V16.ExerciseStyle.AMERICAN,
+                B3.Exchange.Instruments.ExerciseStyle.European => (byte)B3.Umdf.Mbo.Sbe.V17.ExerciseStyle.EUROPEAN,
+                B3.Exchange.Instruments.ExerciseStyle.American => (byte)B3.Umdf.Mbo.Sbe.V17.ExerciseStyle.AMERICAN,
                 _ => throw new InvalidOperationException($"Unsupported ExerciseStyle value: {exerciseStyle}"),
             },
             OptPayoutTypeByte = inst.OptPayoutType switch
             {
                 null => null,
-                B3.Exchange.Instruments.OptPayoutType.Vanilla => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.VANILLA,
-                B3.Exchange.Instruments.OptPayoutType.Capped => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.CAPPED,
-                B3.Exchange.Instruments.OptPayoutType.Binary => (byte)B3.Umdf.Mbo.Sbe.V16.OptPayoutType.BINARY,
+                B3.Exchange.Instruments.OptPayoutType.Vanilla => (byte)B3.Umdf.Mbo.Sbe.V17.OptPayoutType.VANILLA,
+                B3.Exchange.Instruments.OptPayoutType.Capped => (byte)B3.Umdf.Mbo.Sbe.V17.OptPayoutType.CAPPED,
+                B3.Exchange.Instruments.OptPayoutType.Binary => (byte)B3.Umdf.Mbo.Sbe.V17.OptPayoutType.BINARY,
                 _ => throw new InvalidOperationException($"Unsupported OptPayoutType value: {inst.OptPayoutType}"),
             },
             UnderlyingSecurityId = underlyingId,

@@ -1,4 +1,4 @@
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 
 namespace B3.Umdf.WireEncoder;
 

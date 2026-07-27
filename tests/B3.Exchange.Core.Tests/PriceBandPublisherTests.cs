@@ -1,7 +1,7 @@
 using B3.Exchange.Core;
 using B3.Exchange.Instruments;
 using B3.Exchange.Matching;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Core.Tests;

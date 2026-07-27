@@ -164,16 +164,16 @@ public static class UmdfFrameBuilder
     }
 
     /// <summary>
-    /// Writes a <c>SecurityStatus_3</c> frame for an instrument halt
-    /// (<c>securityTradingEvent</c> = <see cref="SecurityTradingEventHalt"/>).
-    /// Used for <c>OnInstrumentHalted</c>.
+    /// Writes the legacy <c>SecurityStatus_3</c> halt marker followed by the
+    /// authoritative V17 <c>InstrumentStatus_58</c> halt transition.
     /// </summary>
     public static void WriteInstrumentHalted(
         IUmdfFrameSink sink,
         long securityId,
         byte securityTradingStatus,
         uint rptSeq,
-        ulong transactTimeNanos)
+        ulong transactTimeNanos,
+        byte haltReason = (byte)B3.Umdf.Mbo.Sbe.V17.HaltReason.REGULATORY_HALT)
     {
         const int size = WireOffsets.FramingHeaderSize
             + WireOffsets.SbeMessageHeaderSize
@@ -190,12 +190,20 @@ public static class UmdfFrameBuilder
             transactTimeNanos: transactTimeNanos,
             rptSeq: rptSeq);
         sink.Commit(n);
+        WriteInstrumentStatus(
+            sink,
+            securityId,
+            securityTradingStatus,
+            UmdfWireEncoder.AdministrativeHaltStateHalted,
+            UmdfWireEncoder.AdministrativeTransitionHalt,
+            haltReason,
+            transactTimeNanos,
+            rptSeq);
     }
 
     /// <summary>
-    /// Writes a <c>SecurityStatus_3</c> frame for an instrument resume
-    /// (<c>securityTradingEvent</c> = <see cref="SecurityTradingEventResume"/>).
-    /// Used for <c>OnInstrumentResumed</c>.
+    /// Writes the legacy <c>SecurityStatus_3</c> resume marker followed by the
+    /// authoritative V17 <c>InstrumentStatus_58</c> resume transition.
     /// </summary>
     public static void WriteInstrumentResumed(
         IUmdfFrameSink sink,
@@ -219,6 +227,45 @@ public static class UmdfFrameBuilder
             transactTimeNanos: transactTimeNanos,
             rptSeq: rptSeq);
         sink.Commit(n);
+        WriteInstrumentStatus(
+            sink,
+            securityId,
+            securityTradingStatus,
+            UmdfWireEncoder.AdministrativeHaltStateActive,
+            UmdfWireEncoder.AdministrativeTransitionResume,
+            UmdfWireEncoder.OptionalEnumNull,
+            transactTimeNanos,
+            rptSeq);
+    }
+
+    /// <summary>Writes one authoritative <c>InstrumentStatus_58</c> frame.</summary>
+    public static void WriteInstrumentStatus(
+        IUmdfFrameSink sink,
+        long securityId,
+        byte securityTradingStatus,
+        byte administrativeHaltState,
+        byte administrativeTransitionKind,
+        byte haltReason,
+        ulong transactTimeNanos,
+        uint rptSeq,
+        byte matchEventIndicator = 0)
+    {
+        const int size = WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.InstrumentStatusBlockLength;
+        var dst = sink.Reserve(size);
+        int n = UmdfWireEncoder.WriteInstrumentStatusFrame(
+            dst,
+            securityId,
+            UmdfWireEncoder.TradingSessionRegular,
+            securityTradingStatus,
+            administrativeHaltState,
+            administrativeTransitionKind,
+            haltReason,
+            transactTimeNanos,
+            rptSeq,
+            matchEventIndicator);
+        sink.Commit(n);
     }
 
     /// <summary>
@@ -231,8 +278,8 @@ public static class UmdfFrameBuilder
         long highLimitPriceMantissa,
         ulong mdEntryTimestampNanos,
         uint rptSeq,
-        byte priceBandType = (byte)B3.Umdf.Mbo.Sbe.V16.PriceBandType.HARD_LIMIT,
-        byte priceLimitType = (byte)B3.Umdf.Mbo.Sbe.V16.PriceLimitType.PRICE_UNIT,
+        byte priceBandType = (byte)B3.Umdf.Mbo.Sbe.V17.PriceBandType.HARD_LIMIT,
+        byte priceLimitType = (byte)B3.Umdf.Mbo.Sbe.V17.PriceLimitType.PRICE_UNIT,
         long tradingReferencePriceMantissa = long.MinValue,
         byte priceBandMidpointPriceType = 255)
     {

@@ -1,4 +1,5 @@
 using B3.Exchange.Matching;
+using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Core;
 
@@ -25,6 +26,13 @@ public interface ISnapshotBookSource
     /// B3 §7.4 (i.e. <c>lastRptSeq</c> absent).
     /// </summary>
     uint GetCurrentRptSeq(long securityId);
+
+    /// <summary>
+    /// Current trading phase plus administrative halt state captured for
+    /// <c>InstrumentStatus_58</c> snapshot publication.
+    /// </summary>
+    InstrumentStatusSnapshot GetInstrumentStatus(long securityId)
+        => InstrumentStatusSnapshot.Active((byte)TradingPhase.Open);
 
     /// <summary>
     /// Iterates the resting orders for <paramref name="securityId"/> on the
@@ -54,6 +62,14 @@ public sealed class MatchingEngineSnapshotSource : ISnapshotBookSource
     }
 
     public uint GetCurrentRptSeq(long securityId) => _engine.GetCurrentRptSeq(securityId);
+
+    public InstrumentStatusSnapshot GetInstrumentStatus(long securityId)
+    {
+        byte phase = (byte)_engine.GetTradingPhase(securityId);
+        return _engine.IsHalted(securityId, out var halt)
+            ? new InstrumentStatusSnapshot(phase, true, (byte)halt.Reason, halt.HaltedAtNanos)
+            : InstrumentStatusSnapshot.Active(phase);
+    }
 
     public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
         => _engine.EnumerateBook(securityId, side);

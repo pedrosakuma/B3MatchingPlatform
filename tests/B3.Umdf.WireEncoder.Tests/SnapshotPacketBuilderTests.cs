@@ -1,5 +1,5 @@
 using System.Runtime.InteropServices;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Umdf.WireEncoder.Tests;
@@ -14,6 +14,19 @@ public class SnapshotPacketBuilderTests
     private const int FrameOffset = WireOffsets.PacketHeaderSize
                                   + WireOffsets.FramingHeaderSize
                                   + WireOffsets.SbeMessageHeaderSize;
+    private const int SnapshotHeaderFrameSize = WireOffsets.FramingHeaderSize
+                                              + WireOffsets.SbeMessageHeaderSize
+                                              + WireOffsets.SnapHeaderBlockLength;
+    private const int InstrumentStatusFrameSize = WireOffsets.FramingHeaderSize
+                                                + WireOffsets.SbeMessageHeaderSize
+                                                + WireOffsets.InstrumentStatusBlockLength;
+    private const int InstrumentStatusBodyOffset = WireOffsets.PacketHeaderSize
+                                                 + SnapshotHeaderFrameSize
+                                                 + WireOffsets.FramingHeaderSize
+                                                 + WireOffsets.SbeMessageHeaderSize;
+    private const int FirstOrdersFrameOffset = WireOffsets.PacketHeaderSize
+                                             + SnapshotHeaderFrameSize
+                                             + InstrumentStatusFrameSize;
 
     private static UmdfWireEncoder.SnapshotEntry Bid(long px, long sz, long oid)
         => new(px, sz, (ulong)oid * 1000UL, oid, UmdfWireEncoder.MdEntryTypeBid);
@@ -54,8 +67,20 @@ public class SnapshotPacketBuilderTests
         Assert.Equal(0u, rdr.Data.TotNumReports);
         Assert.Equal(0u, rdr.Data.TotNumBids);
         Assert.Equal(0u, rdr.Data.TotNumOffers);
+        Assert.Equal((ushort)1, rdr.Data.TotNumStats);
         Assert.Null(rdr.Data.LastRptSeq);
         Assert.Equal((ushort)7, rdr.Data.LastSequenceVersion);
+
+        Assert.True(InstrumentStatus_58Data.TryParse(
+            sink.Packets[0].AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
+            out var status));
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), status.Data.TradingSessionID));
+        Assert.Equal(AdministrativeHaltState.ACTIVE, status.Data.AdministrativeHaltState);
+        Assert.Null(status.Data.AdministrativeTransitionKind);
+        Assert.Null(status.Data.HaltReason);
+        Assert.True(status.Data.MatchEventIndicator.IsRecoveryMsg());
+        Assert.Null(status.Data.RptSeq);
     }
 
     [Fact]
@@ -80,11 +105,12 @@ public class SnapshotPacketBuilderTests
         Assert.Equal(3u, hdr.Data.TotNumReports);
         Assert.Equal(2u, hdr.Data.TotNumBids);
         Assert.Equal(1u, hdr.Data.TotNumOffers);
+        Assert.Equal((ushort)1, hdr.Data.TotNumStats);
         Assert.Equal(99u, hdr.Data.LastRptSeq);
         Assert.Equal((ushort)8, hdr.Data.LastSequenceVersion);
 
         // After the header frame, the same packet must contain the Orders_71 frame.
-        int after = FrameOffset + WireOffsets.SnapHeaderBlockLength;
+        int after = FirstOrdersFrameOffset;
         ushort msgLen = MemoryMarshal.Read<ushort>(pkt.AsSpan(after, 2));
         int ordersFrameLen = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
                            + WireOffsets.SnapOrdersHeaderBlockLength
@@ -143,7 +169,7 @@ public class SnapshotPacketBuilderTests
         {
             var pkt = sink.Packets[i];
             int p = WireOffsets.PacketHeaderSize;
-            if (i == 0) p += WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
+            if (i == 0) p += SnapshotHeaderFrameSize + InstrumentStatusFrameSize;
             while (p < pkt.Length)
             {
                 ushort frameLen = MemoryMarshal.Read<ushort>(pkt.AsSpan(p, 2));
@@ -159,20 +185,16 @@ public class SnapshotPacketBuilderTests
     }
 
     [Fact]
-    public void BufferTooSmallForSingleEntry_Throws()
+    public void BufferTooSmallForHeaderAndInstrumentStatus_Throws()
     {
         var sink = new CapturingHandler();
-        // Buffer must fit packet 1 (PacketHeader 16 + Header_30 frame 46 = 62)
-        // but be too small to add a 1-entry Orders_71 frame (16 + 65 = 81).
-        // Use 70 bytes so packet 1 carries header only and packet 2 has
-        // PacketHeader (16) + 54 bytes free, less than the 65 bytes a single
-        // entry requires → builder must throw.
-        var buf = new byte[70];
+        var buf = new byte[WireOffsets.PacketHeaderSize
+            + SnapshotHeaderFrameSize + InstrumentStatusFrameSize - 1];
 
-        var bids = new[] { Bid(1L, 1L, 1) };
         Assert.Throws<ArgumentException>(() =>
             SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, null, 1,
-                bids, ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket));
+                ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
+                ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket));
     }
 
     [Fact]
@@ -199,7 +221,7 @@ public class SnapshotPacketBuilderTests
         ushort firstFrameLen = MemoryMarshal.Read<ushort>(pkt.AsSpan(p, 2));
         Assert.Equal((ushort)(WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SnapHeaderBlockLength), firstFrameLen);
-        p += firstFrameLen;
+        p += firstFrameLen + InstrumentStatusFrameSize;
 
         var chunkSizes = new List<int>();
         while (p < pkt.Length)
@@ -212,6 +234,38 @@ public class SnapshotPacketBuilderTests
             p += frameLen;
         }
         Assert.Equal(new[] { 3, 3, 3, 1 }, chunkSizes);
+    }
+
+    [Fact]
+    public void HaltedSnapshot_CarriesCurrentReasonWithoutTransitionMarker()
+    {
+        var sink = new CapturingHandler();
+        var buf = new byte[SnapshotPacketBuilder.DefaultPacketBufferSize];
+        var instrumentStatus = new InstrumentStatusSnapshot(
+            SecurityTradingStatus: (byte)SecurityTradingStatus.RESERVED,
+            IsHalted: true,
+            HaltReason: (byte)HaltReason.PENDING_DISCLOSURE,
+            StateChangedNanos: 123_456UL);
+
+        SnapshotPacketBuilder.WriteSnapshot(
+            buf, 84, 3, 10, 999UL, 7L, lastRptSeq: 12u, incrementalSequenceVersion: 5,
+            ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
+            ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
+            instrumentStatus,
+            sink.OnPacket);
+
+        Assert.True(InstrumentStatus_58Data.TryParse(
+            sink.Packets[0].AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
+            out var status));
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), status.Data.TradingSessionID));
+        Assert.Equal(SecurityTradingStatus.RESERVED, status.Data.SecurityTradingStatus);
+        Assert.Equal(AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
+        Assert.Null(status.Data.AdministrativeTransitionKind);
+        Assert.Equal(HaltReason.PENDING_DISCLOSURE, status.Data.HaltReason);
+        Assert.Equal(123_456UL, status.Data.TransactTime.Time);
+        Assert.True(status.Data.MatchEventIndicator.IsRecoveryMsg());
+        Assert.Null(status.Data.RptSeq);
     }
 
     [Fact]

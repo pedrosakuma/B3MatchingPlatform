@@ -6,7 +6,7 @@ using B3.Exchange.Gateway;
 using B3.Exchange.Core;
 using B3.Umdf.WireEncoder;
 using B3.Exchange.TestSupport;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -101,7 +101,7 @@ public class ExchangeHostSnapshotE2ETests
         Assert.True(pkt is not null, "snapshot packet not received");
 
         // PacketHeader sanity.
-        ref readonly var hdr = ref MemoryMarshal.AsRef<B3.Umdf.Mbo.Sbe.V16.PacketHeader>(pkt.AsSpan(0, WireOffsets.PacketHeaderSize));
+        ref readonly var hdr = ref MemoryMarshal.AsRef<B3.Umdf.Mbo.Sbe.V17.PacketHeader>(pkt.AsSpan(0, WireOffsets.PacketHeaderSize));
         Assert.Equal((byte)84, hdr.ChannelNumber);
         Assert.Equal((ushort)1, hdr.SequenceVersion);
         Assert.Equal(1u, hdr.SequenceNumber); // first snap packet on this channel
@@ -110,18 +110,21 @@ public class ExchangeHostSnapshotE2ETests
         // and a non-null LastRptSeq (because the matching engine has emitted
         // 2 OrderAccepted incremental events → RptSeq ≥ 2).
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(Petr, (long)(ulong)snapHdr.Data.SecurityID);
         Assert.Equal(2u, snapHdr.Data.TotNumReports);
         Assert.Equal(2u, snapHdr.Data.TotNumBids);
         Assert.Equal(0u, snapHdr.Data.TotNumOffers);
+        Assert.Equal((ushort)1, snapHdr.Data.TotNumStats);
         Assert.NotNull(snapHdr.Data.LastRptSeq);
         Assert.True(snapHdr.Data.LastRptSeq >= 2u);
         Assert.Equal((ushort)1, snapHdr.Data.LastSequenceVersion);
 
         // Same packet must contain an Orders_71 frame with NumInGroup == 2.
-        int after = frameOff + WireOffsets.SnapHeaderBlockLength;
+        int after = frameOff + WireOffsets.SnapHeaderBlockLength
+            + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.InstrumentStatusBlockLength;
         int groupNumInGroupOff = after
             + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SnapOrdersHeaderBlockLength + 2;
@@ -180,7 +183,7 @@ public class ExchangeHostSnapshotE2ETests
 
         Assert.True(pkt is not null, "snapshot packet not received");
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.TryParse(
+        Assert.True(B3.Umdf.Mbo.Sbe.V17.SnapshotFullRefresh_Header_30Data.TryParse(
             pkt.AsSpan(frameOff, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(0u, snapHdr.Data.TotNumReports);
         Assert.Null(snapHdr.Data.LastRptSeq); // illiquid per B3 §7.4
