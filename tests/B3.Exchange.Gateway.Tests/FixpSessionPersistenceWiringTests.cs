@@ -1,5 +1,7 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
 using B3.Exchange.Gateway;
 using B3.Exchange.Gateway.Persistence;
@@ -183,6 +185,75 @@ public sealed class FixpSessionPersistenceWiringTests
             client.Close();
             listener.Stop();
         }
+    }
+
+    [Fact]
+    public async Task MassActionReportId_ResumesFromDurableOutboundSequence()
+    {
+        var journal = new FakeJournal();
+        var state = new FakeStatePersister();
+        FixpSessionStateSnapshot persisted;
+        ulong firstReportId;
+
+        await using (var first = new FixpSession(
+            connectionId: 1,
+            enteringFirm: 999,
+            sessionId: 4242,
+            stream: new MemoryStream(),
+            sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance,
+            outboundJournal: journal,
+            statePersister: state))
+        {
+            first.ApplyTransition(FixpEvent.Negotiate);
+            first.ApplyTransition(FixpEvent.Establish);
+            var result = first.WriteOrderMassActionReport(
+                clOrdIdValue: 7001,
+                massActionResponse: OrderMassActionReportEncoder.MassActionResponseAccepted,
+                massActionRejectReason: null,
+                side: null,
+                securityId: 0,
+                transactTimeNanos: 1);
+            Assert.True(result.IsCommitted);
+
+            var firstEntry = Assert.Single(journal.ReadRange(4242, 1, 1));
+            firstReportId = BinaryPrimitives.ReadUInt64LittleEndian(
+                firstEntry.Frame.AsSpan(
+                    EntryPointFrameReader.WireHeaderSize + 28, 8));
+            Assert.Equal((4242UL << 32) | firstEntry.Seq, firstReportId);
+
+            first.SaveStateSnapshotSafe();
+            persisted = Assert.IsType<FixpSessionStateSnapshot>(state.Load(4242));
+        }
+
+        await using var restarted = new FixpSession(
+            connectionId: 2,
+            enteringFirm: 0,
+            sessionId: 0,
+            stream: new MemoryStream(),
+            sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance,
+            outboundJournal: journal,
+            statePersister: state,
+            persistedState: persisted);
+        restarted.ApplyTransition(FixpEvent.Negotiate);
+        restarted.ApplyTransition(FixpEvent.Establish);
+
+        var restartedResult = restarted.WriteOrderMassActionReport(
+            clOrdIdValue: 7002,
+            massActionResponse: OrderMassActionReportEncoder.MassActionResponseAccepted,
+            massActionRejectReason: null,
+            side: null,
+            securityId: 0,
+            transactTimeNanos: 2);
+        Assert.True(restartedResult.IsCommitted);
+
+        var restartedEntry = Assert.Single(journal.ReadRange(4242, 2, 1));
+        ulong restartedReportId = BinaryPrimitives.ReadUInt64LittleEndian(
+            restartedEntry.Frame.AsSpan(
+                EntryPointFrameReader.WireHeaderSize + 28, 8));
+        Assert.Equal((4242UL << 32) | restartedEntry.Seq, restartedReportId);
+        Assert.True(restartedReportId > firstReportId);
     }
 
     [Fact]

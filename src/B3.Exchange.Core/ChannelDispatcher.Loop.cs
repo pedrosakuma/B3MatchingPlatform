@@ -118,6 +118,8 @@ public sealed partial class ChannelDispatcher
             item.ExpireDayCompletion?.TrySetException(
                 new InvalidOperationException(
                     $"channel {ChannelNumber} WAL-halted; ExpireDay rejected"));
+            if (item.Kind == WorkKind.MassCancel)
+                CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
             return;
         }
 
@@ -245,10 +247,14 @@ public sealed partial class ChannelDispatcher
             WorkKind.MassCancel => item.MassCancel?.Command.EnteredAtNanos ?? ulong.MaxValue,
             _ => ulong.MaxValue,
         };
+        _trackMassCancelReports = item.Kind == WorkKind.MassCancel
+            && item.MassCancelCompletion is not null;
+        _currentMassCancelReportsCommitted = true;
+        _currentMassCancelReportCompletions?.Clear();
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
-        // observes it. Only New/Cancel/Replace are durable today;
+        // observes it. New/Cancel/Replace/MassCancel are WAL-durable;
         // operator commands force-snapshot post-flush so the
         // resulting state is captured directly. _lastAppliedSeq is
         // advanced by WalAppendIfEnabled regardless, including in
@@ -257,6 +263,7 @@ public sealed partial class ChannelDispatcher
         // returns false on the first append failure — the command
         // must NOT reach the engine (state would diverge from the
         // WAL on next replay). We bail out of ProcessOne entirely.
+        MassCancelOutcome? pendingMassCancelOutcome = null;
         long engineStart = System.Diagnostics.Stopwatch.GetTimestamp();
         // Issue #175: open engine.process as a child of the dispatch.enqueue
         // span captured at enqueue time. The dispatch loop crosses thread
@@ -282,11 +289,13 @@ public sealed partial class ChannelDispatcher
             _reservedOpenOrderFirm = item.Firm;
             _reservedOpenOrderSlots = requiredOpenOrderSlots;
 
-            if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace)
+            if (item.Kind is WorkKind.New or WorkKind.Cancel or WorkKind.Replace or WorkKind.MassCancel)
             {
                 if (!WalAppendIfEnabled(in item))
                 {
                     _metrics?.IncWalHaltReject();
+                    if (item.Kind == WorkKind.MassCancel)
+                        CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
                     return;
                 }
             }
@@ -499,8 +508,21 @@ public sealed partial class ChannelDispatcher
                         // routed back to the originating session by the
                         // Gateway router.
                         var mc = item.MassCancel!;
-                        if (mc.OrderIds.Count > 0)
-                            _engine.MassCancel(mc.OrderIds, mc.Command);
+                        int affected;
+                        try
+                        {
+                            affected = mc.OrderIds.Count > 0
+                                ? _engine.MassCancel(mc.OrderIds, mc.Command)
+                                : 0;
+                        }
+                        catch
+                        {
+                            CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+                            throw;
+                        }
+                        pendingMassCancelOutcome = _currentMassCancelReportsCommitted
+                            ? MassCancelOutcome.Completed(affected)
+                            : MassCancelOutcome.SystemBusy;
                         break;
                     }
                 case WorkKind.DecodeError:
@@ -559,11 +581,29 @@ public sealed partial class ChannelDispatcher
                 }
                 if (_metrics != null)
                     _metrics.OutboundEmit.ObserveTicks(System.Diagnostics.Stopwatch.GetTimestamp() - flushStart);
-                // Issue #260: persist post-flush so any consumer-visible
-                // event corresponds to a durable snapshot on disk before
-                // the next command is observed. Best-effort: failures are
-                // logged and swallowed by the helper.
-                OnAfterCommandFlushed();
+                if (item.Kind == WorkKind.MassCancel)
+                {
+                    var terminalOutcome = pendingMassCancelOutcome
+                        ?? MassCancelOutcome.SystemBusy;
+                    var durability = BeginMassCancelDurability(_lastAppliedSeq);
+                    var deferred = _currentMassCancelReportCompletions is { Count: > 0 } reports
+                        ? reports.ToArray()
+                        : Array.Empty<Task<OrderedStreamWriteResult>>();
+                    ScheduleMassCancelTerminalCompletion(
+                        durability,
+                        deferred,
+                        item.MassCancelCompletion,
+                        terminalOutcome,
+                        reportFailureAlreadyObserved: !_currentMassCancelReportsCommitted);
+                }
+                else
+                {
+                    // Issue #260: persist post-flush so any consumer-visible
+                    // event corresponds to a durable snapshot on disk before
+                    // the next command is observed. Best-effort: failures are
+                    // logged and swallowed by the helper.
+                    OnAfterCommandFlushed();
+                }
             }
             else
             {
@@ -576,6 +616,9 @@ public sealed partial class ChannelDispatcher
             _currentOrigClOrdId = 0;
             _currentWorkKind = null;
             _currentReceivedTimeNanos = ulong.MaxValue;
+            _trackMassCancelReports = false;
+            _currentMassCancelReportsCommitted = true;
+            _currentMassCancelReportCompletions?.Clear();
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
             // Issue #484: flush the last buffered IOC aggressor ER with
@@ -660,7 +703,7 @@ public sealed partial class ChannelDispatcher
             FailWorkItemCompletion(in pending, error);
     }
 
-    private static void FailWorkItemCompletion(in WorkItem item, Exception error)
+    private void FailWorkItemCompletion(in WorkItem item, Exception error)
     {
         item.PhaseCompletion?.TrySetException(error);
         item.HaltCompletion?.TrySetException(error);
@@ -671,6 +714,114 @@ public sealed partial class ChannelDispatcher
         item.ExpireGtdCompletion?.TrySetException(error);
         item.RestateGtCompletion?.TrySetException(error);
         item.ExpireDayCompletion?.TrySetException(error);
+        CompleteMassCancel(item.MassCancelCompletion, MassCancelOutcome.SystemBusy);
+    }
+
+    private void CompleteMassCancel(Action<MassCancelOutcome>? completion, MassCancelOutcome outcome)
+    {
+        if (completion is null) return;
+        try
+        {
+            completion(outcome);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel completion callback failed",
+                ChannelNumber);
+        }
+    }
+
+    private void ScheduleMassCancelTerminalCompletion(
+        Task<bool> durability,
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
+    {
+        var prior = _massCancelTerminalTail;
+        if (prior.IsCompletedSuccessfully
+            && durability.IsCompletedSuccessfully
+            && deferred.All(static task => task.IsCompletedSuccessfully))
+        {
+            bool deferredFailure = deferred.Any(
+                static task => !task.Result.IsCommitted);
+            if (!durability.Result || deferredFailure)
+            {
+                outcome = MassCancelOutcome.SystemBusy;
+            }
+            if (deferredFailure && !reportFailureAlreadyObserved)
+                _metrics?.IncMassCancelReportFailure();
+            CompleteMassCancel(completion, outcome);
+            return;
+        }
+
+        _massCancelTerminalTail = CompleteMassCancelTerminalAsync(
+            prior,
+            durability,
+            deferred,
+            completion,
+            outcome,
+            reportFailureAlreadyObserved);
+    }
+
+    private async Task CompleteMassCancelTerminalAsync(
+        Task prior,
+        Task<bool> durability,
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome,
+        bool reportFailureAlreadyObserved)
+    {
+        try
+        {
+            await prior.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: prior mass-cancel terminal completion failed",
+                ChannelNumber);
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        try
+        {
+            bool durable = await durability.ConfigureAwait(false);
+            if (!durable)
+                outcome = MassCancelOutcome.SystemBusy;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel durability completion failed",
+                ChannelNumber);
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+
+        if (deferred.Length > 0)
+        {
+            try
+            {
+                var results = await Task.WhenAll(deferred).ConfigureAwait(false);
+                if (results.Any(static result => !result.IsCommitted))
+                {
+                    if (!reportFailureAlreadyObserved)
+                        _metrics?.IncMassCancelReportFailure();
+                    outcome = MassCancelOutcome.SystemBusy;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!reportFailureAlreadyObserved)
+                    _metrics?.IncMassCancelReportFailure();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: deferred passive cancellation ExecutionReport commitment failed during solicited mass-cancel",
+                    ChannelNumber);
+                outcome = MassCancelOutcome.SystemBusy;
+            }
+        }
+        CompleteMassCancel(completion, outcome);
     }
 
     /// <summary>

@@ -13,14 +13,13 @@ namespace B3.Exchange.Core;
 /// <see cref="ChannelStateSnapshot.LastAppliedSeq"/>, restoring the
 /// channel to the most-recently-acknowledged command.
 ///
-/// <para>Only the state-mutating high-frequency command kinds are
+/// <para>The state-mutating high-frequency command kinds are
 /// covered (<see cref="WalRecordKind.NewOrder"/>,
 /// <see cref="WalRecordKind.Cancel"/>,
-/// <see cref="WalRecordKind.Replace"/>). Operator commands always
+/// <see cref="WalRecordKind.Replace"/>, and
+/// <see cref="WalRecordKind.MassCancel"/>). Operator commands always
 /// force-snapshot post-flush so their effect survives a crash via the
-/// snapshot itself; <c>Cross</c> and <c>MassCancel</c> are deliberately
-/// out of scope for the v1 WAL — operators that need them on the
-/// recovery path must keep the synchronous snapshot persister enabled.</para>
+/// snapshot itself; <c>Cross</c> remains outside the WAL contract.</para>
 /// </summary>
 public sealed record WalRecord(
     long Seq,
@@ -31,7 +30,9 @@ public sealed record WalRecord(
     ulong OrigClOrdId,
     NewOrderCommand? NewOrder,
     CancelOrderCommand? Cancel,
-    ReplaceOrderCommand? Replace);
+    ReplaceOrderCommand? Replace,
+    MassCancelCommand? MassCancel = null,
+    long[]? MassCancelOrderIds = null);
 
 /// <summary>
 /// Discriminator for <see cref="WalRecord"/>. Stable string-encoded
@@ -43,6 +44,7 @@ public enum WalRecordKind
     NewOrder,
     Cancel,
     Replace,
+    MassCancel,
 }
 
 /// <summary>

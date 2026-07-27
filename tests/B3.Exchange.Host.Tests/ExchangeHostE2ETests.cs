@@ -381,19 +381,18 @@ public class ExchangeHostE2ETests
         // Mass-cancel all orders on this security (no Side filter).
         await stream.WriteAsync(BuildOrderMassActionRequest(clOrdId: 7100, secId: Petr));
 
-        // Expect: OrderMassActionReport(ACCEPTED) first, then 2 ER_Cancel
-        // frames (one per resting order) — order between the two cancels
-        // is FIFO-by-orderId and not part of the assertion.
+        // The per-order cancellation ERs must precede the terminal accepted
+        // report on the ordered FIXP business stream.
+        var cancel1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel1.TemplateId);
+        var cancel2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel2.TemplateId);
+
         var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
         Assert.Equal((byte)'1', report.Body[44]); // MassActionResponse = ACCEPTED
         ulong reportClOrd = BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8));
         Assert.Equal(7100UL, reportClOrd);
-
-        var cancel1 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
-        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel1.TemplateId);
-        var cancel2 = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
-        Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel2.TemplateId);
     }
 
     [Fact]
@@ -422,14 +421,42 @@ public class ExchangeHostE2ETests
         // Mass-cancel only BUY side.
         await stream.WriteAsync(BuildOrderMassActionRequest(clOrdId: 8100, secId: Petr, side: '1'));
 
-        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
-        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
-        Assert.Equal((byte)'1', report.Body[48]); // Side filter echoed = Buy
-
         var cancel = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel.TemplateId);
         // Verify it cancelled the BUY (ER_Cancel.Side @ body[18] = '1')
         Assert.Equal((byte)'1', cancel.Body[18]);
+
+        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal((byte)'1', report.Body[48]); // Side filter echoed = Buy
+    }
+
+    [Fact]
+    public async Task OrderMassActionRequest_ZeroMatchingOrders_EmitsTerminalAcceptedReport()
+    {
+        var (cfg, sink) = BuildConfig();
+        await using var host = new ExchangeHost(cfg, packetSinkFactory: _ => sink);
+        await host.StartAsync();
+        var ep = host.TcpEndpoint!;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(ep.Address, ep.Port);
+        var stream = client.GetStream();
+
+        // No orders have been submitted. The first business response must
+        // therefore be the terminal report, with no cancellation ER before it.
+        await stream.WriteAsync(BuildOrderMassActionRequest(clOrdId: 9100, secId: Petr));
+
+        var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
+        Assert.Equal(6, report.Version);
+        Assert.Equal((byte)'1', report.Body[44]); // MassActionResponse = ACCEPTED
+        Assert.Equal(9100UL,
+            BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8)));
+        // B3 schema 8.4.2 template 702 has no TotalAffectedOrders field.
+        // HostRouterTests proves the terminal outcome count is zero; on wire,
+        // the terminal ACCEPTED itself is the supported zero-match contract.
+        Assert.Equal(0, report.Body[^1]); // empty Text varData
     }
 
     [Fact]
@@ -452,6 +479,8 @@ public class ExchangeHostE2ETests
         var report = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
         Assert.Equal((byte)'1', report.Body[44]); // MassActionResponse = ACCEPTED
+        Assert.Equal(9100UL,
+            BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8)));
     }
 
     private static byte[] BuildOrderCancelRequest(ulong clOrdId, long secId, ulong orderId, ulong origClOrdId, char side)

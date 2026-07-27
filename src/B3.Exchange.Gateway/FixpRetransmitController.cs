@@ -25,7 +25,8 @@ internal sealed class FixpRetransmitController
     private readonly object _outboundLock;
     private readonly int _sendQueueCapacity;
     private readonly Func<bool> _isOpen;
-    private readonly Func<uint> _peekNextMsgSeqNum;
+    private readonly Func<uint?> _tryPeekNextMsgSeqNum;
+    private readonly Action _onSequenceExhausted;
     private readonly Func<FixpEvent, FixpAction> _applyTransition;
     private readonly Func<FixpState> _getState;
     private readonly Action<uint>? _confirmPeerAck;
@@ -44,7 +45,8 @@ internal sealed class FixpRetransmitController
         object outboundLock,
         int sendQueueCapacity,
         Func<bool> isOpen,
-        Func<uint> peekNextMsgSeqNum,
+        Func<uint?> tryPeekNextMsgSeqNum,
+        Action onSequenceExhausted,
         Func<FixpEvent, FixpAction> applyTransition,
         Func<FixpState> getState,
         Action<uint>? confirmPeerAck,
@@ -57,7 +59,8 @@ internal sealed class FixpRetransmitController
         _outboundLock = outboundLock;
         _sendQueueCapacity = sendQueueCapacity;
         _isOpen = isOpen;
-        _peekNextMsgSeqNum = peekNextMsgSeqNum;
+        _tryPeekNextMsgSeqNum = tryPeekNextMsgSeqNum;
+        _onSequenceExhausted = onSequenceExhausted;
         _applyTransition = applyTransition;
         _getState = getState;
         _confirmPeerAck = confirmPeerAck;
@@ -67,7 +70,7 @@ internal sealed class FixpRetransmitController
 
     /// <summary>
     /// Enqueues a FIXP <c>Sequence</c> heartbeat frame announcing
-    /// <see cref="FixpSession.PeekNextMsgSeqNum"/>. Spec §4.5.5: this
+    /// the session's next available business sequence. Spec §4.5.5: this
     /// message announces the *next* MsgSeqNum we intend to send and
     /// does not consume a sequence number itself, so we peek instead
     /// of incrementing — otherwise an idle heartbeat before Establish
@@ -82,11 +85,22 @@ internal sealed class FixpRetransmitController
     {
         if (!_isOpen()) return;
         var frame = new byte[SessionFrameEncoder.SequenceTotal];
+        bool sequenceExhausted = false;
         lock (_outboundLock)
         {
-            SessionFrameEncoder.EncodeSequence(frame, _peekNextMsgSeqNum());
-            _transport().TryEnqueueFrame(frame);
+            uint? nextSeqNo = _tryPeekNextMsgSeqNum();
+            if (nextSeqNo is null)
+            {
+                sequenceExhausted = true;
+            }
+            else
+            {
+                SessionFrameEncoder.EncodeSequence(frame, nextSeqNo.Value);
+                _transport().TryEnqueueFrame(frame);
+            }
         }
+        if (sequenceExhausted)
+            _onSequenceExhausted();
     }
 
     /// <summary>
@@ -107,7 +121,7 @@ internal sealed class FixpRetransmitController
     /// enqueues all replay clones (each carrying the
     /// <c>PossResend</c> bit), and finally enqueues a <c>Sequence</c>
     /// frame whose <c>nextSeqNo</c> is the next live business seq
-    /// (i.e. <see cref="FixpSession.PeekNextMsgSeqNum"/>). The entire
+    /// (i.e. the next available live business sequence). The entire
     /// block is enqueued under <see cref="_outboundLock"/> so live
     /// business writes cannot interleave it on the wire and so the
     /// trailing Sequence's seq matches what the peer will see next.</para>
@@ -166,15 +180,19 @@ internal sealed class FixpRetransmitController
                 EnqueueRetransmitReject(reqTimestamp, code);
                 return;
             }
-            if (fromSeq > 1)
-                _confirmPeerAck?.Invoke(fromSeq - 1);
-
             // Hold the outbound lock for the entire block so (a) no live
             // business frame interleaves on the wire and (b) the
             // trailing Sequence's nextSeqNo matches the next live seq
             // the peer will see (gpt-5.5 critique #1, #2).
             lock (_outboundLock)
             {
+                uint? nextSeqNo = _tryPeekNextMsgSeqNum();
+                if (nextSeqNo is null)
+                {
+                    _onSequenceExhausted();
+                    return;
+                }
+
                 // Backpressure: TcpTransport's bounded send queue can
                 // drop frames if it overflows mid-replay (gpt-5.5 review
                 // #2). Reserve capacity for the FULL block (header +
@@ -189,6 +207,9 @@ internal sealed class FixpRetransmitController
                     return;
                 }
 
+                if (fromSeq > 1)
+                    _confirmPeerAck?.Invoke(fromSeq - 1);
+
                 var headerFrame = new byte[RetransmissionEncoder.RetransmissionTotal];
                 RetransmissionEncoder.EncodeRetransmission(headerFrame,
                     _sessionId(), reqTimestamp,
@@ -199,7 +220,7 @@ internal sealed class FixpRetransmitController
                     transport.TryEnqueueFrame(snap.Frames[i]);
 
                 var trailer = new byte[SessionFrameEncoder.SequenceTotal];
-                SessionFrameEncoder.EncodeSequence(trailer, _peekNextMsgSeqNum());
+                SessionFrameEncoder.EncodeSequence(trailer, nextSeqNo.Value);
                 transport.TryEnqueueFrame(trailer);
             }
         }

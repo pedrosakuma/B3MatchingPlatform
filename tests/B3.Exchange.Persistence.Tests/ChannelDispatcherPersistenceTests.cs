@@ -46,7 +46,7 @@ public class ChannelDispatcherPersistenceTests
         public bool WriteExecutionReportNew(SessionId s, uint f, ulong c, in OrderAcceptedEvent e, ulong r = ulong.MaxValue, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportTrade(SessionId s, in TradeEvent e, bool a, long o, ulong c, long l, long u, DurabilityHandle d = default) => true;
         public bool WriteExecutionReportPassiveTrade(SessionId s, ulong c, long o, in TradeEvent e, long l, long u, DurabilityHandle d = default) => true;
-        public bool WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => true;
+        public OrderedStreamWriteResult WriteExecutionReportPassiveCancel(SessionId s, ulong c, long o, in OrderCanceledEvent e, ulong r, ulong rt = ulong.MaxValue, DurabilityHandle d = default) => OrderedStreamWriteResult.CommittedAndEnqueued;
         public bool WriteExecutionReportModify(SessionId s, long sec, long o, ulong c, ulong oc, Side side, long np, long nq, ulong tt, uint rpt, ulong rt = ulong.MaxValue, DurabilityHandle d = default, InvestorId? iv = null) => true;
         public bool WriteExecutionReportReject(SessionId s, in RejectEvent e, ulong c, DurabilityHandle d = default) => true;
     }
@@ -719,6 +719,44 @@ public class ChannelDispatcherPersistenceTests
         public void Release() => _gate.Set();
     }
 
+    private sealed class BlockFirstFileSavePersister(
+        FileChannelStatePersister inner) : IChannelStatePersister
+    {
+        private readonly ManualResetEventSlim _releaseFirst = new(false);
+        private int _saveCalls;
+
+        public TaskCompletionSource<bool> FirstSaveEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> FirstSaveCompleted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ChannelStateSnapshot? FirstSnapshot { get; private set; }
+
+        public ChannelStateSnapshot? TryLoad(byte channelNumber)
+            => inner.TryLoad(channelNumber);
+
+        public long Save(ChannelStateSnapshot snapshot)
+        {
+            bool first = Interlocked.Increment(ref _saveCalls) == 1;
+            if (first)
+            {
+                FirstSnapshot = snapshot;
+                FirstSaveEntered.TrySetResult(true);
+                _releaseFirst.Wait();
+            }
+            try
+            {
+                return inner.Save(snapshot);
+            }
+            finally
+            {
+                if (first)
+                    FirstSaveCompleted.TrySetResult(true);
+            }
+        }
+
+        public void ReleaseFirstSave() => _releaseFirst.Set();
+    }
+
     private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -808,6 +846,77 @@ public class ChannelDispatcherPersistenceTests
         // The final persisted snapshot must contain all 3 orders
         // (last-write-wins semantics).
         Assert.Equal(3, blocking.Last!.Engine.Books.Single().Orders.Count);
+    }
+
+    [Fact]
+    public async Task AsyncOlderSnapshotCompletingAfterTerminalMassCancel_CannotResurrectOrders()
+    {
+        var root = Path.Combine(AppContext.BaseDirectory, "test-artifacts",
+            $"mass-cancel-snapshot-fence-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var filePersister = new FileChannelStatePersister(
+            root, NullLogger<FileChannelStatePersister>.Instance);
+        var blocking = new BlockFirstFileSavePersister(filePersister);
+        var live = BuildDispatcher(
+            blocking, out _, useAsyncSnapshotWriter: true);
+        ChannelDispatcher? recovered = null;
+        try
+        {
+            live.Start();
+            var session = new SessionId("80804");
+            Assert.True(EnqueueOrder(live, session, "CL-1", 0xD0, 8000UL));
+
+            await blocking.FirstSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Single(blocking.FirstSnapshot!.Engine.Books.Single().Orders);
+            Assert.True(await WaitForAsync(
+                () => live.TryResolveByClOrdId(700, 0xD0, out _, out _),
+                TimeSpan.FromSeconds(5)));
+            Assert.True(live.TryResolveByClOrdId(
+                700, 0xD0, out var orderId, out _));
+
+            var terminal = new TaskCompletionSource<MassCancelOutcome>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(live.EnqueueResolvedMassCancel(
+                [orderId], session, enteringFirm: 700,
+                new MassCancelCommand(Sec, null, EnteredAtNanos: 8001UL),
+                outcome => terminal.TrySetResult(outcome)));
+
+            var outcome = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(outcome.Succeeded);
+            Assert.False(live.TryResolveByClOrdId(700, 0xD0, out _, out _));
+
+            var terminalSnapshot = new FileChannelStatePersister(
+                root, NullLogger<FileChannelStatePersister>.Instance).TryLoad(84);
+            Assert.NotNull(terminalSnapshot);
+            Assert.Empty(terminalSnapshot!.Engine.Books.Single().Orders);
+            Assert.True(terminalSnapshot.LastAppliedSeq
+                > blocking.FirstSnapshot.LastAppliedSeq);
+
+            // The obsolete async save lands after terminal ACCEPTED. Reload
+            // from disk without a graceful dispatcher shutdown, matching the
+            // crash boundary that previously resurrected the resting order.
+            blocking.ReleaseFirstSave();
+            await blocking.FirstSaveCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var restartPersister = new FileChannelStatePersister(
+                root, NullLogger<FileChannelStatePersister>.Instance);
+            var reloaded = restartPersister.TryLoad(84);
+            Assert.NotNull(reloaded);
+            Assert.Equal(terminalSnapshot.LastAppliedSeq, reloaded!.LastAppliedSeq);
+            Assert.Empty(reloaded.Engine.Books.Single().Orders);
+
+            recovered = BuildDispatcher(restartPersister, out _);
+            recovered.Start();
+            Assert.False(recovered.TryResolveByClOrdId(700, 0xD0, out _, out _));
+        }
+        finally
+        {
+            blocking.ReleaseFirstSave();
+            if (recovered is not null)
+                await recovered.DisposeAsync();
+            await live.DisposeAsync();
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
     }
 
     [Fact]

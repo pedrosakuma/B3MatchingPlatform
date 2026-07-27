@@ -20,6 +20,7 @@ public sealed class SessionClaimRegistry
     private readonly object _lock = new();
     private readonly Dictionary<uint, ulong> _lastSessionVerId = new();
     private readonly Dictionary<uint, object> _activeClaims = new();
+    private readonly Dictionary<uint, object> _claimGenerations = new();
 
     /// <summary>Number of currently-claimed sessionIDs.</summary>
     public int ActiveCount
@@ -93,6 +94,7 @@ public sealed class SessionClaimRegistry
                 return ClaimResult.StaleVersion;
 
             _activeClaims[sessionId] = claimToken;
+            _claimGenerations[sessionId] = new object();
             return ClaimResult.Accepted;
         }
     }
@@ -116,6 +118,60 @@ public sealed class SessionClaimRegistry
         ZeroVersion,
     }
 
+    public enum TakeOverFinalizeResult
+    {
+        Committed,
+        RolledBack,
+        FailedClosed,
+        ClaimLost,
+    }
+
+    internal enum TakeOverCommitDecision
+    {
+        Commit,
+        RollBack,
+        FailClosed,
+    }
+
+    /// <summary>
+    /// Opaque receipt for rolling back one accepted, uncommitted
+    /// <see cref="TryClaim(uint, ulong, object, out ClaimRollback)"/> call.
+    /// </summary>
+    public readonly struct ClaimRollback
+    {
+        private readonly object? _generation;
+
+        internal ClaimRollback(ulong previousSessionVerId, object generation)
+        {
+            PreviousSessionVerId = previousSessionVerId;
+            _generation = generation;
+        }
+
+        public ulong PreviousSessionVerId { get; }
+
+        internal object? Generation => _generation;
+    }
+
+    /// <summary>
+    /// Opaque receipt for rolling back one accepted, uncommitted
+    /// <see cref="TryForceTakeOver(uint, ulong, object, out object, out TakeOverRollback)"/>
+    /// call.
+    /// </summary>
+    public readonly struct TakeOverRollback
+    {
+        private readonly object? _generation;
+
+        internal TakeOverRollback(ulong previousSessionVerId, object generation)
+        {
+            PreviousSessionVerId = previousSessionVerId;
+            _generation = generation;
+        }
+
+        public ulong PreviousSessionVerId { get; }
+
+        internal object? Generation => _generation;
+    }
+
     /// <summary>
     /// Atomically validate <paramref name="sessionVerId"/> against the
     /// monotonic-per-process rule and (on success) register
@@ -126,20 +182,76 @@ public sealed class SessionClaimRegistry
     /// <see cref="FixpSession"/>) used to scope <see cref="Release"/>
     /// so a stale teardown of an already-replaced claim is a no-op.</param>
     public ClaimResult TryClaim(uint sessionId, ulong sessionVerId, object claimToken)
+        => TryClaim(sessionId, sessionVerId, claimToken, out _);
+
+    /// <summary>
+    /// Transactional form of <see cref="TryClaim(uint, ulong, object)"/>.
+    /// On success, <paramref name="rollback"/> captures the previous watermark
+    /// and this exact claim generation so the caller can abort without rolling
+    /// back over a later claimant.
+    /// </summary>
+    public ClaimResult TryClaim(uint sessionId, ulong sessionVerId, object claimToken,
+        out ClaimRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(claimToken);
+        rollback = default;
         if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
 
         lock (_lock)
         {
+            _lastSessionVerId.TryGetValue(sessionId, out var previousSessionVerId);
             if (_activeClaims.ContainsKey(sessionId))
                 return ClaimResult.DuplicateConnection;
-            if (_lastSessionVerId.TryGetValue(sessionId, out var last) && sessionVerId <= last)
+            if (previousSessionVerId != 0UL && sessionVerId <= previousSessionVerId)
                 return ClaimResult.StaleVersion;
 
+            var generation = new object();
             _activeClaims[sessionId] = claimToken;
             _lastSessionVerId[sessionId] = sessionVerId;
+            _claimGenerations[sessionId] = generation;
+            rollback = new ClaimRollback(previousSessionVerId, generation);
             return ClaimResult.Accepted;
+        }
+    }
+
+    /// <summary>
+    /// Rolls back an uncommitted successful
+    /// <see cref="TryClaim(uint, ulong, object, out ClaimRollback)"/>.
+    /// The rollback is conditional on the receipt's unique claim generation,
+    /// so a later claimant that acquired and released the same version cannot
+    /// create an ABA window that restores an obsolete watermark.
+    /// </summary>
+    public bool TryRollbackClaim(
+        uint sessionId,
+        ulong claimedSessionVerId,
+        object claimToken,
+        in ClaimRollback rollback)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        lock (_lock)
+        {
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation))
+                return false;
+
+            if (!_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != claimedSessionVerId)
+                return false;
+
+            if (_activeClaims.TryGetValue(sessionId, out var currentOwner))
+            {
+                if (!ReferenceEquals(currentOwner, claimToken))
+                    return false;
+                _activeClaims.Remove(sessionId);
+            }
+
+            if (rollback.PreviousSessionVerId == 0UL)
+                _lastSessionVerId.Remove(sessionId);
+            else
+                _lastSessionVerId[sessionId] = rollback.PreviousSessionVerId;
+            _claimGenerations.Remove(sessionId);
+            return true;
         }
     }
 
@@ -166,22 +278,37 @@ public sealed class SessionClaimRegistry
     /// </summary>
     public ClaimResult TryForceTakeOver(uint sessionId, ulong sessionVerId,
         object newToken, out object? evictedToken)
+        => TryForceTakeOver(sessionId, sessionVerId, newToken, out evictedToken, out _);
+
+    /// <summary>
+    /// Transactional form of
+    /// <see cref="TryForceTakeOver(uint, ulong, object, out object)"/>.
+    /// On success, <paramref name="rollback"/> captures the previous version
+    /// watermark and this exact takeover generation.
+    /// </summary>
+    public ClaimResult TryForceTakeOver(uint sessionId, ulong sessionVerId,
+        object newToken, out object? evictedToken, out TakeOverRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(newToken);
         evictedToken = null;
+        rollback = default;
         if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
 
         lock (_lock)
         {
             // New verId must be strictly greater than the last recorded
             // version — the FIXP monotonicity rule still applies.
-            if (_lastSessionVerId.TryGetValue(sessionId, out var last) && sessionVerId <= last)
+            _lastSessionVerId.TryGetValue(sessionId, out var previousSessionVerId);
+            if (previousSessionVerId != 0UL && sessionVerId <= previousSessionVerId)
                 return ClaimResult.StaleVersion;
 
             // Evict old claim atomically (may or may not exist).
             _activeClaims.TryGetValue(sessionId, out evictedToken);
+            var generation = new object();
             _activeClaims[sessionId] = newToken;
             _lastSessionVerId[sessionId] = sessionVerId;
+            _claimGenerations[sessionId] = generation;
+            rollback = new TakeOverRollback(previousSessionVerId, generation);
             return ClaimResult.Accepted;
         }
     }
@@ -217,6 +344,28 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Runs <paramref name="action"/> while the claim lock proves that
+    /// <paramref name="claimToken"/> is still the active owner. Registry
+    /// handoffs use this to keep the FIXP claim and logical-session route in
+    /// lock-step when a terminating transport is replaced before its delayed
+    /// close callback deregisters it.
+    /// </summary>
+    internal bool TryExecuteIfOwned(uint sessionId, object claimToken, Action action)
+    {
+        ArgumentNullException.ThrowIfNull(claimToken);
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_lock)
+        {
+            if (!_activeClaims.TryGetValue(sessionId, out var owner)
+                || !ReferenceEquals(owner, claimToken))
+                return false;
+
+            action();
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Releases the claim for <paramref name="sessionId"/> if (and only
     /// if) it is currently held by <paramref name="claimToken"/>. Safe to
     /// call from any thread; safe to call multiple times. Does not
@@ -239,6 +388,7 @@ public sealed class SessionClaimRegistry
             if (forgetLastVersion)
             {
                 _lastSessionVerId.Remove(sessionId);
+                _claimGenerations.Remove(sessionId);
             }
         }
     }
@@ -247,31 +397,137 @@ public sealed class SessionClaimRegistry
     /// Rolls back a failed <see cref="TryForceTakeOver"/> by atomically
     /// restoring the evicted session's claim and reverting
     /// <c>_lastSessionVerId</c> to the pre-takeover value. Only acts
-    /// when <paramref name="newToken"/> still holds the active claim
-    /// (guards against a concurrent takeover winning the registry
-    /// between the failed persist and this restore call). Safe to call
-    /// multiple times; idempotent when the claim has already moved on.
+    /// when the supplied rollback receipt still identifies the current claim
+    /// generation and version. The replacement may still own the active slot,
+    /// or it may have released it; both cases restore the victim. A later
+    /// claimant that acquired the same version changes the generation and
+    /// prevents an ABA rollback, even after that later claimant releases.
+    /// Safe to call multiple times; idempotent when the claim has moved on.
     /// Returns <c>true</c> when the claim was actually restored to
     /// <paramref name="oldToken"/>, so the caller can keep the
     /// <see cref="SessionRegistry"/> entry in lock-step; returns
     /// <c>false</c> when a concurrent takeover already moved the claim on
     /// (in which case the caller must not roll the registry back either).
     /// </summary>
-    public bool TryRestoreTakeOver(uint sessionId, object newToken,
-        object oldToken, ulong oldVerId)
+    public bool TryRestoreTakeOver(uint sessionId, ulong takenSessionVerId,
+        object newToken, object oldToken, TakeOverRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(newToken);
         ArgumentNullException.ThrowIfNull(oldToken);
         lock (_lock)
         {
-            if (_activeClaims.TryGetValue(sessionId, out var current) &&
-                ReferenceEquals(current, newToken))
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation)
+                || !_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != takenSessionVerId)
+                return false;
+
+            if (_activeClaims.TryGetValue(sessionId, out var current)
+                && !ReferenceEquals(current, newToken))
             {
-                _activeClaims[sessionId] = oldToken;
-                _lastSessionVerId[sessionId] = oldVerId;
-                return true;
+                return false;
             }
+
+            RestoreTakeOverLocked(sessionId, oldToken, rollback.PreviousSessionVerId);
+            return true;
         }
-        return false;
+    }
+
+    /// <summary>
+    /// Finalizes a previously accepted forced takeover while holding the claim
+    /// lock. The callback therefore observes a stable claim owner. If the
+    /// callback requests rollback, the victim claim and previous version
+    /// watermark are restored before the method returns. A fail-closed
+    /// decision (or an exception with unknown durability) releases the
+    /// replacement claim while retaining its version watermark and rotating
+    /// the generation, so no stale rollback receipt can resurrect the victim.
+    ///
+    /// A replacement transport can close after <see cref="TryForceTakeOver"/>
+    /// and release its claim while persistence is still running. When the
+    /// active slot is vacant and the recorded version still equals
+    /// <paramref name="newVerId"/>, that close is treated as a failed takeover
+    /// and the victim is restored. A different active token means a newer
+    /// takeover won; this method leaves it untouched.
+    /// </summary>
+    internal TakeOverFinalizeResult TryFinalizeTakeOver(
+        uint sessionId,
+        ulong newVerId,
+        object newToken,
+        object oldToken,
+        TakeOverRollback rollback,
+        Func<TakeOverCommitDecision> commit)
+    {
+        ArgumentNullException.ThrowIfNull(newToken);
+        ArgumentNullException.ThrowIfNull(oldToken);
+        ArgumentNullException.ThrowIfNull(commit);
+
+        lock (_lock)
+        {
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation)
+                || !_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != newVerId)
+                return TakeOverFinalizeResult.ClaimLost;
+
+            bool replacementOwnsClaim =
+                _activeClaims.TryGetValue(sessionId, out var current)
+                && ReferenceEquals(current, newToken);
+            bool replacementReleasedClaim =
+                !_activeClaims.ContainsKey(sessionId);
+
+            if (!replacementOwnsClaim && !replacementReleasedClaim)
+                return TakeOverFinalizeResult.ClaimLost;
+
+            if (replacementOwnsClaim)
+            {
+                try
+                {
+                    switch (commit())
+                    {
+                        case TakeOverCommitDecision.Commit:
+                            return TakeOverFinalizeResult.Committed;
+                        case TakeOverCommitDecision.FailClosed:
+                            FailTakeOverClosedLocked(sessionId, newToken);
+                            return TakeOverFinalizeResult.FailedClosed;
+                        case TakeOverCommitDecision.RollBack:
+                            break;
+                        default:
+                            throw new InvalidOperationException("unknown takeover commit decision");
+                    }
+                }
+                catch
+                {
+                    FailTakeOverClosedLocked(sessionId, newToken);
+                    return TakeOverFinalizeResult.FailedClosed;
+                }
+            }
+
+            RestoreTakeOverLocked(
+                sessionId, oldToken, rollback.PreviousSessionVerId);
+            return TakeOverFinalizeResult.RolledBack;
+        }
+    }
+
+    private void FailTakeOverClosedLocked(uint sessionId, object newToken)
+    {
+        if (_activeClaims.TryGetValue(sessionId, out var current)
+            && ReferenceEquals(current, newToken))
+        {
+            _activeClaims.Remove(sessionId);
+        }
+        _claimGenerations[sessionId] = new object();
+    }
+
+    private void RestoreTakeOverLocked(
+        uint sessionId, object oldToken, ulong oldSessionVerId)
+    {
+        _activeClaims[sessionId] = oldToken;
+        if (oldSessionVerId == 0UL)
+            _lastSessionVerId.Remove(sessionId);
+        else
+            _lastSessionVerId[sessionId] = oldSessionVerId;
+        _claimGenerations[sessionId] = new object();
     }
 }

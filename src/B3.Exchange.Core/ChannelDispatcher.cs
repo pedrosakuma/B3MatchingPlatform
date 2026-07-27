@@ -160,6 +160,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     /// the ctor; immutable for the dispatcher's lifetime.
     /// </summary>
     private readonly WalAppendFailurePolicy _walAppendFailurePolicy;
+    private readonly TimeSpan _massCancelDurabilityTimeout;
     /// <summary>
     /// Issue #286: sticky flag set on the first WAL append failure when
     /// the policy is <see cref="WalAppendFailurePolicy.Halt"/>. Read from
@@ -273,6 +274,9 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private bool _hasCurrentSession;
     private ulong _currentClOrdId;
     private ulong _currentOrigClOrdId;
+    private bool _currentMassCancelReportsCommitted;
+    private bool _trackMassCancelReports;
+    private List<Task<OrderedStreamWriteResult>>? _currentMassCancelReportCompletions;
     private WorkKind? _currentWorkKind;
     private Action? _openOrderTransitionHookForTesting;
     /// <summary>
@@ -379,6 +383,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private AuctionPrintInfo? _pendingAuctionPrint;
 
     private readonly CancellationTokenSource _cts = new();
+    private Task _massCancelTerminalTail = Task.CompletedTask;
     private int _drainOnCancellation;
     private int _startCalled;
     private int _activationCalled;
@@ -455,6 +460,11 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
         _persister = options.Persister;
         _wal = options.Wal;
         _walAppendFailurePolicy = options.WalAppendFailurePolicy;
+        if (options.MassCancelDurabilityTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "MassCancelDurabilityTimeout must be positive");
+        _massCancelDurabilityTimeout = options.MassCancelDurabilityTimeout;
         _sessionExists = options.SessionExists;
         _orphanPolicy = options.OrphanPolicy;
         _postTradeSink = options.PostTradeSink ?? B3.Exchange.PostTrade.NullPostTradeSink.Instance;

@@ -1,5 +1,6 @@
 using B3.EntryPoint.Wire;
 using System.Buffers;
+using System.Buffers.Binary;
 using B3.Exchange.Contracts;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging;
@@ -64,6 +65,24 @@ public sealed partial class FixpSession
         if (!EstablishDecoder.TryDecode(fixedBlock, out var req, out var decodeErr))
             return EstablishStep.Decode(decodeErr ?? "decode error: Establish");
 
+        uint? nextOutboundSeqNo = TryPeekNextMsgSeqNum();
+        if (nextOutboundSeqNo is null)
+        {
+            var rejectFrame = new byte[EstablishRejectEncoder.Total];
+            EstablishRejectEncoder.Encode(
+                rejectFrame,
+                req.SessionId,
+                req.SessionVerId,
+                req.TimestampNanos,
+                B3.Entrypoint.Fixp.Sbe.V6.EstablishRejectCode.UNSPECIFIED,
+                lastIncomingSeqNo: LastIncomingSeqNo == 0
+                    ? null
+                    : LastIncomingSeqNo);
+            return EstablishStep.Rejected(
+                rejectFrame,
+                "establish-reject (outbound MsgSeqNum exhausted)");
+        }
+
         // Legacy / no-validator mode mirrors Negotiate: accept whatever
         // the peer asked for, transition to Established, echo an Ack with
         // the requested keepAliveInterval. Existing Phase-1 tests rely on
@@ -91,7 +110,7 @@ public sealed partial class FixpSession
             var ackFrame = new byte[EstablishAckEncoder.Total];
             EstablishAckEncoder.Encode(ackFrame, req.SessionId, req.SessionVerId,
                 req.TimestampNanos, req.KeepAliveIntervalMillis,
-                nextSeqNo: PeekNextMsgSeqNum(), lastIncomingSeqNo: LastIncomingSeqNo,
+                nextSeqNo: nextOutboundSeqNo.Value, lastIncomingSeqNo: LastIncomingSeqNo,
                 semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
             return EstablishStep.Accepted(ackFrame, $"establish-accept (legacy, sid={req.SessionId})");
         }
@@ -134,7 +153,7 @@ public sealed partial class FixpSession
         var ack = new byte[EstablishAckEncoder.Total];
         EstablishAckEncoder.Encode(ack, req.SessionId, req.SessionVerId,
             req.TimestampNanos, req.KeepAliveIntervalMillis,
-            nextSeqNo: PeekNextMsgSeqNum(), lastIncomingSeqNo: LastIncomingSeqNo,
+            nextSeqNo: nextOutboundSeqNo.Value, lastIncomingSeqNo: LastIncomingSeqNo,
             semVerMajor: 8, semVerMinor: 4, semVerPatch: 2);
         return EstablishStep.Accepted(ack, $"establish-accept (sid={req.SessionId})");
     }
@@ -151,8 +170,40 @@ public sealed partial class FixpSession
         if (step.IsAccepted)
         {
             _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
-            if (!_transport.TryEnqueueFrame(step.AckFrame!))
+            var ackFrame = step.AckFrame!;
+            bool enqueued;
+            bool sequenceExhausted = false;
+            lock (_outboundLock)
             {
+                // Patch nextSeqNo and enqueue the Ack under the same lock used
+                // by business sequence allocation. Opening admission before
+                // releasing it lets blocked route writers proceed only after
+                // the Ack is already in the FIFO transport queue.
+                uint? nextSeqNo = TryPeekNextMsgSeqNum();
+                if (nextSeqNo is null)
+                {
+                    sequenceExhausted = true;
+                    enqueued = false;
+                }
+                else
+                {
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        ackFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + 28, 4),
+                        nextSeqNo.Value);
+                    enqueued = _transport.TryEnqueueFrame(ackFrame);
+                    if (enqueued)
+                        OpenBusinessAdmissionLocked();
+                }
+            }
+            if (sequenceExhausted)
+            {
+                AbortBusinessAdmission();
+                HandleOutboundSequenceExhausted();
+                return false;
+            }
+            if (!enqueued)
+            {
+                AbortBusinessAdmission();
                 _logger.LogWarning("session {ConnectionId} could not enqueue EstablishAck — closing",
                     ConnectionId);
                 Close("send-queue-full:EstablishAck");

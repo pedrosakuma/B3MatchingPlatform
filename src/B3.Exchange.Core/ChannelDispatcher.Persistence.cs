@@ -528,13 +528,16 @@ public sealed partial class ChannelDispatcher
     /// to <c>true</c> so SequenceVersion bumps, TradeBust replays and
     /// trading-phase changes always persist immediately.</para>
     /// </summary>
-    private void OnAfterCommandFlushed(bool force = false)
+    private void OnAfterCommandFlushed(
+        bool force = false,
+        bool recordCommandBoundary = true)
     {
         // Issue #329 PR-4: tag the command boundary on the audit sink so
         // the durability watermark can advance on the next Checkpoint.
         // Done before any early-return so the sink sees boundaries even
         // when no persister is wired (cheap when the sink is the no-op).
-        _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
+        if (recordCommandBoundary)
+            _postTradeSink.OnCommandBoundary(_lastAppliedSeq);
         // WAL replay reconstructs state from an already-durable command log.
         // Persisting each replay turn is both unnecessary and unsafe with the
         // async writer: an old-epoch snapshot could land after the startup
@@ -600,6 +603,81 @@ public sealed partial class ChannelDispatcher
             _metrics?.IncSnapshotSaveFailure();
             _metrics?.IncDispatcherCrashes();
             _logger.LogError(ex, "channel {ChannelNumber}: persister Save failed", ChannelNumber);
+        }
+    }
+
+    private Task<bool> BeginMassCancelDurability(long commandSeq)
+    {
+        _postTradeSink.OnCommandBoundary(commandSeq);
+        if (_replayMode)
+            return Task.FromResult(true);
+
+        if (_wal is not null)
+        {
+            OnAfterCommandFlushed(recordCommandBoundary: false);
+            if (_wal.DurableSeqOrZero >= commandSeq)
+                return Task.FromResult(true);
+
+            var wal = _wal;
+            return Task.Run(() => WaitForMassCancelWalDurability(
+                wal, commandSeq));
+        }
+
+        if (_persister is null)
+            return Task.FromResult(true);
+
+        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var snapshot = CaptureChannelState();
+        var persister = _persister;
+        return Task.Run(() =>
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                long bytes = persister.Save(snapshot);
+                long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                if (_metrics is { } metrics)
+                {
+                    metrics.SnapshotWrite.ObserveTicks(elapsed);
+                    metrics.IncSnapshotSaveOk();
+                    if (bytes > 0) metrics.SetSnapshotLastSizeBytes(bytes);
+                    metrics.SetSnapshotLastSuccessUnixMs(nowMs);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _metrics?.IncSnapshotSaveFailure();
+                _metrics?.IncDispatcherCrashes();
+                _logger.LogError(ex,
+                    "channel {ChannelNumber}: asynchronous mass-cancel snapshot failed; terminal ACCEPTED suppressed",
+                    ChannelNumber);
+                return false;
+            }
+        });
+    }
+
+    private bool WaitForMassCancelWalDurability(
+        IChannelWriteAheadLog wal,
+        long commandSeq)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                _cts.Token);
+            timeout.CancelAfter(_massCancelDurabilityTimeout);
+            wal.WaitForDurable(commandSeq, timeout.Token);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _metrics?.IncWalAppendFailure();
+            _metrics?.IncDispatcherCrashes();
+            Volatile.Write(ref _walHalted, 1);
+            _logger.LogCritical(ex,
+                "channel {ChannelNumber}: mass-cancel WAL durability failed at seq={Seq}; channel marked unhealthy and terminal ACCEPTED suppressed",
+                ChannelNumber, commandSeq);
+            return false;
         }
     }
 

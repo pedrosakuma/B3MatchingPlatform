@@ -146,14 +146,29 @@ public class FixpSessionReattachReplayE2ETests
             try
             {
                 Assert.True(session.TryReattach(serverSide2));
-                session.ApplyTransition(FixpEvent.Establish);
+                var clientStream2 = client2.GetStream();
+                var establish = new byte[256];
+                int establishLength = EntryPointFixpFrameCodec.EncodeEstablish(
+                    establish,
+                    sessionId: 100,
+                    sessionVerId: 0,
+                    timestampNanos: 1,
+                    keepAliveIntervalMillis: 10_000,
+                    nextSeqNo: 1,
+                    cancelOnDisconnectType: 0,
+                    codTimeoutWindowMillis: 0,
+                    credentials: ReadOnlySpan<byte>.Empty);
+                await clientStream2.WriteAsync(establish.AsMemory(0, establishLength), cts.Token);
+                var (ackTid, ack) = await ReadOneFrameAsync(clientStream2, cts.Token);
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck, ackTid);
+                Assert.Equal(4u, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                    ack.AsSpan(EntryPointFrameReader.WireHeaderSize + 28, 4)));
                 Assert.Equal(FixpState.Established, session.State);
 
                 // Phase 4: client requests the missing range (seqs 2..3).
                 // Gateway should reply with Retransmission header, the 2
                 // ER clones with PossResend = 1, and a trailing Sequence
                 // (nextSeqNo = 4 — next live business seq).
-                var clientStream2 = client2.GetStream();
                 var req = BuildRetransmitRequest(sessionId: 100, timestampNanos: 99UL,
                     fromSeqNo: 2, count: 2);
                 await clientStream2.WriteAsync(req, cts.Token);

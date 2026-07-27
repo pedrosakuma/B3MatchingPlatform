@@ -321,6 +321,13 @@ public sealed partial class ChannelDispatcher
         }
         _inbound.Writer.TryComplete();
         if (_loopTask != null) { try { await _loopTask.ConfigureAwait(false); } catch { } }
+        try { await _massCancelTerminalTail.ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "channel {ChannelNumber}: mass-cancel terminal pipeline shutdown failed",
+                ChannelNumber);
+        }
         // Issue #269: release the WAL file handle so the underlying
         // file can be deleted by tests / operator tooling. The
         // dispatcher loop has already flushed its final snapshot

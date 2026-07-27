@@ -91,6 +91,30 @@ public interface IChannelStatePersister
     long Save(ChannelStateSnapshot snapshot);
 
     /// <summary>
+    /// Captures the current administrative-reset generation for an
+    /// asynchronous snapshot submission. Implementations that do not need a
+    /// reset fence may keep the default generation. This method runs on the
+    /// dispatcher thread and MUST be non-blocking; implementations should use
+    /// an atomic/volatile generation read rather than their snapshot I/O lock.
+    /// </summary>
+    long CaptureSaveGeneration(byte channelNumber) => 0;
+
+    /// <summary>
+    /// Persists an asynchronously submitted snapshot only when
+    /// <paramref name="saveGeneration"/> still matches the channel's current
+    /// reset generation. Returns <c>false</c> when an intervening
+    /// <see cref="DeleteAll"/> invalidated the submission.
+    /// </summary>
+    bool TrySave(
+        ChannelStateSnapshot snapshot,
+        long saveGeneration,
+        out long bytesWritten)
+    {
+        bytesWritten = Save(snapshot);
+        return true;
+    }
+
+    /// <summary>
     /// Issue #271: deletes every on-disk snapshot artifact for the
     /// given channel (all rolling generations + any legacy files).
     /// Used by the admin "snapshot/reset" endpoint so an operator can
