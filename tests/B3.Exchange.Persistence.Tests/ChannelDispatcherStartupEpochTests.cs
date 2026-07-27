@@ -329,7 +329,10 @@ public sealed class ChannelDispatcherStartupEpochTests
         Assert.Equal(HaltReason.RegulatoryHalt, restoredHalt.Reason);
 
         Assert.True(dispatcher.EnqueueSnapshotTick());
-        Assert.True(WaitFor(() => snapshotSink.Packets.Count == 1));
+        // Snapshot rotation now emits the book snapshot packet followed by a
+        // standalone SecurityStatus_3 recovery packet for the instrument
+        // (issue #583), so a single tick yields 2 packets, not 1.
+        Assert.True(WaitFor(() => snapshotSink.Packets.Count == 2));
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             snapshotSink.Packets[0].AsSpan(
                 SnapshotFrameOffset, WireOffsets.SnapHeaderBlockLength),
