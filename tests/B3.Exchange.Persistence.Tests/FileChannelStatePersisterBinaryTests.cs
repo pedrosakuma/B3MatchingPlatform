@@ -27,7 +27,8 @@ public class FileChannelStatePersisterBinaryTests
                 TimeInForce.Day, 0, 0),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 2, NextTradeId: 1, RptSeq: 1,
+            NextOrderId: 2, NextTradeId: 1,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(900_000_000_001L, 1)],
             Phases: new[] { new EngineStateSnapshot.PhaseEntry(99, TradingPhase.Open) },
             Books: new[] { new EngineStateSnapshot.BookSnapshot(99, orders) },
             Stops: null);

@@ -30,7 +30,7 @@ public class FileChannelStatePersisterTests
         Assert.Equal(snapshot.SequenceVersion, loaded.SequenceVersion);
         Assert.Equal(snapshot.Engine.NextOrderId, loaded.Engine.NextOrderId);
         Assert.Equal(snapshot.Engine.NextTradeId, loaded.Engine.NextTradeId);
-        Assert.Equal(snapshot.Engine.RptSeq, loaded.Engine.RptSeq);
+        Assert.Equal(snapshot.Engine.RptSeqBySecurity, loaded.Engine.RptSeqBySecurity);
         Assert.Equal(snapshot.Engine.Phases.Count, loaded.Engine.Phases.Count);
         Assert.Equal(snapshot.Engine.Books.Count, loaded.Engine.Books.Count);
 
@@ -220,7 +220,11 @@ public class FileChannelStatePersisterTests
             new EngineStateSnapshot.BookSnapshot(900_000_000_001L, orders),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 99, NextTradeId: 11, RptSeq: 17, Phases: phases, Books: books);
+            NextOrderId: 99,
+            NextTradeId: 11,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(900_000_000_001L, 17)],
+            Phases: phases,
+            Books: books);
         var owners = new[]
         {
             new OrderOwnerSnapshot(1, "10101", 100, 0xDEADBEEF, Side.Buy, 900_000_000_001L),

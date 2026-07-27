@@ -229,12 +229,35 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 99,  // dispatcher is 84
             SequenceNumber: 0, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(1, 1, 0,
+            Engine: new EngineStateSnapshot(1, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 Array.Empty<EngineStateSnapshot.BookSnapshot>()),
             Owners: Array.Empty<OrderOwnerSnapshot>());
 
         Assert.Throws<InvalidOperationException>(() => disp.RestoreChannelState(snap));
+    }
+
+    [Fact]
+    public void RestoreChannelState_RejectsRepresentedSecurityWithoutRptSeqCounter()
+    {
+        var persister = new InMemoryPersister();
+        var disp = BuildDispatcher(persister, out _);
+        var snap = new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 84,
+            SequenceNumber: 0,
+            SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(
+                NextOrderId: 1,
+                NextTradeId: 1,
+                RptSeqBySecurity: [],
+                Phases: [new EngineStateSnapshot.PhaseEntry(Sec, TradingPhase.Open)],
+                Books: [new EngineStateSnapshot.BookSnapshot(Sec, [])]),
+            Owners: []);
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => disp.RestoreChannelState(snap));
+        Assert.Contains("no persisted RptSeq counter", error.Message);
     }
 
     [Fact]
@@ -391,7 +414,7 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 84,
             SequenceNumber: 0, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(2, 1, 0,
+            Engine: new EngineStateSnapshot(2, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 Array.Empty<EngineStateSnapshot.BookSnapshot>(),
                 new[] { dupStop, dupStop }),
@@ -416,7 +439,7 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 84,
             SequenceNumber: 0, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(2, 1, 0,
+            Engine: new EngineStateSnapshot(2, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 Array.Empty<EngineStateSnapshot.BookSnapshot>(),
                 new[] { bad }),
@@ -485,7 +508,7 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 84,
             SequenceNumber: 0, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(2, 1, 0,
+            Engine: new EngineStateSnapshot(2, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 Array.Empty<EngineStateSnapshot.BookSnapshot>()),
             Owners: new[]
@@ -524,7 +547,7 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 84,
             SequenceNumber: 5, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(2, 1, 0,
+            Engine: new EngineStateSnapshot(2, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 Array.Empty<EngineStateSnapshot.BookSnapshot>()),
             Owners: new[]
@@ -555,7 +578,7 @@ public class ChannelDispatcherPersistenceTests
             Version: ChannelStateSnapshot.CurrentVersion,
             ChannelNumber: 84,
             SequenceNumber: 0, SequenceVersion: 1,
-            Engine: new EngineStateSnapshot(2, 1, 0,
+            Engine: new EngineStateSnapshot(2, 1, [],
                 Array.Empty<EngineStateSnapshot.PhaseEntry>(),
                 new[] { new EngineStateSnapshot.BookSnapshot(Sec, new[] { dupOrder, dupOrder }) }),
             Owners: Array.Empty<OrderOwnerSnapshot>());

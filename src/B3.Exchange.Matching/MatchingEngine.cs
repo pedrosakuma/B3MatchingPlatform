@@ -6,9 +6,8 @@ namespace B3.Exchange.Matching;
 /// <summary>
 /// Single-threaded matching engine for one UMDF channel. Holds one
 /// <see cref="LimitOrderBook"/> per instrument plus monotonic order/trade-id
-/// allocators and an <see cref="RptSeq"/> that is incremented on every emitted
-/// MBO/Trade event so the integration layer can stamp <c>RptSeq</c> on UMDF
-/// frames without separate bookkeeping.
+/// allocators and one <c>RptSeq</c> counter per SecurityID, shared across every
+/// incremental template emitted for that instrument.
 ///
 /// <para>
 /// Threading invariant (issue #169): every public mutation/read entry point
@@ -42,13 +41,17 @@ public sealed class MatchingEngine
     //                 simulator (sessions reset trade-day boundaries); flag
     //                 for re-evaluation if we ever target sustained
     //                 production-grade rates inside one trading day.
-    //   _rptSeq      : uint. Same limits as _nextTradeId. Per-channel,
-    //                 per-(SequenceVersion). The integration layer's
-    //                 SequenceVersion bump on packet-seq overflow does NOT
-    //                 reset _rptSeq — they are independent counters.
+    //   _rptSeqBySecurityId : uint per SecurityID. Same limits as
+    //                 _nextTradeId. Each counter is per-(SequenceVersion).
+    //                 The integration layer's SequenceVersion bump on packet-
+    //                 seq overflow does NOT reset these counters — they are
+    //                 independent counters. Allocation fails closed at
+    //                 uint.MaxValue because 0 is the SBE null sentinel; an
+    //                 operator channel reset is required before more events.
     private long _nextOrderId = 1;
     private uint _nextTradeId = 1;
-    private uint _rptSeq;
+    private readonly Dictionary<long, uint> _rptSeqBySecurityId;
+    private uint? _legacyGlobalRptSeq;
 
     // Per-instrument trading phase (gap-functional §5 / issue #201).
     // Defaults to Open for every loaded instrument so existing tests and
@@ -133,6 +136,7 @@ public sealed class MatchingEngine
         _stp = selfTradePrevention;
         _rulesById = new Dictionary<long, InstrumentTradingRules>();
         _booksById = new Dictionary<long, LimitOrderBook>();
+        _rptSeqBySecurityId = new Dictionary<long, uint>();
         _phaseById = new Dictionary<long, TradingPhase>();
         _stopsBySymbol = new Dictionary<long, List<RestingStop>>();
         _stopById = new Dictionary<long, RestingStop>();
@@ -141,13 +145,15 @@ public sealed class MatchingEngine
             var rules = new InstrumentTradingRules(i);
             _rulesById.Add(i.SecurityId, rules);
             _booksById.Add(i.SecurityId, new LimitOrderBook(i.SecurityId));
+            _rptSeqBySecurityId.Add(i.SecurityId, 0);
             _phaseById.Add(i.SecurityId, TradingPhase.Open);
             _stopsBySymbol.Add(i.SecurityId, new List<RestingStop>());
         }
         _logger.LogInformation("matching engine initialized with {InstrumentCount} instruments", _rulesById.Count);
     }
 
-    public uint CurrentRptSeq => _rptSeq;
+    public uint GetCurrentRptSeq(long securityId)
+        => _rptSeqBySecurityId.TryGetValue(securityId, out uint rptSeq) ? rptSeq : 0;
     public long PeekNextOrderId => _nextOrderId;
     public SelfTradePrevention SelfTradePrevention => _stp;
 
@@ -214,7 +220,18 @@ public sealed class MatchingEngine
             foreach (var kv in _haltById)
                 halts.Add(new EngineStateSnapshot.HaltEntry(kv.Key, (byte)kv.Value.Reason, kv.Value.HaltedAtNanos, kv.Value.Note));
         }
-        return new EngineStateSnapshot(_nextOrderId, _nextTradeId, _rptSeq, phases, books, stops, halts);
+        var rptSeqBySecurity = new List<EngineStateSnapshot.RptSeqEntry>(_rptSeqBySecurityId.Count);
+        foreach (var kv in _rptSeqBySecurityId.OrderBy(static kv => kv.Key))
+            rptSeqBySecurity.Add(new EngineStateSnapshot.RptSeqEntry(kv.Key, kv.Value));
+        return new EngineStateSnapshot(
+            _nextOrderId,
+            _nextTradeId,
+            rptSeqBySecurity,
+            phases,
+            books,
+            stops,
+            halts,
+            _legacyGlobalRptSeq);
     }
 
     /// <summary>
@@ -232,7 +249,7 @@ public sealed class MatchingEngine
         AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("cannot restore state while a command is being dispatched");
-        if (_nextOrderId != 1 || _nextTradeId != 1 || _rptSeq != 0)
+        if (_nextOrderId != 1 || _nextTradeId != 1 || HasAllocatedRptSeq())
             throw new InvalidOperationException("RestoreState requires a freshly constructed engine");
         foreach (var book in _booksById.Values)
         {
@@ -244,9 +261,18 @@ public sealed class MatchingEngine
         if (_haltById.Count != 0)
             throw new InvalidOperationException("RestoreState requires no halt overlay on the target engine");
 
+        ArgumentNullException.ThrowIfNull(snapshot.RptSeqBySecurity);
+        var restoredRptSeqSecurityIds = new HashSet<long>();
+        foreach (var entry in snapshot.RptSeqBySecurity)
+        {
+            if (!restoredRptSeqSecurityIds.Add(entry.SecurityId))
+                throw new InvalidOperationException($"RestoreState: duplicate RptSeq entry for securityId {entry.SecurityId}");
+        }
         _nextOrderId = snapshot.NextOrderId;
         _nextTradeId = snapshot.NextTradeId;
-        _rptSeq = snapshot.RptSeq;
+        _legacyGlobalRptSeq = snapshot.LegacyGlobalRptSeq;
+        foreach (var entry in snapshot.RptSeqBySecurity)
+            _rptSeqBySecurityId[entry.SecurityId] = entry.RptSeq;
         foreach (var p in snapshot.Phases)
         {
             if (_phaseById.ContainsKey(p.SecurityId))
@@ -320,8 +346,8 @@ public sealed class MatchingEngine
                 _haltById[h.SecurityId] = new HaltState((HaltReason)h.Reason, h.HaltedAtNanos, h.Note);
             }
         }
-        _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeq={RptSeq} restingOrders={RestingOrders} restingStops={RestingStops}",
-            _nextOrderId, _nextTradeId, _rptSeq, restored, restoredStops);
+        _logger.LogInformation("RestoreState complete: nextOrderId={NextOrderId} nextTradeId={NextTradeId} rptSeqCounters={RptSeqCounterCount} restingOrders={RestingOrders} restingStops={RestingStops}",
+            _nextOrderId, _nextTradeId, _rptSeqBySecurityId.Count, restored, restoredStops);
     }
 
     /// <summary>
@@ -329,16 +355,86 @@ public sealed class MatchingEngine
     /// any matching event. Designed for the operator-triggered trade-bust
     /// replay path (issue #15) where the dispatcher synthesises a
     /// <c>TradeBust_57</c> frame outside the engine but must keep the
-    /// channel's <c>RptSeq</c> sequence dense. May only be invoked from the
+    /// target security's <c>RptSeq</c> sequence dense. Unknown SecurityIDs
+    /// start at 0 and are retained in the next persisted snapshot. May only
+    /// be invoked from the
     /// dispatch thread; throws if called while the engine is mid-dispatch
     /// (i.e. from inside a sink callback).
     /// </summary>
-    public uint AllocateNextRptSeq()
+    public uint AllocateNextRptSeq(long securityId)
     {
         AssertOnOwnerThread();
         if (_dispatching)
             throw new InvalidOperationException("AllocateNextRptSeq called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
-        return ++_rptSeq;
+        return NextRptSeq(securityId);
+    }
+
+    /// <summary>
+    /// Enables conservative legacy-global allocation for an unversioned
+    /// WAL-only recovery. Existing WAL records predate allocator provenance,
+    /// so replaying them globally is the only mapping that cannot reuse an
+    /// already-published value.
+    /// </summary>
+    public void BeginLegacyRptSeqMigration(uint legacyGlobalRptSeq)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("cannot begin RptSeq migration while a command is being dispatched");
+        if (HasAllocatedRptSeq() || _legacyGlobalRptSeq.HasValue)
+            throw new InvalidOperationException("legacy RptSeq migration requires a fresh engine");
+        _legacyGlobalRptSeq = legacyGlobalRptSeq;
+    }
+
+    /// <summary>
+    /// Preflights every possible leg of one dispatcher Cross work item before
+    /// the first leg can mutate the book or emit an execution report.
+    /// </summary>
+    public void EnsureRptSeqCapacityForCross(long securityId, params long[] legQuantities)
+    {
+        ArgumentNullException.ThrowIfNull(legQuantities);
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("cannot preflight Cross RptSeq capacity during engine dispatch");
+
+        ulong required = 0;
+        foreach (long quantity in legQuantities)
+        {
+            if (quantity <= 0) continue;
+            required = SaturatingAdd(
+                required,
+                EstimateMatchingRptSeqBudget(securityId, quantity));
+        }
+        EnsureRptSeqCapacity(securityId, required);
+    }
+
+    public void EnsureRptSeqCapacityForSynthetic(long securityId)
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("cannot preflight synthetic RptSeq capacity during engine dispatch");
+        EnsureRptSeqCapacity(securityId, 1);
+    }
+
+    /// <summary>
+    /// Finalizes a v6 global-RptSeq migration after its WAL tail has replayed.
+    /// Legacy replay temporarily reproduces the old global allocator so the
+    /// final high-water mark is exact; this method then conservatively assigns
+    /// that mark to every known security before normal per-security allocation
+    /// resumes.
+    /// </summary>
+    public void CompleteLegacyRptSeqMigration()
+    {
+        AssertOnOwnerThread();
+        if (_dispatching)
+            throw new InvalidOperationException("cannot finalize RptSeq migration while a command is being dispatched");
+        if (_legacyGlobalRptSeq is not { } legacyGlobalRptSeq) return;
+
+        foreach (long securityId in _rptSeqBySecurityId.Keys.ToArray())
+        {
+            if (_rptSeqBySecurityId[securityId] < legacyGlobalRptSeq)
+                _rptSeqBySecurityId[securityId] = legacyGlobalRptSeq;
+        }
+        _legacyGlobalRptSeq = null;
     }
 
     /// <summary>
@@ -361,7 +457,9 @@ public sealed class MatchingEngine
         foreach (var list in _stopsBySymbol.Values) list.Clear();
         _stopById.Clear();
         _haltById.Clear();
-        _rptSeq = 0;
+        _legacyGlobalRptSeq = null;
+        foreach (long securityId in _rptSeqBySecurityId.Keys.ToArray())
+            _rptSeqBySecurityId[securityId] = 0;
     }
 
     /// <summary>
@@ -427,12 +525,13 @@ public sealed class MatchingEngine
         if (!_phaseById.TryGetValue(securityId, out var current))
             throw new KeyNotFoundException($"unknown securityId {securityId}");
         if (current == phase) return false;
+        uint rptSeq = NextRptSeq(securityId);
         _phaseById[securityId] = phase;
         _sink.OnTradingPhaseChanged(new TradingPhaseChangedEvent(
             SecurityId: securityId,
             Phase: phase,
             TransactTimeNanos: txnNanos,
-            RptSeq: ++_rptSeq));
+            RptSeq: rptSeq));
         return true;
     }
 
@@ -457,13 +556,14 @@ public sealed class MatchingEngine
         if (!_phaseById.ContainsKey(securityId))
             throw new KeyNotFoundException($"unknown securityId {securityId}");
         if (_haltById.ContainsKey(securityId)) return false;
+        uint rptSeq = NextRptSeq(securityId);
         _haltById[securityId] = new HaltState(reason, txnNanos, note);
         _sink.OnInstrumentHalted(new InstrumentHaltedEvent(
             SecurityId: securityId,
             Reason: reason,
             Note: note,
             TransactTimeNanos: txnNanos,
-            RptSeq: ++_rptSeq));
+            RptSeq: rptSeq));
         return true;
     }
 
@@ -483,11 +583,13 @@ public sealed class MatchingEngine
             throw new InvalidOperationException("ResumeInstrument called from inside a sink callback. Operator commands must not interleave with engine dispatch.");
         if (!_phaseById.ContainsKey(securityId))
             throw new KeyNotFoundException($"unknown securityId {securityId}");
-        if (!_haltById.Remove(securityId)) return false;
+        if (!_haltById.ContainsKey(securityId)) return false;
+        uint rptSeq = NextRptSeq(securityId);
+        _haltById.Remove(securityId);
         _sink.OnInstrumentResumed(new InstrumentResumedEvent(
             SecurityId: securityId,
             TransactTimeNanos: txnNanos,
-            RptSeq: ++_rptSeq));
+            RptSeq: rptSeq));
         return true;
     }
 
@@ -553,6 +655,7 @@ public sealed class MatchingEngine
             throw new KeyNotFoundException($"unknown securityId rules {securityId}");
         if (!_booksById.TryGetValue(securityId, out var book))
             throw new KeyNotFoundException($"unknown securityId book {securityId}");
+        EnsureRptSeqCapacity(securityId, EstimateUncrossRptSeqBudget(securityId));
 
         var topState = ComputeAuctionTop(book);
         bool anyTrade = false;
@@ -575,7 +678,7 @@ public sealed class MatchingEngine
                 PriceMantissa: topState.TopPriceMantissa,
                 ClearedQuantity: clearedQty,
                 TransactTimeNanos: txnNanos,
-                RptSeq: NextRptSeq()));
+                RptSeq: NextRptSeq(securityId)));
         }
 
         // M5 (issue #232): expire any survivor whose TIF was bound to
@@ -605,6 +708,7 @@ public sealed class MatchingEngine
         var post = ComputeAuctionTop(book);
         if (!_auctionTopById.TryGetValue(securityId, out var prev) || prev != post)
         {
+            var rptSeq = NextAuctionTopRptSeq(securityId);
             _auctionTopById[securityId] = post;
             _sink.OnAuctionTopChanged(new AuctionTopChangedEvent(
                 SecurityId: securityId,
@@ -615,7 +719,8 @@ public sealed class MatchingEngine
                 ImbalanceSide: post.ImbalanceSide,
                 ImbalanceQuantity: post.ImbalanceQuantity,
                 TransactTimeNanos: txnNanos,
-                RptSeq: ++_rptSeq));
+                TopRptSeq: rptSeq.Top,
+                ImbalanceRptSeq: rptSeq.Imbalance));
         }
 
         ApplyTradingPhase(securityId, targetPhase, txnNanos);
@@ -667,7 +772,7 @@ public sealed class MatchingEngine
                 RestingOrderId: maker.OrderId,
                 RestingFirm: maker.EnteringFirm,
                 TransactTimeNanos: txnNanos,
-                RptSeq: NextRptSeq()));
+                RptSeq: NextRptSeq(book.SecurityId)));
             anyTrade = true;
             clearedQuantity += tradeQty;
 
@@ -705,7 +810,7 @@ public sealed class MatchingEngine
                 NewRemainingQuantity: o.RemainingQuantity,
                 InsertTimestampNanos: o.InsertTimestampNanos,
                 TransactTimeNanos: txnNanos,
-                RptSeq: NextRptSeq()));
+                RptSeq: NextRptSeq(book.SecurityId)));
             return;
         }
 
@@ -727,8 +832,8 @@ public sealed class MatchingEngine
             o.HiddenQuantity = newHidden;
             o.InsertTimestampNanos = txnNanos;
             book.Insert(o);
-            uint deleteSeq = NextRptSeq();
-            uint addSeq = NextRptSeq();
+            uint deleteSeq = NextRptSeq(book.SecurityId);
+            uint addSeq = NextRptSeq(book.SecurityId);
             _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
                 SecurityId: book.SecurityId,
                 OrderId: icebergOid,
@@ -752,7 +857,7 @@ public sealed class MatchingEngine
             PriceMantissa: o.PriceMantissa,
             FinalFilledQuantity: lastTradeQty,
             TransactTimeNanos: txnNanos,
-            RptSeq: NextRptSeq()));
+            RptSeq: NextRptSeq(book.SecurityId)));
         if (book.BestLevel(side) is null)
         {
             _sink.OnOrderBookSideEmpty(new OrderBookSideEmptyEvent(
@@ -978,6 +1083,10 @@ public sealed class MatchingEngine
                 { Reject(cmd.ClOrdId, cmd.SecurityId, 0, RejectReason.MinQtyNotMet, cmd.EnteredAtNanos); return; }
             }
 
+            EnsureRptSeqCapacity(
+                cmd.SecurityId,
+                EstimateMatchingRptSeqBudget(cmd.SecurityId, cmd.Quantity));
+
             // Issue #214: stop branch handled earlier (right after MinQty
             // range-check). Falling through here means cmd.Type is Limit
             // or Market.
@@ -1025,7 +1134,7 @@ public sealed class MatchingEngine
                     LimitPriceMantissa: stop.LimitPriceMantissa,
                     RemainingQuantityAtCancel: stop.Quantity,
                     TransactTimeNanos: cmd.EnteredAtNanos,
-                    RptSeq: NextRptSeq(),
+                    RptSeq: PrivateEventRptSeqDuringLegacyReplay(cmd.SecurityId),
                     Memo: cmd.Memo));
                 return;
             }
@@ -1033,6 +1142,10 @@ public sealed class MatchingEngine
             if (!book.TryGet(cmd.OrderId, out var resting))
             { Reject(cmd.ClOrdId, cmd.SecurityId, cmd.OrderId, RejectReason.UnknownOrderId, cmd.EnteredAtNanos); return; }
 
+            var phase = _phaseById[cmd.SecurityId];
+            EnsureRptSeqCapacity(
+                cmd.SecurityId,
+                phase is TradingPhase.Reserved or TradingPhase.FinalClosingCall ? 3UL : 1UL);
             EmitCanceled(book, resting, cmd.EnteredAtNanos, CancelReason.Client, cmd.Memo);
             RecomputeAuctionTopIfApplicable(cmd.SecurityId, cmd.EnteredAtNanos);
         }
@@ -1081,6 +1194,29 @@ public sealed class MatchingEngine
                     }
                 }
             }
+            if (resolved.Count > 0)
+            {
+                var requiredBySecurity = new Dictionary<long, ulong>();
+                if (groups is not null)
+                {
+                    foreach (var group in groups.Keys)
+                    {
+                        requiredBySecurity[group.securityId] =
+                            requiredBySecurity.GetValueOrDefault(group.securityId) + 1;
+                    }
+                }
+                foreach (var (book, _) in resolved)
+                {
+                    requiredBySecurity[book.SecurityId] =
+                        requiredBySecurity.GetValueOrDefault(book.SecurityId) + 1;
+                }
+                foreach (var required in requiredBySecurity)
+                {
+                    // One extra slot covers the ExpireSecurity composite,
+                    // which follows MassCancel with SecurityStatus_3.
+                    EnsureRptSeqCapacity(required.Key, required.Value + 1);
+                }
+            }
             if (groups is not null)
             {
                 foreach (var kv in groups)
@@ -1090,7 +1226,7 @@ public sealed class MatchingEngine
                         Side: kv.Key.side,
                         CancelledCount: kv.Value,
                         TransactTimeNanos: command.EnteredAtNanos,
-                        RptSeq: NextRptSeq()));
+                        RptSeq: NextRptSeq(kv.Key.securityId)));
                 }
             }
 
@@ -1127,6 +1263,21 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            foreach (var book in _booksById.Values)
+            {
+                ulong required = 0;
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    if (resting.Tif == TimeInForce.Gtd
+                        && resting.ExpireDate != 0
+                        && resting.ExpireDate <= currentDate)
+                    {
+                        required++;
+                    }
+                }
+                if (required > 0) EnsureRptSeqCapacity(book.SecurityId, required);
+            }
+
             int cancelled = 0;
             foreach (var book in _booksById.Values)
             {
@@ -1170,6 +1321,16 @@ public sealed class MatchingEngine
         EnterDispatch();
         try
         {
+            foreach (var book in _booksById.Values)
+            {
+                ulong required = 0;
+                foreach (var resting in book.SnapshotOrders())
+                {
+                    if (resting.Tif == TimeInForce.Day) required++;
+                }
+                if (required > 0) EnsureRptSeqCapacity(book.SecurityId, required);
+            }
+
             int cancelled = 0;
             foreach (var book in _booksById.Values)
             {
@@ -1214,7 +1375,7 @@ public sealed class MatchingEngine
                         LimitPriceMantissa: stop.LimitPriceMantissa,
                         RemainingQuantityAtCancel: stop.Quantity,
                         TransactTimeNanos: txnNanos,
-                        RptSeq: NextRptSeq(),
+                        RptSeq: PrivateEventRptSeqDuringLegacyReplay(stop.SecurityId),
                         Memo: stop.Memo,
                         Reason: CancelReason.DayExpired));
                     cancelled++;
@@ -1485,12 +1646,18 @@ public sealed class MatchingEngine
                                 && effectiveTif == resting.Tif
                                 && cmd.NewPriceMantissa == resting.PriceMantissa
                                 && cmd.NewQuantity <= resting.RemainingQuantity;
+            EnsureRptSeqCapacity(
+                cmd.SecurityId,
+                priorityKept
+                    ? (phase is TradingPhase.Reserved or TradingPhase.FinalClosingCall ? 3UL : 1UL)
+                    : SaturatingAdd(1, EstimateMatchingRptSeqBudget(cmd.SecurityId, cmd.NewQuantity)));
 
             if (priorityKept)
             {
                 // In-place quantity decrease: priority preserved, original
                 // InsertTimestamp preserved → OrderQuantityReducedEvent (UPDATE).
                 long delta = resting.RemainingQuantity - cmd.NewQuantity;
+                uint rptSeq = NextRptSeq(book.SecurityId);
                 resting.RemainingQuantity = cmd.NewQuantity;
                 resting.Level!.TotalQuantity -= delta;
                 // Issue #451: spec §7.4 allows InvestorID mutation via OCRR
@@ -1506,7 +1673,6 @@ public sealed class MatchingEngine
                 // so this only changes the date, never the TIF). For non-GTD
                 // orders effectiveExpireDate is 0, leaving the field untouched.
                 resting.ExpireDate = effectiveExpireDate;
-                uint rptSeq = NextRptSeq();
                 _sink.OnOrderQuantityReduced(new OrderQuantityReducedEvent(
                     SecurityId: book.SecurityId,
                     OrderId: resting.OrderId,
@@ -1630,6 +1796,7 @@ public sealed class MatchingEngine
             HiddenQuantity = hidden,
             ExpireDate = cmd.ExpireDate,
         };
+        uint rptSeq = NextRptSeq(book.SecurityId);
         book.Insert(resting);
         _sink.OnOrderAccepted(new OrderAcceptedEvent(
             SecurityId: book.SecurityId,
@@ -1640,7 +1807,7 @@ public sealed class MatchingEngine
             RemainingQuantity: resting.RemainingQuantity,
             EnteringFirm: resting.EnteringFirm,
             InsertTimestampNanos: resting.InsertTimestampNanos,
-            RptSeq: NextRptSeq(),
+            RptSeq: rptSeq,
             OrdType: cmd.Type,
             ProtectionPriceMantissa: cmd.Type == OrderType.MarketWithLeftover ? resting.PriceMantissa : null,
             CrossType: crossType,
@@ -1684,8 +1851,9 @@ public sealed class MatchingEngine
 
         if (_auctionTopById.TryGetValue(securityId, out var prev) && prev == newState)
             return;
-        _auctionTopById[securityId] = newState;
 
+        var rptSeq = NextAuctionTopRptSeq(securityId);
+        _auctionTopById[securityId] = newState;
         _sink.OnAuctionTopChanged(new AuctionTopChangedEvent(
             SecurityId: securityId,
             HasTop: newState.HasTop,
@@ -1695,7 +1863,8 @@ public sealed class MatchingEngine
             ImbalanceSide: newState.ImbalanceSide,
             ImbalanceQuantity: newState.ImbalanceQuantity,
             TransactTimeNanos: txnNanos,
-            RptSeq: NextRptSeq()));
+            TopRptSeq: rptSeq.Top,
+            ImbalanceRptSeq: rptSeq.Imbalance));
     }
 
     private AuctionTopState ComputeAuctionTop(LimitOrderBook book)
@@ -1902,7 +2071,7 @@ public sealed class MatchingEngine
                         RestingOrderId: maker.OrderId,
                         RestingFirm: maker.EnteringFirm,
                         TransactTimeNanos: cmd.EnteredAtNanos,
-                        RptSeq: NextRptSeq(),
+                        RptSeq: NextRptSeq(book.SecurityId),
                         AggressorMemo: cmd.Memo,
                         RestingMemo: maker.Memo,
                         CrossType: crossType,
@@ -1946,8 +2115,8 @@ public sealed class MatchingEngine
                             maker.HiddenQuantity = newHidden;
                             maker.InsertTimestampNanos = cmd.EnteredAtNanos;
                             book.Insert(maker);
-                            uint deleteSeq = NextRptSeq();
-                            uint addSeq = NextRptSeq();
+                            uint deleteSeq = NextRptSeq(book.SecurityId);
+                            uint addSeq = NextRptSeq(book.SecurityId);
                             _sink.OnIcebergReplenished(new IcebergReplenishedEvent(
                                 SecurityId: book.SecurityId,
                                 OrderId: icebergOid,
@@ -1976,7 +2145,7 @@ public sealed class MatchingEngine
                             PriceMantissa: maker.PriceMantissa,
                             FinalFilledQuantity: finalFilled,
                             TransactTimeNanos: cmd.EnteredAtNanos,
-                            RptSeq: NextRptSeq()));
+                            RptSeq: NextRptSeq(book.SecurityId)));
                         // #200: emit EmptyBook_9 if this fill drained the side.
                         if (book.BestLevel(makerSide) is null)
                         {
@@ -1997,7 +2166,7 @@ public sealed class MatchingEngine
                             NewRemainingQuantity: maker.RemainingQuantity,
                             InsertTimestampNanos: maker.InsertTimestampNanos,
                             TransactTimeNanos: cmd.EnteredAtNanos,
-                            RptSeq: NextRptSeq()));
+                            RptSeq: NextRptSeq(book.SecurityId)));
                     }
                     maker = next;
                 }
@@ -2060,7 +2229,7 @@ public sealed class MatchingEngine
                         RemainingQuantityAtCancel: aggressorRemaining,
                         TransactTimeNanos: cmd.EnteredAtNanos,
                         Reason: CancelReason.IocUnmatched,
-                        RptSeq: NextRptSeq(),
+                        RptSeq: PrivateEventRptSeqDuringLegacyReplay(book.SecurityId),
                         Memo: cmd.Memo));
                 }
                 return;
@@ -2095,6 +2264,7 @@ public sealed class MatchingEngine
                 ExpireDate = cmd.ExpireDate,
                 Memo = cmd.Memo,
             };
+            uint rptSeq = NextRptSeq(book.SecurityId);
             book.Insert(resting);
             _sink.OnOrderAccepted(new OrderAcceptedEvent(
                 SecurityId: book.SecurityId,
@@ -2105,7 +2275,7 @@ public sealed class MatchingEngine
                 RemainingQuantity: resting.RemainingQuantity,
                 EnteringFirm: resting.EnteringFirm,
                 InsertTimestampNanos: resting.InsertTimestampNanos,
-                RptSeq: NextRptSeq(),
+                RptSeq: rptSeq,
                 Memo: resting.Memo,
                 OrdType: cmd.Type,
                 ProtectionPriceMantissa: isMwl ? limitPx : null,
@@ -2132,6 +2302,7 @@ public sealed class MatchingEngine
         long qty = o.RemainingQuantity;
         long oid = o.OrderId;
         var memo = requestMemo ?? o.Memo;
+        uint rptSeq = NextRptSeq(book.SecurityId);
         book.Remove(o);
         _sink.OnOrderCanceled(new OrderCanceledEvent(
             SecurityId: book.SecurityId,
@@ -2141,7 +2312,7 @@ public sealed class MatchingEngine
             RemainingQuantityAtCancel: qty,
             TransactTimeNanos: txn,
             Reason: reason,
-            RptSeq: NextRptSeq(),
+            RptSeq: rptSeq,
             Memo: memo));
         // #200: when this cancel emptied the side, publish EmptyBook_9 so
         // recovery consumers can drop their per-side state without waiting
@@ -2260,7 +2431,7 @@ public sealed class MatchingEngine
             Quantity: cmd.Quantity,
             EnteringFirm: cmd.EnteringFirm,
             InsertTimestampNanos: cmd.EnteredAtNanos,
-            RptSeq: NextRptSeq(),
+            RptSeq: PrivateEventRptSeqDuringLegacyReplay(cmd.SecurityId),
             Memo: cmd.Memo));
     }
 
@@ -2309,7 +2480,7 @@ public sealed class MatchingEngine
                 StopPxMantissa: s.StopPxMantissa,
                 TriggerTradePriceMantissa: tradePxMantissa,
                 TransactTimeNanos: txnNanos,
-                RptSeq: NextRptSeq()));
+                RptSeq: PrivateEventRptSeqDuringLegacyReplay(securityId)));
             ExecuteTriggeredStop(s, rules, book, txnNanos);
         }
     }
@@ -2355,7 +2526,113 @@ public sealed class MatchingEngine
     private void Reject(string clOrdId, long securityId, long orderId, RejectReason r, ulong txn)
         => _sink.OnReject(new RejectEvent(clOrdId, securityId, orderId, r, txn, _currentMemo));
 
-    private uint NextRptSeq() => ++_rptSeq;
+    private bool HasAllocatedRptSeq()
+    {
+        foreach (uint rptSeq in _rptSeqBySecurityId.Values)
+        {
+            if (rptSeq != 0) return true;
+        }
+        return false;
+    }
+
+    private void EnsureRptSeqCapacity(long securityId, ulong required)
+    {
+        uint current = _legacyGlobalRptSeq ?? GetCurrentRptSeq(securityId);
+        if (required > uint.MaxValue - (ulong)current)
+            throw new RptSeqExhaustedException(securityId);
+    }
+
+    private ulong EstimateMatchingRptSeqBudget(long securityId, long aggressorQuantity)
+    {
+        var book = _booksById[securityId];
+        ulong orderCount = 0;
+        ulong visibleSliceCount = 0;
+        foreach (var order in book.SnapshotOrders())
+        {
+            orderCount = SaturatingAdd(orderCount, 1);
+            ulong slices = 1;
+            if (order.HiddenQuantity > 0 && order.MaxFloor > 0)
+            {
+                ulong hidden = (ulong)order.HiddenQuantity;
+                ulong floor = (ulong)order.MaxFloor;
+                slices = SaturatingAdd(slices, (hidden + floor - 1) / floor);
+            }
+            visibleSliceCount = SaturatingAdd(visibleSliceCount, slices);
+        }
+
+        ulong totalAggressorQuantity = aggressorQuantity > 0 ? (ulong)aggressorQuantity : 0;
+        ulong stopCount = 0;
+        if (_stopsBySymbol.TryGetValue(securityId, out var stops))
+        {
+            stopCount = (ulong)stops.Count;
+            foreach (var stop in stops)
+                totalAggressorQuantity = SaturatingAdd(totalAggressorQuantity, (ulong)stop.Quantity);
+        }
+
+        ulong maxVisitsAcrossAggressors = SaturatingMultiply(
+            visibleSliceCount,
+            SaturatingAdd(stopCount, 1));
+        ulong interactions = Math.Min(maxVisitsAcrossAggressors, totalAggressorQuantity);
+        ulong frames = SaturatingMultiply(interactions, 3);
+        frames = SaturatingAdd(frames, orderCount);
+        frames = SaturatingAdd(frames, stopCount);
+        // One residual add plus auction TOP/imbalance headroom.
+        return SaturatingAdd(frames, 3);
+    }
+
+    private ulong EstimateUncrossRptSeqBudget(long securityId)
+    {
+        var book = _booksById[securityId];
+        ulong orderCount = 0;
+        ulong visibleSliceCount = 0;
+        foreach (var order in book.SnapshotOrders())
+        {
+            orderCount = SaturatingAdd(orderCount, 1);
+            ulong slices = 1;
+            if (order.HiddenQuantity > 0 && order.MaxFloor > 0)
+            {
+                ulong hidden = (ulong)order.HiddenQuantity;
+                ulong floor = (ulong)order.MaxFloor;
+                slices = SaturatingAdd(slices, (hidden + floor - 1) / floor);
+            }
+            visibleSliceCount = SaturatingAdd(visibleSliceCount, slices);
+        }
+
+        // One auction trade can emit five sequenced frames: Trade_53 plus
+        // one post-trade event per side, with either side's event expanding
+        // to an iceberg Delete+Add pair.
+        ulong frames = SaturatingMultiply(visibleSliceCount, 5);
+        frames = SaturatingAdd(frames, orderCount);
+        return SaturatingAdd(frames, 4);
+    }
+
+    private static ulong SaturatingAdd(ulong left, ulong right)
+        => ulong.MaxValue - left < right ? ulong.MaxValue : left + right;
+
+    private static ulong SaturatingMultiply(ulong left, ulong right)
+        => left != 0 && right > ulong.MaxValue / left ? ulong.MaxValue : left * right;
+
+    private uint NextRptSeq(long securityId)
+    {
+        uint current = _legacyGlobalRptSeq ?? GetCurrentRptSeq(securityId);
+        if (current == uint.MaxValue)
+            throw new RptSeqExhaustedException(securityId);
+        uint next = current + 1;
+        if (_legacyGlobalRptSeq.HasValue)
+            _legacyGlobalRptSeq = next;
+        _rptSeqBySecurityId[securityId] = next;
+        return next;
+    }
+
+    private uint PrivateEventRptSeqDuringLegacyReplay(long securityId)
+        => _legacyGlobalRptSeq.HasValue ? NextRptSeq(securityId) : 0;
+
+    private (uint Top, uint Imbalance) NextAuctionTopRptSeq(long securityId)
+    {
+        uint top = NextRptSeq(securityId);
+        uint imbalance = _legacyGlobalRptSeq.HasValue ? top : NextRptSeq(securityId);
+        return (top, imbalance);
+    }
 
     private void EnterDispatch()
     {

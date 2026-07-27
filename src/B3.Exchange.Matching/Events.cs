@@ -182,7 +182,9 @@ public readonly record struct IcebergReplenishedEvent(
 /// a paired UMDF emission: <c>TheoreticalOpeningPrice_16</c> +
 /// <c>AuctionImbalance_19</c>. The engine throttles emission so an
 /// accumulation event that does not change the indicative state does
-/// not produce duplicate frames.
+/// not produce duplicate frames. <see cref="TopRptSeq"/> and
+/// <see cref="ImbalanceRptSeq"/> are distinct because each UMDF frame
+/// advances the security's shared sequence.
 /// <para>
 /// When <see cref="HasTop"/> is false there is no crossing in the book
 /// (one side is empty, or the best bid is below the best ask). The
@@ -207,7 +209,8 @@ public readonly record struct AuctionTopChangedEvent(
     Side ImbalanceSide,
     long ImbalanceQuantity,
     ulong TransactTimeNanos,
-    uint RptSeq);
+    uint TopRptSeq,
+    uint ImbalanceRptSeq);
 
 /// <summary>
 /// Distinguishes the two auction-print kinds emitted by
@@ -247,7 +250,8 @@ public readonly record struct AuctionPrintEvent(
 /// Issue #214. Carries the original order parameters so the integration
 /// layer can emit ER_New back to the originating session. The order is
 /// off-book so NO MBO frame is emitted; only ER_New surfaces to the
-/// client. The order remains parked until either:
+/// client. <see cref="RptSeq"/> is 0 because no public incremental frame is
+/// emitted. The order remains parked until either:
 /// <list type="bullet">
 ///   <item>a trade prints at or through <see cref="StopPxMantissa"/>
 ///   on the watching side, in which case it triggers and is re-routed
@@ -277,7 +281,7 @@ public readonly record struct StopOrderAcceptedEvent(
 /// OrderAccepted / OrderFilled etc. with the SAME <see cref="OrderId"/>).
 /// The integration layer's default is to log this and emit no separate
 /// frame; per-trade and per-resting-event frames already cover the
-/// client-visible state changes.
+/// client-visible state changes. <see cref="RptSeq"/> is therefore 0.
 /// </summary>
 public readonly record struct StopOrderTriggeredEvent(
     long SecurityId,
@@ -292,7 +296,7 @@ public readonly record struct StopOrderTriggeredEvent(
 /// Fired when a parked stop order is cancelled before triggering.
 /// Issue #214. The integration layer translates this to ER_Cancel back
 /// to the owning session; no MBO frame is emitted because the stop was
-/// never on the book.
+/// never on the book. <see cref="RptSeq"/> is therefore 0.
 /// </summary>
 public readonly record struct StopOrderCanceledEvent(
     long SecurityId,

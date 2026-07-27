@@ -13,6 +13,8 @@ namespace B3.Exchange.Persistence.Tests;
 public class MatchingEngineRestoreTests
 {
     private const long Sec = 900_000_000_001L;
+    private const long Vale = 900_000_000_002L;
+    private const long Itub = 900_000_000_003L;
 
     private static Instrument Petr4 => new()
     {
@@ -27,12 +29,33 @@ public class MatchingEngineRestoreTests
         SecurityType = "EQUITY",
     };
 
+    private static Instrument Vale3 => CreateInstrument("VALE3", Vale, "BRVALEACNOR0");
+    private static Instrument Itub4 => CreateInstrument("ITUB4", Itub, "BRITUBACNPR1");
+
+    private static Instrument CreateInstrument(string symbol, long securityId, string isin) => new()
+    {
+        Symbol = symbol,
+        SecurityId = securityId,
+        TickSize = 0.01m,
+        LotSize = 100,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000.00m,
+        Currency = "BRL",
+        Isin = isin,
+        SecurityType = "EQUITY",
+    };
+
     private sealed class CountingSink : IMatchingEventSink
     {
         public List<long> AcceptedOrderIds { get; } = new();
+        public List<OrderAcceptedEvent> Accepted { get; } = new();
         public List<TradeEvent> Trades { get; } = new();
         public List<OrderModifiedEvent> Modified { get; } = new();
-        public void OnOrderAccepted(in OrderAcceptedEvent e) => AcceptedOrderIds.Add(e.OrderId);
+        public void OnOrderAccepted(in OrderAcceptedEvent e)
+        {
+            AcceptedOrderIds.Add(e.OrderId);
+            Accepted.Add(e);
+        }
         public void OnOrderQuantityReduced(in OrderQuantityReducedEvent e) { }
         public void OnOrderModified(in OrderModifiedEvent e) => Modified.Add(e);
         public void OnOrderCanceled(in OrderCanceledEvent e) { }
@@ -54,6 +77,12 @@ public class MatchingEngineRestoreTests
     {
         sink = new CountingSink();
         return new MatchingEngine(new[] { Petr4 }, sink, NullLogger<MatchingEngine>.Instance);
+    }
+
+    private static MatchingEngine NewThreeSecurityEngine(out CountingSink sink)
+    {
+        sink = new CountingSink();
+        return new MatchingEngine([Petr4, Vale3, Itub4], sink, NullLogger<MatchingEngine>.Instance);
     }
 
     private static long Px(decimal p) => (long)(p * 10_000m);
@@ -82,7 +111,7 @@ public class MatchingEngineRestoreTests
         dst.RestoreState(snap);
 
         Assert.Equal(src.PeekNextOrderId, dst.PeekNextOrderId);
-        Assert.Equal(src.CurrentRptSeq, dst.CurrentRptSeq);
+        Assert.Equal(src.GetCurrentRptSeq(Sec), dst.GetCurrentRptSeq(Sec));
 
         // Resting buys after restore should be {B, C} (A was consumed).
         var restingBuys = dst.EnumerateBook(Sec, Side.Buy).ToList();
@@ -168,5 +197,35 @@ public class MatchingEngineRestoreTests
         Assert.Equal(Px(10.00m), modified.ProtectionPriceMantissa);
         Assert.Equal(Px(10.00m), modified.NewPriceMantissa);
         Assert.Equal(100, modified.NewRemainingQuantity);
+    }
+
+    [Fact]
+    public void Restore_PreservesIndependentRptSeqCountersAcrossThreeSecurities()
+    {
+        var src = NewThreeSecurityEngine(out _);
+        src.Submit(new NewOrderCommand("P-S", Sec, Side.Sell, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 1, 1_000));
+        src.Submit(new NewOrderCommand("V-B1", Vale, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(20m), 100, 2, 2_000));
+        src.Submit(new NewOrderCommand("I-B", Itub, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(30m), 100, 3, 3_000));
+        src.Submit(new NewOrderCommand("V-B2", Vale, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(19m), 100, 2, 4_000));
+        src.Submit(new NewOrderCommand("P-B", Sec, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 4, 5_000));
+
+        var dst = NewThreeSecurityEngine(out var sink);
+        dst.RestoreState(src.CaptureState());
+
+        Assert.Equal(3u, dst.GetCurrentRptSeq(Sec));
+        Assert.Equal(2u, dst.GetCurrentRptSeq(Vale));
+        Assert.Equal(1u, dst.GetCurrentRptSeq(Itub));
+
+        dst.Submit(new NewOrderCommand("V-B3", Vale, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(18m), 100, 2, 6_000));
+        Assert.Equal(3u, Assert.Single(sink.Accepted).RptSeq);
+        Assert.Equal(3u, dst.GetCurrentRptSeq(Sec));
+        Assert.Equal(3u, dst.GetCurrentRptSeq(Vale));
+        Assert.Equal(1u, dst.GetCurrentRptSeq(Itub));
     }
 }

@@ -104,7 +104,7 @@ public class ChannelDispatcherOrphanSessionTests
         var engine = new EngineStateSnapshot(
             NextOrderId: nextId,
             NextTradeId: 1,
-            RptSeq: 0,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(Sec, 0)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: new[] { book });
         return new ChannelStateSnapshot(

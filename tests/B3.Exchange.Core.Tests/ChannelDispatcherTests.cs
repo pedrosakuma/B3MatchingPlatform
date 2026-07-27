@@ -17,6 +17,8 @@ namespace B3.Exchange.Core.Tests;
 public partial class ChannelDispatcherTests
 {
     private const long Petr = 900_000_000_001L;
+    private const long Vale = 900_000_000_002L;
+    private const long Itub = 900_000_000_003L;
 
     private static Instrument Petr4 => new()
     {
@@ -28,6 +30,22 @@ public partial class ChannelDispatcherTests
         MaxPrice = 1_000m,
         Currency = "BRL",
         Isin = "BRPETRACNPR6",
+        SecurityType = "EQUITY",
+    };
+
+    private static Instrument Vale3 => CreateInstrument("VALE3", Vale, "BRVALEACNOR0");
+    private static Instrument Itub4 => CreateInstrument("ITUB4", Itub, "BRITUBACNPR1");
+
+    private static Instrument CreateInstrument(string symbol, long securityId, string isin) => new()
+    {
+        Symbol = symbol,
+        SecurityId = securityId,
+        TickSize = 0.01m,
+        LotSize = 100,
+        MinPrice = 0.01m,
+        MaxPrice = 1_000m,
+        Currency = "BRL",
+        Isin = isin,
         SecurityType = "EQUITY",
     };
 
@@ -115,6 +133,27 @@ public partial class ChannelDispatcherTests
                 OpenOrders = metrics?.OpenOrders,
                 MaxOpenOrdersPerFirm = maxOpenOrdersPerFirm,
                 OpenOrderTracker = openOrderTracker,
+            });
+        return (disp, pkt, outbound);
+    }
+
+    private static (ChannelDispatcher disp, RecordingPacketSink pkt, RecordingOutbound outbound)
+        NewThreeSecurityDispatcher()
+    {
+        var pkt = new RecordingPacketSink();
+        var outbound = new RecordingOutbound();
+        var disp = new ChannelDispatcher(channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(
+                [Petr4, Vale3, Itub4],
+                sink,
+                NullLogger<MatchingEngine>.Instance),
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = pkt,
+                Outbound = outbound,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                TimeSource = new FakeNanosTimeSource(1_000_000_000UL),
+                TradeDate = 19_000,
             });
         return (disp, pkt, outbound);
     }
@@ -1174,7 +1213,7 @@ public partial class ChannelDispatcherTests
         disp.EnqueueNewOrder(new NewOrderCommand("1", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1_000UL),
             reply.Id, reply.EnteringFirm, clOrdIdValue: 1UL);
         DrainInbound(disp);
-        uint rptBefore = GetEngine(disp).CurrentRptSeq;
+        uint rptBefore = GetEngine(disp).GetCurrentRptSeq(Petr);
         Assert.True(rptBefore > 0);
         pkt.Packets.Clear();
         uint seqBefore = disp.SequenceNumber;
@@ -1185,7 +1224,7 @@ public partial class ChannelDispatcherTests
         DrainInbound(disp);
 
         // Engine RptSeq was bumped exactly once by the bust.
-        Assert.Equal(rptBefore + 1, GetEngine(disp).CurrentRptSeq);
+        Assert.Equal(rptBefore + 1, GetEngine(disp).GetCurrentRptSeq(Petr));
 
         // Single bust packet emitted on the incremental channel.
         Assert.Single(pkt.Packets);
@@ -1219,6 +1258,40 @@ public partial class ChannelDispatcherTests
     }
 
     [Fact]
+    public void OperatorTradeBust_UsesTargetSecurityRptSeqAfterOtherSymbolTraffic()
+    {
+        var (disp, pkt, outbound) = NewThreeSecurityDispatcher();
+        var reply = new FakeSession(outbound);
+
+        disp.EnqueueNewOrder(new NewOrderCommand("V", Vale, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(20m), 100, 7, 1_000),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 1);
+        disp.EnqueueNewOrder(new NewOrderCommand("I", Itub, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(30m), 100, 7, 2_000),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 2);
+        disp.EnqueueNewOrder(new NewOrderCommand("P", Petr, Side.Buy, OrderType.Limit,
+            TimeInForce.Day, Px(10m), 100, 7, 3_000),
+            reply.Id, reply.EnteringFirm, clOrdIdValue: 3);
+        DrainInbound(disp);
+        pkt.Packets.Clear();
+
+        Assert.True(disp.EnqueueOperatorTradeBust(
+            Petr, Px(10m), 100, tradeId: 42, tradeDate: 19_500));
+        DrainInbound(disp);
+
+        var engine = GetEngine(disp);
+        Assert.Equal(2u, engine.GetCurrentRptSeq(Petr));
+        Assert.Equal(1u, engine.GetCurrentRptSeq(Vale));
+        Assert.Equal(1u, engine.GetCurrentRptSeq(Itub));
+        var packet = Assert.Single(pkt.Packets);
+        int bodyStart = WireOffsets.PacketHeaderSize
+            + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize;
+        Assert.Equal(2u, MemoryMarshal.Read<uint>(
+            packet.AsSpan(bodyStart + WireOffsets.TradeBustBodyRptSeqOffset, 4)));
+    }
+
+    [Fact]
     public void OperatorBumpVersion_ClearsBook_BumpsVersions_EmitsChannelResetPacket()
     {
         var (disp, pkt, outbound) = NewDispatcher();
@@ -1235,7 +1308,7 @@ public partial class ChannelDispatcherTests
         uint seqBefore = disp.SequenceNumber;
         Assert.Equal(2, pkt.Packets.Count);
         Assert.Equal(2, GetEngine(disp).OrderCount(Petr));
-        Assert.True(GetEngine(disp).CurrentRptSeq > 0);
+        Assert.True(GetEngine(disp).GetCurrentRptSeq(Petr) > 0);
         pkt.Packets.Clear();
 
         Assert.True(disp.EnqueueOperatorBumpVersion());
@@ -1243,7 +1316,7 @@ public partial class ChannelDispatcherTests
 
         // Book wiped, RptSeq reset.
         Assert.Equal(0, GetEngine(disp).OrderCount(Petr));
-        Assert.Equal(0u, GetEngine(disp).CurrentRptSeq);
+        Assert.Equal(0u, GetEngine(disp).GetCurrentRptSeq(Petr));
 
         // SequenceVersion bumped on the dispatcher (incremental). Snapshot
         // rotator is not attached in this test (no rotator wired) — the
@@ -1270,6 +1343,149 @@ public partial class ChannelDispatcherTests
         int sbeHdrStart = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize;
         ushort templateId = MemoryMarshal.Read<ushort>(packet.AsSpan(sbeHdrStart + 2, 2));
         Assert.Equal((ushort)11, templateId);
+    }
+
+    [Fact]
+    public void OperatorBumpVersion_ResetsEverySecurityRptSeq()
+    {
+        var (disp, _, outbound) = NewThreeSecurityDispatcher();
+        var reply = new FakeSession(outbound);
+        long[] securityIds = [Petr, Vale, Itub];
+        for (int i = 0; i < securityIds.Length; i++)
+        {
+            disp.EnqueueNewOrder(new NewOrderCommand(
+                $"PRE-{i}",
+                securityIds[i],
+                Side.Buy,
+                OrderType.Limit,
+                TimeInForce.Day,
+                Px(10m + i),
+                100,
+                7,
+                (ulong)(1_000 + i)),
+                reply.Id,
+                reply.EnteringFirm,
+                clOrdIdValue: (ulong)(i + 1));
+        }
+        DrainInbound(disp);
+
+        Assert.True(disp.EnqueueOperatorBumpVersion());
+        DrainInbound(disp);
+
+        var engine = GetEngine(disp);
+        Assert.All(securityIds, securityId =>
+            Assert.Equal(0u, engine.GetCurrentRptSeq(securityId)));
+
+        reply.News.Clear();
+        for (int i = 0; i < securityIds.Length; i++)
+        {
+            disp.EnqueueNewOrder(new NewOrderCommand(
+                $"POST-{i}",
+                securityIds[i],
+                Side.Buy,
+                OrderType.Limit,
+                TimeInForce.Day,
+                Px(20m + i),
+                100,
+                7,
+                (ulong)(2_000 + i)),
+                reply.Id,
+                reply.EnteringFirm,
+                clOrdIdValue: (ulong)(10 + i));
+        }
+        DrainInbound(disp);
+
+        Assert.Equal(3, reply.News.Count);
+        Assert.All(reply.News, accepted => Assert.Equal(1u, accepted.RptSeq));
+    }
+
+    [Fact]
+    public void AuctionTopFrames_UseDistinctContiguousRptSeqValues()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        Assert.True(disp.EnqueueOperatorSetTradingPhase(Petr, TradingPhase.Reserved));
+        DrainInbound(disp);
+        pkt.Packets.Clear();
+
+        disp.EnqueueNewOrder(new NewOrderCommand(
+            "GFA",
+            Petr,
+            Side.Buy,
+            OrderType.Limit,
+            TimeInForce.GoodForAuction,
+            Px(10m),
+            100,
+            7,
+            2_000),
+            reply.Id,
+            reply.EnteringFirm,
+            clOrdIdValue: 1);
+        DrainInbound(disp);
+
+        var packet = Assert.Single(pkt.Packets);
+        int orderFrameStart = WireOffsets.PacketHeaderSize;
+        int topFrameStart = orderFrameStart
+            + MemoryMarshal.Read<ushort>(packet.AsSpan(orderFrameStart, 2));
+        int imbalanceFrameStart = topFrameStart
+            + MemoryMarshal.Read<ushort>(packet.AsSpan(topFrameStart, 2));
+        int topBodyStart = topFrameStart
+            + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize;
+        int imbalanceBodyStart = imbalanceFrameStart
+            + WireOffsets.FramingHeaderSize
+            + WireOffsets.SbeMessageHeaderSize;
+
+        Assert.Equal(3u, MemoryMarshal.Read<uint>(packet.AsSpan(
+            topBodyStart + WireOffsets.TheoreticalOpeningPriceBodyRptSeqOffset,
+            sizeof(uint))));
+        Assert.Equal(4u, MemoryMarshal.Read<uint>(packet.AsSpan(
+            imbalanceBodyStart + WireOffsets.AuctionImbalanceBodyRptSeqOffset,
+            sizeof(uint))));
+    }
+
+    [Fact]
+    public void Cross_PreflightsAllLegsBeforeFirstMutationAtRptSeqExhaustion()
+    {
+        var (disp, pkt, outbound) = NewDispatcher();
+        var reply = new FakeSession(outbound);
+        disp.RestoreChannelState(new ChannelStateSnapshot(
+            Version: ChannelStateSnapshot.CurrentVersion,
+            ChannelNumber: 1,
+            SequenceNumber: 0,
+            SequenceVersion: 1,
+            Engine: new EngineStateSnapshot(
+                NextOrderId: 1,
+                NextTradeId: 1,
+                RptSeqBySecurity:
+                [
+                    new EngineStateSnapshot.RptSeqEntry(Petr, uint.MaxValue - 5),
+                ],
+                Phases:
+                [
+                    new EngineStateSnapshot.PhaseEntry(Petr, TradingPhase.Open),
+                ],
+                Books:
+                [
+                    new EngineStateSnapshot.BookSnapshot(Petr, []),
+                ]),
+            Owners: []));
+        var cross = new CrossOrderCommand(
+            new NewOrderCommand("B", Petr, Side.Buy, OrderType.Limit,
+                TimeInForce.Day, Px(10m), 100, 7, 1_000),
+            new NewOrderCommand("S", Petr, Side.Sell, OrderType.Limit,
+                TimeInForce.Day, Px(10m), 100, 7, 1_000),
+            BuyClOrdIdValue: 1,
+            SellClOrdIdValue: 2,
+            CrossId: 3);
+
+        Assert.True(disp.EnqueueCross(cross, reply.Id, reply.EnteringFirm));
+        Assert.Throws<RptSeqExhaustedException>(() => DrainInbound(disp));
+
+        Assert.Equal(0, GetEngine(disp).OrderCount(Petr));
+        Assert.Empty(reply.News);
+        Assert.Empty(reply.Trades);
+        Assert.Empty(pkt.Packets);
     }
 
     [Fact]

@@ -69,7 +69,13 @@ public class BinaryChannelStateSnapshotCodecTests
             new OrderOwnerSnapshot(102, "conn-9b", 9, 19UL, Side.Sell, 999_001),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 103, NextTradeId: 50, RptSeq: 12,
+            NextOrderId: 103,
+            NextTradeId: 50,
+            RptSeqBySecurity:
+            [
+                new EngineStateSnapshot.RptSeqEntry(999_001, 12),
+                new EngineStateSnapshot.RptSeqEntry(999_002, 4),
+            ],
             Phases: phases, Books: books, Stops: stops);
         return new ChannelStateSnapshot(
             Version: ChannelStateSnapshot.CurrentVersion,
@@ -92,7 +98,7 @@ public class BinaryChannelStateSnapshotCodecTests
         Assert.Equal(a.LastAppliedSeq, b.LastAppliedSeq);
         Assert.Equal(a.Engine.NextOrderId, b.Engine.NextOrderId);
         Assert.Equal(a.Engine.NextTradeId, b.Engine.NextTradeId);
-        Assert.Equal(a.Engine.RptSeq, b.Engine.RptSeq);
+        Assert.Equal(a.Engine.RptSeqBySecurity, b.Engine.RptSeqBySecurity);
         Assert.Equal(a.Engine.Phases, b.Engine.Phases);
         Assert.Equal(a.Engine.Books.Count, b.Engine.Books.Count);
         for (int i = 0; i < a.Engine.Books.Count; i++)
@@ -125,7 +131,7 @@ public class BinaryChannelStateSnapshotCodecTests
         // 0); on decode we want null back so encode→decode→encode is
         // bit-stable for legacy snapshots.
         var engine = new EngineStateSnapshot(
-            NextOrderId: 1, NextTradeId: 1, RptSeq: 0,
+            NextOrderId: 1, NextTradeId: 1, RptSeqBySecurity: [],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: Array.Empty<EngineStateSnapshot.BookSnapshot>(),
             Stops: null);
@@ -164,7 +170,9 @@ public class BinaryChannelStateSnapshotCodecTests
             new EngineStateSnapshot.BookSnapshot(999_001, orders),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 102, NextTradeId: 1, RptSeq: 0,
+            NextOrderId: 102,
+            NextTradeId: 1,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(999_001, 0)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: books,
             Stops: null);
@@ -181,6 +189,50 @@ public class BinaryChannelStateSnapshotCodecTests
         // The v5 trailer fields (OrdTagId/Asset/InvestorId) still survive.
         Assert.Equal((byte)77, roundTripped.OrdTagId);
         Assert.Equal("PETR", roundTripped.Asset);
+    }
+
+    [Fact]
+    public void Decode_V6GlobalRptSeq_MapsHighWaterToEverySecurity()
+    {
+        var phases = new[]
+        {
+            new EngineStateSnapshot.PhaseEntry(11, TradingPhase.Open),
+            new EngineStateSnapshot.PhaseEntry(22, TradingPhase.Pause),
+            new EngineStateSnapshot.PhaseEntry(33, TradingPhase.Close),
+        };
+        var engine = new EngineStateSnapshot(
+            NextOrderId: 1,
+            NextTradeId: 1,
+            RptSeqBySecurity:
+            [
+                new EngineStateSnapshot.RptSeqEntry(11, 29),
+            ],
+            Phases: phases,
+            Books: phases.Select(phase =>
+                new EngineStateSnapshot.BookSnapshot(
+                    phase.SecurityId,
+                    Array.Empty<RestingOrderRecord>())).ToArray());
+        var legacy = new ChannelStateSnapshot(
+            Version: 6,
+            ChannelNumber: 1,
+            SequenceNumber: 0,
+            SequenceVersion: 1,
+            Engine: engine,
+            Owners: []);
+
+        var decoded = BinaryChannelStateSnapshotCodec.Decode(
+            BinaryChannelStateSnapshotCodec.Encode(legacy));
+
+        Assert.Equal(ChannelStateSnapshot.CurrentVersion, decoded.Version);
+        Assert.Equal(
+            new[]
+            {
+                new EngineStateSnapshot.RptSeqEntry(11, 29),
+                new EngineStateSnapshot.RptSeqEntry(22, 29),
+                new EngineStateSnapshot.RptSeqEntry(33, 29),
+            },
+            decoded.Engine.RptSeqBySecurity);
+        Assert.Equal(29u, decoded.Engine.LegacyGlobalRptSeq);
     }
 
     [Fact]
@@ -209,7 +261,9 @@ public class BinaryChannelStateSnapshotCodecTests
             new EngineStateSnapshot.BookSnapshot(999_001, orders),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 102, NextTradeId: 1, RptSeq: 0,
+            NextOrderId: 102,
+            NextTradeId: 1,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(999_001, 0)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: books,
             Stops: null);
@@ -248,7 +302,9 @@ public class BinaryChannelStateSnapshotCodecTests
                 InvestorId: new InvestorId(0x1234, 567u)),
         };
         var engine = new EngineStateSnapshot(
-            NextOrderId: 1, NextTradeId: 1, RptSeq: 0,
+            NextOrderId: 1,
+            NextTradeId: 1,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(999_001, 0)],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: Array.Empty<EngineStateSnapshot.BookSnapshot>(),
             Stops: stops);
@@ -269,7 +325,7 @@ public class BinaryChannelStateSnapshotCodecTests
     public void Encode_EmptySnapshot_ProducesShortPayload()
     {
         var engine = new EngineStateSnapshot(
-            NextOrderId: 1, NextTradeId: 1, RptSeq: 0,
+            NextOrderId: 1, NextTradeId: 1, RptSeqBySecurity: [],
             Phases: Array.Empty<EngineStateSnapshot.PhaseEntry>(),
             Books: Array.Empty<EngineStateSnapshot.BookSnapshot>(),
             Stops: null);
@@ -353,7 +409,9 @@ public class BinaryChannelStateSnapshotCodecTests
                 (ulong)i, orders[i].Side, 999_001);
         }
         var engine = new EngineStateSnapshot(
-            NextOrderId: 1_000_200, NextTradeId: 50, RptSeq: 5_000,
+            NextOrderId: 1_000_200,
+            NextTradeId: 50,
+            RptSeqBySecurity: [new EngineStateSnapshot.RptSeqEntry(999_001, 5_000)],
             Phases: new[] { new EngineStateSnapshot.PhaseEntry(999_001, TradingPhase.Open) },
             Books: new[] { new EngineStateSnapshot.BookSnapshot(999_001, orders) },
             Stops: null);
