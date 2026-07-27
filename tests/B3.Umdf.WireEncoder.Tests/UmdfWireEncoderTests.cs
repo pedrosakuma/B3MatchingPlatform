@@ -578,12 +578,32 @@ public class UmdfWireEncoderTests
         Assert.True(InstrumentStatus_58Data.TryParse(
             buf.AsSpan(FrameOffset, WireOffsets.InstrumentStatusBlockLength), out var rdr));
         Assert.Equal(4242L, (long)(ulong)rdr.Data.SecurityID.Value);
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, rdr.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), rdr.Data.TradingSessionID));
         Assert.Equal(SecurityTradingStatus.OPEN, rdr.Data.SecurityTradingStatus);
         Assert.Equal(AdministrativeHaltState.HALTED, rdr.Data.AdministrativeHaltState);
         Assert.Equal(AdministrativeTransitionKind.HALT, rdr.Data.AdministrativeTransitionKind);
         Assert.Equal(HaltReason.VOLATILITY_CIRCUIT_BREAKER, rdr.Data.HaltReason);
         Assert.Equal(1_700_000_000_000_000_000UL, rdr.Data.TransactTime.Time);
         Assert.Equal(43u, rdr.Data.RptSeq);
+    }
+
+    [Fact]
+    public void InstrumentStatus_RejectsUndefinedTradingSession()
+    {
+        var buf = new byte[80];
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            UmdfWireEncoder.WriteInstrumentStatusFrame(
+                buf,
+                securityId: 4242L,
+                tradingSessionId: 0,
+                securityTradingStatus: (byte)SecurityTradingStatus.OPEN,
+                administrativeHaltState: UmdfWireEncoder.AdministrativeHaltStateActive,
+                administrativeTransitionKind: UmdfWireEncoder.OptionalEnumNull,
+                haltReason: UmdfWireEncoder.OptionalEnumNull,
+                transactTimeNanos: 0,
+                rptSeq: 0));
     }
 
     [Fact]

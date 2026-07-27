@@ -8,7 +8,7 @@ The 28-byte fixed block contains:
 |---|---:|---:|---|
 | `securityID` | 48 | 0 | Instrument identifier. |
 | `matchEventIndicator` | 37035 | 8 | `RecoveryMsg` is set on snapshot publication. |
-| `tradingSessionID` | 336 | 9 | Trading session identifier. |
+| `tradingSessionID` | 336 | 9 | Required enum; currently `REGULAR_TRADING_SESSION=1`. |
 | `securityTradingStatus` | 326 | 10 | Underlying trading phase preserved across the overlay. |
 | `administrativeHaltState` | 37781 | 11 | `ACTIVE=0`, `HALTED=1`. |
 | `administrativeTransitionKind` | 37782 | 12 | Optional: `HALT=1`, `RESUME=2`; null in snapshots. |

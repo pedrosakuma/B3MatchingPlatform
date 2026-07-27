@@ -74,6 +74,8 @@ public class SnapshotPacketBuilderTests
         Assert.True(InstrumentStatus_58Data.TryParse(
             sink.Packets[0].AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
             out var status));
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), status.Data.TradingSessionID));
         Assert.Equal(AdministrativeHaltState.ACTIVE, status.Data.AdministrativeHaltState);
         Assert.Null(status.Data.AdministrativeTransitionKind);
         Assert.Null(status.Data.HaltReason);
@@ -255,6 +257,8 @@ public class SnapshotPacketBuilderTests
         Assert.True(InstrumentStatus_58Data.TryParse(
             sink.Packets[0].AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
             out var status));
+        Assert.Equal(TradingSessionID.REGULAR_TRADING_SESSION, status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(TradingSessionID), status.Data.TradingSessionID));
         Assert.Equal(SecurityTradingStatus.RESERVED, status.Data.SecurityTradingStatus);
         Assert.Equal(AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
         Assert.Null(status.Data.AdministrativeTransitionKind);

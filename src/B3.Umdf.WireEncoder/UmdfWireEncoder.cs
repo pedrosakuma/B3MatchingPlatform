@@ -38,6 +38,8 @@ public static class UmdfWireEncoder
     public const byte AdministrativeTransitionResume = 2;
     public const byte OptionalEnumNull = 255;
     public const byte MatchEventIndicatorRecovery = 1 << 5;
+    public const byte TradingSessionRegular = (byte)TradingSessionID.REGULAR_TRADING_SESSION;
+    public const byte TradingSessionNonRegular = (byte)TradingSessionID.NON_REGULAR_TRADING_SESSION;
 
     /// <summary>
     /// Writes the 16-byte UMDF PacketHeader at the start of <paramref name="dst"/>.
@@ -732,6 +734,9 @@ public static class UmdfWireEncoder
         uint rptSeq,
         byte matchEventIndicator = 0)
     {
+        if (tradingSessionId is not (TradingSessionRegular or TradingSessionNonRegular))
+            throw new ArgumentOutOfRangeException(nameof(tradingSessionId));
+
         const int total = WireOffsets.FramingHeaderSize
             + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.InstrumentStatusBlockLength;

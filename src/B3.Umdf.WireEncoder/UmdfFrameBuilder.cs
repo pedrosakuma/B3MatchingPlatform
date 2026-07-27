@@ -257,7 +257,7 @@ public static class UmdfFrameBuilder
         int n = UmdfWireEncoder.WriteInstrumentStatusFrame(
             dst,
             securityId,
-            tradingSessionId: 0,
+            UmdfWireEncoder.TradingSessionRegular,
             securityTradingStatus,
             administrativeHaltState,
             administrativeTransitionKind,

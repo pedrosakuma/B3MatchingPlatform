@@ -179,7 +179,7 @@ public static class SnapshotPacketBuilder
         p += UmdfWireEncoder.WriteInstrumentStatusFrame(
             buffer.Slice(p),
             securityId,
-            tradingSessionId: 0,
+            UmdfWireEncoder.TradingSessionRegular,
             instrumentStatus.SecurityTradingStatus,
             instrumentStatus.IsHalted
                 ? UmdfWireEncoder.AdministrativeHaltStateHalted

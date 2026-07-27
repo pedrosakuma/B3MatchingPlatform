@@ -186,6 +186,10 @@ public class UmdfFrameBuilderTests
             + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
             sink.Buffer.AsSpan(authoritativeBody, WireOffsets.InstrumentStatusBlockLength), out var status));
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.TradingSessionID.REGULAR_TRADING_SESSION,
+            status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(B3.Umdf.Mbo.Sbe.V17.TradingSessionID),
+            status.Data.TradingSessionID));
         Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
         Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.HALT, status.Data.AdministrativeTransitionKind);
         Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.NEWS_HOLD, status.Data.HaltReason);
@@ -224,6 +228,10 @@ public class UmdfFrameBuilderTests
             + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
             sink.Buffer.AsSpan(authoritativeBody, WireOffsets.InstrumentStatusBlockLength), out var status));
+        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.TradingSessionID.REGULAR_TRADING_SESSION,
+            status.Data.TradingSessionID);
+        Assert.True(Enum.IsDefined(typeof(B3.Umdf.Mbo.Sbe.V17.TradingSessionID),
+            status.Data.TradingSessionID));
         Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.ACTIVE, status.Data.AdministrativeHaltState);
         Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.RESUME, status.Data.AdministrativeTransitionKind);
         Assert.Null(status.Data.HaltReason);
