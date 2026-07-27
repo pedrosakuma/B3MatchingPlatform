@@ -33,13 +33,41 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          flagged=0
+
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- schemas/)"
-          if [ -z "$changed" ]; then
-            echo "No changes under schemas/. OK."
+          if [ -n "$changed" ]; then
+            flagged=1
+            echo "PR modifies vendored schema file(s):"
+            echo "$changed"
+          fi
+
+          # Best-effort cross-check against the companion SbeB3UmdfConsumer
+          # repo, which vendors the same UMDF market-data schema and is kept
+          # in lock-step per README.md/CONTRIBUTING.md. Network/availability
+          # issues here only warn (they must not make an unrelated outage
+          # block every PR); an entrypoint-only file that isn't vendored
+          # there also just warns. An actual content mismatch on a shared
+          # file is treated the same as a local edit.
+          for f in schemas/*.xml; do
+            name="$(basename "$f")"
+            url="https://raw.githubusercontent.com/pedrosakuma/SbeB3UmdfConsumer/main/schemas/$name"
+            if remote_sha="$(curl -fsSL "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
+              local_sha="$(sha256sum "$f" | awk '{print $1}')"
+              if [ "$remote_sha" != "$local_sha" ]; then
+                flagged=1
+                echo "$f (sha256 $local_sha) diverges from SbeB3UmdfConsumer's vendored copy (sha256 $remote_sha)."
+              fi
+            else
+              echo "::warning::Could not fetch $url to cross-check vendored schema fidelity; skipping cross-repo check for $name."
+            fi
+          done
+
+          if [ "$flagged" = 0 ]; then
+            echo "No changes under schemas/ and no drift from the companion repo. OK."
             exit 0
           fi
-          echo "Changed vendored schema files:"
-          echo "$changed"
+
           has_label="$(jq -r '([.pull_request.labels[].name] | index("schema-upgrade")) != null' "$GITHUB_EVENT_PATH")"
           if [ "$has_label" != "true" ]; then
             echo "::error::Files under schemas/ are vendored (see CONTRIBUTING.md) and must not be hand-edited. If this is an intentional, reviewed schema upgrade, add the 'schema-upgrade' label to this PR to acknowledge and unblock this check."
@@ -51,7 +79,6 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
 
     steps:
       - name: Checkout
@@ -98,7 +125,6 @@ jobs:
     name: Build & Test (Debug)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
     # Debug builds enforce single-thread invariants (MatchingEngine /
     # ChannelDispatcher) via Debug.Assert, which compiles out in
     # Release. Two latent bugs (#374 dispatcher async-loop continuation
@@ -153,7 +179,6 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name != 'pull_request' || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
 
     steps:
       - name: Checkout
