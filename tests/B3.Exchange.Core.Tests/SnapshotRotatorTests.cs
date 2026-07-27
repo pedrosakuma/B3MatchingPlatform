@@ -123,6 +123,11 @@ public class SnapshotRotatorTests
             + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SnapOrdersHeaderBlockLength + 2;
         Assert.Equal((byte)3, pkt[groupNumInGroupOff]);
+
+        // Issue #583: SecurityStatus_3.rptSeq must be zeroed in the snapshot
+        // feed per schema, even though LastRptSeq (17) is non-null above.
+        int trailingRptSeqOffset = FrameOffset + WireOffsets.SecurityStatusBodyRptSeqOffset;
+        Assert.Equal(0u, BitConverter.ToUInt32(sink.Packets[1], trailingRptSeqOffset));
     }
 
     [Fact]

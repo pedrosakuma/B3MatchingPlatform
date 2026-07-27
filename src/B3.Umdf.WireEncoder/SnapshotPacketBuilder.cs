@@ -197,7 +197,7 @@ public static class SnapshotPacketBuilder
             tradeDate: 0,
             tradSesOpenTimeNanos: 0,
             transactTimeNanos: sendingTimeNanos,
-            rptSeq: lastRptSeq ?? 0);
+            rptSeq: 0); // schema: "Sequence number per instrument update. (Zeroed in snapshot feed)"
         onPacket(buffer.Slice(0, p));
         packetCount++;
 
