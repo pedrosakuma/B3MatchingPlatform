@@ -71,7 +71,8 @@ public class WalAppendFailurePolicyTests
         IChannelWriteAheadLog wal,
         WalAppendFailurePolicy policy,
         out CountingOutbound outbound,
-        ChannelMetrics? metrics = null)
+        ChannelMetrics? metrics = null,
+        FirmOpenOrderTracker? openOrderTracker = null)
     {
         var sink = new NoOpPacketSink();
         var localOutbound = outbound = new CountingOutbound();
@@ -87,6 +88,8 @@ public class WalAppendFailurePolicyTests
                 Metrics = metrics,
                 Wal = wal,
                 WalAppendFailurePolicy = policy,
+                MaxOpenOrdersPerFirm = openOrderTracker?.MaximumPerFirm ?? 100_000,
+                OpenOrderTracker = openOrderTracker,
             });
     }
 
@@ -135,7 +138,9 @@ public class WalAppendFailurePolicyTests
     {
         var wal = new FailingWal();
         var metrics = new ChannelMetrics(84);
-        var disp = BuildDispatcher(wal, WalAppendFailurePolicy.Halt, out var outbound, metrics);
+        var openOrders = new FirmOpenOrderTracker(maximumPerFirm: 1);
+        var disp = BuildDispatcher(
+            wal, WalAppendFailurePolicy.Halt, out var outbound, metrics, openOrders);
         try
         {
             disp.Start();
@@ -148,6 +153,9 @@ public class WalAppendFailurePolicyTests
             Assert.False(disp.IsWalHealthy);
             Assert.Equal(1, metrics.WalAppendFailures);
             Assert.True(metrics.WalHaltRejects >= 1);
+            Assert.Equal(0, openOrders.Count(700));
+            Assert.True(openOrders.TryReserve(700, 1));
+            openOrders.Release(700, 1);
 
             // Subsequent enqueues are rejected at the producer side
             // (no work item posted, no Append call).

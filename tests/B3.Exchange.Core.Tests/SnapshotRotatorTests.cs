@@ -143,31 +143,44 @@ public class SnapshotRotatorTests
     }
 
     [Fact]
-    public void LargeBook_ChunksIntoMultiplePacketsAndStepsSequence()
+    public void LargeBookAboveLegacyBufferLimit_PublishesCompleteSnapshotAndStepsSequence()
     {
         var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
         var bids = new List<RestingOrderView>();
-        for (int i = 0; i < 400; i++) bids.Add(Order(i + 1, Side.Buy, 100_0000 - i, 100));
+        for (int i = 0; i < 20_000; i++) bids.Add(Order(i + 1, Side.Buy, 100_0000 - i, 100));
         var asks = new List<RestingOrderView>();
-        for (int i = 0; i < 200; i++) asks.Add(Order(10_000 + i, Side.Sell, 101_0000 + i, 100));
+        for (int i = 0; i < 5_000; i++) asks.Add(Order(100_000 + i, Side.Sell, 101_0000 + i, 100));
         src.Books[(7L, Side.Buy)] = bids;
         src.Books[(7L, Side.Sell)] = asks;
 
         var sink = new CapturingSink();
-        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
+        var rot = new SnapshotRotator(
+            channelNumber: 84,
+            source: src,
+            sink: sink,
+            timeSource: new FakeNanosTimeSource(123_456UL));
 
-        int packets = rot.PublishNext(incrementalSequenceVersion: 1);
+        int packets = rot.PublishNext(incrementalSequenceVersion: 17);
         Assert.True(packets >= 2, $"expected multi-packet snapshot, got {packets}");
         Assert.Equal((uint)packets, rot.SequenceNumber);
 
-        // PacketHeader.SequenceNumber stepped 1..N within this snapshot.
         for (int i = 0; i < packets; i++)
         {
             ref readonly var pkthdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[i].AsSpan(0, PacketHeaderSize));
             Assert.Equal((uint)(i + 1), pkthdr.SequenceNumber);
+            Assert.Equal((ushort)1, pkthdr.SequenceVersion);
+            Assert.Equal(123_456UL, pkthdr.SendingTime);
+            Assert.InRange(sink.Packets[i].Length, 1, SnapshotPacketBuilder.DefaultPacketBufferSize);
         }
 
-        // Sum NumInGroup across every Orders_71 frame in every packet → 600.
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            sink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var header));
+        Assert.Equal(25_000u, header.Data.TotNumReports);
+        Assert.Equal(20_000u, header.Data.TotNumBids);
+        Assert.Equal(5_000u, header.Data.TotNumOffers);
+        Assert.Equal(99u, header.Data.LastRptSeq);
+        Assert.Equal((ushort)17, header.Data.LastSequenceVersion);
+
         int totalEntries = 0;
         for (int i = 0; i < packets; i++)
         {
@@ -184,7 +197,79 @@ public class SnapshotRotatorTests
                 p += frameLen;
             }
         }
-        Assert.Equal(600, totalEntries);
+        Assert.Equal(25_000, totalEntries);
+    }
+
+    [Fact]
+    public void MultiPacketAtSequenceBoundary_UsesMaxThenBumpsEpochWithoutWrapping()
+    {
+        var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
+        src.Books[(7L, Side.Buy)] = Enumerable.Range(1, 700)
+            .Select(i => Order(i, Side.Buy, 100_0000 - i, 100))
+            .ToList();
+        src.Books[(7L, Side.Sell)] = Enumerable.Range(1, 300)
+            .Select(i => Order(10_000 + i, Side.Sell, 101_0000 + i, 100))
+            .ToList();
+        var sink = new CapturingSink();
+        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
+        int requiredPackets = SnapshotPacketBuilder.GetPacketCount(
+            SnapshotPacketBuilder.DefaultPacketBufferSize, 700, 300);
+        Assert.True(requiredPackets > 1);
+        rot.CreateTestProbe().SetSequence(
+            version: 7,
+            number: uint.MaxValue - (uint)requiredPackets);
+
+        int firstPublishPackets = rot.PublishNext(incrementalSequenceVersion: 55);
+
+        Assert.Equal(requiredPackets, firstPublishPackets);
+        Assert.Equal((ushort)7, rot.SequenceVersion);
+        Assert.Equal(uint.MaxValue, rot.SequenceNumber);
+        for (int i = 0; i < requiredPackets; i++)
+        {
+            ref readonly var header = ref MemoryMarshal.AsRef<PacketHeader>(
+                sink.Packets[i].AsSpan(0, PacketHeaderSize));
+            Assert.Equal((ushort)7, header.SequenceVersion);
+            Assert.Equal(uint.MaxValue - (uint)requiredPackets + (uint)i + 1, header.SequenceNumber);
+            Assert.NotEqual(0u, header.SequenceNumber);
+        }
+
+        int secondPublishPackets = rot.PublishNext(incrementalSequenceVersion: 55);
+
+        Assert.Equal(requiredPackets, secondPublishPackets);
+        Assert.Equal((ushort)8, rot.SequenceVersion);
+        Assert.Equal((uint)requiredPackets, rot.SequenceNumber);
+        for (int i = 0; i < requiredPackets; i++)
+        {
+            ref readonly var header = ref MemoryMarshal.AsRef<PacketHeader>(
+                sink.Packets[requiredPackets + i].AsSpan(0, PacketHeaderSize));
+            Assert.Equal((ushort)8, header.SequenceVersion);
+            Assert.Equal((uint)(i + 1), header.SequenceNumber);
+            Assert.NotEqual(0u, header.SequenceNumber);
+        }
+        Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
+            sink.Packets[requiredPackets].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength),
+            out var snapshotHeader));
+        Assert.Equal((ushort)55, snapshotHeader.Data.LastSequenceVersion);
+    }
+
+    [Fact]
+    public void MultiPacketAtTerminalEpoch_FailsBeforePublishingAnyFragment()
+    {
+        var src = new FakeSource { SecurityIds = new[] { 7L }, CurrentRptSeq = 99 };
+        src.Books[(7L, Side.Buy)] = Enumerable.Range(1, 1_000)
+            .Select(i => Order(i, Side.Buy, 100_0000 - i, 100))
+            .ToList();
+        var sink = new CapturingSink();
+        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
+        rot.CreateTestProbe().SetSequence(ushort.MaxValue, uint.MaxValue - 1);
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => rot.PublishNext(incrementalSequenceVersion: 55));
+
+        Assert.Contains("SequenceVersion space is exhausted", error.Message);
+        Assert.Empty(sink.Packets);
+        Assert.Equal(ushort.MaxValue, rot.SequenceVersion);
+        Assert.Equal(uint.MaxValue - 1, rot.SequenceNumber);
     }
 
     [Fact]

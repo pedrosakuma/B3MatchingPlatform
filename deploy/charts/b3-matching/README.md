@@ -13,7 +13,7 @@ ghcr.io/pedrosakuma/b3-matching            (image, digest-pinned per env)
 
 ```bash
 helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching \
-  --version 0.2.0 \
+  --version 0.3.1 \
   --namespace b3-prod --create-namespace \
   --set image.digest=sha256:... \
   --set marketData.host=marketdata
@@ -46,6 +46,7 @@ helm install matching oci://ghcr.io/pedrosakuma/charts/b3-matching \
 | `image.digest` | validated-on-AKS `sha256:…` | wins over `tag` when set |
 | `image.tag` | `""` (→ appVersion) | used when `digest` is empty |
 | `replicas` | `1` | **do not raise** |
+| `maxOpenOrdersPerFirm` | `100000` | host-wide cap across all UMDF channels; excess resting-capable orders receive `ER_Reject(OrdRejReason=3)` |
 | `marketData.host` | `marketdata` | unicast UDP target hostname |
 | `marketData.udpPorts` | `[30084, 30184, 31084]` | egress UDP ports (match the bridge config) |
 | `colocation.enabled` / `colocation.matchTargetLabels` | `true` / `{app.kubernetes.io/name: marketdata}` | podAffinity target |

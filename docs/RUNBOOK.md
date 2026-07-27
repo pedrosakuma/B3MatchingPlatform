@@ -118,6 +118,8 @@ dependency). Key counters / gauges:
 | `exch_session_cancel_on_disconnect_fired_total` | counter | CoD timer fired and a session-scoped mass-cancel was enqueued (issue #54 / GAP-18). |
 | `exch_throttle_accepted_total` | counter | Inbound app messages allowed through the per-session sliding-window throttle (#56 / GAP-20). |
 | `exch_throttle_rejected_total` | counter | Inbound app messages rejected with `BusinessMessageReject("Throttle limit exceeded")`. |
+| `open_orders_per_firm` | gauge | Host-wide simultaneously open orders by entering firm, summed across channels. |
+| `open_order_limit_rejected_total` | counter | Resting-capable new-order requests rejected after the firm reached `maxOpenOrdersPerFirm`. |
 | `exch_session_state` | gauge | `0`=Idle, `1`=Negotiated, `2`=Established, `3`=Suspended, `4`=Terminated. |
 | `exch_session_attached` | gauge | `1` while a TCP transport is attached, `0` while Suspended. |
 
@@ -282,13 +284,13 @@ Also calibrate `maxOpenOrdersPerFirm` for MM-heavy hosts. The knob is defined
 once in `HostConfig.MaxOpenOrdersPerFirm`
 (`src/B3.Exchange.Host/HostConfig.cs:22`) and defaults to `100_000`; GAP-21a
 records the current behavior in
-[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md). Today the
-host copies that value into each `ChannelDispatcher`, so enforcement is **per
-firm, per channel/dispatcher** — not per session, and not a single host-wide
-aggregate cap. On multi-firm deployments, make sure the value is high enough
-for the resting quote count you expect on each busy options channel, or bursts
-of new option quotes can devolve into `OrdRejReason=3 (OrderExceedsLimit)`
-storms.
+[`docs/B3-ENTRYPOINT-COMPLIANCE.md`](./B3-ENTRYPOINT-COMPLIANCE.md).
+Enforcement is **per firm across the entire host**, not per session or per
+channel. Resting-capable orders reserve capacity atomically before engine
+admission; IOC/FOK orders bypass the cap because they cannot remain open.
+Watch `open_orders_per_firm` and `open_order_limit_rejected_total` and leave
+headroom for quote bursts; breaches produce
+`OrdRejReason=3 (OrderExceedsLimit)`.
 
 What the venue does **not** do for MMs is just as important. Per ADR 0012 and
 RFC 0002 §2.3, the simulator does not enforce market-maker obligations such as

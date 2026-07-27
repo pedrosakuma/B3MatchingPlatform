@@ -11,6 +11,9 @@ type: application
 # (see docs/HELM-CHART.md § Versioning contract). appVersion tracks the
 # b3-matching image version this chart was validated against.
 #
+# 0.3.1 (#567): expose the host-wide maxOpenOrdersPerFirm admission cap in
+# chart values and render it into the bundled exchange configuration.
+#
 # 0.3.0 (B3TradingPlatform#683 follow-up): networkPolicy.fixpClientSelector
 # (single matchLabels) renamed to networkPolicy.fixpClientSelectors (list of
 # matchLabels, OR'd `from` entries) so a second FIXP client — the
@@ -18,7 +21,7 @@ type: application
 # session 10101 — can be admitted on fixpPort without opening it to
 # everything. Breaking values-key rename; bump any release's values before
 # upgrading.
-version: 0.3.0
+version: 0.3.1
 appVersion: "0.1.0"
 
 kubeVersion: ">=1.27.0-0"

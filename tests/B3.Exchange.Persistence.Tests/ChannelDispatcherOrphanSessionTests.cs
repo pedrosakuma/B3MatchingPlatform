@@ -53,7 +53,8 @@ public class ChannelDispatcherOrphanSessionTests
     private static ChannelDispatcher BuildDispatcher(
         ChannelMetrics? metrics,
         Func<string, bool>? sessionExists,
-        OrphanSessionPolicy policy)
+        OrphanSessionPolicy policy,
+        FirmOpenOrderTracker? openOrderTracker = null)
     {
         return new ChannelDispatcher(
             channelNumber: 84,
@@ -67,6 +68,8 @@ public class ChannelDispatcherOrphanSessionTests
                 Metrics = metrics,
                 SessionExists = sessionExists,
                 OrphanPolicy = policy,
+                MaxOpenOrdersPerFirm = openOrderTracker?.MaximumPerFirm ?? 100_000,
+                OpenOrderTracker = openOrderTracker,
             });
     }
 
@@ -117,9 +120,11 @@ public class ChannelDispatcherOrphanSessionTests
     public void DropPolicy_OrphanOwnerIsSkipped_KnownOwnerIsRegistered()
     {
         var metrics = new ChannelMetrics(84);
+        var openOrders = new FirmOpenOrderTracker(maximumPerFirm: 10);
         var disp = BuildDispatcher(metrics,
             sessionExists: sid => sid == "10101",
-            policy: OrphanSessionPolicy.Drop);
+            policy: OrphanSessionPolicy.Drop,
+            openOrderTracker: openOrders);
         var snap = BuildSnapshotWithOwners("10101", "99999");
 
         disp.RestoreChannelState(snap);
@@ -128,6 +133,7 @@ public class ChannelDispatcherOrphanSessionTests
         // session's owner is in the routing map.
         Assert.Equal(2, snap.Engine.Books.Single().Orders.Count);
         Assert.Equal(1L, metrics.OwnerOrphansDropped);
+        Assert.Equal(2, openOrders.Count(100));
     }
 
     [Fact]

@@ -27,6 +27,8 @@
   "auth": {
     "devMode": true
   },
+  // Host-wide cap across every channel. IOC/FOK orders do not consume a slot.
+  "maxOpenOrdersPerFirm": 100000,
   // Participants (corretoras). One entry per firm; enteringFirmCode is
   // stamped on outbound SBE headers as EnteringFirm.
   "firms": [
