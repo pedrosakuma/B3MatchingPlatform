@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
-using B3.Umdf.Mbo.Sbe.V17;
+using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Umdf.WireEncoder;
 
@@ -15,11 +15,9 @@ namespace B3.Umdf.WireEncoder;
 /// </code>
 /// Use <see cref="WritePacketHeader"/> once per UDP datagram.
 ///
-/// Existing B3 templates use their established V16 layouts; the
-/// B3MatchingPlatform <c>InstrumentStatus_58</c> extension uses V17.
-/// For messages where layout differs
+/// All encoders write the V16 SBE schema for messages where layout differs
 /// across versions (notably DeleteOrder_MBO_51 and Trade_53). For
-/// Order_MBO_50, the V6 body is used (56 bytes) since the V17 reader
+/// Order_MBO_50, the V6 body is used (56 bytes) since the V16 reader
 /// honours the BlockLength field in the SBE MessageHeader.
 /// </summary>
 public static class UmdfWireEncoder
@@ -32,14 +30,6 @@ public static class UmdfWireEncoder
     public const byte MdEntryTypeTrade = (byte)MDEntryType.TRADE;
     public const byte TrdSubTypeNull = 255;
     public const byte TrdSubTypeSweepTrade = 109;
-    public const byte AdministrativeHaltStateActive = 0;
-    public const byte AdministrativeHaltStateHalted = 1;
-    public const byte AdministrativeTransitionHalt = 1;
-    public const byte AdministrativeTransitionResume = 2;
-    public const byte OptionalEnumNull = 255;
-    public const byte MatchEventIndicatorRecovery = 1 << 5;
-    public const byte TradingSessionRegular = (byte)TradingSessionID.REGULAR_TRADING_SESSION;
-    public const byte TradingSessionNonRegular = (byte)TradingSessionID.NON_REGULAR_TRADING_SESSION;
 
     /// <summary>
     /// Writes the 16-byte UMDF PacketHeader at the start of <paramref name="dst"/>.
@@ -96,7 +86,7 @@ public static class UmdfWireEncoder
 
         WriteFramingHeader(dst, total);
         var msgHeaderSpan = dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize);
-        B3.Umdf.Mbo.Sbe.V17.V6.Order_MBO_50Data.WriteHeader(msgHeaderSpan);
+        B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data.WriteHeader(msgHeaderSpan);
 
         var body = dst.Slice(
             WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
@@ -132,7 +122,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.DeleteOrder_MBO_51Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.DeleteOrder_MBO_51Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -172,7 +162,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.Trade_53Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.Trade_53Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -213,7 +203,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.SnapshotFullRefresh_Header_30Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -262,7 +252,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.SnapshotFullRefresh_Orders_MBO_71Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Orders_MBO_71Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         int p = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
@@ -388,10 +378,10 @@ public static class UmdfWireEncoder
 
         WriteFramingHeader(dst, total);
         // V16 WriteHeader stamps BlockLength=232, TemplateId=12, SchemaId=2, Version=16.
-        // The consumer's V17 reader dispatches on the explicit BlockLength
+        // The consumer's V16 reader dispatches on the explicit BlockLength
         // field, so equity and option frames share the same header shape
         // and only differ in the trailing NoUnderlyings group dimensions.
-        B3.Umdf.Mbo.Sbe.V17.SecurityDefinition_12Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -502,7 +492,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.ChannelReset_11Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.ChannelReset_11Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -536,7 +526,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.TradeBust_57Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.TradeBust_57Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -571,7 +561,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.Sequence_2Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.Sequence_2Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -596,7 +586,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.SequenceReset_1Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SequenceReset_1Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
         return total;
     }
@@ -618,7 +608,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.EmptyBook_9Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.EmptyBook_9Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -651,7 +641,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.MassDeleteOrders_MBO_52Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.MassDeleteOrders_MBO_52Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -695,7 +685,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.SecurityStatus_3Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SecurityStatus_3Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -713,53 +703,6 @@ public static class UmdfWireEncoder
         MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyTradSesOpenTimeOffset, 8), in tradSesOpenTimeNanos);
         MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyTransactTimeOffset, 8), in transactTimeNanos);
         MemoryMarshal.Write(body.Slice(WireOffsets.SecurityStatusBodyRptSeqOffset, 4), in rptSeq);
-
-        return total;
-    }
-
-    /// <summary>
-    /// Writes the authoritative V17 <c>InstrumentStatus_58</c> extension.
-    /// Legacy <c>SecurityStatus_3</c> halt/resume markers remain published
-    /// separately for consumers that have not adopted schema 2.3.0.
-    /// </summary>
-    public static int WriteInstrumentStatusFrame(
-        Span<byte> dst,
-        long securityId,
-        byte tradingSessionId,
-        byte securityTradingStatus,
-        byte administrativeHaltState,
-        byte administrativeTransitionKind,
-        byte haltReason,
-        ulong transactTimeNanos,
-        uint rptSeq,
-        byte matchEventIndicator = 0)
-    {
-        if (tradingSessionId is not (TradingSessionRegular or TradingSessionNonRegular))
-            throw new ArgumentOutOfRangeException(nameof(tradingSessionId));
-
-        const int total = WireOffsets.FramingHeaderSize
-            + WireOffsets.SbeMessageHeaderSize
-            + WireOffsets.InstrumentStatusBlockLength;
-        if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
-
-        WriteFramingHeader(dst, total);
-        var header = dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize);
-        B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.WriteHeader(header);
-
-        var body = dst.Slice(
-            WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize,
-            WireOffsets.InstrumentStatusBlockLength);
-        body.Clear();
-
-        MemoryMarshal.Write(body.Slice(WireOffsets.InstrumentStatusBodySecurityIdOffset, 8), in securityId);
-        body[WireOffsets.InstrumentStatusBodyMatchEventIndicatorOffset] = matchEventIndicator;
-        body[WireOffsets.InstrumentStatusBodyTradingSessionIdOffset] = tradingSessionId;
-        body[WireOffsets.InstrumentStatusBodySecurityTradingStatusOffset] = securityTradingStatus;
-        body[WireOffsets.InstrumentStatusBodyAdministrativeHaltStateOffset] = administrativeHaltState;
-        body[WireOffsets.InstrumentStatusBodyAdministrativeTransitionKindOffset] = administrativeTransitionKind;
-        body[WireOffsets.InstrumentStatusBodyHaltReasonOffset] = haltReason;
-        MemoryMarshal.Write(body.Slice(WireOffsets.InstrumentStatusBodyTransactTimeOffset, 8), in transactTimeNanos);
-        MemoryMarshal.Write(body.Slice(WireOffsets.InstrumentStatusBodyRptSeqOffset, 4), in rptSeq);
 
         return total;
     }
@@ -787,7 +730,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.PriceBand_22Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.PriceBand_22Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -830,7 +773,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.SecurityGroupPhase_10Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.SecurityGroupPhase_10Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -876,7 +819,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.TheoreticalOpeningPrice_16Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.TheoreticalOpeningPrice_16Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -938,7 +881,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.AuctionImbalance_19Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.AuctionImbalance_19Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -987,7 +930,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.OpeningPrice_15Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.OpeningPrice_15Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(
@@ -1031,7 +974,7 @@ public static class UmdfWireEncoder
         if (dst.Length < total) ThrowTooSmall(nameof(dst), total);
 
         WriteFramingHeader(dst, total);
-        B3.Umdf.Mbo.Sbe.V17.ClosingPrice_17Data.WriteHeader(
+        B3.Umdf.Mbo.Sbe.V16.ClosingPrice_17Data.WriteHeader(
             dst.Slice(WireOffsets.FramingHeaderSize, WireOffsets.SbeMessageHeaderSize));
 
         var body = dst.Slice(

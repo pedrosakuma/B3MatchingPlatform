@@ -16,7 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <AdditionalFiles Include="..\..\schemas\b3-market-data-messages-2.3.0.xml" />
+    <AdditionalFiles Include="..\..\schemas\b3-market-data-messages-2.2.0.xml" />
   </ItemGroup>
 
 </Project>

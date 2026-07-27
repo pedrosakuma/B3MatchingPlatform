@@ -68,7 +68,7 @@ participants that surround a real exchange:
   (market-maker + noise-taker strategies, seeded RNG for repro). See
   `config/synthetic-trader.json` and `docker-compose.synthtrader.yml`.
 - **`B3.Umdf.WireEncoder`** — stateless byte-level encoders for UMDF MBO,
-  Trade, Snapshot, and administrative instrument-status frames (V17 schema).
+  Trade, and Snapshot frames (V16 schema).
 - **`B3.Umdf.Sbe` / `B3.EntryPoint.Sbe`** — SBE bindings generated from the
   B3 schemas under `schemas/`.
 
@@ -142,16 +142,10 @@ EntryPoint TCP listener (default port 9876).
 
 ## Schemas
 
-`schemas/b3-market-data-messages-2.3.0.xml` is schema version 17: the official
-B3 2.2.0 UMDF schema plus the additive B3MatchingPlatform
-`InstrumentStatus_58` extension. `schemas/b3-entrypoint-messages-8.4.2.xml`
-is the vendored official EntryPoint schema. Mirror the UMDF schema into every
-consumer before decoding the extension.
-
-The administrative halt contract is documented in
-[`docs/UMDF-INSTRUMENT-STATUS.md`](docs/UMDF-INSTRUMENT-STATUS.md). Existing
-consumers remain compatible because halt/resume still publishes the legacy
-`SecurityStatus_3.securityTradingEvent` marker before `InstrumentStatus_58`.
+`schemas/b3-market-data-messages-2.2.0.xml` and
+`schemas/b3-entrypoint-messages-8.4.2.xml` are vendored copies of the
+official B3 SBE schemas. The same files exist in `SbeB3UmdfConsumer`; keep
+them in sync when upgrading.
 
 ### Inbound EntryPoint compatibility matrix
 

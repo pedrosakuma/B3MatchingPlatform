@@ -154,7 +154,6 @@ public sealed class SnapshotRotator
         // orders matched and no new ones have arrived). A zero RptSeq is
         // therefore treated as "illiquid" only when the book is also empty.
         uint currentRptSeq = _source.GetCurrentRptSeq(securityId);
-        InstrumentStatusSnapshot instrumentStatus = _source.GetInstrumentStatus(securityId);
         bool isBookEmpty = bidsList.Count == 0 && asksList.Count == 0;
         uint? lastRptSeq = isBookEmpty && currentRptSeq == 0 ? null : currentRptSeq;
 
@@ -182,7 +181,6 @@ public sealed class SnapshotRotator
             incrementalSequenceVersion: incrementalSequenceVersion,
             bids: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bidsList),
             asks: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(asksList),
-            instrumentStatus: instrumentStatus,
             onPacket: pkt => sink.Publish(channel, pkt),
             maxEntriesPerChunk: _maxEntriesPerChunk);
 

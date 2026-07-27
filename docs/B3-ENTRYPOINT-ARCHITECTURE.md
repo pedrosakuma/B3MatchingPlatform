@@ -796,8 +796,7 @@ The two SBE XML schemas live under `schemas/`:
 
 - `schemas/b3-entrypoint-messages-8.4.2.xml` — inbound EntryPoint
   protocol; consumed by `src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj`.
-- `schemas/b3-market-data-messages-2.3.0.xml` — outbound UMDF protocol
-  (schema version 17, including `InstrumentStatus_58`);
+- `schemas/b3-market-data-messages-2.2.0.xml` — outbound UMDF protocol;
   consumed by `src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj`.
 
 Both `.csproj` files use the `SbeSourceGenerator` package to regenerate

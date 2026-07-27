@@ -370,9 +370,10 @@ public readonly record struct OrderRestatedEvent(
 /// <summary>
 /// Fired when an instrument is placed into administrative halt via
 /// <see cref="MatchingEngine.HaltInstrument"/> (issue #322). The
-/// integration layer translates this to a legacy UMDF
-/// <c>SecurityStatus_3</c> marker plus authoritative
-/// <c>InstrumentStatus_58</c> state, transition and reason. While halted the
+/// integration layer translates this to a UMDF
+/// <c>SecurityStatus_3</c> frame carrying the current
+/// <see cref="TradingPhase"/> as <c>securityTradingStatus</c> and a
+/// halt-marker as <c>securityTradingEvent</c>. While halted the
 /// engine rejects new orders and replaces with
 /// <see cref="RejectReason.InstrumentHalted"/>; cancels of resting
 /// orders are still accepted.
@@ -387,9 +388,9 @@ public readonly record struct InstrumentHaltedEvent(
 /// <summary>
 /// Fired when an instrument is resumed from administrative halt via
 /// <see cref="MatchingEngine.ResumeInstrument"/> (issue #322). The
-/// integration layer translates this to a legacy UMDF
-/// <c>SecurityStatus_3</c> marker plus an authoritative
-/// <c>InstrumentStatus_58</c> active/resume update.
+/// integration layer translates this to a UMDF
+/// <c>SecurityStatus_3</c> frame with the engine's preserved phase
+/// and a resume-marker on <c>securityTradingEvent</c>.
 /// </summary>
 public readonly record struct InstrumentResumedEvent(
     long SecurityId,
@@ -507,8 +508,7 @@ public interface IMatchingEventSink
     /// <summary>
     /// Issue #322: fired when an instrument enters administrative halt.
     /// Default no-op; the production <c>ChannelDispatcher</c> overrides
-    /// this to emit legacy <c>SecurityStatus_3</c> and authoritative
-    /// <c>InstrumentStatus_58</c> frames.
+    /// this to emit a UMDF <c>SecurityStatus_3</c> frame.
     /// </summary>
     void OnInstrumentHalted(in InstrumentHaltedEvent e) { }
 
@@ -516,8 +516,7 @@ public interface IMatchingEventSink
     /// Issue #322: fired when an instrument is resumed from
     /// administrative halt. Default no-op; the production
     /// <c>ChannelDispatcher</c> overrides this to emit a UMDF
-    /// legacy <c>SecurityStatus_3</c> and authoritative
-    /// <c>InstrumentStatus_58</c> frames.
+    /// <c>SecurityStatus_3</c> frame.
     /// </summary>
     void OnInstrumentResumed(in InstrumentResumedEvent e) { }
 }

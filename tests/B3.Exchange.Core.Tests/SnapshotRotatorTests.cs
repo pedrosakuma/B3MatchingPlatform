@@ -8,7 +8,7 @@ using B3.Exchange.Core;
 using B3.Exchange.Matching;
 using B3.Exchange.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
-using B3.Umdf.Mbo.Sbe.V17;
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.WireEncoder;
 
 namespace B3.Exchange.Core.Tests;
@@ -26,31 +26,15 @@ public class SnapshotRotatorTests
     private const int FrameOffset = PacketHeaderSize
                                     + WireOffsets.FramingHeaderSize
                                     + WireOffsets.SbeMessageHeaderSize;
-    private const int SnapshotHeaderFrameSize = WireOffsets.FramingHeaderSize
-                                              + WireOffsets.SbeMessageHeaderSize
-                                              + WireOffsets.SnapHeaderBlockLength;
-    private const int InstrumentStatusFrameSize = WireOffsets.FramingHeaderSize
-                                                + WireOffsets.SbeMessageHeaderSize
-                                                + WireOffsets.InstrumentStatusBlockLength;
-    private const int InstrumentStatusBodyOffset = PacketHeaderSize
-                                                 + SnapshotHeaderFrameSize
-                                                 + WireOffsets.FramingHeaderSize
-                                                 + WireOffsets.SbeMessageHeaderSize;
 
     private sealed class FakeSource : ISnapshotBookSource
     {
         public IReadOnlyList<long> SecurityIds { get; init; } = Array.Empty<long>();
         public Dictionary<long, uint> RptSeqBySecurity { get; } = new();
-        public Dictionary<long, InstrumentStatusSnapshot> StatusBySecurity { get; } = new();
         public Dictionary<(long, Side), List<RestingOrderView>> Books { get; } = new();
 
         public uint GetCurrentRptSeq(long securityId)
             => RptSeqBySecurity.TryGetValue(securityId, out uint rptSeq) ? rptSeq : 0;
-
-        public InstrumentStatusSnapshot GetInstrumentStatus(long securityId)
-            => StatusBySecurity.TryGetValue(securityId, out var status)
-                ? status
-                : InstrumentStatusSnapshot.Active((byte)TradingPhase.Open);
 
         public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
             => Books.TryGetValue((securityId, side), out var l) ? l : Enumerable.Empty<RestingOrderView>();
@@ -89,7 +73,6 @@ public class SnapshotRotatorTests
             pkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal(42L, (long)(ulong)snapHdr.Data.SecurityID);
         Assert.Equal(0u, snapHdr.Data.TotNumReports);
-        Assert.Equal((ushort)1, snapHdr.Data.TotNumStats);
         Assert.Null(snapHdr.Data.LastRptSeq); // illiquid: §7.4
         Assert.Equal((ushort)3, snapHdr.Data.LastSequenceVersion);
     }
@@ -122,12 +105,11 @@ public class SnapshotRotatorTests
         Assert.Equal(3u, snapHdr.Data.TotNumReports);
         Assert.Equal(2u, snapHdr.Data.TotNumBids);
         Assert.Equal(1u, snapHdr.Data.TotNumOffers);
-        Assert.Equal((ushort)1, snapHdr.Data.TotNumStats);
         Assert.Equal(17u, snapHdr.Data.LastRptSeq);
         Assert.Equal((ushort)4, snapHdr.Data.LastSequenceVersion);
 
         // Same packet must carry an Orders_71 frame with NumInGroup == 3.
-        int after = PacketHeaderSize + SnapshotHeaderFrameSize + InstrumentStatusFrameSize;
+        int after = FrameOffset + WireOffsets.SnapHeaderBlockLength;
         int groupNumInGroupOff = after
             + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SnapOrdersHeaderBlockLength + 2;
@@ -229,7 +211,7 @@ public class SnapshotRotatorTests
         {
             var pkt = sink.Packets[i];
             int p = PacketHeaderSize;
-            if (i == 0) p += SnapshotHeaderFrameSize + InstrumentStatusFrameSize;
+            if (i == 0) p += WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
             while (p < pkt.Length)
             {
                 ushort frameLen = MemoryMarshal.Read<ushort>(pkt.AsSpan(p, 2));
@@ -241,33 +223,6 @@ public class SnapshotRotatorTests
             }
         }
         Assert.Equal(25_000, totalEntries);
-    }
-
-    [Fact]
-    public void HaltedInstrument_PublishesCurrentStateAndReason()
-    {
-        var src = new FakeSource { SecurityIds = new[] { 42L } };
-        src.RptSeqBySecurity[42L] = 9;
-        src.StatusBySecurity[42L] = new InstrumentStatusSnapshot(
-            (byte)TradingPhase.Pause,
-            IsHalted: true,
-            HaltReason: (byte)B3.Exchange.Matching.HaltReason.NewsHold,
-            StateChangedNanos: 777UL);
-        var sink = new CapturingSink();
-        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
-
-        rot.PublishNext(incrementalSequenceVersion: 4);
-
-        Assert.True(InstrumentStatus_58Data.TryParse(
-            sink.Packets[0].AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
-            out var status));
-        Assert.Equal(SecurityTradingStatus.PAUSE, status.Data.SecurityTradingStatus);
-        Assert.Equal(AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
-        Assert.Null(status.Data.AdministrativeTransitionKind);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.NEWS_HOLD, status.Data.HaltReason);
-        Assert.Equal(777UL, status.Data.TransactTime.Time);
-        Assert.True(status.Data.MatchEventIndicator.IsRecoveryMsg());
-        Assert.Null(status.Data.RptSeq);
     }
 
     [Fact]
@@ -404,12 +359,6 @@ public class ChannelDispatcherSnapshotTests
     private const int FrameOffset = PacketHeaderSize
                                     + WireOffsets.FramingHeaderSize
                                     + WireOffsets.SbeMessageHeaderSize;
-    private const int InstrumentStatusBodyOffset = PacketHeaderSize
-                                                 + WireOffsets.FramingHeaderSize
-                                                 + WireOffsets.SbeMessageHeaderSize
-                                                 + WireOffsets.SnapHeaderBlockLength
-                                                 + WireOffsets.FramingHeaderSize
-                                                 + WireOffsets.SbeMessageHeaderSize;
     private const long Petr = 900_000_000_001L;
     private static B3.Exchange.Instruments.Instrument Petr4 => new()
     {
@@ -511,47 +460,6 @@ public class ChannelDispatcherSnapshotTests
         // After 3 OrderAccepted events the engine's RptSeq is 3.
         Assert.Equal(3u, hdr.Data.LastRptSeq);
         Assert.Equal(disp.SequenceVersion, hdr.Data.LastSequenceVersion);
-    }
-
-    [Fact]
-    public void SnapshotTick_ReadsLiveAdministrativeHalt_FromMatchingEngine()
-    {
-        var incSink = new CapturingSink();
-        var snapSink = new CapturingSink();
-        MatchingEngine? engine = null;
-        var disp = new ChannelDispatcher(channelNumber: 1,
-            engineFactory: s =>
-            {
-                engine = new MatchingEngine(new[] { Petr4 }, s, NullLogger<MatchingEngine>.Instance);
-                return engine;
-            },
-            options: new ChannelDispatcherOptions
-            {
-                PacketSink = incSink,
-                Outbound = new ChannelDispatcherTests_RecordingOutbound(),
-                Logger = NullLogger<ChannelDispatcher>.Instance,
-                TimeSource = new FakeNanosTimeSource(123UL),
-                TradeDate = 1,
-            });
-        var rotator = new SnapshotRotator(channelNumber: 1,
-            source: new MatchingEngineSnapshotSource(engine!, new[] { Petr }),
-            sink: snapSink, timeSource: new FakeNanosTimeSource(456UL));
-        disp.AttachSnapshotRotator(rotator);
-
-        Assert.True(disp.EnqueueOperatorHalt(Petr, B3.Exchange.Matching.HaltReason.PendingDisclosure, null));
-        Drain(disp);
-        Assert.True(disp.EnqueueSnapshotTick());
-        Drain(disp);
-
-        var packet = Assert.Single(snapSink.Packets);
-        Assert.True(InstrumentStatus_58Data.TryParse(
-            packet.AsSpan(InstrumentStatusBodyOffset, WireOffsets.InstrumentStatusBlockLength),
-            out var status));
-        Assert.Equal(AdministrativeHaltState.HALTED, status.Data.AdministrativeHaltState);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.PENDING_DISCLOSURE, status.Data.HaltReason);
-        Assert.Null(status.Data.AdministrativeTransitionKind);
-        Assert.Equal(123UL, status.Data.TransactTime.Time);
-        Assert.True(status.Data.MatchEventIndicator.IsRecoveryMsg());
     }
 
     [Fact]

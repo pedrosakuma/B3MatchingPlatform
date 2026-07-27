@@ -189,7 +189,7 @@ public partial class ChannelDispatcherTests
     [Fact]
     public void MwlPartialFillThenRest_ExecReportNewCarriesMwlOrdTypeAndProtectionPrice()
     {
-        var (disp, packets, outbound) = NewDispatcher();
+        var (disp, _, outbound) = NewDispatcher();
         var seller = new FakeSession(outbound) { EnteringFirm = 7 };
         var mwlBuyer = new FakeSession(outbound) { EnteringFirm = 8 };
         var plainLimit = new FakeSession(outbound) { EnteringFirm = 9 };
@@ -239,7 +239,7 @@ public partial class ChannelDispatcherTests
     [InlineData(OrderType.StopLimit)]
     public void StopAccepted_ExecReportNewCarriesStopOrdType(OrderType stopType)
     {
-        var (disp, packets, outbound) = NewDispatcher();
+        var (disp, _, outbound) = NewDispatcher();
         var reply = new FakeSession(outbound);
         long limitPrice = stopType == OrderType.StopLimit ? Px(10.50m) : 0L;
 
@@ -2207,7 +2207,7 @@ public partial class ChannelDispatcherTests
     [Fact]
     public async Task Issue322_OperatorHaltInstrument_RejectsSubsequentOrdersAndPopulatesSnapshot()
     {
-        var (disp, packets, outbound) = NewDispatcher();
+        var (disp, _, outbound) = NewDispatcher();
         var session = new FakeSession(outbound);
 
         var tcs = new TaskCompletionSource<HaltOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2223,20 +2223,6 @@ public partial class ChannelDispatcherTests
         Assert.True(disp.TryGetHaltSnapshot(Petr, out var snap));
         Assert.Equal(B3.Exchange.Matching.HaltReason.RegulatoryHalt, snap.Reason);
 
-        var haltPacket = Assert.Single(packets.Packets);
-        int legacyFrameSize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
-            + WireOffsets.SecurityStatusBlockLength;
-        int statusHeader = WireOffsets.PacketHeaderSize + legacyFrameSize + WireOffsets.FramingHeaderSize;
-        Assert.Equal((ushort)58, MemoryMarshal.Read<ushort>(haltPacket.AsSpan(statusHeader + 2, 2)));
-        int statusBody = statusHeader + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
-            haltPacket.AsSpan(statusBody, WireOffsets.InstrumentStatusBlockLength), out var haltStatus));
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.HALTED,
-            haltStatus.Data.AdministrativeHaltState);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.HALT,
-            haltStatus.Data.AdministrativeTransitionKind);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.HaltReason.REGULATORY_HALT, haltStatus.Data.HaltReason);
-
         // Subsequent NewOrder is rejected back to the originating session.
         session.Rejects.Clear();
         disp.EnqueueNewOrder(new NewOrderCommand("X", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day, Px(10m), 100, session.EnteringFirm, 1_000UL),
@@ -2249,13 +2235,12 @@ public partial class ChannelDispatcherTests
     [Fact]
     public async Task Issue322_OperatorResumeInstrument_RestoresOrderAcceptanceAndClearsSnapshot()
     {
-        var (disp, packets, outbound) = NewDispatcher();
+        var (disp, _, outbound) = NewDispatcher();
         var session = new FakeSession(outbound);
 
         Assert.True(disp.EnqueueOperatorHalt(Petr, B3.Exchange.Matching.HaltReason.NewsHold, null));
         DrainInbound(disp);
         Assert.True(disp.TryGetHaltSnapshot(Petr, out _));
-        packets.Packets.Clear();
 
         var resumeTcs = new TaskCompletionSource<HaltOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         Assert.True(disp.EnqueueOperatorResume(Petr, resumeTcs));
@@ -2265,19 +2250,6 @@ public partial class ChannelDispatcherTests
         Assert.True(outcome.StateChanged);
         Assert.False(outcome.IsHaltedNow);
         Assert.False(disp.TryGetHaltSnapshot(Petr, out _));
-
-        var resumePacket = Assert.Single(packets.Packets);
-        int legacyFrameSize = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
-            + WireOffsets.SecurityStatusBlockLength;
-        int statusBody = WireOffsets.PacketHeaderSize + legacyFrameSize
-            + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
-        Assert.True(B3.Umdf.Mbo.Sbe.V17.InstrumentStatus_58Data.TryParse(
-            resumePacket.AsSpan(statusBody, WireOffsets.InstrumentStatusBlockLength), out var resumeStatus));
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeHaltState.ACTIVE,
-            resumeStatus.Data.AdministrativeHaltState);
-        Assert.Equal(B3.Umdf.Mbo.Sbe.V17.AdministrativeTransitionKind.RESUME,
-            resumeStatus.Data.AdministrativeTransitionKind);
-        Assert.Null(resumeStatus.Data.HaltReason);
 
         // New order now accepted again.
         session.News.Clear();
