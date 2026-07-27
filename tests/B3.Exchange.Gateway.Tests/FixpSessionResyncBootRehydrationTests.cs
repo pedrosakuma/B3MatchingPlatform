@@ -951,17 +951,15 @@ public class FixpSessionResyncBootRehydrationTests
             Reason: CancelReason.MassCancel,
             RptSeq: 1);
         var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
-        var routed = Task.Run(() => gateway.WriteExecutionReportPassiveCancel(
+        var routed = gateway.WriteExecutionReportPassiveCancel(
             new B3.Exchange.Contracts.SessionId("1"),
             ownerClOrdId: 5001,
             orderId: canceled.OrderId,
             canceled,
-            requesterClOrdIdOrZero: 7001));
+            requesterClOrdIdOrZero: 7001);
         var session = listener.ActiveSessions.Single(s => s.SessionVerId == 101UL);
-        Assert.True(await TestUtil.WaitUntilAsync(
-            () => session.BusinessAdmissionWaiterCount == 1,
-            TimeSpan.FromSeconds(5)));
-        Assert.False(routed.IsCompleted);
+        Assert.True(routed.IsDeferred);
+        Assert.Equal(1, registry.PendingWriteCount(session));
         Assert.Equal(3u, journal.MaxSeq(1));
         await AssertNoFrameAsync(stream);
 
@@ -972,7 +970,8 @@ public class FixpSessionResyncBootRehydrationTests
         Assert.Equal(4u,
             BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
-        Assert.True((await routed.WaitAsync(TimeSpan.FromSeconds(5))).IsTransportEnqueued);
+        Assert.True((await routed.Completion.WaitAsync(
+            TimeSpan.FromSeconds(5))).IsTransportEnqueued);
         var report = await ReadFrameAsync(stream);
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, report.TemplateId);
         Assert.Equal(4u, report.MsgSeqNum);
@@ -1054,17 +1053,15 @@ public class FixpSessionResyncBootRehydrationTests
             Reason: CancelReason.MassCancel,
             RptSeq: 2);
         var gateway = new GatewayRouter(registry, NullLogger<GatewayRouter>.Instance);
-        var routed = Task.Run(() => gateway.WriteExecutionReportPassiveCancel(
+        var routed = gateway.WriteExecutionReportPassiveCancel(
             new B3.Exchange.Contracts.SessionId("1"),
             ownerClOrdId: 5002,
             orderId: canceled.OrderId,
             canceled,
-            requesterClOrdIdOrZero: 7002));
+            requesterClOrdIdOrZero: 7002);
         var session = listener.ActiveSessions.Single(s => s.SessionVerId == 100UL);
-        Assert.True(await TestUtil.WaitUntilAsync(
-            () => session.BusinessAdmissionWaiterCount == 1,
-            TimeSpan.FromSeconds(5)));
-        Assert.False(routed.IsCompleted);
+        Assert.True(routed.IsDeferred);
+        Assert.Equal(1, registry.PendingWriteCount(session));
         Assert.Equal(3u, journal.MaxSeq(1));
         await AssertNoFrameAsync(stream);
 
@@ -1074,7 +1071,8 @@ public class FixpSessionResyncBootRehydrationTests
         Assert.Equal(4u,
             BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
-        Assert.True((await routed.WaitAsync(TimeSpan.FromSeconds(5))).IsTransportEnqueued);
+        Assert.True((await routed.Completion.WaitAsync(
+            TimeSpan.FromSeconds(5))).IsTransportEnqueued);
         var report = await ReadFrameAsync(stream);
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, report.TemplateId);
         Assert.Equal(4u, report.MsgSeqNum);

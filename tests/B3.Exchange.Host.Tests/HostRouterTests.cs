@@ -3,6 +3,7 @@ using Side = B3.Exchange.Matching.Side;
 using RejectEvent = B3.Exchange.Matching.RejectEvent;
 using OrderType = B3.Exchange.Matching.OrderType;
 using TimeInForce = B3.Exchange.Matching.TimeInForce;
+using B3.Exchange.Gateway;
 using B3.Exchange.Host;
 using B3.Exchange.Core;
 using B3.Exchange.Instruments;
@@ -14,6 +15,17 @@ namespace B3.Exchange.Host.Tests;
 
 public class HostRouterTests
 {
+    private sealed class NoopInbound : IInboundCommandSink
+    {
+        public bool EnqueueNewOrder(in NewOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue) => true;
+        public bool EnqueueCancel(in CancelOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
+        public bool EnqueueReplace(in ReplaceOrderCommand cmd, SessionId session, uint enteringFirm, ulong clOrdIdValue, ulong origClOrdIdValue) => true;
+        public bool EnqueueCross(in CrossOrderCommand cmd, SessionId session, uint enteringFirm) => true;
+        public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm) => true;
+        public void OnDecodeError(SessionId session, string error) { }
+        public void OnSessionClosed(SessionId session) { }
+    }
+
     private sealed class NoopPacketSink : IUmdfPacketSink
     {
         public List<int> Calls { get; } = new();
@@ -181,6 +193,57 @@ public class HostRouterTests
         Assert.False(outcome?.Succeeded);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SolicitedMassCancel_DeferredReportDoesNotBlockUnrelatedWork(
+        bool commitDeferredReport)
+    {
+        var inst = CreateInstrument();
+        var deferred = new TaskCompletionSource<OrderedStreamWriteResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var outbound = new RecordingOutbound
+        {
+            CancelWriteResult = OrderedStreamWriteResult.Deferred(deferred.Task),
+        };
+        var disp = CreateDispatcher(inst, outbound);
+        var router = new HostRouter(
+            new Dictionary<long, ChannelDispatcher> { [inst.SecurityId] = disp },
+            outbound, NullLogger<HostRouter>.Instance);
+        var probe = disp.CreateTestProbe();
+        var owner = new SessionId("owner");
+
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("1", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1),
+            owner, enteringFirm: 7, clOrdIdValue: 1));
+        probe.DrainInbound();
+        outbound.Events.Clear();
+
+        var terminal = new TaskCompletionSource<MassCancelOutcome>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(router.EnqueueMassCancel(
+            new MassCancelCommand(inst.SecurityId, null, 2),
+            owner, enteringFirm: 7,
+            outcome => terminal.TrySetResult(outcome)));
+        Assert.True(router.EnqueueNewOrder(
+            new NewOrderCommand("2", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(9m), 100, 8, 3),
+            new SessionId("unrelated"), enteringFirm: 8, clOrdIdValue: 2));
+
+        probe.DrainInbound();
+
+        Assert.False(terminal.Task.IsCompleted);
+        Assert.Equal(new[] { "cancel", "new" }, outbound.Events);
+
+        deferred.TrySetResult(commitDeferredReport
+            ? OrderedStreamWriteResult.CommittedAndEnqueued
+            : OrderedStreamWriteResult.NotCommitted);
+        var outcome = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(commitDeferredReport, outcome.Succeeded);
+        Assert.Equal(commitDeferredReport ? 1 : 0, outcome.TotalAffectedOrders);
+    }
+
     [Fact]
     public void SolicitedMassCancel_PartialEnqueueDefersSystemBusyUntilAcceptedReports()
     {
@@ -285,6 +348,79 @@ public class HostRouterTests
 
         probe1.DrainInbound();
         Assert.Equal(new[] { "cancel" }, outbound.Events);
+    }
+
+    [Fact]
+    public async Task PendingHandshake_QueuesBoundedlyWithoutBlockingUnrelatedChannelWork()
+    {
+        var inst = CreateInstrument();
+        var registry = new SessionRegistry();
+        var inbound = new NoopInbound();
+        await using var pending = new FixpSession(
+            connectionId: 10,
+            enteringFirm: 7,
+            sessionId: 1,
+            stream: new MemoryStream(),
+            sink: inbound,
+            logger: NullLogger<FixpSession>.Instance,
+            sendQueueCapacity: 1,
+            sessionClaims: new SessionClaimRegistry(),
+            sessionRegistry: registry);
+        await using var active = new FixpSession(
+            connectionId: 11,
+            enteringFirm: 8,
+            sessionId: 2,
+            stream: new MemoryStream(),
+            sink: inbound,
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        registry.Register(pending);
+        registry.Register(active);
+
+        var gateway = new GatewayRouter(
+            registry, NullLogger<GatewayRouter>.Instance);
+        var disp = new ChannelDispatcher(
+            channelNumber: 1,
+            engineFactory: sink => new MatchingEngine(
+                new[] { inst }, sink, NullLogger<MatchingEngine>.Instance),
+            options: new ChannelDispatcherOptions
+            {
+                PacketSink = new NoopPacketSink(),
+                Outbound = gateway,
+                Logger = NullLogger<ChannelDispatcher>.Instance,
+                TimeSource = new FakeNanosTimeSource(1_000UL),
+            });
+        var probe = disp.CreateTestProbe();
+
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("pending-1", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(10m), 100, 7, 1),
+            new SessionId("1"), enteringFirm: 7, clOrdIdValue: 1));
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("active-1", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(9m), 100, 8, 2),
+            new SessionId("2"), enteringFirm: 8, clOrdIdValue: 2));
+
+        probe.DrainInbound();
+
+        Assert.Equal(0, disp.InboundQueueDepth);
+        Assert.Equal(0u, pending.OutboundSeq);
+        Assert.Equal(1u, active.OutboundSeq);
+        Assert.True(disp.TryResolveByClOrdId(7, 1, out _, out _));
+        Assert.True(disp.TryResolveByClOrdId(8, 2, out _, out _));
+        Assert.False(gateway.WriteExecutionReportReject(
+            new SessionId("1"),
+            new B3.Exchange.Matching.RejectEvent(
+                "capacity", inst.SecurityId, 0,
+                RejectReason.UnknownOrderId, 3),
+            clOrdIdValue: 99));
+
+        Assert.True(disp.EnqueueNewOrder(
+            new NewOrderCommand("pending-2", inst.SecurityId, Side.Buy,
+                OrderType.Limit, TimeInForce.Day, Px(8m), 100, 7, 3),
+            new SessionId("1"), enteringFirm: 7, clOrdIdValue: 3));
+        probe.DrainInbound();
+        Assert.Equal(0u, pending.OutboundSeq);
     }
 
     [Fact]

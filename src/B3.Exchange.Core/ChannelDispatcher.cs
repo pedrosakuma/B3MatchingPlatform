@@ -275,6 +275,7 @@ public sealed partial class ChannelDispatcher : IInboundCommandSink, IMatchingEv
     private ulong _currentOrigClOrdId;
     private bool _currentMassCancelReportsCommitted;
     private bool _trackMassCancelReports;
+    private List<Task<OrderedStreamWriteResult>>? _currentMassCancelReportCompletions;
     private WorkKind? _currentWorkKind;
     private Action? _openOrderTransitionHookForTesting;
     /// <summary>

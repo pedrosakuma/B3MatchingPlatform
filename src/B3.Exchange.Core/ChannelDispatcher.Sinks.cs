@@ -259,8 +259,7 @@ public sealed partial class ChannelDispatcher
         {
             var write = _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, e,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
-            if (_trackMassCancelReports && !write.IsCommitted)
-                _currentMassCancelReportsCommitted = false;
+            TrackMassCancelReport(write);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
@@ -650,8 +649,7 @@ public sealed partial class ChannelDispatcher
                 StopPxMantissa: e.StopPxMantissa);
             var write = _outbound.WriteExecutionReportPassiveCancel(owner.Session, owner.ClOrdId, e.OrderId, canceled,
                 _currentClOrdId, _currentReceivedTimeNanos, CurrentDurability);
-            if (_trackMassCancelReports && !write.IsCommitted)
-                _currentMassCancelReportsCommitted = false;
+            TrackMassCancelReport(write);
             _metrics?.IncExecutionReport(ExecutionReportKind.CancelPassive);
         }
     }
@@ -667,5 +665,20 @@ public sealed partial class ChannelDispatcher
     {
         AssertOnLoopThread();
         TransitionTriggeredOpenOrder(e.OrderId);
+    }
+
+    private void TrackMassCancelReport(OrderedStreamWriteResult write)
+    {
+        if (!_trackMassCancelReports)
+            return;
+        if (!write.IsAccepted)
+        {
+            _currentMassCancelReportsCommitted = false;
+            return;
+        }
+        if (write.IsDeferred)
+        {
+            (_currentMassCancelReportCompletions ??= new()).Add(write.Completion);
+        }
     }
 }

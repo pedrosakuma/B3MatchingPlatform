@@ -494,36 +494,144 @@ public sealed partial class FixpSession
     /// the race). The caller is responsible for closing the new socket
     /// in that case.</para>
     /// </summary>
+    internal AttachmentSnapshot CaptureAttachmentSnapshot()
+    {
+        lock (_attachLock)
+        {
+            return new AttachmentSnapshot(
+                State,
+                Volatile.Read(ref _attachmentGeneration));
+        }
+    }
+
     public bool TryReattach(Stream rebindStream)
     {
         ArgumentNullException.ThrowIfNull(rebindStream);
-        // Snapshot the previous loop tasks so we can JOIN with them
-        // before installing the new transport. This guarantees that any
-        // in-flight dispatch from the old receive loop (which still
-        // reads `_transport`) has fully run to completion before a new
-        // generation can be observed — eliminating the race in which an
-        // old dispatch path's continuation would close or write to the
-        // freshly attached transport.
-        Task? oldRecv;
-        Task? oldWatchdog;
-        lock (_attachLock)
+        var expected = CaptureAttachmentSnapshot();
+        if (expected.State != FixpState.Suspended)
+            return false;
+        return TryReattachCore(rebindStream, expected, allowEstablishedTakeover: false);
+    }
+
+    internal bool TryReattachForEstablish(
+        Stream rebindStream,
+        AttachmentSnapshot expected)
+    {
+        ArgumentNullException.ThrowIfNull(rebindStream);
+        if (expected.State is not (FixpState.Suspended or FixpState.Established))
+            return false;
+        return TryReattachCore(rebindStream, expected, allowEstablishedTakeover: true);
+    }
+
+    private bool TryReattachCore(
+        Stream rebindStream,
+        AttachmentSnapshot expected,
+        bool allowEstablishedTakeover)
+    {
+        Task? oldRecv = null;
+        Task? oldWatchdog = null;
+        long reservation = 0;
+
+        bool reserved = ExecuteLogicalSessionExclusive(() =>
         {
-            if (Volatile.Read(ref _isOpen) == 0) return false;
-            if (Volatile.Read(ref _isAttached) == 1) return false;
-            if (State != FixpState.Suspended) return false;
-            oldRecv = _recvTask;
-            oldWatchdog = _watchdogTask;
+            lock (_outboundLock)
+            {
+                lock (_attachLock)
+                {
+                    if (Volatile.Read(ref _isOpen) == 0
+                        || Volatile.Read(ref _attachmentGeneration) != expected.Generation
+                        || Volatile.Read(ref _reattachReservation) != 0)
+                        return false;
+
+                    if (expected.State == FixpState.Established)
+                    {
+                        if (!allowEstablishedTakeover
+                            || State != FixpState.Established
+                            || Volatile.Read(ref _isAttached) == 0)
+                            return false;
+
+                        ResetBusinessAdmissionLocked();
+                        SuspendLocked(
+                            $"establish-takeover:generation={expected.Generation}",
+                            armCancelOnDisconnect: false);
+                    }
+                    else if (State != FixpState.Suspended
+                        || Volatile.Read(ref _isAttached) != 0)
+                    {
+                        return false;
+                    }
+
+                    if (Volatile.Read(ref _isOpen) == 0
+                        || State != FixpState.Suspended
+                        || Volatile.Read(ref _isAttached) != 0)
+                        return false;
+
+                    reservation = expected.Generation + 1;
+                    Volatile.Write(ref _attachmentGeneration, reservation);
+                    Volatile.Write(ref _reattachReservation, reservation);
+                    oldRecv = _recvTask;
+                    oldWatchdog = _watchdogTask;
+                    return true;
+                }
+            }
+        });
+        if (!reserved)
+            return false;
+
+        if (!DrainPriorAttachment(oldRecv, oldWatchdog))
+        {
+            ClearReattachReservation(reservation);
+            return false;
         }
-        // Drain old loops outside the lock to avoid holding _attachLock
-        // across an await of arbitrary duration. Loops were already
-        // cancelled (and the old stream disposed) in Suspend, so this
-        // join should complete promptly. Bound by a short timeout as a
-        // belt-and-suspenders against runaway tasks; on timeout we skip
-        // the attempt and let the caller close the new socket — the
-        // suspended-session reaper will eventually clean up.
+
+        bool attached = ExecuteLogicalSessionExclusive(() =>
+        {
+            lock (_outboundLock)
+            {
+                lock (_attachLock)
+                {
+                    if (Volatile.Read(ref _reattachReservation) != reservation
+                        || Volatile.Read(ref _isOpen) == 0
+                        || Volatile.Read(ref _isAttached) != 0
+                        || State != FixpState.Suspended)
+                        return false;
+
+                    _logger.LogInformation(
+                        "fixp session {ConnectionId} re-attaching generation={Generation} (sessionId={SessionId} sessionVerId={SessionVerId})",
+                        ConnectionId, reservation, SessionId, SessionVerId);
+
+                    try { _cts.Dispose(); } catch (ObjectDisposedException) { }
+                    _cts = new CancellationTokenSource();
+                    ResetBusinessAdmissionLocked();
+                    _transport = CreateBoundTransport(rebindStream);
+                    StopCodTimerLocked();
+                    Volatile.Write(ref _suspendedSinceMs, 0);
+                    Volatile.Write(ref _lastInboundMs, NowMs());
+                    Volatile.Write(ref _isAttached, 1);
+                    Volatile.Write(ref _suspendInProgress, 0);
+                    Volatile.Write(ref _reattachReservation, 0);
+
+                    _transport.StartSendLoop(_cts.Token);
+                    _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
+                    _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
+                    return true;
+                }
+            }
+        });
+        if (!attached)
+            ClearReattachReservation(reservation);
+        return attached;
+    }
+
+    private bool DrainPriorAttachment(Task? oldRecv, Task? oldWatchdog)
+    {
         if (oldRecv is not null)
         {
-            try { if (!oldRecv.Wait(TimeSpan.FromSeconds(2))) return false; }
+            try
+            {
+                if (!oldRecv.Wait(TimeSpan.FromSeconds(2)))
+                    return false;
+            }
             catch (AggregateException ex)
             {
                 _logger.LogWarning(ex,
@@ -533,7 +641,11 @@ public sealed partial class FixpSession
         }
         if (oldWatchdog is not null)
         {
-            try { if (!oldWatchdog.Wait(TimeSpan.FromSeconds(2))) return false; }
+            try
+            {
+                if (!oldWatchdog.Wait(TimeSpan.FromSeconds(2)))
+                    return false;
+            }
             catch (AggregateException ex)
             {
                 _logger.LogWarning(ex,
@@ -541,56 +653,15 @@ public sealed partial class FixpSession
                     ConnectionId);
             }
         }
-        // Business writers and EstablishAck serialize on _outboundLock.
-        // Acquire it before publishing the replacement transport so no writer
-        // can observe the new generation while its Ack admission gate is open.
-        // The lock order matches outbound send-failure handling
-        // (_outboundLock -> _attachLock) and avoids inversion.
-        lock (_outboundLock)
-        {
-            lock (_attachLock)
-            {
-                // Re-validate after the unlock-join-relock window: a
-                // concurrent Close (e.g. reaper) may have terminated the
-                // session while we waited.
-                if (Volatile.Read(ref _isOpen) == 0) return false;
-                if (Volatile.Read(ref _isAttached) == 1) return false;
-                if (State != FixpState.Suspended) return false;
-
-                _logger.LogInformation(
-                    "fixp session {ConnectionId} re-attaching transport (sessionId={SessionId} sessionVerId={SessionVerId})",
-                    ConnectionId, SessionId, SessionVerId);
-
-                try { _cts.Dispose(); } catch (ObjectDisposedException) { /* concurrent dispose; benign */ }
-                _cts = new CancellationTokenSource();
-                ResetBusinessAdmissionLocked();
-                _transport = CreateBoundTransport(rebindStream);
-                // The new transport is back; cancel-on-disconnect grace is
-                // satisfied (issue #54 spec §4.7: reconnect inside the
-                // window cancels the pending CoD trigger).
-                StopCodTimerLocked();
-                Volatile.Write(ref _suspendedSinceMs, 0);
-                Volatile.Write(ref _lastInboundMs, NowMs());
-                Volatile.Write(ref _isAttached, 1);
-                // Installing a fresh attached generation begins a new suspend
-                // cycle: clear the one-shot SuspendLocked guard so a subsequent
-                // disconnect can demote this session again. Without this reset a
-                // second drop after any reattach would silently no-op the suspend
-                // (the guard is only otherwise cleared on the never-attached early
-                // return), leaving the session wedged Established over a dead
-                // transport.
-                Volatile.Write(ref _suspendInProgress, 0);
-
-                // Spin up new send / recv / watchdog loops bound to the fresh
-                // transport + cancellation source. The buffered Establish frame
-                // already inside `rebindStream` will flow through the recv loop
-                // and drive ProcessEstablish → state machine Suspended → Established.
-                _transport.StartSendLoop(_cts.Token);
-                _recvTask = Task.Run(() => RunReceiveLoopAsync(_cts.Token));
-                _watchdogTask = Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
-            }
-        }
         return true;
+    }
+
+    private void ClearReattachReservation(long reservation)
+    {
+        lock (_attachLock)
+        {
+            Interlocked.CompareExchange(ref _reattachReservation, 0, reservation);
+        }
     }
 
     /// <summary>
@@ -642,7 +713,6 @@ public sealed partial class FixpSession
         }
         await _transport.DisposeAsync().ConfigureAwait(false);
         _retxBuffer.Dispose();
-        _businessAdmissionSignal.Dispose();
         _cts.Dispose();
     }
 }

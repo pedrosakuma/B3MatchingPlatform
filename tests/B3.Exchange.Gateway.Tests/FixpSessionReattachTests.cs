@@ -197,10 +197,13 @@ public class FixpSessionReattachTests
     public async Task SuspendForTakeover_blocks_business_until_successor_EstablishAck()
     {
         var (tcp0, serverStream0, client0) = await ConnectPairAsync();
+        var registry = new SessionRegistry();
         var session = new FixpSession(
             connectionId: 2, enteringFirm: 7, sessionId: 100,
             stream: serverStream0, sink: new NoOpEngineSink(),
-            logger: NullLogger<FixpSession>.Instance);
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        registry.Register(session);
         try
         {
             session.Start();
@@ -219,13 +222,17 @@ public class FixpSessionReattachTests
                 TransactTimeNanos: 1_700_000_000_000_000_000UL,
                 Reason: CancelReason.MassCancel,
                 RptSeq: 2);
-            var routed = Task.Run(() => session.WriteExecutionReportCancel(
-                canceled, clOrdIdValue: 5555, origClOrdIdValue: 0));
+            var gateway = new GatewayRouter(
+                registry, NullLogger<GatewayRouter>.Instance);
+            var routed = gateway.WriteExecutionReportPassiveCancel(
+                new B3.Exchange.Contracts.SessionId("100"),
+                ownerClOrdId: 5555,
+                orderId: canceled.OrderId,
+                canceled,
+                requesterClOrdIdOrZero: 0);
 
-            Assert.True(await TestUtil.WaitUntilAsync(
-                () => session.BusinessAdmissionWaiterCount == 1,
-                TimeSpan.FromSeconds(3)));
-            Assert.False(routed.IsCompleted);
+            Assert.True(routed.IsDeferred);
+            Assert.Equal(1, registry.PendingWriteCount(session));
             Assert.Equal(0u, session.OutboundSeq);
             Assert.Equal(0, session.RetxBufferDepth);
 
@@ -233,7 +240,7 @@ public class FixpSessionReattachTests
             try
             {
                 Assert.True(session.TryReattach(serverStream1));
-                Assert.False(routed.IsCompleted);
+                Assert.True(routed.IsDeferred);
 
                 var establish = new byte[256];
                 int length = EntryPointFixpFrameCodec.EncodeEstablish(
@@ -251,7 +258,7 @@ public class FixpSessionReattachTests
 
                 Assert.Equal(EntryPointFrameReader.TidEstablishAck,
                     await ReadTemplateIdAsync(stream));
-                Assert.True((await routed.WaitAsync(
+                Assert.True((await routed.Completion.WaitAsync(
                     TimeSpan.FromSeconds(3))).IsTransportEnqueued);
                 Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel,
                     await ReadTemplateIdAsync(stream));
@@ -269,6 +276,161 @@ public class FixpSessionReattachTests
             session.Close("test-cleanup");
             await session.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task Concurrent_Establish_takeovers_keep_exactly_one_generation()
+    {
+        var (tcp0, server0, client0) = await ConnectPairAsync();
+        var registry = new SessionRegistry();
+        var session = new FixpSession(
+            connectionId: 3, enteringFirm: 7, sessionId: 100,
+            stream: server0, sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance,
+            sessionRegistry: registry);
+        registry.Register(session);
+
+        var (tcp1, server1, client1) = await ConnectPairAsync();
+        var (tcp2, server2, client2) = await ConnectPairAsync();
+        try
+        {
+            session.Start();
+            session.ApplyTransition(FixpEvent.Negotiate);
+            session.ApplyTransition(FixpEvent.Establish);
+            var expected = session.CaptureAttachmentSnapshot();
+
+            using var start = new ManualResetEventSlim(false);
+            var first = Task.Factory.StartNew(
+                () =>
+                {
+                    start.Wait();
+                    return session.TryReattachForEstablish(server1, expected);
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+            var second = Task.Factory.StartNew(
+                () =>
+                {
+                    start.Wait();
+                    return session.TryReattachForEstablish(server2, expected);
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+
+            start.Set();
+            bool firstWon = await first.WaitAsync(TimeSpan.FromSeconds(5));
+            bool secondWon = await second.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.NotEqual(firstWon, secondWon);
+
+            var winner = firstWon ? client1 : client2;
+            var loser = firstWon ? client2 : client1;
+            loser.Close();
+
+            var establish = new byte[256];
+            int length = EntryPointFixpFrameCodec.EncodeEstablish(
+                establish,
+                sessionId: 100,
+                sessionVerId: 0,
+                timestampNanos: 1,
+                keepAliveIntervalMillis: 10_000,
+                nextSeqNo: 1,
+                cancelOnDisconnectType: 0,
+                codTimeoutWindowMillis: 0,
+                credentials: ReadOnlySpan<byte>.Empty);
+            var stream = winner.GetStream();
+            await stream.WriteAsync(establish.AsMemory(0, length));
+            Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+                await ReadTemplateIdAsync(stream));
+
+            Assert.True(await TestUtil.WaitUntilAsync(
+                () => session.State == FixpState.Established && session.IsAttached,
+                TimeSpan.FromSeconds(3)));
+
+            var canceled = new OrderCanceledEvent(
+                SecurityId: 1001,
+                OrderId: 1000,
+                Side: Side.Buy,
+                PriceMantissa: 100_0000,
+                RemainingQuantityAtCancel: 10,
+                TransactTimeNanos: 2,
+                Reason: CancelReason.MassCancel,
+                RptSeq: 3);
+            var gateway = new GatewayRouter(
+                registry, NullLogger<GatewayRouter>.Instance);
+            Assert.True(gateway.WriteExecutionReportPassiveCancel(
+                new B3.Exchange.Contracts.SessionId("100"),
+                ownerClOrdId: 6000,
+                orderId: canceled.OrderId,
+                canceled,
+                requesterClOrdIdOrZero: 0).IsTransportEnqueued);
+            Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel,
+                await ReadTemplateIdAsync(stream));
+        }
+        finally
+        {
+            client0.Close();
+            client1.Close();
+            client2.Close();
+            server1.Dispose();
+            server2.Dispose();
+            tcp0.Stop();
+            tcp1.Stop();
+            tcp2.Stop();
+            session.Close("test-cleanup");
+            await session.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Deferred_business_queue_is_bounded_and_failed_on_close()
+    {
+        var registry = new SessionRegistry();
+        await using var session = new FixpSession(
+            connectionId: 4,
+            enteringFirm: 7,
+            sessionId: 100,
+            stream: new MemoryStream(),
+            sink: new NoOpEngineSink(),
+            logger: NullLogger<FixpSession>.Instance,
+            sendQueueCapacity: 1,
+            sessionClaims: new SessionClaimRegistry(),
+            sessionRegistry: registry);
+        registry.Register(session);
+        var gateway = new GatewayRouter(
+            registry, NullLogger<GatewayRouter>.Instance);
+        var canceled = new OrderCanceledEvent(
+            SecurityId: 1001,
+            OrderId: 1001,
+            Side: Side.Buy,
+            PriceMantissa: 100_0000,
+            RemainingQuantityAtCancel: 10,
+            TransactTimeNanos: 2,
+            Reason: CancelReason.MassCancel,
+            RptSeq: 4);
+
+        var first = gateway.WriteExecutionReportPassiveCancel(
+            new B3.Exchange.Contracts.SessionId("100"),
+            ownerClOrdId: 6001,
+            orderId: canceled.OrderId,
+            canceled,
+            requesterClOrdIdOrZero: 0);
+        var second = gateway.WriteExecutionReportPassiveCancel(
+            new B3.Exchange.Contracts.SessionId("100"),
+            ownerClOrdId: 6002,
+            orderId: canceled.OrderId + 1,
+            canceled with { OrderId = canceled.OrderId + 1 },
+            requesterClOrdIdOrZero: 0);
+
+        Assert.True(first.IsDeferred);
+        Assert.False(second.IsAccepted);
+        Assert.Equal(1, registry.PendingWriteCount(session));
+
+        session.Close("test-close-pending-route");
+        Assert.False((await first.Completion.WaitAsync(
+            TimeSpan.FromSeconds(3))).IsCommitted);
+        Assert.Equal(0, registry.PendingWriteCount(session));
     }
 
     private static async Task<ushort> ReadTemplateIdAsync(NetworkStream stream)

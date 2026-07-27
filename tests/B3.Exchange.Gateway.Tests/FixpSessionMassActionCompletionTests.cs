@@ -172,7 +172,7 @@ public class FixpSessionMassActionCompletionTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task TerminalCompletionDuringReattach_BlocksUntilEstablishAck(
+    public async Task TerminalCompletionDuringReattach_DefersUntilEstablishAck(
         bool succeeded)
     {
         var sink = new ControlledSink();
@@ -195,13 +195,10 @@ public class FixpSessionMassActionCompletionTests
             {
                 Assert.True(session.TryReattach(server2));
 
-                var completion = Task.Run(() => complete(succeeded
+                complete(succeeded
                     ? MassCancelOutcome.Completed(0)
-                    : MassCancelOutcome.SystemBusy));
-                Assert.True(await TestUtil.WaitUntilAsync(
-                    () => session.BusinessAdmissionWaiterCount == 1,
-                    TimeSpan.FromSeconds(3)));
-                Assert.False(completion.IsCompleted);
+                    : MassCancelOutcome.SystemBusy);
+                Assert.Equal(1, registry.PendingWriteCount(session));
                 Assert.Equal(0u, session.OutboundSeq);
 
                 var establish = new byte[256];
@@ -223,7 +220,6 @@ public class FixpSessionMassActionCompletionTests
                 Assert.Equal(1u,
                     BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
-                await completion.WaitAsync(TimeSpan.FromSeconds(3));
                 var terminal = await ReadFrameAsync(stream2);
                 Assert.Equal(1u,
                     BinaryPrimitives.ReadUInt32LittleEndian(terminal.Body.AsSpan(4, 4)));

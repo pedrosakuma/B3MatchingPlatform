@@ -283,6 +283,12 @@ public sealed class SessionRegistry
         return RouteFor(session);
     }
 
+    internal int PendingWriteCount(FixpSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        return RouteFor(session).Execute(route => route.PendingWriteCount);
+    }
+
     internal bool TryInvoke(SessionId session, Func<FixpSession, bool> action)
     {
         ArgumentNullException.ThrowIfNull(action);

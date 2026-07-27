@@ -75,9 +75,8 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// holding <see cref="_outboundLock"/>.
     /// </summary>
     private bool _transportReadyForBusiness = true;
-    private readonly ManualResetEventSlim _businessAdmissionSignal;
+    private TaskCompletionSource<bool> _businessAdmissionCompletion = NewAdmissionCompletion();
     private int _businessAdmissionState;
-    private int _businessAdmissionWaiters;
     /// <summary>
     /// Per-session retransmission ring buffer (issue #46, spec §4.5.6).
     /// Holds copies of the wire frames for ExecutionReport_* and
@@ -118,6 +117,8 @@ public sealed partial class FixpSession : IAsyncDisposable
     private long _msgSeqNum;
     private int _isOpen = 1;
     private int _isAttached = 1;
+    private long _attachmentGeneration = 1;
+    private long _reattachReservation;
     private int _closeRequested;
     private int _takeOverCommitFence;
     /// <summary>De-dup CAS guard for <c>SuspendLocked</c>. Distinct from
@@ -304,6 +305,10 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// </summary>
     public bool IsAttached => Volatile.Read(ref _isAttached) == 1;
 
+    internal readonly record struct AttachmentSnapshot(
+        FixpState State,
+        long Generation);
+
     /// <summary>
     /// Current FIXP lifecycle state. Mutated only via <see cref="ApplyTransition"/>,
     /// which routes through <see cref="FixpStateMachine.Apply"/>. Starts at
@@ -374,8 +379,13 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// Diagnostic only.</summary>
     public int RetxBufferCapacity => _retxBuffer.Capacity;
 
-    internal int BusinessAdmissionWaiterCount =>
-        Volatile.Read(ref _businessAdmissionWaiters);
+    internal int BusinessAdmissionState =>
+        Volatile.Read(ref _businessAdmissionState);
+
+    internal int DeferredBusinessWriteCapacity => _sendQueueCapacity;
+
+    internal Task<bool> BusinessAdmissionCompletion =>
+        Volatile.Read(ref _businessAdmissionCompletion).Task;
 
     /// <summary>Last allocated outbound MsgSeqNum (the value the next
     /// emitted business frame's <c>NextMsgSeqNum()</c> call will return
@@ -473,8 +483,8 @@ public sealed partial class FixpSession : IAsyncDisposable
             && !deferPersistedStateUntilNegotiate;
         _transportReadyForBusiness = businessAdmissionInitiallyOpen;
         _businessAdmissionState = businessAdmissionInitiallyOpen ? 1 : 0;
-        _businessAdmissionSignal = new ManualResetEventSlim(
-            businessAdmissionInitiallyOpen);
+        if (businessAdmissionInitiallyOpen)
+            _businessAdmissionCompletion.TrySetResult(true);
         // Issue #405 rehydration: when a state snapshot survives a
         // host restart, seed identity (SessionId / SessionVerId /
         // EnteringFirm) and seq counters BEFORE wiring the buffer
@@ -705,39 +715,21 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// <c>Sequence</c> frames, which announce but do not consume.</summary>
     private uint PeekNextMsgSeqNum() => (uint)(Volatile.Read(ref _msgSeqNum) + 1);
 
-    internal bool WaitForBusinessAdmission()
-    {
-        while (true)
-        {
-            int state = Volatile.Read(ref _businessAdmissionState);
-            if (state != 0)
-                return state == 1;
-
-            Interlocked.Increment(ref _businessAdmissionWaiters);
-            try
-            {
-                if (Volatile.Read(ref _businessAdmissionState) == 0)
-                    _businessAdmissionSignal.Wait();
-            }
-            finally
-            {
-                Interlocked.Decrement(ref _businessAdmissionWaiters);
-            }
-        }
-    }
-
     private void ResetBusinessAdmissionLocked()
     {
         _transportReadyForBusiness = false;
+        var previous = Interlocked.Exchange(
+            ref _businessAdmissionCompletion,
+            NewAdmissionCompletion());
         Volatile.Write(ref _businessAdmissionState, 0);
-        _businessAdmissionSignal.Reset();
+        previous.TrySetResult(false);
     }
 
     private void OpenBusinessAdmissionLocked()
     {
         _transportReadyForBusiness = true;
         Volatile.Write(ref _businessAdmissionState, 1);
-        _businessAdmissionSignal.Set();
+        Volatile.Read(ref _businessAdmissionCompletion).TrySetResult(true);
     }
 
     private void AbortBusinessAdmission()
@@ -746,35 +738,25 @@ public sealed partial class FixpSession : IAsyncDisposable
         {
             _transportReadyForBusiness = false;
             Volatile.Write(ref _businessAdmissionState, 2);
-            _businessAdmissionSignal.Set();
+            Volatile.Read(ref _businessAdmissionCompletion).TrySetResult(false);
         }
     }
 
     private T ExecuteAdmittedBusinessWrite<T>(Func<T> write, T unavailable)
     {
-        while (WaitForBusinessAdmission())
+        return ExecuteLogicalSessionExclusive(() =>
         {
-            bool retry = false;
-            var result = ExecuteLogicalSessionExclusive(() =>
+            lock (_outboundLock)
             {
-                lock (_outboundLock)
-                {
-                    int state = Volatile.Read(ref _businessAdmissionState);
-                    if (state == 0)
-                    {
-                        retry = true;
-                        return unavailable;
-                    }
-                    if (state != 1)
-                        return unavailable;
-                    return write();
-                }
-            });
-            if (!retry)
-                return result;
-        }
-        return unavailable;
+                if (Volatile.Read(ref _businessAdmissionState) != 1)
+                    return unavailable;
+                return write();
+            }
+        });
     }
+
+    private static TaskCompletionSource<bool> NewAdmissionCompletion() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private void ExecuteLogicalSessionExclusive(Action action)
     {

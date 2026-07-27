@@ -460,14 +460,8 @@ public sealed class EntryPointListener : IAsyncDisposable
                 && existing.SessionVerId == req.SessionVerId
                 && req.SessionVerId == lastVerId)
             {
-                // Snapshot State ONCE so the takeover decision is consistent: a
-                // connection that matched a Suspended session must never later
-                // re-read State and escalate to SuspendForTakeover — by then a
-                // concurrent reconnect may have legitimately reattached and
-                // moved the session back to Established, and tearing that fresh
-                // transport down would steal a live successor. Only a connection
-                // that matched an Established session performs the takeover.
-                var matchedState = existing.State;
+                var attachment = existing.CaptureAttachmentSnapshot();
+                var matchedState = attachment.State;
                 if (matchedState == FixpState.Suspended
                     || matchedState == FixpState.Established)
                 {
@@ -483,21 +477,13 @@ public sealed class EntryPointListener : IAsyncDisposable
                     // instead of falling through to a fresh Idle session that
                     // rejects UNNEGOTIATED. Mirrors the Negotiate-path takeover
                     // added in #488.
-                    if (matchedState == FixpState.Established)
-                    {
-                        _logger.LogInformation(
-                            "establish-takeover: force-suspending still-Established session {ConnectionId} for resuming Establish (sessionId={SessionId} sessionVerId={SessionVerId} from {Remote})",
-                            existing.ConnectionId, req.SessionId, req.SessionVerId, SafeRemote(sock));
-                        existing.SuspendForTakeover(
-                            $"establish-takeover:sessionId={req.SessionId}");
-                    }
-
                     var prepended = new PrependedStream(firstFrame, stream);
-                    if (existing.TryReattach(prepended))
+                    if (existing.TryReattachForEstablish(prepended, attachment))
                     {
                         _logger.LogInformation(
-                            "re-attached transport to existing session {ConnectionId} (sessionId={SessionId} from {Remote})",
-                            existing.ConnectionId, existing.SessionId, SafeRemote(sock));
+                            "re-attached transport to existing session {ConnectionId} (sessionId={SessionId} generation={Generation} priorState={PriorState} from {Remote})",
+                            existing.ConnectionId, existing.SessionId,
+                            attachment.Generation, matchedState, SafeRemote(sock));
                         return;
                     }
                     _logger.LogInformation(

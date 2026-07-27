@@ -246,6 +246,7 @@ public sealed partial class ChannelDispatcher
         _trackMassCancelReports = item.Kind == WorkKind.MassCancel
             && item.MassCancelCompletion is not null;
         _currentMassCancelReportsCommitted = true;
+        _currentMassCancelReportCompletions?.Clear();
         _packetWritten = 0;
         bool succeeded = false;
         // Issue #269: write-ahead the command before the engine
@@ -559,7 +560,17 @@ public sealed partial class ChannelDispatcher
                         ?? MassCancelOutcome.SystemBusy;
                     if (!TryCompleteMassCancelDurability())
                         terminalOutcome = MassCancelOutcome.SystemBusy;
-                    CompleteMassCancel(item.MassCancelCompletion, terminalOutcome);
+                    if (_currentMassCancelReportCompletions is { Count: > 0 } deferred)
+                    {
+                        _ = CompleteMassCancelAfterDeferredAsync(
+                            deferred.ToArray(),
+                            item.MassCancelCompletion,
+                            terminalOutcome);
+                    }
+                    else
+                    {
+                        CompleteMassCancel(item.MassCancelCompletion, terminalOutcome);
+                    }
                 }
                 else
                 {
@@ -583,6 +594,7 @@ public sealed partial class ChannelDispatcher
             _currentReceivedTimeNanos = ulong.MaxValue;
             _trackMassCancelReports = false;
             _currentMassCancelReportsCommitted = true;
+            _currentMassCancelReportCompletions?.Clear();
             _aggressorOrigQty = 0;
             _aggressorCumQty = 0;
             // Issue #484: flush the last buffered IOC aggressor ER with
@@ -694,6 +706,24 @@ public sealed partial class ChannelDispatcher
                 "channel {ChannelNumber}: mass-cancel completion callback failed",
                 ChannelNumber);
         }
+    }
+
+    private async Task CompleteMassCancelAfterDeferredAsync(
+        Task<OrderedStreamWriteResult>[] deferred,
+        Action<MassCancelOutcome>? completion,
+        MassCancelOutcome outcome)
+    {
+        try
+        {
+            var results = await Task.WhenAll(deferred).ConfigureAwait(false);
+            if (results.Any(static result => !result.IsCommitted))
+                outcome = MassCancelOutcome.SystemBusy;
+        }
+        catch
+        {
+            outcome = MassCancelOutcome.SystemBusy;
+        }
+        CompleteMassCancel(completion, outcome);
     }
 
     /// <summary>
