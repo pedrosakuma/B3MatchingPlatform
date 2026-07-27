@@ -198,6 +198,12 @@ public sealed class SessionRegistry
                                         result = IdentityUpdateAttempt.Rejected;
                                         return;
                                     }
+                                    if (!session.TryResetOutboundStateForRetiredReplacement(
+                                            previous, claimedSessionId))
+                                    {
+                                        result = IdentityUpdateAttempt.Rejected;
+                                        return;
+                                    }
                                     if (!_sessions.TryUpdate(newIdentity, session, previous))
                                     {
                                         result = IdentityUpdateAttempt.Retry;
@@ -220,6 +226,12 @@ public sealed class SessionRegistry
                                 if (!CanReplace(previous))
                                 {
                                     result = IdentityUpdateAttempt.Retry;
+                                    return;
+                                }
+                                if (!session.TryResetOutboundStateForRetiredReplacement(
+                                        previous, claimedSessionId))
+                                {
+                                    result = IdentityUpdateAttempt.Rejected;
                                     return;
                                 }
                                 if (!_sessions.TryAdd(newIdentity, session))

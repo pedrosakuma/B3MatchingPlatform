@@ -162,6 +162,11 @@ public sealed partial class FixpSession : IAsyncDisposable
     /// successful <see cref="SessionClaimRegistry.TryRestoreTakeOver"/>.
     /// </summary>
     private readonly Action<FixpSession>? _onTakeOverRollback;
+    private readonly Action<uint>? _onPersistedStateClaimed;
+    private readonly B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? _pendingNegotiateState;
+    private bool _pendingNegotiateStateApplied;
+    private readonly uint _acceptedSessionId;
+    private readonly uint _acceptedEnteringFirm;
     private readonly SessionRegistry? _sessionRegistry;
 
     public long ConnectionId { get; }
@@ -417,12 +422,16 @@ public sealed partial class FixpSession : IAsyncDisposable
         B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? statePersister = null,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState = null,
         bool resumeAsNegotiated = false,
+        bool deferPersistedStateUntilNegotiate = false,
         int? persistedMaxOrderRatePerSecond = null,
         Action<FixpSession, ContractsSessionId, ContractsSessionId>? onIdentityChanged = null,
         Action<FixpSession>? onTakeOverRollback = null,
+        Action<uint>? onPersistedStateClaimed = null,
         SessionRegistry? sessionRegistry = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
+        _acceptedEnteringFirm = enteringFirm;
+        _acceptedSessionId = sessionId;
         ConnectionId = connectionId;
         EnteringFirm = enteringFirm;
         SessionId = sessionId;
@@ -444,18 +453,22 @@ public sealed partial class FixpSession : IAsyncDisposable
         _options.Validate();
         _onIdentityChanged = onIdentityChanged;
         _onTakeOverRollback = onTakeOverRollback;
+        _onPersistedStateClaimed = onPersistedStateClaimed;
         _sessionRegistry = sessionRegistry;
         if (persistedMaxOrderRatePerSecond is < 0)
             throw new ArgumentOutOfRangeException(nameof(persistedMaxOrderRatePerSecond));
         _outboundJournal = outboundJournal;
         _statePersister = statePersister;
+        _pendingNegotiateState = deferPersistedStateUntilNegotiate
+            ? persistedState
+            : null;
         // Issue #405 rehydration: when a state snapshot survives a
         // host restart, seed identity (SessionId / SessionVerId /
         // EnteringFirm) and seq counters BEFORE wiring the buffer
         // callbacks, so the very first journal.Append / state.Save
         // sees the resumed identity rather than the
         // identityFactory-supplied placeholder.
-        if (persistedState is { } state)
+        if (persistedState is { } state && !deferPersistedStateUntilNegotiate)
         {
             SessionId = state.SessionId;
             SessionVerId = state.SessionVerId;
@@ -479,11 +492,7 @@ public sealed partial class FixpSession : IAsyncDisposable
             // incoming Establish event lands as (Negotiated, Establish)
             // → Established. Without this, a peer that legitimately
             // skips Negotiate after a host crash (spec §1.5 RECOVERABLE
-            // serverFlow) would be rejected as UNNEGOTIATED. Negotiate-
-            // shaped resumes (peer abandons old session for a fresh
-            // SessionVerId) keep the default Idle so the normal
-            // handshake gate fires and SeedLastVersion can enforce
-            // monotonicity against the persisted version.
+            // serverFlow) would be rejected as UNNEGOTIATED.
             if (resumeAsNegotiated)
             {
                 State = FixpState.Negotiated;
@@ -573,6 +582,20 @@ public sealed partial class FixpSession : IAsyncDisposable
                 // accept a duplicate session.
                 State = FixpState.Idle;
                 _claimedSessionId = 0;
+                SessionId = _acceptedSessionId;
+                SessionVerId = 0;
+                EnteringFirm = _acceptedEnteringFirm;
+                LastIncomingSeqNo = 0;
+                Volatile.Write(ref _msgSeqNum, 0);
+                Identity = _acceptedSessionId != 0
+                    ? new ContractsSessionId(_acceptedSessionId.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture))
+                    : new ContractsSessionId("pending-" + connectionId.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                _onPersistedStateClaimed?.Invoke(resumed.SessionId);
             }
         }
         // The transport's onClose callback funnels back through our
@@ -627,6 +650,41 @@ public sealed partial class FixpSession : IAsyncDisposable
             throw new InvalidOperationException(
                 $"cannot roll back outbound sequence {allocated}; allocator advanced concurrently");
         Volatile.Write(ref _msgSeqNum, allocated - 1u);
+    }
+
+    private bool TryApplyPendingNegotiateState(uint sessionId)
+    {
+        if (_pendingNegotiateState is not { } state)
+            return true;
+        if (state.SessionId != sessionId)
+            return false;
+
+        try
+        {
+            uint resumedSeq = state.OutboundMsgSeqNum;
+            if (_outboundJournal is not null)
+                resumedSeq = Math.Max(resumedSeq, _outboundJournal.MaxSeq(sessionId));
+            LastIncomingSeqNo = state.LastIncomingSeqNo;
+            Volatile.Write(ref _msgSeqNum, resumedSeq);
+            _pendingNegotiateStateApplied = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to reconcile pending persisted state for sessionId={SessionId}",
+                ConnectionId, sessionId);
+            return false;
+        }
+    }
+
+    private void RollbackPendingNegotiateState()
+    {
+        if (!_pendingNegotiateStateApplied)
+            return;
+        LastIncomingSeqNo = 0;
+        Volatile.Write(ref _msgSeqNum, 0);
+        _pendingNegotiateStateApplied = false;
     }
 
     /// <summary>Peek the value <see cref="NextMsgSeqNum"/> would return on
@@ -706,6 +764,56 @@ public sealed partial class FixpSession : IAsyncDisposable
                 _outboundEncoder.AdvanceMassActionReportSeqTo(
                     previous._outboundEncoder.MassActionReportSeq);
                 return commit();
+            }
+        }
+    }
+
+    internal bool TryResetOutboundStateForRetiredReplacement(
+        FixpSession previous,
+        uint sessionId)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        if (sessionId == 0
+            || !ReferenceEquals(_outboundJournal, previous._outboundJournal)
+            || !ReferenceEquals(_statePersister, previous._statePersister))
+            return false;
+
+        var first = ConnectionId < previous.ConnectionId ? _outboundLock : previous._outboundLock;
+        var second = ReferenceEquals(first, _outboundLock) ? previous._outboundLock : _outboundLock;
+        lock (first)
+        {
+            lock (second)
+            {
+                if (!IsLiveTakeOverCandidate
+                    || (previous.State != FixpState.Terminated && previous.IsRegistered)
+                    || _retxBuffer.Count != 0)
+                    return false;
+
+                try
+                {
+                    if (_outboundJournal is not null)
+                    {
+                        _outboundJournal.Remove(sessionId);
+                        if (_outboundJournal.MaxSeq(sessionId) != 0)
+                            return false;
+                    }
+                    if (_statePersister is not null)
+                    {
+                        _statePersister.Remove(sessionId);
+                        if (_statePersister.Load(sessionId) is not null)
+                            return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} failed to reset retired session persistence for sessionId={SessionId}",
+                        ConnectionId, sessionId);
+                    return false;
+                }
+
+                Volatile.Write(ref _msgSeqNum, 0);
+                return true;
             }
         }
     }

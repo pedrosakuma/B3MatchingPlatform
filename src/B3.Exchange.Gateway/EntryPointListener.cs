@@ -1,4 +1,5 @@
 using B3.EntryPoint.Wire;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.Contracts;
@@ -31,7 +32,7 @@ public sealed class EntryPointListener : IAsyncDisposable
     private readonly B3.Exchange.Contracts.RetransmitMetrics? _retransmitMetrics;
     private readonly B3.Exchange.Gateway.Persistence.IFixpOutboundJournal? _outboundJournal;
     private readonly B3.Exchange.Gateway.Persistence.IFixpSessionStatePersister? _statePersister;
-    private readonly IDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
+    private readonly ConcurrentDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>? _persistedSessionStates;
     private readonly Func<uint, int?>? _persistedMaxOrderRateResolver;
     private readonly CancellationTokenSource _cts = new();
     private TcpListener? _listener;
@@ -93,7 +94,8 @@ public sealed class EntryPointListener : IAsyncDisposable
         _statePersister = statePersister;
         _persistedSessionStates = persistedSessionStates is null
             ? null
-            : new Dictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>(persistedSessionStates);
+            : new ConcurrentDictionary<uint, B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot>(
+                persistedSessionStates);
         _persistedMaxOrderRateResolver = persistedMaxOrderRateResolver;
         if ((_negotiationValidator is null) ^ (_sessionClaims is null))
         {
@@ -237,7 +239,7 @@ public sealed class EntryPointListener : IAsyncDisposable
             {
                 s.Close(reason, closeKind);
                 if (closeKind == CloseKind.DailyReset)
-                    _persistedSessionStates?.Remove(s.SessionId);
+                    _persistedSessionStates?.TryRemove(s.SessionId, out _);
                 closed++;
             }
             catch (Exception ex)
@@ -513,23 +515,20 @@ public sealed class EntryPointListener : IAsyncDisposable
         // (SessionVerId / LastIncomingSeqNo / outbound seq) resumes
         // where the previous incarnation left off.
         //
-        // Two distinct entry shapes need rehydration after a host crash:
-        //   (a) Negotiate with a STRICTLY-GREATER SessionVerId — peer
-        //       abandons the old session and starts fresh; SeedLastVersion
-        //       on the claim registry enforces monotonicity vs the
-        //       persisted version (spec §1.4).
-        //   (b) Establish with the SAME SessionVerId — peer resumes the
-        //       prior session per the EstablishmentAck.serverFlow=RECOVERABLE
-        //       contract (spec §1.5). The rehydrated session must come
-        //       up in FixpState.Negotiated (not Idle) so the Establish
-        //       lands as (Negotiated, Establish) → Established instead
-        //       of being rejected as UNNEGOTIATED.
+        // Only Establish with the SAME SessionVerId consumes the boot
+        // snapshot: the peer is resuming the prior session under the
+        // EstablishmentAck.serverFlow=RECOVERABLE contract (spec §1.5).
+        // A Negotiate with a strictly-greater version keeps the transport
+        // pending until its claim succeeds, then adopts the recoverable
+        // envelope. SeedLastVersion enforces monotonicity without stamping
+        // an unclaimed candidate with the old stable identity.
         // The active-claim re-attach branch above already handles the
         // hot path (same-process Suspended session); this block handles
         // the cold path where the prior incarnation died.
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? rehydrateState = null;
         int? persistedMaxOrderRatePerSecond = null;
         bool resumeAsNegotiated = false;
+        bool deferPersistedStateUntilNegotiate = false;
         if (_persistedSessionStates is not null
             && firstFrame.Length >= EntryPointFrameReader.WireHeaderSize)
         {
@@ -562,33 +561,40 @@ public sealed class EntryPointListener : IAsyncDisposable
                     decoded = true;
                 }
             }
-            if (decoded && _persistedSessionStates.TryGetValue(sessionIdFromFrame, out var snap))
+            if (decoded
+                && _persistedSessionStates.TryGetValue(sessionIdFromFrame, out var snap))
             {
-                rehydrateState = snap;
-                persistedMaxOrderRatePerSecond = _persistedMaxOrderRateResolver?.Invoke(snap.SessionId);
-                // Only the Establish-with-matching-SessionVerId shape
-                // should resume in Negotiated state. A Negotiate frame
-                // (any SessionVerId) and an Establish with a different
-                // SessionVerId both go through the normal handshake
-                // gate — the latter will be rejected by EstablishValidator
-                // as INVALID_SESSIONVERID, which is the correct
-                // spec-defined response.
-                resumeAsNegotiated = isEstablish && sessionVerIdFromFrame == snap.SessionVerId;
-                _logger.LogInformation(
-                    "rehydrating persisted session {SessionId} (verId={VerId} → peer verId={PeerVerId} firstFrame={Frame} resumeAsNegotiated={Resume}) from {Remote}",
-                    snap.SessionId, snap.SessionVerId, sessionVerIdFromFrame,
-                    isEstablish ? "Establish" : "Negotiate", resumeAsNegotiated, SafeRemote(sock));
+                if (isEstablish && sessionVerIdFromFrame == snap.SessionVerId)
+                {
+                    rehydrateState = snap;
+                    persistedMaxOrderRatePerSecond = _persistedMaxOrderRateResolver?.Invoke(snap.SessionId);
+                    resumeAsNegotiated = true;
+                }
+                else if (!isEstablish)
+                {
+                    rehydrateState = snap;
+                    deferPersistedStateUntilNegotiate = true;
+                }
+                if (rehydrateState is not null)
+                {
+                    _logger.LogInformation(
+                        "rehydrating persisted session {SessionId} (verId={VerId} → peer verId={PeerVerId} firstFrame={Frame} resumeAsNegotiated={Resume}) from {Remote}",
+                        snap.SessionId, snap.SessionVerId, sessionVerIdFromFrame,
+                        isEstablish ? "Establish" : "Negotiate", resumeAsNegotiated, SafeRemote(sock));
+                }
             }
         }
 
         ConstructAndStartSession(stream, sock, firstFrame, persistedState: rehydrateState,
             resumeAsNegotiated: resumeAsNegotiated,
+            deferPersistedStateUntilNegotiate: deferPersistedStateUntilNegotiate,
             persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond);
     }
 
     private void ConstructAndStartSession(NetworkStream stream, Socket sock, byte[]? firstFrame,
         B3.Exchange.Gateway.Persistence.FixpSessionStateSnapshot? persistedState,
         bool resumeAsNegotiated = false,
+        bool deferPersistedStateUntilNegotiate = false,
         int? persistedMaxOrderRatePerSecond = null)
     {
         var identity = _identityFactory(SafeRemote(sock));
@@ -608,7 +614,8 @@ public sealed class EntryPointListener : IAsyncDisposable
             (s, oldId, newId) => _registry.UpdateIdentity(s, oldId, newId);
 
         Stream sessionStream = firstFrame is null ? stream : new PrependedStream(firstFrame, stream);
-        var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, identity.SessionId,
+        uint initialSessionId = _sessionClaims is null ? identity.SessionId : 0u;
+        var session = new FixpSession(identity.ConnectionId, identity.EnteringFirm, initialSessionId,
             sessionStream, _sink, _loggerFactory.CreateLogger<FixpSession>(),
             options: _sessionOptions, onClosed: onClosed,
             negotiationValidator: _negotiationValidator,
@@ -619,9 +626,12 @@ public sealed class EntryPointListener : IAsyncDisposable
             statePersister: _statePersister,
             persistedState: persistedState,
             resumeAsNegotiated: resumeAsNegotiated,
+            deferPersistedStateUntilNegotiate: deferPersistedStateUntilNegotiate,
             persistedMaxOrderRatePerSecond: persistedMaxOrderRatePerSecond,
             onIdentityChanged: onIdentityChanged,
             onTakeOverRollback: s => _registry.Register(s),
+            onPersistedStateClaimed: sessionId =>
+                _persistedSessionStates?.TryRemove(sessionId, out _),
             sessionRegistry: _registry);
         _registry.Register(session);
         lock (_lock) _sessions.Add(session);

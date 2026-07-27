@@ -180,7 +180,23 @@ public sealed partial class FixpSession
         }
 
         _claimedSessionId = req.SessionId;
+        if (!TryApplyPendingNegotiateState(req.SessionId))
+        {
+            _claims.Release(req.SessionId, this);
+            _claimedSessionId = 0;
+            var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+            NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                req.TimestampNanos, enteringFirm: null,
+                B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                currentSessionVerId: null);
+            return NegotiateStep.Rejected(rejectFrame,
+                "negotiate-reject (UNSPECIFIED: persisted outbound state reconcile failed)");
+        }
         _ = ApplyTransition(FixpEvent.Negotiate);
+        SessionId = req.SessionId;
+        EnteringFirm = outcome.Firm!.EnteringFirmCode;
+        SessionVerId = req.SessionVerId;
+        ConfigureOrderRateLimit(outcome.Credential!.Policy.MaxOrderRatePerSecond);
         // Issue #485: update Identity to the stable FIXP SessionId and notify
         // the registry to re-index. Capture the old identity for rollback.
         var pendingIdentity = UpdateIdentityAfterNegotiate(
@@ -199,6 +215,10 @@ public sealed partial class FixpSession
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
+            SessionId = _acceptedSessionId;
+            SessionVerId = 0;
+            EnteringFirm = _acceptedEnteringFirm;
+            RollbackPendingNegotiateState();
             RollbackIdentity(pendingIdentity);
 
             var rejectFrame = new byte[NegotiateRejectEncoder.Total];
@@ -209,10 +229,6 @@ public sealed partial class FixpSession
             return NegotiateStep.Rejected(rejectFrame,
                 "negotiate-reject (UNSPECIFIED: session claim/route handoff lost)");
         }
-        SessionId = req.SessionId;
-        EnteringFirm = outcome.Firm!.EnteringFirmCode;
-        SessionVerId = req.SessionVerId;
-        ConfigureOrderRateLimit(outcome.Credential!.Policy.MaxOrderRatePerSecond);
         // Issue #405 (review finding): commit the new SessionVerID to
         // disk BEFORE acking the Negotiate. If persistence fails, abort
         // the handshake — without this, a transient disk error would
@@ -259,9 +275,10 @@ public sealed partial class FixpSession
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
-            SessionId = 0;
+            SessionId = _acceptedSessionId;
             SessionVerId = 0;
-            EnteringFirm = 0;
+            EnteringFirm = _acceptedEnteringFirm;
+            RollbackPendingNegotiateState();
             // Issue #485: roll back Identity to the pending format so
             // OnSessionClosed doesn't evict ownership for a real session.
             RollbackIdentity(pendingIdentity);
@@ -288,6 +305,7 @@ public sealed partial class FixpSession
             return NegotiateStep.Rejected(rejectFrame,
                 "negotiate-reject (UNSPECIFIED: state snapshot persist failed)");
         }
+        _onPersistedStateClaimed?.Invoke(req.SessionId);
 
         var responseFrame = new byte[NegotiateResponseEncoder.Total];
         NegotiateResponseEncoder.Encode(responseFrame, req.SessionId, req.SessionVerId,

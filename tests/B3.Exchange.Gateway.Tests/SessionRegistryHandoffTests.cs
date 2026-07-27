@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Contracts;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -19,6 +20,51 @@ public class SessionRegistryHandoffTests
         public bool EnqueueMassCancel(in MassCancelCommand cmd, SessionId session, uint enteringFirm) => true;
         public void OnDecodeError(SessionId session, string error) { }
         public void OnSessionClosed(SessionId session) { }
+    }
+
+    private sealed class StrictJournal : IFixpOutboundJournal
+    {
+        private readonly SortedDictionary<uint, OutboundJournalEntry> _entries = new();
+
+        public IReadOnlyList<OutboundJournalEntry> Entries => _entries.Values.ToArray();
+
+        public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
+        {
+            if (_entries.Count > 0 && seq <= _entries.Keys.Max())
+                throw new InvalidOperationException("outbound sequence must be strictly monotonic");
+            _entries.Add(seq, new OutboundJournalEntry(seq, timestampNanos, frame.ToArray()));
+        }
+
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
+        public void PruneUpTo(uint sessionId, uint uptoSeq) { }
+        public IReadOnlyList<OutboundJournalEntry> ReadRange(uint sessionId, uint fromSeq, int count)
+            => _entries.Values.Where(entry => entry.Seq >= fromSeq).Take(count).ToArray();
+        public uint MaxSeq(uint sessionId) => _entries.Count == 0 ? 0u : _entries.Keys.Max();
+        public long EntryCount(uint sessionId) => _entries.Count;
+        public void Remove(uint sessionId) => _entries.Clear();
+        public IReadOnlyCollection<uint> ListSessions() => _entries.Count == 0 ? Array.Empty<uint>() : new[] { 1u };
+        public void Dispose() { }
+    }
+
+    private sealed class MemoryStatePersister : IFixpSessionStatePersister
+    {
+        private FixpSessionStateSnapshot? _snapshot;
+
+        public void Save(in FixpSessionStateSnapshot snapshot) => _snapshot = snapshot;
+        public FixpSessionStateSnapshot? Load(uint sessionId)
+            => _snapshot is { } snapshot && snapshot.SessionId == sessionId
+                ? snapshot
+                : null;
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll()
+            => _snapshot is { } snapshot
+                ? new[] { snapshot }
+                : Array.Empty<FixpSessionStateSnapshot>();
+        public void Remove(uint sessionId)
+        {
+            if (_snapshot?.SessionId == sessionId)
+                _snapshot = null;
+        }
+        public void Dispose() { }
     }
 
     [Fact]
@@ -43,6 +89,7 @@ public class SessionRegistryHandoffTests
         claims.Release(1, oldSession);
         Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
             claims.TryClaim(1, 3, replacement));
+        replacement.ApplyTransition(FixpEvent.Negotiate);
 
         Assert.True(registry.TryUpdateIdentity(
             replacement,
@@ -82,6 +129,79 @@ public class SessionRegistryHandoffTests
             (await ReadFrameAsync(replacementClient.GetStream())).TemplateId);
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport,
             (await ReadFrameAsync(replacementClient.GetStream())).TemplateId);
+
+        oldClient.Close();
+        replacementClient.Close();
+    }
+
+    [Fact]
+    public async Task FastTerminalReconnect_ResetsJournalBeforeReplacementEmission_AndDisposesRetiredRetx()
+    {
+        var registry = new SessionRegistry();
+        var claims = new SessionClaimRegistry();
+        var journal = new StrictJournal();
+        var statePersister = new MemoryStatePersister();
+        var sink = new NoOpSink();
+        var (oldServer, oldClient) = await ConnectPairAsync();
+        var (replacementServer, replacementClient) = await ConnectPairAsync();
+        await using var oldSession = NewSession(
+            20, oldServer, sink, registry, journal, statePersister);
+        await using var replacement = NewSession(
+            21, replacementServer, sink, registry, journal, statePersister);
+        oldSession.Start();
+        replacement.Start();
+        oldSession.ApplyTransition(FixpEvent.Negotiate);
+        oldSession.ApplyTransition(FixpEvent.Establish);
+        registry.Register(oldSession);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            claims.TryClaim(1, 2, oldSession));
+
+        Assert.True(oldSession.WriteOrderMassActionReport(
+            clOrdIdValue: 7100,
+            massActionResponse: OrderMassActionReportEncoder.MassActionResponseAccepted,
+            massActionRejectReason: null,
+            side: (byte)'1',
+            securityId: 123,
+            transactTimeNanos: 1).IsCommitted);
+        Assert.Equal(1u, (await ReadFrameAsync(oldClient.GetStream())).MsgSeqNum);
+        Assert.Equal(1, oldSession.RetxBufferDepth);
+        Assert.Equal(1u, journal.MaxSeq(1));
+
+        oldSession.ApplyTransition(FixpEvent.Terminate);
+        claims.Release(1, oldSession);
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            claims.TryClaim(1, 3, replacement));
+        replacement.ApplyTransition(FixpEvent.Negotiate);
+        Assert.True(registry.TryUpdateIdentity(
+            replacement,
+            new SessionId("pending-21"),
+            new SessionId("1"),
+            claims,
+            claimedSessionId: 1,
+            replaceRetired: true));
+        replacement.ApplyTransition(FixpEvent.Establish);
+
+        Assert.True(replacement.WriteOrderMassActionReport(
+            clOrdIdValue: 7101,
+            massActionResponse: OrderMassActionReportEncoder.MassActionResponseAccepted,
+            massActionRejectReason: null,
+            side: (byte)'1',
+            securityId: 123,
+            transactTimeNanos: 2).IsCommitted);
+        var replacementFrame = await ReadFrameAsync(replacementClient.GetStream());
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, replacementFrame.TemplateId);
+        Assert.Equal(1u, replacementFrame.MsgSeqNum);
+        replacement.SaveStateSnapshotSafe();
+
+        oldSession.Close("peer-terminate-delayed-cleanup", CloseKind.PeerTerminate);
+
+        Assert.Equal(0, oldSession.RetxBufferDepth);
+        var persisted = Assert.Single(journal.Entries);
+        Assert.Equal(1u, persisted.Seq);
+        Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport,
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                persisted.Frame.AsSpan(EntryPointFrameReader.SofhSize + 2, 2)));
+        Assert.NotNull(statePersister.Load(1));
 
         oldClient.Close();
         replacementClient.Close();
@@ -152,7 +272,9 @@ public class SessionRegistryHandoffTests
         long connectionId,
         NetworkStream stream,
         IInboundCommandSink sink,
-        SessionRegistry registry)
+        SessionRegistry registry,
+        IFixpOutboundJournal? outboundJournal = null,
+        IFixpSessionStatePersister? statePersister = null)
         => new(
             connectionId,
             enteringFirm: 42,
@@ -160,6 +282,8 @@ public class SessionRegistryHandoffTests
             stream,
             sink,
             NullLogger<FixpSession>.Instance,
+            outboundJournal: outboundJournal,
+            statePersister: statePersister,
             sessionRegistry: registry);
 
     private static OrderCanceledEvent CreateCancel(long orderId, uint rptSeq) =>
@@ -187,7 +311,7 @@ public class SessionRegistryHandoffTests
         return (new NetworkStream(serverSocket, ownsSocket: true), client);
     }
 
-    private readonly record struct ReadFrame(ushort TemplateId);
+    private readonly record struct ReadFrame(ushort TemplateId, uint MsgSeqNum);
 
     private static async Task<ReadFrame> ReadFrameAsync(NetworkStream stream)
     {
@@ -199,6 +323,9 @@ public class SessionRegistryHandoffTests
             header.AsSpan(EntryPointFrameReader.SofhSize + 2, 2));
         var body = new byte[messageLength - EntryPointFrameReader.WireHeaderSize];
         await stream.ReadExactlyAsync(body, cts.Token);
-        return new ReadFrame(templateId);
+        uint msgSeqNum = body.Length >= 8
+            ? BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4, 4))
+            : 0u;
+        return new ReadFrame(templateId, msgSeqNum);
     }
 }

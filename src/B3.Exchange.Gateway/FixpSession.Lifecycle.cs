@@ -404,10 +404,10 @@ public sealed partial class FixpSession
             || kind == CloseKind.KeepaliveLapsed
             || kind == CloseKind.SuspendedTimeout
             || kind == CloseKind.DailyReset;
-        if (removePersistence && ownsLogicalSession)
+        if (removePersistence)
         {
             _retxBuffer.Dispose();
-            if (_outboundJournal is not null && SessionId != 0)
+            if (ownsLogicalSession && _outboundJournal is not null && SessionId != 0)
             {
                 try { _outboundJournal.Remove(SessionId); }
                 catch (Exception ex)
@@ -417,7 +417,7 @@ public sealed partial class FixpSession
                         ConnectionId, SessionId);
                 }
             }
-            if (_statePersister is not null && SessionId != 0)
+            if (ownsLogicalSession && _statePersister is not null && SessionId != 0)
             {
                 try { _statePersister.Remove(SessionId); }
                 catch (Exception ex)
