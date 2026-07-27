@@ -52,7 +52,7 @@ jobs:
           for f in schemas/*.xml; do
             name="$(basename "$f")"
             url="https://raw.githubusercontent.com/pedrosakuma/SbeB3UmdfConsumer/main/schemas/$name"
-            if remote_sha="$(curl -fsSL "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
+            if remote_sha="$(curl -fsSL --connect-timeout 5 --max-time 15 "$url" 2>/dev/null | sha256sum | awk '{print $1}')"; then
               local_sha="$(sha256sum "$f" | awk '{print $1}')"
               if [ "$remote_sha" != "$local_sha" ]; then
                 flagged=1
