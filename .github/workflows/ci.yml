@@ -14,6 +14,38 @@ permissions:
   contents: read
 
 jobs:
+  schema-guard:
+    name: Vendored schema guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Block hand-edits to vendored schemas
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- schemas/ || true)"
+          if [ -z "$changed" ]; then
+            echo "No changes under schemas/. OK."
+            exit 0
+          fi
+          echo "Changed vendored schema files:"
+          echo "$changed"
+          has_label="$(jq -r '([.pull_request.labels[].name] | index("schema-upgrade")) != null' "$GITHUB_EVENT_PATH")"
+          if [ "$has_label" != "true" ]; then
+            echo "::error::Files under schemas/ are vendored (see CONTRIBUTING.md) and must not be hand-edited. If this is an intentional, reviewed schema upgrade, add the 'schema-upgrade' label to this PR to acknowledge and unblock this check."
+            exit 1
+          fi
+          echo "PR is labeled 'schema-upgrade' — allowing vendored schema change."
+
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest
