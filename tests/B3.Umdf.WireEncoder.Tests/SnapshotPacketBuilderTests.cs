@@ -28,21 +28,22 @@ public class SnapshotPacketBuilderTests
     }
 
     [Fact]
-    public void EmptyBook_EmitsSingleHeaderOnlyPacket()
+    public void EmptyBook_EmitsHeaderAndTrailingStatusPacket()
     {
         var sink = new CapturingHandler();
         var buf = new byte[SnapshotPacketBuilder.DefaultPacketBufferSize];
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(buf,
             channelNumber: 84, snapshotSequenceVersion: 0, firstSequenceNumber: 100,
-            sendingTimeNanos: 1_700_000_000_000_000_000UL, securityId: 7L, lastRptSeq: null,
+            sendingTimeNanos: 1_700_000_000_000_000_000UL, securityId: 7L,
+            securityTradingStatus: 17, lastRptSeq: null,
             incrementalSequenceVersion: 7,
             bids: ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
             asks: ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
             onPacket: sink.OnPacket);
 
-        Assert.Equal(1, packets);
-        Assert.Single(sink.Packets);
+        Assert.Equal(2, packets);
+        Assert.Equal(2, sink.Packets.Count);
 
         // PacketHeader.SequenceNumber == 100
         ref readonly var hdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[0].AsSpan(0, 16));
@@ -56,6 +57,17 @@ public class SnapshotPacketBuilderTests
         Assert.Equal(0u, rdr.Data.TotNumOffers);
         Assert.Null(rdr.Data.LastRptSeq);
         Assert.Equal((ushort)7, rdr.Data.LastSequenceVersion);
+
+        // Issue #583: trailing packet carries a SecurityStatus_3 frame
+        // stamped with the caller-supplied trading status and RptSeq NULL
+        // (255 sentinel event, rptSeq 0 for the illiquid/no-history case).
+        var statusPkt = sink.Packets[1];
+        ref readonly var statusHdr = ref MemoryMarshal.AsRef<PacketHeader>(statusPkt.AsSpan(0, 16));
+        Assert.Equal(101u, statusHdr.SequenceNumber);
+        int statusOffset = FrameOffset + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        int eventOffset = FrameOffset + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
+        Assert.Equal((byte)17, statusPkt[statusOffset]);
+        Assert.Equal((byte)255, statusPkt[eventOffset]);
     }
 
     [Fact]
@@ -68,10 +80,10 @@ public class SnapshotPacketBuilderTests
         var asks = new[] { Ask(101_0000L, 300L, 3) };
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(
-            buf, 84, 0, 50, 1UL, 7L, lastRptSeq: 99u, incrementalSequenceVersion: 8,
-            bids, asks, sink.OnPacket);
+            buf, 84, 0, 50, 1UL, 7L, securityTradingStatus: 17, lastRptSeq: 99u,
+            incrementalSequenceVersion: 8, bids, asks, sink.OnPacket);
 
-        Assert.Equal(1, packets);
+        Assert.Equal(2, packets);
         var pkt = sink.Packets[0];
 
         // Header counts derived from input spans.
@@ -113,7 +125,8 @@ public class SnapshotPacketBuilderTests
         for (int i = 0; i < asks.Length; i++) asks[i] = Ask(101_0000L + i, 100L, 10_000 + i);
 
         int packets = SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0,
-            firstSequenceNumber: 1000, sendingTimeNanos: 42UL, securityId: 7L, lastRptSeq: 12345u,
+            firstSequenceNumber: 1000, sendingTimeNanos: 42UL, securityId: 7L,
+            securityTradingStatus: 17, lastRptSeq: 12345u,
             incrementalSequenceVersion: 11,
             bids, asks, sink.OnPacket);
 
@@ -137,9 +150,10 @@ public class SnapshotPacketBuilderTests
         Assert.Equal(700u, hdr.Data.TotNumBids);
         Assert.Equal(300u, hdr.Data.TotNumOffers);
 
-        // Walk both packets summing NumInGroup across every Orders_71 frame.
+        // Walk every packet except the trailing SecurityStatus_3 packet,
+        // summing NumInGroup across every Orders_71 frame.
         int totalEntries = 0;
-        for (int i = 0; i < packets; i++)
+        for (int i = 0; i < packets - 1; i++)
         {
             var pkt = sink.Packets[i];
             int p = WireOffsets.PacketHeaderSize;
@@ -156,6 +170,10 @@ public class SnapshotPacketBuilderTests
         }
         Assert.Equal(1_000, totalEntries);
         Assert.All(sink.Packets, packet => Assert.InRange(packet.Length, 1, buf.Length));
+
+        // Trailing packet carries the SecurityStatus_3 frame.
+        int statusOffset = FrameOffset + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        Assert.Equal((byte)17, sink.Packets[^1][statusOffset]);
     }
 
     [Fact]
@@ -171,7 +189,7 @@ public class SnapshotPacketBuilderTests
 
         var bids = new[] { Bid(1L, 1L, 1) };
         Assert.Throws<ArgumentException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, null, 1,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 84, 0, 0, 0, 7L, 17, null, 1,
                 bids, ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket));
     }
 
@@ -185,13 +203,15 @@ public class SnapshotPacketBuilderTests
         for (int i = 0; i < bids.Length; i++) bids[i] = Bid(100L - i, 1L, i + 1);
 
         // cap=3 → expect 4 chunks (3,3,3,1). They all fit in one 16 KB buffer
-        // alongside the snapshot header → 1 packet.
+        // alongside the snapshot header → 1 book packet + 1 trailing status
+        // packet = 2 packets total.
         int packets = SnapshotPacketBuilder.WriteSnapshot(
-            buf, 84, 0, 0, 0, 7L, lastRptSeq: 1u, incrementalSequenceVersion: 1,
+            buf, 84, 0, 0, 0, 7L, securityTradingStatus: 17, lastRptSeq: 1u,
+            incrementalSequenceVersion: 1,
             bids, ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty, sink.OnPacket,
             maxEntriesPerChunk: 3);
 
-        Assert.Equal(1, packets);
+        Assert.Equal(2, packets);
         // Walk the packet and count Orders_71 frames + their NumInGroup.
         var pkt = sink.Packets[0];
         int p = WireOffsets.PacketHeaderSize;
@@ -220,12 +240,12 @@ public class SnapshotPacketBuilderTests
         var sink = new CapturingHandler();
         var buf = new byte[1024];
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null, 1,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, 17, null, 1,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 sink.OnPacket, maxEntriesPerChunk: 0));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, null, 1,
+            SnapshotPacketBuilder.WriteSnapshot(buf, 0, 0, 0, 0, 0, 17, null, 1,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 ReadOnlySpan<UmdfWireEncoder.SnapshotEntry>.Empty,
                 sink.OnPacket, maxEntriesPerChunk: 256));

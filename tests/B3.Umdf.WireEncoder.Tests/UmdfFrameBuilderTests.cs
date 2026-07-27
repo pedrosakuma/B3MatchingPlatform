@@ -151,7 +151,7 @@ public class UmdfFrameBuilderTests
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
+            securityId: 1L, rptSeq: 6u, transactTimeNanos: 0ul);
 
         int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBlockLength;
@@ -160,15 +160,18 @@ public class UmdfFrameBuilderTests
     }
 
     [Fact]
-    public void WriteInstrumentHalted_WritesHaltEventByte()
+    public void WriteInstrumentHalted_WritesForbiddenStatusAndSecurityStatusChangeEvent()
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentHalted(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 6u, transactTimeNanos: 0ul);
+            securityId: 1L, rptSeq: 6u, transactTimeNanos: 0ul);
 
+        int statusOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
-        Assert.Equal(UmdfFrameBuilder.SecurityTradingEventHalt, sink.Buffer[eventOffset]);
+        Assert.Equal(UmdfFrameBuilder.SecurityTradingStatusForbidden, sink.Buffer[statusOffset]);
+        Assert.Equal(UmdfFrameBuilder.SecurityTradingEventSecurityStatusChange, sink.Buffer[eventOffset]);
     }
 
     [Fact]
@@ -176,7 +179,7 @@ public class UmdfFrameBuilderTests
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentResumed(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 7u, transactTimeNanos: 0ul);
+            securityId: 1L, restoredSecurityTradingStatus: 17, rptSeq: 7u, transactTimeNanos: 0ul);
 
         int expected = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBlockLength;
@@ -185,15 +188,18 @@ public class UmdfFrameBuilderTests
     }
 
     [Fact]
-    public void WriteInstrumentResumed_WritesResumeEventByte()
+    public void WriteInstrumentResumed_WritesRestoredStatusAndRejoinsGroupEvent()
     {
         var sink = MakeSink();
         UmdfFrameBuilder.WriteInstrumentResumed(sink,
-            securityId: 1L, securityTradingStatus: 2, rptSeq: 7u, transactTimeNanos: 0ul);
+            securityId: 1L, restoredSecurityTradingStatus: 17, rptSeq: 7u, transactTimeNanos: 0ul);
 
+        int statusOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
+            + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
         int eventOffset = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
             + WireOffsets.SecurityStatusBodySecurityTradingEventOffset;
-        Assert.Equal(UmdfFrameBuilder.SecurityTradingEventResume, sink.Buffer[eventOffset]);
+        Assert.Equal((byte)17, sink.Buffer[statusOffset]);
+        Assert.Equal(UmdfFrameBuilder.SecurityTradingEventSecurityRejoinsGroupStatus, sink.Buffer[eventOffset]);
     }
 
     [Fact]

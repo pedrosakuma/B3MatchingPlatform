@@ -5,6 +5,10 @@ namespace B3.Umdf.WireEncoder;
 /// the first packet carries the <c>SnapshotFullRefresh_Header_30</c> frame
 /// followed by as many <c>SnapshotFullRefresh_Orders_MBO_71</c> frames as fit
 /// in the destination buffer; subsequent packets carry only Orders_71 frames.
+/// The final packet carries a single <c>SecurityStatus_3</c> frame reporting
+/// the instrument's current official trading status — e.g. FORBIDDEN while
+/// administratively halted (issue #583) — so late subscribers can bootstrap
+/// without waiting for the next incremental status transition.
 /// Each packet is written to a caller-supplied <see cref="Span{T}"/> via the
 /// <see cref="PacketHandler"/> delegate so the caller can pool the buffer and
 /// invoke its multicast publisher synchronously.
@@ -63,7 +67,12 @@ public static class SnapshotPacketBuilder
                 bufferSize - WireOffsets.PacketHeaderSize,
                 maxEntriesPerChunk);
         }
-        return packetCount;
+
+        // Issue #583: every snapshot ends with one trailing packet carrying
+        // the instrument's current SecurityStatus_3 state, so late
+        // subscribers can bootstrap FORBIDDEN/halted instruments without
+        // waiting for the next incremental status transition.
+        return checked(packetCount + 1);
     }
 
     /// <summary>
@@ -84,6 +93,12 @@ public static class SnapshotPacketBuilder
     /// stamped on every packet of the snapshot so consumers see it as one
     /// logical refresh.</param>
     /// <param name="securityId">Instrument identifier (Trade/Order semantic).</param>
+    /// <param name="securityTradingStatus">Current official UMDF 2.2.0
+    /// <c>SecurityTradingStatus</c> value for this instrument (issue #583):
+    /// e.g. FORBIDDEN=18 while administratively halted, or the current
+    /// trading-group phase otherwise. Written as a trailing
+    /// <c>SecurityStatus_3</c> packet so late subscribers can bootstrap
+    /// without waiting for the next incremental status transition.</param>
     /// <param name="lastRptSeq">Last incremental RptSeq published before this
     /// snapshot was taken; consumers gate snapshot acceptance on this value.
     /// Pass <c>null</c> for an empty illiquid snapshot (per B3 §7.4).</param>
@@ -103,6 +118,7 @@ public static class SnapshotPacketBuilder
         uint firstSequenceNumber,
         ulong sendingTimeNanos,
         long securityId,
+        byte securityTradingStatus,
         uint? lastRptSeq,
         ushort incrementalSequenceVersion,
         ReadOnlySpan<UmdfWireEncoder.SnapshotEntry> bids,
@@ -164,6 +180,27 @@ public static class SnapshotPacketBuilder
             packetCount++;
         }
 
+        // -------- Trailing packet: current SecurityStatus_3 (issue #583) ----
+        // Written as its own packet (not merged into the header packet) so
+        // the header/orders packing logic above is unaffected by the
+        // instrument's status and consumers can process it independently.
+        // securityTradingEvent is NULL (255): this is a point-in-time status
+        // report, not a transition event.
+        seqNum++;
+        p = UmdfWireEncoder.WritePacketHeader(buffer, channelNumber, snapshotSequenceVersion, seqNum, sendingTimeNanos);
+        p += UmdfWireEncoder.WriteSecurityStatusFrame(
+            buffer.Slice(p),
+            securityId: securityId,
+            tradingSessionId: 0,
+            securityTradingStatus: securityTradingStatus,
+            securityTradingEvent: 255,
+            tradeDate: 0,
+            tradSesOpenTimeNanos: 0,
+            transactTimeNanos: sendingTimeNanos,
+            rptSeq: lastRptSeq ?? 0);
+        onPacket(buffer.Slice(0, p));
+        packetCount++;
+
         return packetCount;
     }
 
@@ -177,6 +214,11 @@ public static class SnapshotPacketBuilder
         => WireOffsets.FramingHeaderSize
          + WireOffsets.SbeMessageHeaderSize
          + WireOffsets.SnapHeaderBlockLength;
+
+    private static int SecurityStatusFrameSize
+        => WireOffsets.FramingHeaderSize
+         + WireOffsets.SbeMessageHeaderSize
+         + WireOffsets.SecurityStatusBlockLength;
 
     private static void ValidateLayout(
         int bufferSize,
@@ -197,6 +239,14 @@ public static class SnapshotPacketBuilder
         {
             throw new ArgumentException(
                 $"buffer too small ({bufferSize} bytes) for a single Orders_71 entry frame ({OrdersFrameSize(1)} bytes); increase buffer size.",
+                nameof(bufferSize));
+        }
+        // Issue #583: the trailing SecurityStatus_3 packet reuses the same
+        // scratch buffer, starting a fresh PacketHeader at offset 0.
+        if (bufferSize < WireOffsets.PacketHeaderSize + SecurityStatusFrameSize)
+        {
+            throw new ArgumentException(
+                $"buffer too small ({bufferSize} bytes) for the trailing SecurityStatus_3 packet ({WireOffsets.PacketHeaderSize + SecurityStatusFrameSize} bytes); increase buffer size.",
                 nameof(bufferSize));
         }
     }

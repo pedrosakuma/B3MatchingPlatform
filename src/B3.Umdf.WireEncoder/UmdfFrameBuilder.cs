@@ -10,18 +10,27 @@ namespace B3.Umdf.WireEncoder;
 public static class UmdfFrameBuilder
 {
     /// <summary>
-    /// <c>SecurityTradingEvent</c> byte written for an instrument halt
-    /// (<c>SecurityStatus_3</c>). Matches the B3-aligned value documented
-    /// in issue #322.
+    /// Official UMDF 2.2.0 <c>SecurityTradingStatus</c> value meaning the
+    /// instrument is not available for trading (administrative halt).
+    /// Issue #583: replaces the previous out-of-domain marker approach.
     /// </summary>
-    public const byte SecurityTradingEventHalt = 1;
+    public const byte SecurityTradingStatusForbidden = 18;
 
     /// <summary>
-    /// <c>SecurityTradingEvent</c> byte written for an instrument resume
-    /// (<c>SecurityStatus_3</c>). Matches the B3-aligned value documented
-    /// in issue #322.
+    /// Official UMDF 2.2.0 <c>SecurityTradingEvent</c> value meaning the
+    /// instrument's status is being maintained separately from its
+    /// security group's phase. Written when an instrument enters
+    /// administrative halt (issue #583).
     /// </summary>
-    public const byte SecurityTradingEventResume = 2;
+    public const byte SecurityTradingEventSecurityStatusChange = 101;
+
+    /// <summary>
+    /// Official UMDF 2.2.0 <c>SecurityTradingEvent</c> value meaning the
+    /// instrument's status now follows its security group's phase again.
+    /// Written when an instrument resumes from administrative halt,
+    /// restoring the preserved pre-halt phase (issue #583).
+    /// </summary>
+    public const byte SecurityTradingEventSecurityRejoinsGroupStatus = 102;
 
     /// <summary>
     /// Writes an <c>Order_MBO_50</c> NEW frame (action=NEW).
@@ -164,14 +173,18 @@ public static class UmdfFrameBuilder
     }
 
     /// <summary>
-    /// Writes a <c>SecurityStatus_3</c> frame for an instrument halt
-    /// (<c>securityTradingEvent</c> = <see cref="SecurityTradingEventHalt"/>).
-    /// Used for <c>OnInstrumentHalted</c>.
+    /// Writes a <c>SecurityStatus_3</c> frame for an instrument halt.
+    /// <c>securityTradingStatus</c> is always
+    /// <see cref="SecurityTradingStatusForbidden"/> (issue #583: the
+    /// official "not available for trading" status, not the pre-halt
+    /// phase) and <c>securityTradingEvent</c> is
+    /// <see cref="SecurityTradingEventSecurityStatusChange"/>, marking
+    /// that this instrument's status now diverges from its security
+    /// group's phase. Used for <c>OnInstrumentHalted</c>.
     /// </summary>
     public static void WriteInstrumentHalted(
         IUmdfFrameSink sink,
         long securityId,
-        byte securityTradingStatus,
         uint rptSeq,
         ulong transactTimeNanos)
     {
@@ -183,8 +196,8 @@ public static class UmdfFrameBuilder
             dst,
             securityId: securityId,
             tradingSessionId: 0,
-            securityTradingStatus: securityTradingStatus,
-            securityTradingEvent: SecurityTradingEventHalt,
+            securityTradingStatus: SecurityTradingStatusForbidden,
+            securityTradingEvent: SecurityTradingEventSecurityStatusChange,
             tradeDate: 0,
             tradSesOpenTimeNanos: 0,
             transactTimeNanos: transactTimeNanos,
@@ -193,14 +206,19 @@ public static class UmdfFrameBuilder
     }
 
     /// <summary>
-    /// Writes a <c>SecurityStatus_3</c> frame for an instrument resume
-    /// (<c>securityTradingEvent</c> = <see cref="SecurityTradingEventResume"/>).
-    /// Used for <c>OnInstrumentResumed</c>.
+    /// Writes a <c>SecurityStatus_3</c> frame for an instrument resume.
+    /// <paramref name="restoredSecurityTradingStatus"/> is the pre-halt
+    /// phase the engine preserved while the instrument was halted, and
+    /// <c>securityTradingEvent</c> is
+    /// <see cref="SecurityTradingEventSecurityRejoinsGroupStatus"/>,
+    /// marking that this instrument's status now follows its security
+    /// group's phase again (issue #583). Used for
+    /// <c>OnInstrumentResumed</c>.
     /// </summary>
     public static void WriteInstrumentResumed(
         IUmdfFrameSink sink,
         long securityId,
-        byte securityTradingStatus,
+        byte restoredSecurityTradingStatus,
         uint rptSeq,
         ulong transactTimeNanos)
     {
@@ -212,8 +230,8 @@ public static class UmdfFrameBuilder
             dst,
             securityId: securityId,
             tradingSessionId: 0,
-            securityTradingStatus: securityTradingStatus,
-            securityTradingEvent: SecurityTradingEventResume,
+            securityTradingStatus: restoredSecurityTradingStatus,
+            securityTradingEvent: SecurityTradingEventSecurityRejoinsGroupStatus,
             tradeDate: 0,
             tradSesOpenTimeNanos: 0,
             transactTimeNanos: transactTimeNanos,

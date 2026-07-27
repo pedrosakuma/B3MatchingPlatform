@@ -11,7 +11,10 @@ namespace B3.Exchange.Core;
 /// <c>SnapshotFullRefresh_Header_30</c> + as many
 /// <c>SnapshotFullRefresh_Orders_MBO_71</c> chunks as the book requires (each
 /// chunk capped at <see cref="SnapshotPacketBuilder.MaxEntriesPerChunk"/> or
-/// the caller-supplied per-chunk cap, whichever is smaller).
+/// the caller-supplied per-chunk cap, whichever is smaller), followed by a
+/// trailing <c>SecurityStatus_3</c> packet reporting the instrument's current
+/// official trading status (issue #583) via
+/// <see cref="ISnapshotBookSource.GetSecurityTradingStatus"/>.
 ///
 /// <para>
 /// Threading: <see cref="PublishNext"/> reads the matching engine's resting
@@ -177,6 +180,7 @@ public sealed class SnapshotRotator
             firstSequenceNumber: firstSeq,
             sendingTimeNanos: nowNanos,
             securityId: securityId,
+            securityTradingStatus: _source.GetSecurityTradingStatus(securityId),
             lastRptSeq: lastRptSeq,
             incrementalSequenceVersion: incrementalSequenceVersion,
             bids: System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bidsList),

@@ -27,6 +27,16 @@ public interface ISnapshotBookSource
     uint GetCurrentRptSeq(long securityId);
 
     /// <summary>
+    /// The current official UMDF 2.2.0 <c>SecurityTradingStatus</c> value
+    /// for <paramref name="securityId"/> (issue #583): FORBIDDEN while the
+    /// instrument is administratively halted, otherwise the instrument's
+    /// current trading-group phase. <see cref="SnapshotRotator"/> stamps
+    /// this into the trailing <c>SecurityStatus_3</c> packet of every
+    /// published snapshot.
+    /// </summary>
+    byte GetSecurityTradingStatus(long securityId);
+
+    /// <summary>
     /// Iterates the resting orders for <paramref name="securityId"/> on the
     /// requested side in price-time priority. Caller must fully drain the
     /// enumerator before mutating the book.
@@ -54,6 +64,10 @@ public sealed class MatchingEngineSnapshotSource : ISnapshotBookSource
     }
 
     public uint GetCurrentRptSeq(long securityId) => _engine.GetCurrentRptSeq(securityId);
+
+    public byte GetSecurityTradingStatus(long securityId) => _engine.IsHalted(securityId, out _)
+        ? B3.Umdf.WireEncoder.UmdfFrameBuilder.SecurityTradingStatusForbidden
+        : (byte)_engine.GetTradingPhase(securityId);
 
     public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
         => _engine.EnumerateBook(securityId, side);

@@ -329,7 +329,8 @@ public sealed class ChannelDispatcherStartupEpochTests
         Assert.Equal(HaltReason.RegulatoryHalt, restoredHalt.Reason);
 
         Assert.True(dispatcher.EnqueueSnapshotTick());
-        Assert.True(WaitFor(() => snapshotSink.Packets.Count == 1));
+        // Header(+orders) packet + trailing SecurityStatus_3 packet (issue #583).
+        Assert.True(WaitFor(() => snapshotSink.Packets.Count == 2));
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             snapshotSink.Packets[0].AsSpan(
                 SnapshotFrameOffset, WireOffsets.SnapHeaderBlockLength),
@@ -339,6 +340,11 @@ public sealed class ChannelDispatcherStartupEpochTests
         Assert.Equal(1u, snapshotHeader.Data.TotNumOffers);
         Assert.Equal(30u, snapshotHeader.Data.LastRptSeq);
         Assert.Equal((ushort)10, snapshotHeader.Data.LastSequenceVersion);
+
+        // Rotation publishes Petr first; it isn't halted, so the trailing
+        // status packet reports its restored OPEN phase, not FORBIDDEN.
+        int statusOffset = SnapshotFrameOffset + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        Assert.Equal((byte)TradingPhase.Open, snapshotSink.Packets[1][statusOffset]);
 
         Assert.True(dispatcher.EnqueueNewOrder(
             new NewOrderCommand(

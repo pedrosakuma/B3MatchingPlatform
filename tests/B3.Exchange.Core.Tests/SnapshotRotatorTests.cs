@@ -33,8 +33,13 @@ public class SnapshotRotatorTests
         public Dictionary<long, uint> RptSeqBySecurity { get; } = new();
         public Dictionary<(long, Side), List<RestingOrderView>> Books { get; } = new();
 
+        /// <summary>Default OPEN=17; tests override per issue #583 scenarios.</summary>
+        public byte SecurityTradingStatus { get; set; } = 17;
+
         public uint GetCurrentRptSeq(long securityId)
             => RptSeqBySecurity.TryGetValue(securityId, out uint rptSeq) ? rptSeq : 0;
+
+        public byte GetSecurityTradingStatus(long securityId) => SecurityTradingStatus;
 
         public IEnumerable<RestingOrderView> EnumerateBook(long securityId, Side side)
             => Books.TryGetValue((securityId, side), out var l) ? l : Enumerable.Empty<RestingOrderView>();
@@ -58,9 +63,9 @@ public class SnapshotRotatorTests
 
         int packets = rot.PublishNext(incrementalSequenceVersion: 3);
 
-        Assert.Equal(1, packets);
-        Assert.Single(sink.Packets);
-        Assert.Equal(1u, rot.SequenceNumber);
+        Assert.Equal(2, packets); // header (illiquid) + trailing SecurityStatus_3 (issue #583)
+        Assert.Equal(2, sink.Packets.Count);
+        Assert.Equal(2u, rot.SequenceNumber);
 
         var pkt = sink.Packets[0];
         ref readonly var hdr = ref MemoryMarshal.AsRef<PacketHeader>(pkt.AsSpan(0, PacketHeaderSize));
@@ -75,6 +80,10 @@ public class SnapshotRotatorTests
         Assert.Equal(0u, snapHdr.Data.TotNumReports);
         Assert.Null(snapHdr.Data.LastRptSeq); // illiquid: §7.4
         Assert.Equal((ushort)3, snapHdr.Data.LastSequenceVersion);
+
+        // Issue #583: trailing packet reports the current SecurityTradingStatus.
+        int statusOffset = FrameOffset + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        Assert.Equal(src.SecurityTradingStatus, sink.Packets[1][statusOffset]);
     }
 
     [Fact]
@@ -96,8 +105,8 @@ public class SnapshotRotatorTests
         var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
 
         int packets = rot.PublishNext(incrementalSequenceVersion: 4);
-        Assert.Equal(1, packets);
-        Assert.Single(sink.Packets);
+        Assert.Equal(2, packets); // header+orders packet + trailing status packet
+        Assert.Equal(2, sink.Packets.Count);
 
         var pkt = sink.Packets[0];
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
@@ -117,6 +126,33 @@ public class SnapshotRotatorTests
     }
 
     [Fact]
+    public void HaltedInstrument_TrailingStatusPacket_ReportsForbidden()
+    {
+        // Issue #583: a late subscriber joining while an instrument is halted
+        // must learn the FORBIDDEN status from the snapshot's trailing
+        // SecurityStatus_3 packet, not just from a future incremental event.
+        const byte securityTradingStatusForbidden = 18;
+        var src = new FakeSource
+        {
+            SecurityIds = new[] { 42L },
+            SecurityTradingStatus = securityTradingStatusForbidden,
+        };
+        src.RptSeqBySecurity[42L] = 9;
+        src.Books[(42L, Side.Buy)] = new() { Order(1, Side.Buy, 100_0000, 500) };
+
+        var sink = new CapturingSink();
+        var rot = new SnapshotRotator(channelNumber: 84, source: src, sink: sink);
+
+        int packets = rot.PublishNext(incrementalSequenceVersion: 1);
+
+        Assert.Equal(2, packets);
+        Assert.Equal(2, sink.Packets.Count);
+
+        int statusOffset = FrameOffset + WireOffsets.SecurityStatusBodySecurityTradingStatusOffset;
+        Assert.Equal(securityTradingStatusForbidden, sink.Packets[1][statusOffset]);
+    }
+
+    [Fact]
     public void RoundRobinsThroughInstruments_AndAdvancesSnapSequence()
     {
         var src = new FakeSource { SecurityIds = new[] { 11L, 22L, 33L } };
@@ -125,20 +161,22 @@ public class SnapshotRotatorTests
 
         for (int i = 0; i < 4; i++) rot.PublishNext(incrementalSequenceVersion: 1); // wraps after 3
 
-        Assert.Equal(4, sink.Packets.Count);
-        // Each tick → 1 packet (empty book), so SequenceNumber == 4.
-        Assert.Equal(4u, rot.SequenceNumber);
+        // Each tick → 2 packets (empty-book header + trailing status), issue #583.
+        Assert.Equal(8, sink.Packets.Count);
+        Assert.Equal(8u, rot.SequenceNumber);
 
         // SecurityIDs read out of each header packet must follow the rotation
-        // order 11, 22, 33, 11.
+        // order 11, 22, 33, 11. Header packets are the first of each 2-packet
+        // publish, at indices 0, 2, 4, 6.
         long[] expected = new[] { 11L, 22L, 33L, 11L };
         for (int i = 0; i < expected.Length; i++)
         {
+            int headerIdx = i * 2;
             Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
-                sink.Packets[i].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
+                sink.Packets[headerIdx].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var hdr));
             Assert.Equal(expected[i], (long)(ulong)hdr.Data.SecurityID);
-            ref readonly var packetHdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[i].AsSpan(0, PacketHeaderSize));
-            Assert.Equal((uint)(i + 1), packetHdr.SequenceNumber);
+            ref readonly var packetHdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[headerIdx].AsSpan(0, PacketHeaderSize));
+            Assert.Equal((uint)(headerIdx + 1), packetHdr.SequenceNumber);
         }
     }
 
@@ -156,11 +194,13 @@ public class SnapshotRotatorTests
         rot.PublishFor(11, incrementalSequenceVersion: 4);
         rot.PublishFor(33, incrementalSequenceVersion: 4);
 
+        // Each PublishFor emits 2 packets (empty-book header + trailing
+        // status, issue #583); header packets sit at indices 0, 2, 4.
         uint[] expected = [2, 7, 11];
         for (int i = 0; i < expected.Length; i++)
         {
             Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
-                sink.Packets[i].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength),
+                sink.Packets[i * 2].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength),
                 out var header));
             Assert.Equal(expected[i], header.Data.LastRptSeq);
         }
@@ -207,7 +247,7 @@ public class SnapshotRotatorTests
         Assert.Equal((ushort)17, header.Data.LastSequenceVersion);
 
         int totalEntries = 0;
-        for (int i = 0; i < packets; i++)
+        for (int i = 0; i < packets - 1; i++)
         {
             var pkt = sink.Packets[i];
             int p = PacketHeaderSize;
@@ -308,7 +348,8 @@ public class SnapshotRotatorTests
 
         rot.PublishNext(incrementalSequenceVersion: 9);
         rot.PublishNext(incrementalSequenceVersion: 9);
-        Assert.Equal(2u, rot.SequenceNumber);
+        // Each publish → 2 packets (empty-book header + trailing status).
+        Assert.Equal(4u, rot.SequenceNumber);
         Assert.Equal((ushort)1, rot.SequenceVersion);
 
         rot.BumpSequenceVersion();
@@ -317,12 +358,14 @@ public class SnapshotRotatorTests
         Assert.Equal(0u, rot.SequenceNumber);
 
         rot.PublishNext(incrementalSequenceVersion: 9);
-        // Next packet: SequenceVersion=2, SequenceNumber=1
-        ref readonly var hdr = ref MemoryMarshal.AsRef<PacketHeader>(sink.Packets[^1].AsSpan(0, PacketHeaderSize));
+        // Next publish: SequenceVersion=2, header packet SequenceNumber=1,
+        // trailing status packet SequenceNumber=2.
+        var headerPkt = sink.Packets[^2];
+        ref readonly var hdr = ref MemoryMarshal.AsRef<PacketHeader>(headerPkt.AsSpan(0, PacketHeaderSize));
         Assert.Equal((ushort)2, hdr.SequenceVersion);
         Assert.Equal(1u, hdr.SequenceNumber);
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
-            sink.Packets[^1].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
+            headerPkt.AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapHdr));
         Assert.Equal((ushort)9, snapHdr.Data.LastSequenceVersion);
     }
 
@@ -404,9 +447,9 @@ public class ChannelDispatcherSnapshotTests
         Assert.True(disp.EnqueueSnapshotTick());
         Drain(disp);
 
-        Assert.Single(snapSink.Packets);          // snapshot went to snap-sink only
+        Assert.Equal(2, snapSink.Packets.Count);  // header + trailing status (issue #583)
         Assert.Empty(incSink.Packets);            // incremental sink untouched
-        Assert.Equal(1u, rotator.SequenceNumber); // snap-channel seq advanced
+        Assert.Equal(2u, rotator.SequenceNumber); // snap-channel seq advanced
         Assert.Equal(0u, disp.SequenceNumber);    // inc-channel seq untouched
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             snapSink.Packets[0].AsSpan(FrameOffset, WireOffsets.SnapHeaderBlockLength), out var snapshotHeader));
@@ -449,7 +492,7 @@ public class ChannelDispatcherSnapshotTests
         Assert.True(disp.EnqueueSnapshotTick());
         Drain(disp);
 
-        Assert.Single(snapSink.Packets);
+        Assert.Equal(2, snapSink.Packets.Count); // header(+orders) + trailing status (issue #583)
         var pkt = snapSink.Packets[0];
         int frameOff = WireOffsets.PacketHeaderSize + WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize;
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
@@ -488,7 +531,7 @@ public class ChannelDispatcherSnapshotTests
         Assert.True(disp.EnqueueSnapshotTick());
         Drain(disp);
 
-        Assert.Single(snapSink.Packets);
+        Assert.Equal(2, snapSink.Packets.Count); // header(+orders) + trailing status (issue #583)
         ref readonly var packetHeader = ref MemoryMarshal.AsRef<PacketHeader>(
             snapSink.Packets[0].AsSpan(0, PacketHeaderSize));
         Assert.Equal((ushort)2, packetHeader.SequenceVersion);
@@ -538,7 +581,7 @@ public class ChannelDispatcherSnapshotTests
         Assert.True(restoredDispatcher.EnqueueSnapshotTick());
         Drain(restoredDispatcher);
 
-        Assert.Single(snapSink.Packets);
+        Assert.Equal(2, snapSink.Packets.Count); // header(+orders) + trailing status (issue #583)
         ref readonly var packetHeader = ref MemoryMarshal.AsRef<PacketHeader>(
             snapSink.Packets[0].AsSpan(0, PacketHeaderSize));
         Assert.Equal((ushort)1, packetHeader.SequenceVersion);

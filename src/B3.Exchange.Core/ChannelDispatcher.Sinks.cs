@@ -134,21 +134,20 @@ public sealed partial class ChannelDispatcher
     }
 
     /// <summary>
-    /// Issue #322: B3-aligned best-effort wire markers on
-    /// <c>securityTradingEvent</c> for halt and resume. The downstream
-    /// consumer just needs them to be distinct and non-NULL; the
-    /// <c>SecurityStatus_3</c> frame's <c>securityTradingStatus</c> still
-    /// carries the engine's preserved <see cref="TradingPhase"/> so the
-    /// post-resume phase is unambiguous.
+    /// Issue #583: encodes administrative halt/resume using only official
+    /// UMDF 2.2.0 <c>SecurityStatus_3</c> semantics. On halt,
+    /// <c>securityTradingStatus</c> reports the official FORBIDDEN status
+    /// (not the pre-halt phase); on resume, the engine's preserved
+    /// <see cref="TradingPhase"/> is restored as <c>securityTradingStatus</c>.
+    /// <c>securityTradingEvent</c> uses the official
+    /// SECURITY_STATUS_CHANGE / SECURITY_REJOINS_SECURITY_GROUP_STATUS
+    /// values to mark the divergence/rejoin with the security group's phase.
     /// </summary>
 
     public void OnInstrumentHalted(in InstrumentHaltedEvent e)
     {
         AssertOnLoopThread();
-        byte phaseByte = _phaseSnapshot.TryGetValue(e.SecurityId, out var phase)
-            ? (byte)phase
-            : (byte)TradingPhase.Open;
-        UmdfFrameBuilder.WriteInstrumentHalted(FrameSink, e.SecurityId, phaseByte, e.RptSeq, e.TransactTimeNanos);
+        UmdfFrameBuilder.WriteInstrumentHalted(FrameSink, e.SecurityId, e.RptSeq, e.TransactTimeNanos);
     }
 
     public void OnInstrumentResumed(in InstrumentResumedEvent e)
