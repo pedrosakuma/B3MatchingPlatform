@@ -145,6 +145,26 @@ public sealed class SessionClaimRegistry
     }
 
     /// <summary>
+    /// Opaque receipt for rolling back one accepted, uncommitted
+    /// <see cref="TryForceTakeOver(uint, ulong, object, out object, out TakeOverRollback)"/>
+    /// call.
+    /// </summary>
+    public readonly struct TakeOverRollback
+    {
+        private readonly object? _generation;
+
+        internal TakeOverRollback(ulong previousSessionVerId, object generation)
+        {
+            PreviousSessionVerId = previousSessionVerId;
+            _generation = generation;
+        }
+
+        public ulong PreviousSessionVerId { get; }
+
+        internal object? Generation => _generation;
+    }
+
+    /// <summary>
     /// Atomically validate <paramref name="sessionVerId"/> against the
     /// monotonic-per-process rule and (on success) register
     /// <paramref name="claimToken"/> as the live owner of
@@ -250,23 +270,37 @@ public sealed class SessionClaimRegistry
     /// </summary>
     public ClaimResult TryForceTakeOver(uint sessionId, ulong sessionVerId,
         object newToken, out object? evictedToken)
+        => TryForceTakeOver(sessionId, sessionVerId, newToken, out evictedToken, out _);
+
+    /// <summary>
+    /// Transactional form of
+    /// <see cref="TryForceTakeOver(uint, ulong, object, out object)"/>.
+    /// On success, <paramref name="rollback"/> captures the previous version
+    /// watermark and this exact takeover generation.
+    /// </summary>
+    public ClaimResult TryForceTakeOver(uint sessionId, ulong sessionVerId,
+        object newToken, out object? evictedToken, out TakeOverRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(newToken);
         evictedToken = null;
+        rollback = default;
         if (sessionVerId == 0UL) return ClaimResult.ZeroVersion;
 
         lock (_lock)
         {
             // New verId must be strictly greater than the last recorded
             // version — the FIXP monotonicity rule still applies.
-            if (_lastSessionVerId.TryGetValue(sessionId, out var last) && sessionVerId <= last)
+            _lastSessionVerId.TryGetValue(sessionId, out var previousSessionVerId);
+            if (previousSessionVerId != 0UL && sessionVerId <= previousSessionVerId)
                 return ClaimResult.StaleVersion;
 
             // Evict old claim atomically (may or may not exist).
             _activeClaims.TryGetValue(sessionId, out evictedToken);
+            var generation = new object();
             _activeClaims[sessionId] = newToken;
             _lastSessionVerId[sessionId] = sessionVerId;
-            _claimGenerations[sessionId] = new object();
+            _claimGenerations[sessionId] = generation;
+            rollback = new TakeOverRollback(previousSessionVerId, generation);
             return ClaimResult.Accepted;
         }
     }
@@ -355,33 +389,41 @@ public sealed class SessionClaimRegistry
     /// Rolls back a failed <see cref="TryForceTakeOver"/> by atomically
     /// restoring the evicted session's claim and reverting
     /// <c>_lastSessionVerId</c> to the pre-takeover value. Only acts
-    /// when <paramref name="newToken"/> still holds the active claim
-    /// (guards against a concurrent takeover winning the registry
-    /// between the failed persist and this restore call). Safe to call
-    /// multiple times; idempotent when the claim has already moved on.
+    /// when the supplied rollback receipt still identifies the current claim
+    /// generation and version. The replacement may still own the active slot,
+    /// or it may have released it; both cases restore the victim. A later
+    /// claimant that acquired the same version changes the generation and
+    /// prevents an ABA rollback, even after that later claimant releases.
+    /// Safe to call multiple times; idempotent when the claim has moved on.
     /// Returns <c>true</c> when the claim was actually restored to
     /// <paramref name="oldToken"/>, so the caller can keep the
     /// <see cref="SessionRegistry"/> entry in lock-step; returns
     /// <c>false</c> when a concurrent takeover already moved the claim on
     /// (in which case the caller must not roll the registry back either).
     /// </summary>
-    public bool TryRestoreTakeOver(uint sessionId, object newToken,
-        object oldToken, ulong oldVerId)
+    public bool TryRestoreTakeOver(uint sessionId, ulong takenSessionVerId,
+        object newToken, object oldToken, TakeOverRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(newToken);
         ArgumentNullException.ThrowIfNull(oldToken);
         lock (_lock)
         {
-            if (_activeClaims.TryGetValue(sessionId, out var current) &&
-                ReferenceEquals(current, newToken))
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation)
+                || !_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != takenSessionVerId)
+                return false;
+
+            if (_activeClaims.TryGetValue(sessionId, out var current)
+                && !ReferenceEquals(current, newToken))
             {
-                _activeClaims[sessionId] = oldToken;
-                _lastSessionVerId[sessionId] = oldVerId;
-                _claimGenerations[sessionId] = new object();
-                return true;
+                return false;
             }
+
+            RestoreTakeOverLocked(sessionId, oldToken, rollback.PreviousSessionVerId);
+            return true;
         }
-        return false;
     }
 
     /// <summary>
@@ -402,7 +444,7 @@ public sealed class SessionClaimRegistry
         ulong newVerId,
         object newToken,
         object oldToken,
-        ulong oldVerId,
+        TakeOverRollback rollback,
         Func<bool> commit)
     {
         ArgumentNullException.ThrowIfNull(newToken);
@@ -411,13 +453,18 @@ public sealed class SessionClaimRegistry
 
         lock (_lock)
         {
+            if (rollback.Generation is not { } generation
+                || !_claimGenerations.TryGetValue(sessionId, out var currentGeneration)
+                || !ReferenceEquals(currentGeneration, generation)
+                || !_lastSessionVerId.TryGetValue(sessionId, out var currentVersion)
+                || currentVersion != newVerId)
+                return TakeOverFinalizeResult.ClaimLost;
+
             bool replacementOwnsClaim =
                 _activeClaims.TryGetValue(sessionId, out var current)
                 && ReferenceEquals(current, newToken);
             bool replacementReleasedClaim =
-                !_activeClaims.ContainsKey(sessionId)
-                && _lastSessionVerId.TryGetValue(sessionId, out var last)
-                && last == newVerId;
+                !_activeClaims.ContainsKey(sessionId);
 
             if (!replacementOwnsClaim && !replacementReleasedClaim)
                 return TakeOverFinalizeResult.ClaimLost;
@@ -431,17 +478,26 @@ public sealed class SessionClaimRegistry
                 }
                 catch
                 {
-                    _activeClaims[sessionId] = oldToken;
-                    _lastSessionVerId[sessionId] = oldVerId;
-                    _claimGenerations[sessionId] = new object();
+                    RestoreTakeOverLocked(
+                        sessionId, oldToken, rollback.PreviousSessionVerId);
                     throw;
                 }
             }
 
-            _activeClaims[sessionId] = oldToken;
-            _lastSessionVerId[sessionId] = oldVerId;
-            _claimGenerations[sessionId] = new object();
+            RestoreTakeOverLocked(
+                sessionId, oldToken, rollback.PreviousSessionVerId);
             return TakeOverFinalizeResult.RolledBack;
         }
+    }
+
+    private void RestoreTakeOverLocked(
+        uint sessionId, object oldToken, ulong oldSessionVerId)
+    {
+        _activeClaims[sessionId] = oldToken;
+        if (oldSessionVerId == 0UL)
+            _lastSessionVerId.Remove(sessionId);
+        else
+            _lastSessionVerId[sessionId] = oldSessionVerId;
+        _claimGenerations[sessionId] = new object();
     }
 }

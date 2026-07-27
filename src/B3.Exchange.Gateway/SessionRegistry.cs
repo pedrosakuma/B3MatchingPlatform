@@ -292,8 +292,7 @@ public sealed class SessionRegistry
             if (!_sessions.TryGetValue(session, out current!))
                 return false;
         }
-        return RouteFor(current).Execute(route =>
-            route.Current is { } target ? action(target) : false);
+        return RouteFor(current).TryInvoke(action);
     }
 
     internal OrderedStreamWriteResult TryInvokeOrdered(
@@ -307,10 +306,7 @@ public sealed class SessionRegistry
             if (!_sessions.TryGetValue(session, out current!))
                 return OrderedStreamWriteResult.NotCommitted;
         }
-        return RouteFor(current).Execute(route =>
-            route.Current is { } target
-                ? action(target)
-                : OrderedStreamWriteResult.NotCommitted);
+        return RouteFor(current).TryInvoke(action);
     }
 
     internal void ExecuteExclusive(FixpSession session, Action action)
@@ -335,7 +331,7 @@ public sealed class SessionRegistry
         FixpSession previous,
         FixpSession replacement,
         SessionClaimRegistry claims,
-        ulong previousSessionVerId)
+        SessionClaimRegistry.TakeOverRollback rollback)
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(replacement);
@@ -352,7 +348,7 @@ public sealed class SessionRegistry
                 replacement.SessionVerId,
                 replacement,
                 previous,
-                previousSessionVerId,
+                rollback,
                 commit: () =>
                 {
                     lock (_mapLock)

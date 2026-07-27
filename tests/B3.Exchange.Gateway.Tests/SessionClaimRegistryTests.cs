@@ -312,15 +312,58 @@ public class SessionClaimRegistryTests
         r.TryClaim(42, 5, oldToken);
 
         var newToken = new object();
-        r.TryForceTakeOver(42, 6, newToken, out _);
+        r.TryForceTakeOver(42, 6, newToken, out _, out var rollback);
         Assert.Equal(6UL, r.CurrentSessionVerId(42));
 
-        var restored = r.TryRestoreTakeOver(42, newToken, oldToken, oldVerId: 5);
+        var restored = r.TryRestoreTakeOver(42, 6, newToken, oldToken, rollback);
 
         Assert.True(restored);
         Assert.True(r.TryGetActiveClaim(42, out var holder, out _));
         Assert.Same(oldToken, holder);
         Assert.Equal(5UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void TryRestoreTakeOver_WhenReplacementReleased_RestoresOldClaimAndVerId()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _, out var rollback);
+        r.Release(42, newToken);
+
+        var restored = r.TryRestoreTakeOver(42, 6, newToken, oldToken, rollback);
+
+        Assert.True(restored);
+        Assert.True(r.TryGetActiveClaim(42, out var holder, out var version));
+        Assert.Same(oldToken, holder);
+        Assert.Equal(5UL, version);
+        Assert.Equal(5UL, r.CurrentSessionVerId(42));
+    }
+
+    [Fact]
+    public void TryRestoreTakeOver_AfterSameVersionClaimantABA_DoesNotClobber()
+    {
+        var r = new SessionClaimRegistry();
+        var oldToken = new object();
+        r.TryClaim(42, 5, oldToken);
+
+        var newToken = new object();
+        r.TryForceTakeOver(42, 6, newToken, out _, out var rollback);
+        r.Release(42, newToken);
+
+        var laterToken = new object();
+        Assert.Equal(SessionClaimRegistry.ClaimResult.Accepted,
+            r.TryReclaim(42, 6, laterToken));
+        r.Release(42, laterToken);
+
+        var restored = r.TryRestoreTakeOver(42, 6, newToken, oldToken, rollback);
+
+        Assert.False(restored);
+        Assert.False(r.TryGetActiveClaim(42, out _, out _));
+        Assert.Equal(6UL, r.CurrentSessionVerId(42));
     }
 
     [Fact]
@@ -334,12 +377,12 @@ public class SessionClaimRegistryTests
         r.TryClaim(42, 5, oldToken);
 
         var newToken = new object();
-        r.TryForceTakeOver(42, 6, newToken, out _);
+        r.TryForceTakeOver(42, 6, newToken, out _, out var rollback);
 
         var racingToken = new object();
         r.TryForceTakeOver(42, 7, racingToken, out _);
 
-        var restored = r.TryRestoreTakeOver(42, newToken, oldToken, oldVerId: 5);
+        var restored = r.TryRestoreTakeOver(42, 6, newToken, oldToken, rollback);
 
         Assert.False(restored);
         Assert.True(r.TryGetActiveClaim(42, out var holder, out _));

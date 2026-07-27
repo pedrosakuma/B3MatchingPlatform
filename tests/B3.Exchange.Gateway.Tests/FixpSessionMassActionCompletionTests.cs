@@ -172,7 +172,7 @@ public class FixpSessionMassActionCompletionTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task TerminalCompletionDuringReattach_IsBufferedUntilEstablishAckAndReplay(
+    public async Task TerminalCompletionDuringReattach_BlocksUntilEstablishAck(
         bool succeeded)
     {
         var sink = new ControlledSink();
@@ -195,10 +195,14 @@ public class FixpSessionMassActionCompletionTests
             {
                 Assert.True(session.TryReattach(server2));
 
-                complete(succeeded
+                var completion = Task.Run(() => complete(succeeded
                     ? MassCancelOutcome.Completed(0)
-                    : MassCancelOutcome.SystemBusy);
-                Assert.Equal(1u, session.OutboundSeq);
+                    : MassCancelOutcome.SystemBusy));
+                Assert.True(await TestUtil.WaitUntilAsync(
+                    () => session.BusinessAdmissionWaiterCount == 1,
+                    TimeSpan.FromSeconds(3)));
+                Assert.False(completion.IsCompleted);
+                Assert.Equal(0u, session.OutboundSeq);
 
                 var establish = new byte[256];
                 int establishLength = EntryPointFixpFrameCodec.EncodeEstablish(
@@ -216,14 +220,10 @@ public class FixpSessionMassActionCompletionTests
 
                 var ack = await ReadFrameAsync(stream2);
                 Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
-                Assert.Equal(2u,
+                Assert.Equal(1u,
                     BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
-                await stream2.WriteAsync(BuildRetransmitRequest(
-                    sessionId: 100, timestampNanos: 2, fromSeqNo: 1, count: 1));
-                Assert.Equal(EntryPointFrameReader.TidRetransmission,
-                    (await ReadFrameAsync(stream2)).TemplateId);
-
+                await completion.WaitAsync(TimeSpan.FromSeconds(3));
                 var terminal = await ReadFrameAsync(stream2);
                 Assert.Equal(1u,
                     BinaryPrimitives.ReadUInt32LittleEndian(terminal.Body.AsSpan(4, 4)));
@@ -241,10 +241,7 @@ public class FixpSessionMassActionCompletionTests
                         expectedClOrdId: 7005);
                 }
 
-                var sequence = await ReadFrameAsync(stream2);
-                Assert.Equal(EntryPointFrameReader.TidSequence, sequence.TemplateId);
-                Assert.Equal(2u,
-                    BinaryPrimitives.ReadUInt32LittleEndian(sequence.Body.AsSpan(0, 4)));
+                Assert.Equal(1u, session.OutboundSeq);
             }
             finally
             {

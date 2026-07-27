@@ -139,7 +139,7 @@ public sealed partial class FixpSession
         // no live session to own it — the old session's TCP will time out
         // naturally and call OnSessionClosed via the TransportError path.
         FixpSession? evictedByTakeOver = null;
-        ulong evictedVerId = 0UL;
+        SessionClaimRegistry.TakeOverRollback takeOverRollback = default;
         if (claim == SessionClaimRegistry.ClaimResult.DuplicateConnection)
         {
             // Session takeover — the peer crashed and reconnected before our
@@ -155,7 +155,7 @@ public sealed partial class FixpSession
             if (activeClaimIsCommitted)
             {
                 claim = _claims.TryForceTakeOver(req.SessionId, req.SessionVerId, this,
-                    out evicted);
+                    out evicted, out takeOverRollback);
             }
             if (claim == SessionClaimRegistry.ClaimResult.Accepted && evicted is FixpSession oldSession)
             {
@@ -163,7 +163,6 @@ public sealed partial class FixpSession
                     "session {ConnectionId} taking over sessionId={SessionId} from {OldConnectionId} (new verId={NewVerId})",
                     ConnectionId, req.SessionId, oldSession.ConnectionId, req.SessionVerId);
                 evictedByTakeOver = oldSession;
-                evictedVerId = oldSession.SessionVerId;
             }
         }
         if (claim != SessionClaimRegistry.ClaimResult.Accepted)
@@ -190,9 +189,10 @@ public sealed partial class FixpSession
             {
                 _claims.TryRestoreTakeOver(
                     req.SessionId,
+                    req.SessionVerId,
                     this,
                     evictedByTakeOver,
-                    evictedVerId);
+                    takeOverRollback);
             }
             else
             {
@@ -229,9 +229,10 @@ public sealed partial class FixpSession
             {
                 _claims.TryRestoreTakeOver(
                     req.SessionId,
+                    req.SessionVerId,
                     this,
                     evictedByTakeOver,
-                    evictedVerId);
+                    takeOverRollback);
             }
             else
             {
@@ -271,7 +272,7 @@ public sealed partial class FixpSession
                 evictedByTakeOver,
                 this,
                 _claims,
-                evictedVerId);
+                takeOverRollback);
             committed = takeOverFinalize == SessionClaimRegistry.TakeOverFinalizeResult.Committed;
         }
         else
@@ -298,7 +299,7 @@ public sealed partial class FixpSession
                 if (takeOverFinalize is null)
                 {
                     takeOverRolledBack = _claims.TryRestoreTakeOver(req.SessionId,
-                        this, evictedByTakeOver, evictedVerId);
+                        req.SessionVerId, this, evictedByTakeOver, takeOverRollback);
                 }
             }
             if (evictedByTakeOver is null)
@@ -372,6 +373,7 @@ public sealed partial class FixpSession
             _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
             if (!_transport.TryEnqueueFrame(step.ResponseFrame!))
             {
+                AbortBusinessAdmission();
                 _logger.LogWarning("session {ConnectionId} could not enqueue NegotiateResponse — closing",
                     ConnectionId);
                 Close("send-queue-full:NegotiateResponse");

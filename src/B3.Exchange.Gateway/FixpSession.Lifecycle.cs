@@ -42,7 +42,10 @@ public sealed partial class FixpSession
     {
         if (Volatile.Read(ref _isOpen) == 0) return;
         if (State != FixpState.Established)
+        {
             MarkCloseRequested();
+            AbortBusinessAdmission();
+        }
         // Decision must run under _attachLock so the generation check and
         // the actual lifecycle transition can't be split by a concurrent
         // TryReattach. Without the lock a stale callback could pass the
@@ -319,6 +322,7 @@ public sealed partial class FixpSession
     public void Close(string reason, CloseKind kind)
     {
         MarkCloseRequested();
+        AbortBusinessAdmission();
         ExecuteLogicalSessionExclusive(() =>
         {
             lock (_attachLock)
@@ -544,7 +548,7 @@ public sealed partial class FixpSession
 
                 try { _cts.Dispose(); } catch (ObjectDisposedException) { /* concurrent dispose; benign */ }
                 _cts = new CancellationTokenSource();
-                _transportReadyForBusiness = false;
+                ResetBusinessAdmissionLocked();
                 _transport = CreateBoundTransport(rebindStream);
                 // The new transport is back; cancel-on-disconnect grace is
                 // satisfied (issue #54 spec §4.7: reconnect inside the
@@ -623,6 +627,7 @@ public sealed partial class FixpSession
         }
         await _transport.DisposeAsync().ConfigureAwait(false);
         _retxBuffer.Dispose();
+        _businessAdmissionSignal.Dispose();
         _cts.Dispose();
     }
 }

@@ -119,7 +119,7 @@ public class FixpSessionMassActionTakeoverTests
     }
 
     [Fact]
-    public async Task TakeoverDuringMassCancel_BuffersRoutedOutputUntilEstablishAck()
+    public async Task TakeoverDuringMassCancel_BlocksRoutedOutputUntilEstablishAck()
     {
         var sink = new ControlledSink();
         var registry = new SessionRegistry();
@@ -147,17 +147,24 @@ public class FixpSessionMassActionTakeoverTests
             Reason: CancelReason.MassCancel,
             RptSeq: 1);
 
-        var cancelResult = gateway.WriteExecutionReportPassiveCancel(
-            new SessionId("1"),
-            ownerClOrdId: 5001,
-            orderId: canceled.OrderId,
-            canceled,
-            requesterClOrdIdOrZero: 7001);
-        Assert.True(cancelResult.IsCommitted);
-        Assert.False(cancelResult.IsTransportEnqueued);
-        complete(MassCancelOutcome.Completed(1));
-        Assert.Equal(2u, listener.ActiveSessions.Single(
-            session => session.SessionVerId == 3).OutboundSeq);
+        var routed = Task.Run(() =>
+        {
+            var result = gateway.WriteExecutionReportPassiveCancel(
+                new SessionId("1"),
+                ownerClOrdId: 5001,
+                orderId: canceled.OrderId,
+                canceled,
+                requesterClOrdIdOrZero: 7001);
+            complete(MassCancelOutcome.Completed(1));
+            return result;
+        });
+        var replacement = listener.ActiveSessions.Single(
+            session => session.SessionVerId == 3);
+        Assert.True(await TestUtil.WaitUntilAsync(
+            () => replacement.BusinessAdmissionWaiterCount == 1,
+            TimeSpan.FromSeconds(5)));
+        Assert.False(routed.IsCompleted);
+        Assert.Equal(0u, replacement.OutboundSeq);
         await AssertNoFrameAsync(replacementStream);
 
         var establish = new byte[256];
@@ -175,14 +182,10 @@ public class FixpSessionMassActionTakeoverTests
 
         var ack = await ReadOneFrameAsync(replacementStream);
         Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
-        Assert.Equal(3u,
+        Assert.Equal(1u,
             BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
-        await replacementStream.WriteAsync(BuildRetransmitRequest(
-            sessionId: 1, timestampNanos: 2, fromSeqNo: 1, count: 2));
-        Assert.Equal(EntryPointFrameReader.TidRetransmission,
-            (await ReadOneFrameAsync(replacementStream)).TemplateId);
-
+        Assert.True((await routed.WaitAsync(TimeSpan.FromSeconds(5))).IsTransportEnqueued);
         var cancel = await ReadOneFrameAsync(replacementStream);
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, cancel.TemplateId);
         Assert.Equal(1u,
@@ -193,8 +196,7 @@ public class FixpSessionMassActionTakeoverTests
             BinaryPrimitives.ReadUInt32LittleEndian(report.Body.AsSpan(4, 4)));
         Assert.Equal(7001UL,
             BinaryPrimitives.ReadUInt64LittleEndian(report.Body.AsSpan(20, 8)));
-        Assert.Equal(EntryPointFrameReader.TidSequence,
-            (await ReadOneFrameAsync(replacementStream)).TemplateId);
+        Assert.Equal(2u, replacement.OutboundSeq);
     }
 
     [Fact]

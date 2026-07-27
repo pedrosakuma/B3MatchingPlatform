@@ -153,27 +153,23 @@ public sealed partial class FixpSession
         {
             _logger.LogInformation("session {ConnectionId} {Reason}", ConnectionId, step.LogReason);
             var ackFrame = step.AckFrame!;
-            bool enqueued = ExecuteLogicalSessionExclusive(() =>
+            bool enqueued;
+            lock (_outboundLock)
             {
-                lock (_outboundLock)
-                {
-                    // A deferred business completion may have committed while
-                    // the reattached transport was waiting for Establish. Patch
-                    // nextSeqNo and enqueue the Ack under the same lock used by
-                    // business sequence allocation, then open transport
-                    // admission before releasing it. Queue FIFO therefore keeps
-                    // every subsequently admitted business frame behind the Ack.
-                    BinaryPrimitives.WriteUInt32LittleEndian(
-                        ackFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + 28, 4),
-                        PeekNextMsgSeqNum());
-                    if (!_transport.TryEnqueueFrame(ackFrame))
-                        return false;
-                    _transportReadyForBusiness = true;
-                    return true;
-                }
-            });
+                // Patch nextSeqNo and enqueue the Ack under the same lock used
+                // by business sequence allocation. Opening admission before
+                // releasing it lets blocked route writers proceed only after
+                // the Ack is already in the FIFO transport queue.
+                BinaryPrimitives.WriteUInt32LittleEndian(
+                    ackFrame.AsSpan(EntryPointFrameReader.WireHeaderSize + 28, 4),
+                    PeekNextMsgSeqNum());
+                enqueued = _transport.TryEnqueueFrame(ackFrame);
+                if (enqueued)
+                    OpenBusinessAdmissionLocked();
+            }
             if (!enqueued)
             {
+                AbortBusinessAdmission();
                 _logger.LogWarning("session {ConnectionId} could not enqueue EstablishAck — closing",
                     ConnectionId);
                 Close("send-queue-full:EstablishAck");

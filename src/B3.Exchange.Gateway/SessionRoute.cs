@@ -23,12 +23,40 @@ internal sealed class SessionRoute
 
     public OrderedStreamWriteResult TryInvoke(
         Func<FixpSession, OrderedStreamWriteResult> action)
+        => TryInvokeCore(action, OrderedStreamWriteResult.NotCommitted);
+
+    internal bool TryInvoke(Func<FixpSession, bool> action)
+        => TryInvokeCore(action, false);
+
+    private T TryInvokeCore<T>(Func<FixpSession, T> action, T unavailable)
     {
         ArgumentNullException.ThrowIfNull(action);
-        return Execute(route =>
-            route.Current is { } current
-                ? action(current)
-                : OrderedStreamWriteResult.NotCommitted);
+        while (true)
+        {
+            var target = Execute(route => route.Current);
+            if (target is null)
+                return unavailable;
+
+            if (!target.WaitForBusinessAdmission())
+            {
+                if (Execute(route => !ReferenceEquals(route.Current, target)))
+                    continue;
+                return unavailable;
+            }
+
+            bool routeChanged = false;
+            var result = Execute(route =>
+            {
+                if (!ReferenceEquals(route.Current, target))
+                {
+                    routeChanged = true;
+                    return unavailable;
+                }
+                return action(target);
+            });
+            if (!routeChanged)
+                return result;
+        }
     }
 
     internal FixpSession? Current => Volatile.Read(ref _current);
