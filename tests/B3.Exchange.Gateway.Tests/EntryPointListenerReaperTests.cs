@@ -37,6 +37,7 @@ public class EntryPointListenerReaperTests
     private sealed class FakeJournal : IFixpOutboundJournal
     {
         private readonly Dictionary<uint, SortedDictionary<uint, byte[]>> _data = new();
+        private readonly Dictionary<uint, List<SortedDictionary<uint, byte[]>>> _retired = new();
         public int RemoveCalls { get; private set; }
 
         public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
@@ -75,6 +76,34 @@ public class EntryPointListenerReaperTests
 
         public long EntryCount(uint sessionId)
             => _data.TryGetValue(sessionId, out var session) ? session.Count : 0L;
+
+        public IReadOnlyList<uint[]> RetiredSequences(uint sessionId)
+            => _retired.TryGetValue(sessionId, out var retired)
+                ? retired.Select(entries => entries.Keys.ToArray()).ToArray()
+                : Array.Empty<uint[]>();
+
+        public void RollGeneration(uint sessionId)
+        {
+            if (_data.Remove(sessionId, out var session))
+            {
+                if (!_retired.TryGetValue(sessionId, out var retired))
+                    _retired[sessionId] = retired = new();
+                retired.Add(session);
+            }
+        }
+
+        public void RestoreLatestGeneration(uint sessionId)
+        {
+            if (_retired.TryGetValue(sessionId, out var retired) && retired.Count > 0)
+            {
+                _data[sessionId] = retired[^1];
+                retired.RemoveAt(retired.Count - 1);
+            }
+        }
+
+        public void ReleaseActive(uint sessionId) { }
+
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
 
         public void Remove(uint sessionId)
         {
@@ -492,7 +521,44 @@ public class EntryPointListenerReaperTests
             securityId: 0,
             transactTimeNanos: 2);
         Assert.True(result.IsCommitted);
-        Assert.Equal(2u, resumedSession.OutboundSeq);
-        Assert.Equal(new uint[] { 1u, 2u }, journal.ReadRange(sessionId, 1, 10).Select(x => x.Seq).ToArray());
+        Assert.Equal(1u, resumedSession.OutboundSeq);
+        Assert.Equal(new uint[] { 1u }, journal.ReadRange(sessionId, 1, 10).Select(x => x.Seq).ToArray());
+        Assert.Equal(new uint[] { 1u }, Assert.Single(journal.RetiredSequences(sessionId)));
+    }
+
+    [Fact]
+    public async Task RetentionSweep_prunes_expired_abandoned_journal_without_future_append()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fixp-reaper-retention-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var journal = new FileFixpOutboundJournal(
+                dir,
+                NullLogger<FileFixpOutboundJournal>.Instance,
+                segmentMaxBytes: 220,
+                maxRetention: TimeSpan.FromHours(1));
+            const uint sessionId = 0x596u;
+            journal.Append(sessionId, 1, 1_000_000_000L, new byte[100]);
+            journal.Append(sessionId, 2, 2_000_000_000L, new byte[100]);
+            journal.ConfirmPeerAck(sessionId, 2);
+
+            await using var listener = new EntryPointListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new NoOpEngineSink(),
+                new SessionRegistry(),
+                NullLoggerFactory.Instance,
+                sessionOptions: new FixpSessionOptions { SuspendedTimeoutMs = 200 },
+                outboundJournal: journal);
+
+            listener.SweepOutboundJournalRetentionOnce(8_000_000_000_000L);
+
+            Assert.Empty(journal.ReadRange(sessionId, 1, 10));
+            Assert.Equal(new uint[] { 2u }, journal.ReadRange(sessionId, 2, 10).Select(x => x.Seq).ToArray());
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
     }
 }

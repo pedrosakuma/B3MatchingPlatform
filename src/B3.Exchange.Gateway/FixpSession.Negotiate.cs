@@ -84,15 +84,9 @@ public sealed partial class FixpSession
                 return NegotiateStep.Rejected(rejectFrame,
                     $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
             }
-            SessionId = req.SessionId;
-            EnteringFirm = req.EnteringFirm;
-            SessionVerId = req.SessionVerId;
-            if (!TrySeedOutboundSeqFromJournal(req.SessionId))
+            if (!TryPrepareFreshNegotiateState(req.SessionId))
             {
                 State = FixpState.Idle;
-                SessionId = _acceptedSessionId;
-                SessionVerId = 0;
-                EnteringFirm = _acceptedEnteringFirm;
                 RollbackPendingNegotiateState();
                 var rejectFrame = new byte[NegotiateRejectEncoder.Total];
                 NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
@@ -100,8 +94,11 @@ public sealed partial class FixpSession
                     B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
                     currentSessionVerId: null);
                 return NegotiateStep.Rejected(rejectFrame,
-                    "negotiate-reject (legacy, outbound state reconcile failed)");
+                    "negotiate-reject (legacy, outbound journal rollover failed)");
             }
+            SessionId = req.SessionId;
+            EnteringFirm = req.EnteringFirm;
+            SessionVerId = req.SessionVerId;
             // Issue #485: update Identity to stable FIXP SessionId (legacy path).
             UpdateIdentityAfterNegotiate(
                 req.SessionId,
@@ -198,8 +195,8 @@ public sealed partial class FixpSession
         }
 
         _claimedSessionId = req.SessionId;
-        if (!TryApplyPendingNegotiateState(req.SessionId)
-            || !TrySeedOutboundSeqFromJournal(req.SessionId))
+        if (evictedByTakeOver is null
+            && !TryPrepareFreshNegotiateState(req.SessionId))
         {
             if (evictedByTakeOver is not null)
             {
@@ -227,7 +224,7 @@ public sealed partial class FixpSession
                 B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
                 currentSessionVerId: null);
             return NegotiateStep.Rejected(rejectFrame,
-                "negotiate-reject (UNSPECIFIED: persisted outbound state reconcile failed)");
+                "negotiate-reject (UNSPECIFIED: outbound journal rollover failed)");
         }
         _ = ApplyTransition(FixpEvent.Negotiate);
         SessionId = req.SessionId;
@@ -298,6 +295,8 @@ public sealed partial class FixpSession
         }
         if (!committed)
         {
+            if (evictedByTakeOver is null && SessionId != 0)
+                _ = TryRestoreRolledOutboundJournalGenerationForTakeOver(SessionId);
             // Roll back the in-memory claim taken above so the session
             // can be retried by the peer (same SessionVerID, same TCP
             // connection or a new one); without this the second attempt

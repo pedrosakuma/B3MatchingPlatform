@@ -52,6 +52,10 @@ public class FixpSessionMassActionCompletionTests
             => Entries.Where(entry => entry.Seq >= fromSeq).Take(count).ToArray();
         public uint MaxSeq(uint sessionId) => Entries.Count == 0 ? 0u : Entries.Max(entry => entry.Seq);
         public long EntryCount(uint sessionId) => Entries.Count;
+        public void RollGeneration(uint sessionId) => Entries.Clear();
+        public void RestoreLatestGeneration(uint sessionId) { }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId) => Entries.Clear();
         public IReadOnlyCollection<uint> ListSessions() => Array.Empty<uint>();
         public void Dispose() { }

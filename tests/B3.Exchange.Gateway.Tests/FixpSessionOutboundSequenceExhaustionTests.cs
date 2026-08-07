@@ -119,6 +119,13 @@ public sealed class FixpSessionOutboundSequenceExhaustionTests
                 ? sessionEntries.Count
                 : 0;
 
+        public void RollGeneration(uint sessionId)
+            => _entries.Remove(sessionId);
+        public void RestoreLatestGeneration(uint sessionId) { }
+        public void ReleaseActive(uint sessionId) { }
+
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
+
         public void Remove(uint sessionId)
         {
             RemoveCalls++;

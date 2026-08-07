@@ -41,6 +41,10 @@ public class SessionRegistryHandoffTests
             => _entries.Values.Where(entry => entry.Seq >= fromSeq).Take(count).ToArray();
         public uint MaxSeq(uint sessionId) => _entries.Count == 0 ? 0u : _entries.Keys.Max();
         public long EntryCount(uint sessionId) => _entries.Count;
+        public void RollGeneration(uint sessionId) => _entries.Clear();
+        public void RestoreLatestGeneration(uint sessionId) { }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId) => _entries.Clear();
         public IReadOnlyCollection<uint> ListSessions() => _entries.Count == 0 ? Array.Empty<uint>() : new[] { 1u };
         public void Dispose() { }

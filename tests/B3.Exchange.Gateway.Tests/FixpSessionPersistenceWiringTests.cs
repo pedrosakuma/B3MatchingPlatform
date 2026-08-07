@@ -41,6 +41,7 @@ public sealed class FixpSessionPersistenceWiringTests
     private sealed class FakeJournal : IFixpOutboundJournal
     {
         private readonly Dictionary<uint, SortedDictionary<uint, byte[]>> _data = new();
+        private readonly Dictionary<uint, List<SortedDictionary<uint, byte[]>>> _retired = new();
         public int RemoveCalls { get; private set; }
         public void Append(uint sessionId, uint seq, long ts, ReadOnlySpan<byte> frame)
         {
@@ -66,6 +67,25 @@ public sealed class FixpSessionPersistenceWiringTests
             => _data.TryGetValue(sessionId, out var s) && s.Count > 0 ? s.Keys.Max() : 0u;
         public long EntryCount(uint sessionId)
             => _data.TryGetValue(sessionId, out var s) ? s.Count : 0;
+        public void RollGeneration(uint sessionId)
+        {
+            if (_data.Remove(sessionId, out var entries))
+            {
+                if (!_retired.TryGetValue(sessionId, out var retired))
+                    _retired[sessionId] = retired = new();
+                retired.Add(entries);
+            }
+        }
+        public void RestoreLatestGeneration(uint sessionId)
+        {
+            if (_retired.TryGetValue(sessionId, out var retired) && retired.Count > 0)
+            {
+                _data[sessionId] = retired[^1];
+                retired.RemoveAt(retired.Count - 1);
+            }
+        }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId)
         {
             RemoveCalls++;

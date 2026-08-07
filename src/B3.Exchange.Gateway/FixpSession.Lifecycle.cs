@@ -437,6 +437,19 @@ public sealed partial class FixpSession
         if (removeStateSnapshot)
         {
             _retxBuffer.Dispose();
+            if (!removeOutboundJournal
+                && ownsLogicalSession
+                && _outboundJournal is not null
+                && SessionId != 0)
+            {
+                try { _outboundJournal.ReleaseActive(SessionId); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "fixp session {ConnectionId} sessionId={SessionId} failed to release active outbound journal state",
+                        ConnectionId, SessionId);
+                }
+            }
             if (removeOutboundJournal
                 && ownsLogicalSession
                 && _outboundJournal is not null

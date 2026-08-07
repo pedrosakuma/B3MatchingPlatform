@@ -45,6 +45,7 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
 {
     /// <summary>Subdirectory under the configured data directory.</summary>
     public const string JournalSubdir = "journal";
+    private const string RetiredSubdir = "retired";
 
     /// <summary>Default per-segment cap (16 MiB).</summary>
     public const int DefaultSegmentMaxBytes = 16 * 1024 * 1024;
@@ -60,6 +61,7 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
     private readonly object _lock = new();
     private readonly Dictionary<uint, ActiveSegment> _active = new();
     private readonly Dictionary<uint, uint> _confirmedPeerAck = new();
+    private readonly Dictionary<uint, Stack<uint>> _retiredPeerAcks = new();
     private bool _disposed;
 
     /// <summary>
@@ -102,6 +104,9 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
 
     private string SessionDir(uint sessionId)
         => Path.Combine(_journalDir, $"session-{sessionId:x8}");
+
+    private string RetiredSessionDir(uint sessionId)
+        => Path.Combine(_journalDir, RetiredSubdir, $"session-{sessionId:x8}");
 
     private static string SegmentFileName(uint firstSeq)
         => $"segment-{firstSeq:x8}.log";
@@ -162,14 +167,15 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         }
     }
 
-    private long CurrentSessionBytesLocked(uint sessionId, ActiveSegment active)
+    private long CurrentSessionBytesLocked(uint sessionId, ActiveSegment? active)
     {
-        long total = active.Stream.Length;
+        long total = active?.Stream.Length ?? 0;
         var dir = SessionDir(sessionId);
         if (!Directory.Exists(dir)) return total;
         foreach (var path in Directory.EnumerateFiles(dir, "segment-*.log"))
         {
-            if (string.Equals(path, active.Path, StringComparison.Ordinal)) continue;
+            if (active is not null
+                && string.Equals(path, active.Path, StringComparison.Ordinal)) continue;
             try { total += new FileInfo(path).Length; }
             catch (FileNotFoundException) { /* concurrent prune race; ignore */ }
         }
@@ -190,9 +196,9 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         }
 
         if (overBytes)
-            RotateSafeSegmentsLocked(sessionId, active, nowNanos, "bytes");
+            RotateSafeSegmentsLocked(sessionId, active.Path, nowNanos, "bytes");
         if (overAge)
-            RotateSafeSegmentsLocked(sessionId, active, nowNanos, "age");
+            RotateSafeSegmentsLocked(sessionId, active.Path, nowNanos, "age");
 
         ObserveSessionLocked(sessionId, active, nowNanos);
     }
@@ -214,13 +220,13 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         return AgeSeconds(nowNanos, oldest) > _maxRetention.TotalSeconds;
     }
 
-    private void RotateSafeSegmentsLocked(uint sessionId, ActiveSegment active,
+    private void RotateSafeSegmentsLocked(uint sessionId, string? activePath,
         long nowNanos, string reason)
     {
         uint watermark = _confirmedPeerAck.TryGetValue(sessionId, out var ack) ? ack : 0u;
         if (watermark == 0)
         {
-            LogRotationBlocked(sessionId, reason, watermark, active, nowNanos);
+            LogRotationBlocked(sessionId, reason, watermark, activePath, nowNanos);
             return;
         }
 
@@ -237,7 +243,8 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
                 : nextFirst - 1;
             if (segmentLastSeq == 0) continue;
             if (segmentLastSeq > watermark) break;
-            if (string.Equals(path, active.Path, StringComparison.Ordinal)) continue;
+            if (activePath is not null
+                && string.Equals(path, activePath, StringComparison.Ordinal)) continue;
             try
             {
                 File.Delete(path);
@@ -256,15 +263,18 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         }
 
         bool stillOver = reason == "bytes"
-            ? MaxBytesPerSession > 0 && CurrentSessionBytesLocked(sessionId, active) > MaxBytesPerSession
+            ? MaxBytesPerSession > 0 && CurrentSessionBytesLocked(sessionId, _active.GetValueOrDefault(sessionId)) > MaxBytesPerSession
             : IsRetentionExceededLocked(sessionId, nowNanos);
         if (deleted == 0 || stillOver)
-            LogRotationBlocked(sessionId, reason, watermark, active, nowNanos);
+            LogRotationBlocked(sessionId, reason, watermark, activePath, nowNanos);
     }
 
     private void LogRotationBlocked(uint sessionId, string reason, uint watermark,
-        ActiveSegment active, long nowNanos)
+        string? activePath, long nowNanos)
     {
+        ActiveSegment? active = null;
+        if (activePath is not null && _active.TryGetValue(sessionId, out var maybeActive))
+            active = maybeActive;
         long bytes = CurrentSessionBytesLocked(sessionId, active);
         long oldestAge = OldestAgeSecondsLocked(sessionId, nowNanos);
         _metrics?.Observe(sessionId, bytes, oldestAge);
@@ -273,19 +283,91 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
             reason, sessionId, watermark, bytes, oldestAge);
     }
 
-    private void ObserveSessionLocked(uint sessionId, ActiveSegment active, long nowNanos)
+    private void TrimRetiredGenerationsForAgeLocked(uint sessionId, long nowNanos)
+    {
+        if (_maxRetention <= TimeSpan.Zero) return;
+        foreach (var retiredDir in EnumerateRetiredGenerationDirs(RetiredSessionDir(sessionId)))
+        {
+            long oldest = OldestTimestampNanos(retiredDir);
+            if (oldest == 0 || AgeSeconds(nowNanos, oldest) <= _maxRetention.TotalSeconds)
+                continue;
+            DeleteRetiredGeneration(sessionId, retiredDir, "age");
+        }
+    }
+
+    private void TrimRetiredGenerationsForBytesLocked(uint sessionId)
+    {
+        if (MaxBytesPerSession <= 0) return;
+        while (CurrentRetainedBytesLocked(sessionId) > MaxBytesPerSession)
+        {
+            var retiredDir = EnumerateRetiredGenerationDirs(RetiredSessionDir(sessionId))
+                .FirstOrDefault();
+            if (retiredDir is null)
+                break;
+            DeleteRetiredGeneration(sessionId, retiredDir, "bytes");
+        }
+    }
+
+    private long CurrentRetainedBytesLocked(uint sessionId)
+    {
+        long total = CurrentSessionBytesLocked(sessionId, _active.GetValueOrDefault(sessionId));
+        foreach (var retiredDir in EnumerateRetiredGenerationDirs(RetiredSessionDir(sessionId)))
+        {
+            foreach (var path in Directory.EnumerateFiles(retiredDir, "segment-*.log"))
+            {
+                try { total += new FileInfo(path).Length; }
+                catch (FileNotFoundException) { }
+            }
+        }
+        return total;
+    }
+
+    private void DeleteRetiredGeneration(uint sessionId, string retiredDir, string reason)
+    {
+        try
+        {
+            Directory.Delete(retiredDir, recursive: true);
+            var retiredRoot = Path.GetDirectoryName(retiredDir);
+            if (retiredRoot is not null
+                && Directory.Exists(retiredRoot)
+                && !Directory.EnumerateFileSystemEntries(retiredRoot).Any())
+            {
+                Directory.Delete(retiredRoot);
+            }
+            _metrics?.IncRotation(sessionId, $"retired-{reason}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp outbound journal: failed to delete retired generation {Dir} (session=0x{SessionId:x8}, reason={Reason})",
+                retiredDir, sessionId, reason);
+        }
+    }
+
+    private void ObserveSessionLocked(uint sessionId, ActiveSegment? active, long nowNanos)
         => _metrics?.Observe(sessionId, CurrentSessionBytesLocked(sessionId, active),
             OldestAgeSecondsLocked(sessionId, nowNanos));
 
     private long OldestAgeSecondsLocked(uint sessionId, long nowNanos)
     {
-        var dir = SessionDir(sessionId);
+        long oldest = OldestTimestampNanos(SessionDir(sessionId));
+        foreach (var retiredDir in EnumerateRetiredGenerationDirs(RetiredSessionDir(sessionId)))
+        {
+            long retiredOldest = OldestTimestampNanos(retiredDir);
+            if (retiredOldest != 0 && (oldest == 0 || retiredOldest < oldest))
+                oldest = retiredOldest;
+        }
+        return oldest == 0 ? 0 : AgeSeconds(nowNanos, oldest);
+    }
+
+    private long OldestTimestampNanos(string dir)
+    {
         if (!Directory.Exists(dir)) return 0;
         foreach (var (_, path) in EnumerateSegmentsOrdered(dir))
         {
             var info = ScanSegment(path);
             if (info.EntryCount == 0) continue;
-            return AgeSeconds(nowNanos, info.FirstTimestampNanos);
+            return info.FirstTimestampNanos;
         }
         return 0;
     }
@@ -505,6 +587,120 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
         return total;
     }
 
+    public void ReleaseActive(uint sessionId)
+    {
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_active.Remove(sessionId, out var active))
+            {
+                try { active.Dispose(); } catch { }
+            }
+        }
+    }
+
+    public void RollGeneration(uint sessionId)
+    {
+        ReleaseActive(sessionId);
+        lock (_lock)
+        {
+            if (_confirmedPeerAck.Remove(sessionId, out var ack) && ack != 0)
+            {
+                if (!_retiredPeerAcks.TryGetValue(sessionId, out var retiredAcks))
+                    _retiredPeerAcks[sessionId] = retiredAcks = new();
+                retiredAcks.Push(ack);
+            }
+        }
+
+        var dir = SessionDir(sessionId);
+        if (!Directory.Exists(dir))
+        {
+            _metrics?.Reset(sessionId);
+            return;
+        }
+
+        var segments = Directory.EnumerateFiles(dir, "segment-*.log").ToArray();
+        if (segments.Length == 0)
+        {
+            if (!Directory.EnumerateFileSystemEntries(dir).Any())
+                Directory.Delete(dir);
+            _metrics?.Reset(sessionId);
+            return;
+        }
+
+        var retiredRoot = RetiredSessionDir(sessionId);
+        Directory.CreateDirectory(retiredRoot);
+        string archiveDir = NextRetiredGenerationDir(retiredRoot);
+        DirectorySync.Fsync(retiredRoot);
+        Directory.Move(dir, archiveDir);
+        _metrics?.Reset(sessionId);
+    }
+
+    public void RestoreLatestGeneration(uint sessionId)
+    {
+        ReleaseActive(sessionId);
+
+        var retiredRoot = RetiredSessionDir(sessionId);
+        if (!Directory.Exists(retiredRoot))
+            return;
+
+        var latest = EnumerateRetiredGenerationDirs(retiredRoot).LastOrDefault();
+        if (latest is null)
+            return;
+
+        var dir = SessionDir(sessionId);
+        if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+            Directory.Delete(dir);
+        Directory.Move(latest, dir);
+        if (!Directory.EnumerateFileSystemEntries(retiredRoot).Any())
+            Directory.Delete(retiredRoot);
+
+        lock (_lock)
+        {
+            if (_retiredPeerAcks.TryGetValue(sessionId, out var retiredAcks)
+                && retiredAcks.Count > 0)
+            {
+                uint ack = retiredAcks.Pop();
+                if (ack != 0)
+                    _confirmedPeerAck[sessionId] = ack;
+                if (retiredAcks.Count == 0)
+                    _retiredPeerAcks.Remove(sessionId);
+            }
+        }
+    }
+
+    public void EnforceRetention(uint sessionId, long nowNanos)
+    {
+        if (MaxBytesPerSession <= 0 && _maxRetention <= TimeSpan.Zero)
+            return;
+
+        FlushActiveLocked(sessionId);
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _active.TryGetValue(sessionId, out var active);
+            TrimRetiredGenerationsForAgeLocked(sessionId, nowNanos);
+            TrimRetiredGenerationsForBytesLocked(sessionId);
+
+            bool overBytes = MaxBytesPerSession > 0
+                && CurrentSessionBytesLocked(sessionId, active) > MaxBytesPerSession;
+            bool overAge = IsRetentionExceededLocked(sessionId, nowNanos);
+
+            if (!overBytes && !overAge)
+            {
+                ObserveSessionLocked(sessionId, active, nowNanos);
+                return;
+            }
+
+            string? activePath = active?.Path;
+            if (overBytes)
+                RotateSafeSegmentsLocked(sessionId, activePath, nowNanos, "bytes");
+            if (overAge)
+                RotateSafeSegmentsLocked(sessionId, activePath, nowNanos, "age");
+            ObserveSessionLocked(sessionId, active, nowNanos);
+        }
+    }
+
     public void Remove(uint sessionId)
     {
         lock (_lock)
@@ -516,6 +712,7 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
             }
         }
         var dir = SessionDir(sessionId);
+        var retiredRoot = RetiredSessionDir(sessionId);
         bool removed = !Directory.Exists(dir);
         if (!removed)
         {
@@ -531,12 +728,24 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
                     dir);
             }
         }
+        if (Directory.Exists(retiredRoot))
+        {
+            try { Directory.Delete(retiredRoot, recursive: true); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "fixp outbound journal: failed to delete retired session directory {Dir}",
+                    retiredRoot);
+                removed = false;
+            }
+        }
 
         if (!removed) return;
 
         lock (_lock)
         {
             _confirmedPeerAck.Remove(sessionId);
+            _retiredPeerAcks.Remove(sessionId);
         }
         _metrics?.Reset(sessionId);
     }
@@ -554,7 +763,37 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
                 _logger.LogWarning(
                     "fixp outbound journal: skipping unparseable session directory {Dir}", sub);
         }
+        var retiredDir = Path.Combine(_journalDir, RetiredSubdir);
+        if (!Directory.Exists(retiredDir)) return result;
+        foreach (var sub in Directory.EnumerateDirectories(retiredDir, "session-*"))
+        {
+            var name = Path.GetFileName(sub);
+            if (TryParseSessionDirName(name, out var sessionId) && !result.Contains(sessionId))
+                result.Add(sessionId);
+            else if (!TryParseSessionDirName(name, out _))
+                _logger.LogWarning(
+                    "fixp outbound journal: skipping unparseable retired session directory {Dir}", sub);
+        }
         return result;
+    }
+
+    private static string NextRetiredGenerationDir(string retiredRoot)
+    {
+        long stamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        while (true)
+        {
+            string candidate = Path.Combine(retiredRoot, $"generation-{stamp:x16}");
+            if (!Directory.Exists(candidate)) return candidate;
+            stamp++;
+        }
+    }
+
+    private static IReadOnlyList<string> EnumerateRetiredGenerationDirs(string retiredRoot)
+    {
+        if (!Directory.Exists(retiredRoot)) return Array.Empty<string>();
+        return Directory.EnumerateDirectories(retiredRoot, "generation-*")
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
     }
 
     private static bool TryParseSessionDirName(string dirName, out uint sessionId)

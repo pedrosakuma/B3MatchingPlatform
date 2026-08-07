@@ -16,8 +16,9 @@ namespace B3.Exchange.Gateway.Tests;
 /// Issue #405 — boot rehydration end-to-end. Validates that an
 /// <see cref="EntryPointListener"/> wired with a persisted outbound
 /// journal + session-state snapshots resumes a previously persisted
-/// session through matching Establish or a successfully claimed
-/// higher-version Negotiate. Negotiate candidates remain pending until
+/// session through matching Establish, while a successfully claimed
+/// higher-version Negotiate starts a fresh sequence generation after
+/// retiring the old journal. Negotiate candidates remain pending until
 /// their claim commits.
 /// </summary>
 public class FixpSessionResyncBootRehydrationTests
@@ -71,6 +72,13 @@ public class FixpSessionResyncBootRehydrationTests
             lock (_lock)
                 return _sessions.TryGetValue(sessionId, out var entries) ? entries.Count : 0;
         }
+        public void RollGeneration(uint sessionId)
+        {
+            lock (_lock) _sessions.Remove(sessionId);
+        }
+        public void RestoreLatestGeneration(uint sessionId) { }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId)
         {
             lock (_lock) _sessions.Remove(sessionId);
@@ -102,6 +110,17 @@ public class FixpSessionResyncBootRehydrationTests
             return _inner.MaxSeq(sessionId);
         }
         public long EntryCount(uint sessionId) => _inner.EntryCount(sessionId);
+        public void RollGeneration(uint sessionId)
+        {
+            if (Interlocked.Exchange(ref _failuresRemaining, 0) == 1)
+                throw new IOException("simulated journal rollover failure");
+            _inner.RollGeneration(sessionId);
+        }
+        public void RestoreLatestGeneration(uint sessionId)
+            => _inner.RestoreLatestGeneration(sessionId);
+        public void ReleaseActive(uint sessionId) => _inner.ReleaseActive(sessionId);
+        public void EnforceRetention(uint sessionId, long nowNanos)
+            => _inner.EnforceRetention(sessionId, nowNanos);
         public void Remove(uint sessionId) => _inner.Remove(sessionId);
         public IReadOnlyCollection<uint> ListSessions() => _inner.ListSessions();
         public void Dispose() => _inner.Dispose();
@@ -406,10 +425,11 @@ public class FixpSessionResyncBootRehydrationTests
                 $"rehydrated session should register (have {listener.ActiveSessions.Count})");
 
             // The higher-version candidate remained pending until its claim
-            // succeeded, then adopted the recoverable sequence envelope.
+            // succeeded, then started a fresh FIXP generation rather than
+            // inheriting the prior SessionVerId's sequence envelope.
             var session = listener.ActiveSessions.Single(s => s.SessionId == 1);
-            Assert.Equal(3u, session.OutboundSeq);
-            Assert.Equal(2u, session.LastIncomingSeqNo);
+            Assert.Equal(0u, session.OutboundSeq);
+            Assert.Equal(0u, session.LastIncomingSeqNo);
             Assert.Equal(42u, session.EnteringFirm);
         }
         finally
@@ -784,8 +804,8 @@ public class FixpSessionResyncBootRehydrationTests
             TimeSpan.FromSeconds(5)));
 
         Assert.True(registry.TryGet(new B3.Exchange.Contracts.SessionId("1"), out var replacement));
-        Assert.Equal(3u, replacement.OutboundSeq);
-        Assert.Equal(3u, journal.MaxSeq(1));
+        Assert.Equal(0u, replacement.OutboundSeq);
+        Assert.Equal(0u, journal.MaxSeq(1));
     }
 
     [Theory]
@@ -960,22 +980,22 @@ public class FixpSessionResyncBootRehydrationTests
         var session = listener.ActiveSessions.Single(s => s.SessionVerId == 101UL);
         Assert.True(routed.IsDeferred);
         Assert.Equal(1, registry.PendingWriteCount(session));
-        Assert.Equal(3u, journal.MaxSeq(1));
+        Assert.Equal(0u, journal.MaxSeq(1));
         await AssertNoFrameAsync(stream);
 
         await stream.WriteAsync(BuildEstablish(
-            sessionId: 1, sessionVerId: 101UL, nextSeqNo: 3u));
+            sessionId: 1, sessionVerId: 101UL, nextSeqNo: 1u));
         var ack = await ReadFrameAsync(stream);
         Assert.Equal(EntryPointFrameReader.TidEstablishAck, ack.TemplateId);
-        Assert.Equal(4u,
+        Assert.Equal(1u,
             BinaryPrimitives.ReadUInt32LittleEndian(ack.Body.AsSpan(28, 4)));
 
         Assert.True((await routed.Completion.WaitAsync(
             TimeSpan.FromSeconds(5))).IsTransportEnqueued);
         var report = await ReadFrameAsync(stream);
         Assert.Equal(EntryPointFrameReader.TidExecutionReportCancel, report.TemplateId);
-        Assert.Equal(4u, report.MsgSeqNum);
-        Assert.Equal(4u, journal.MaxSeq(1));
+        Assert.Equal(1u, report.MsgSeqNum);
+        Assert.Equal(1u, journal.MaxSeq(1));
     }
 
     [Fact]

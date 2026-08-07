@@ -38,6 +38,7 @@ public class FixpSessionMassActionTakeoverTests
     {
         private readonly object _lock = new();
         private readonly SortedDictionary<uint, OutboundJournalEntry> _entries = new();
+        private readonly List<SortedDictionary<uint, OutboundJournalEntry>> _retired = new();
         private readonly ManualResetEventSlim _releaseMaxSeq = new(false);
 
         public IReadOnlyList<OutboundJournalEntry> Entries
@@ -45,7 +46,17 @@ public class FixpSessionMassActionTakeoverTests
             get { lock (_lock) return _entries.Values.ToArray(); }
         }
 
+        public IReadOnlyList<uint[]> RetiredSequences
+        {
+            get
+            {
+                lock (_lock)
+                    return _retired.Select(entries => entries.Keys.ToArray()).ToArray();
+            }
+        }
+
         public bool BlockMaxSeq { get; set; }
+        public bool FailRollGeneration { get; set; }
         public TaskCompletionSource<bool> MaxSeqEntered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -84,6 +95,30 @@ public class FixpSessionMassActionTakeoverTests
                     .ToArray();
             }
         }
+        public void RollGeneration(uint sessionId)
+        {
+            lock (_lock)
+            {
+                if (FailRollGeneration)
+                    throw new IOException("simulated journal rollover failure");
+                if (_entries.Count == 0) return;
+                _retired.Add(new SortedDictionary<uint, OutboundJournalEntry>(_entries));
+                _entries.Clear();
+            }
+        }
+        public void RestoreLatestGeneration(uint sessionId)
+        {
+            lock (_lock)
+            {
+                if (_retired.Count == 0) return;
+                _entries.Clear();
+                foreach (var entry in _retired[^1])
+                    _entries[entry.Key] = entry.Value;
+                _retired.RemoveAt(_retired.Count - 1);
+            }
+        }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId)
         {
             lock (_lock) _entries.Clear();
@@ -321,19 +356,16 @@ public class FixpSessionMassActionTakeoverTests
 
         var report = await ReadOneFrameAsync(replacementClient.GetStream());
         Assert.Equal(EntryPointFrameReader.TidOrderMassActionReport, report.TemplateId);
-        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(report.Body.AsSpan(4, 4)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(report.Body.AsSpan(4, 4)));
 
         var entries = journal.Entries;
-        Assert.Equal(new uint[] { 1, 2 }, entries.Select(entry => entry.Seq));
+        Assert.Equal(new uint[] { 1 }, entries.Select(entry => entry.Seq));
         Assert.Equal(
-            new[]
-            {
-                EntryPointFrameReader.TidExecutionReportCancel,
-                EntryPointFrameReader.TidOrderMassActionReport,
-            },
+            new[] { EntryPointFrameReader.TidOrderMassActionReport },
             entries.Select(entry => BinaryPrimitives.ReadUInt16LittleEndian(
                 entry.Frame.AsSpan(EntryPointFrameReader.SofhSize + 2, 2))));
-        Assert.Equal(2u, listener.ActiveSessions.Single(
+        Assert.Equal(new uint[] { 1 }, Assert.Single(journal.RetiredSequences));
+        Assert.Equal(1u, listener.ActiveSessions.Single(
             session => session.SessionVerId == 3).OutboundSeq);
     }
 
@@ -388,7 +420,7 @@ public class FixpSessionMassActionTakeoverTests
     }
 
     [Fact]
-    public async Task ReplacementCloseBeforeSeal_RestoresVictimWithoutPersistingRejectedVersion()
+    public async Task TakeoverJournalRolloverFailure_RestoresVictimWithoutPersistingRejectedVersion()
     {
         var sink = new ControlledSink();
         var registry = new SessionRegistry();
@@ -402,26 +434,15 @@ public class FixpSessionMassActionTakeoverTests
         using var oldClient = await ConnectAndEstablishAsync(listener, sessionVerId: 2);
         var oldSession = listener.ActiveSessions.Single(
             session => session.SessionVerId == 2);
-        journal.BlockMaxSeq = true;
+        journal.FailRollGeneration = true;
 
         using var replacementClient = await ConnectAndSendNegotiateAsync(
             listener, sessionVerId: 3);
-        await journal.MaxSeqEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var replacement = listener.ActiveSessions.Single(
-            session => !ReferenceEquals(session, oldSession));
-        var closeTask = Task.Run(() =>
-            replacement.Close("test-close-before-takeover-seal", CloseKind.TransportError));
-        Assert.True(await TestUtil.WaitUntilAsync(
-            () => !replacement.IsRegistered
-                && replacement.LastCloseKind == CloseKind.TransportError,
-            TimeSpan.FromSeconds(5)));
-
-        journal.ReleaseMaxSeq();
-        await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var reject = await ReadOneFrameAsync(replacementClient.GetStream());
+        Assert.Equal(EntryPointFrameReader.TidNegotiateReject, reject.TemplateId);
 
         Assert.True(await TestUtil.WaitUntilAsync(
-            () => !replacement.IsOpen
-                && registry.TryGet(new SessionId("1"), out var currentSession)
+            () => registry.TryGet(new SessionId("1"), out var currentSession)
                 && ReferenceEquals(currentSession, oldSession)
                 && claims.TryGetActiveClaim(1, out var claimHolder, out var claimVersion)
                 && ReferenceEquals(claimHolder, oldSession)
