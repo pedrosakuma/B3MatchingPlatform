@@ -366,23 +366,38 @@ public sealed class SessionRegistry
                             return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
                     }
 
-                    var decision = SessionClaimRegistry.TakeOverCommitDecision.RollBack;
-                    if (!replacement.TryAdoptOutboundStateForTakeOver(previous, () =>
+                    bool freshGeneration = replacement.SessionVerId > previous.SessionVerId;
+                    var decision = replacement.TryFinalizeOutboundStateForTakeOver(previous,
+                        freshGeneration, () =>
                     {
                         if (!ReferenceEquals(previousRoute.Current, previous)
                             || !ReferenceEquals(replacementRoute.Current, replacement))
-                            return;
+                            return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
                         if (!replacement.TrySealTakeOverCandidate())
-                            return;
+                            return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
 
-                        if (!replacement.TrySaveStateSnapshot())
+                        if (freshGeneration
+                            && !replacement.TryRollOutboundJournalGenerationForFreshTakeOver(
+                                replacement.SessionId))
                         {
                             bool rollbackPersisted = previous.TrySaveStateSnapshot();
                             replacement.RollbackTakeOverSeal();
-                            decision = rollbackPersisted
+                            return rollbackPersisted
                                 ? SessionClaimRegistry.TakeOverCommitDecision.RollBack
                                 : SessionClaimRegistry.TakeOverCommitDecision.FailClosed;
-                            return;
+                        }
+
+                        if (!replacement.TrySaveStateSnapshot())
+                        {
+                            bool journalRestored =
+                                !freshGeneration
+                                || replacement.TryRestoreRolledOutboundJournalGenerationForTakeOver(
+                                    replacement.SessionId);
+                            bool rollbackPersisted = journalRestored && previous.TrySaveStateSnapshot();
+                            replacement.RollbackTakeOverSeal();
+                            return rollbackPersisted
+                                ? SessionClaimRegistry.TakeOverCommitDecision.RollBack
+                                : SessionClaimRegistry.TakeOverCommitDecision.FailClosed;
                         }
 
                         previousRoute.SetCurrent(replacement);
@@ -392,11 +407,8 @@ public sealed class SessionRegistry
                         {
                             _sessions[identity] = replacement;
                         }
-                        decision = SessionClaimRegistry.TakeOverCommitDecision.Commit;
-                    }))
-                    {
-                        return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
-                    }
+                        return SessionClaimRegistry.TakeOverCommitDecision.Commit;
+                    });
                     return decision;
                 });
 

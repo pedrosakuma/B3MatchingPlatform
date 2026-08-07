@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using B3.Exchange.Contracts;
+using B3.Exchange.Contracts.Time;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Exchange.Gateway;
@@ -158,6 +159,7 @@ public sealed class EntryPointListener : IAsyncDisposable
                 try { await Task.Delay(poll, ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { return; /* expected: reaper cancelled during shutdown */ }
                 ReapSuspendedOnce(Environment.TickCount64);
+                SweepOutboundJournalRetentionOnce((long)SystemNanosTimeSource.Instance.NowNanos());
             }
         }
         catch (Exception ex)
@@ -199,6 +201,29 @@ public sealed class EntryPointListener : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "reaper failed to close session {ConnectionId}", s.ConnectionId);
+            }
+        }
+    }
+
+    internal void SweepOutboundJournalRetentionOnce(long nowNanos)
+    {
+        if (_outboundJournal is null) return;
+        IReadOnlyCollection<uint> sessions;
+        try { sessions = _outboundJournal.ListSessions(); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "journal retention sweep failed to enumerate sessions");
+            return;
+        }
+
+        foreach (var sessionId in sessions)
+        {
+            try { _outboundJournal.EnforceRetention(sessionId, nowNanos); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "journal retention sweep failed for sessionId={SessionId}",
+                    sessionId);
             }
         }
     }

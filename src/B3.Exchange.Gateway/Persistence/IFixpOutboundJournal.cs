@@ -40,11 +40,19 @@ namespace B3.Exchange.Gateway.Persistence;
 /// boundary for I/O efficiency.</para>
 ///
 /// <para><b>Terminal removal</b>: <see cref="Remove"/> is called by
-/// <c>FixpSession.CloseLocked</c> only on terminal close events
-/// (peer-initiated <c>Terminate(Finished)</c>, suspended-timeout
-/// reaper). Graceful host shutdown does NOT remove journals — they
-/// must survive process restart so a reconnecting peer can recover
-/// every event produced while the matching-platform was down.</para>
+/// <c>FixpSession.CloseLocked</c> only on terminal close events that
+/// intentionally retire the durable replay history itself (for example
+/// peer-initiated <c>Terminate(Finished)</c> or daily/session-local
+/// teardown). Graceful host shutdown and suspended-timeout reaping do
+/// NOT remove journals — they must survive so retention/size policy,
+/// rather than wall-clock session-slot lifetime, remains the authority
+/// on what replay data is still servable.</para>
+///
+/// <para><b>Fresh session-version rollover</b>: a higher
+/// <c>sessionVerId</c> accepted via a new <c>Negotiate</c> starts a fresh
+/// FIXP sequence generation. Implementations therefore need a way to
+/// preserve the prior durable bytes without letting them collide with the
+/// new generation's <c>MsgSeqNum</c> space; see <see cref="RollGeneration"/>.</para>
 ///
 /// <para><b>Boot rehydration</b>: <see cref="ListSessions"/> enumerates
 /// every session whose journal survived the last process exit. The
@@ -127,11 +135,45 @@ public interface IFixpOutboundJournal : IDisposable
     long EntryCount(uint sessionId);
 
     /// <summary>
+    /// Releases any active writer state for <paramref name="sessionId"/>
+    /// without deleting retained journal bytes. Used when a logical session
+    /// is fully reaped but its durable replay history must remain subject to
+    /// normal retention policy.
+    /// </summary>
+    void ReleaseActive(uint sessionId);
+
+    /// <summary>
+    /// Preserves any currently-retained journal bytes for
+    /// <paramref name="sessionId"/> as a retired generation and resets the
+    /// active append path so a fresh higher-<c>sessionVerId</c> Negotiate
+    /// can start its outbound sequence from 1 without colliding with prior
+    /// retained bytes. Idempotent; safe when the session has no journal.
+    /// </summary>
+    void RollGeneration(uint sessionId);
+
+    /// <summary>
+    /// Restores the most recently retired generation for
+    /// <paramref name="sessionId"/> back to the active append path. Used to
+    /// roll back a failed higher-<c>sessionVerId</c> takeover after the
+    /// journal was already rolled forward but the new durable session state
+    /// could not be committed.
+    /// </summary>
+    void RestoreLatestGeneration(uint sessionId);
+
+    /// <summary>
+    /// Applies the journal's configured quota / age retention policy to
+    /// <paramref name="sessionId"/> outside the hot append path. Used by
+    /// background maintenance for abandoned sessions whose journals may
+    /// never see another append.
+    /// </summary>
+    void EnforceRetention(uint sessionId, long nowNanos);
+
+    /// <summary>
     /// Terminal removal: deletes every artifact for
     /// <paramref name="sessionId"/>. Idempotent — safe to call when
-    /// nothing exists for the session. Called only on peer-initiated
-    /// <c>Terminate(Finished)</c> and on suspended-timeout reaping.
-    /// Graceful host shutdown must NOT call this.
+    /// nothing exists for the session. Called only when the close path
+    /// intentionally retires the durable replay history itself; not on
+    /// graceful host shutdown or suspended-timeout reaping.
     /// </summary>
     void Remove(uint sessionId);
 

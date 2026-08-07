@@ -70,8 +70,10 @@ public enum CloseKind
     /// <summary>
     /// Suspended-state reaper aged the session out after the
     /// configured Suspended-window expired without re-attach. The
-    /// session is considered abandoned; persisted state should be
-    /// removed.
+    /// session slot is considered abandoned and its resumability
+    /// snapshot should be removed, but the durable outbound journal is
+    /// preserved so the journal's own retention policy remains the
+    /// sole authority on when replay bytes are deleted.
     /// </summary>
     SuspendedTimeout,
 

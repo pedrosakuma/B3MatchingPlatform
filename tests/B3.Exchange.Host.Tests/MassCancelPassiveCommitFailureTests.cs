@@ -108,6 +108,18 @@ public sealed class MassCancelPassiveCommitFailureTests
             });
         }
 
+        public void RollGeneration(uint sessionId)
+        {
+            lock (_gate)
+                _entries.Clear();
+        }
+
+        public void RestoreLatestGeneration(uint sessionId) { }
+
+        public void ReleaseActive(uint sessionId) { }
+
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
+
         public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
         public void PruneUpTo(uint sessionId, uint uptoSeq) { }
 

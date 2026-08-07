@@ -1,7 +1,11 @@
 using B3.Exchange.Contracts;
 using System.Net;
 using System.Net.Sockets;
+using System.Buffers.Binary;
+using System.Text;
+using B3.EntryPoint.Wire;
 using B3.Exchange.Gateway;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.Matching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -28,6 +32,109 @@ public class EntryPointListenerReaperTests
         public bool EnqueueMassCancel(in MassCancelCommand cmd, B3.Exchange.Contracts.SessionId session, uint enteringFirm) { return true; }
         public void OnDecodeError(B3.Exchange.Contracts.SessionId session, string error) { }
         public void OnSessionClosed(B3.Exchange.Contracts.SessionId session) => Interlocked.Increment(ref SessionClosedCalls);
+    }
+
+    private sealed class FakeJournal : IFixpOutboundJournal
+    {
+        private readonly Dictionary<uint, SortedDictionary<uint, byte[]>> _data = new();
+        private readonly Dictionary<uint, List<SortedDictionary<uint, byte[]>>> _retired = new();
+        public int RemoveCalls { get; private set; }
+
+        public void Append(uint sessionId, uint seq, long timestampNanos, ReadOnlySpan<byte> frame)
+        {
+            if (!_data.TryGetValue(sessionId, out var session))
+                _data[sessionId] = session = new();
+            if (session.Count > 0 && seq <= session.Keys.Max())
+                throw new InvalidOperationException(
+                    $"journal append for session 0x{sessionId:x8} seq={seq} is not strictly greater than last persisted seq {session.Keys.Max()}");
+            session[seq] = frame.ToArray();
+        }
+
+        public void ConfirmPeerAck(uint sessionId, uint uptoSeq) { }
+
+        public IReadOnlyList<OutboundJournalEntry> ReadRange(uint sessionId, uint fromSeq, int count)
+        {
+            if (!_data.TryGetValue(sessionId, out var session))
+                return Array.Empty<OutboundJournalEntry>();
+            var list = new List<OutboundJournalEntry>(count);
+            for (int i = 0; i < count; i++)
+            {
+                uint seq = fromSeq + (uint)i;
+                if (!session.TryGetValue(seq, out var frame))
+                    break;
+                list.Add(new OutboundJournalEntry(seq, 0L, frame));
+            }
+            return list;
+        }
+
+        public void PruneUpTo(uint sessionId, uint uptoSeq) { }
+
+        public uint MaxSeq(uint sessionId)
+            => _data.TryGetValue(sessionId, out var session) && session.Count > 0
+                ? session.Keys.Max()
+                : 0u;
+
+        public long EntryCount(uint sessionId)
+            => _data.TryGetValue(sessionId, out var session) ? session.Count : 0L;
+
+        public IReadOnlyList<uint[]> RetiredSequences(uint sessionId)
+            => _retired.TryGetValue(sessionId, out var retired)
+                ? retired.Select(entries => entries.Keys.ToArray()).ToArray()
+                : Array.Empty<uint[]>();
+
+        public void RollGeneration(uint sessionId)
+        {
+            if (_data.Remove(sessionId, out var session))
+            {
+                if (!_retired.TryGetValue(sessionId, out var retired))
+                    _retired[sessionId] = retired = new();
+                retired.Add(session);
+            }
+        }
+
+        public void RestoreLatestGeneration(uint sessionId)
+        {
+            if (_retired.TryGetValue(sessionId, out var retired) && retired.Count > 0)
+            {
+                _data[sessionId] = retired[^1];
+                retired.RemoveAt(retired.Count - 1);
+            }
+        }
+
+        public void ReleaseActive(uint sessionId) { }
+
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
+
+        public void Remove(uint sessionId)
+        {
+            RemoveCalls++;
+            _data.Remove(sessionId);
+        }
+
+        public IReadOnlyCollection<uint> ListSessions() => _data.Keys.ToArray();
+
+        public void Dispose() { }
+    }
+
+    private sealed class FakeStatePersister : IFixpSessionStatePersister
+    {
+        private readonly Dictionary<uint, FixpSessionStateSnapshot> _data = new();
+        public int RemoveCalls { get; private set; }
+
+        public void Save(in FixpSessionStateSnapshot snapshot) => _data[snapshot.SessionId] = snapshot;
+
+        public FixpSessionStateSnapshot? Load(uint sessionId)
+            => _data.TryGetValue(sessionId, out var snapshot) ? snapshot : null;
+
+        public IReadOnlyCollection<FixpSessionStateSnapshot> LoadAll() => _data.Values.ToArray();
+
+        public void Remove(uint sessionId)
+        {
+            RemoveCalls++;
+            _data.Remove(sessionId);
+        }
+
+        public void Dispose() { }
     }
 
     /// <summary>
@@ -79,6 +186,86 @@ public class EntryPointListenerReaperTests
             TimeSpan.FromSeconds(2));
         Assert.True(suspended, $"session never became Suspended (state={session.State})");
         return (listener, sink, client, session, closures);
+    }
+
+    private readonly record struct ReadFrame(ushort TemplateId, byte[] Body);
+
+    private static async Task<TcpClient> ConnectAndEstablishAsync(
+        EntryPointListener listener,
+        uint sessionId,
+        ulong sessionVerId)
+    {
+        var client = await ConnectAndSendNegotiateAsync(listener, sessionId, sessionVerId);
+        var stream = client.GetStream();
+        var buffer = new byte[512];
+
+        Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+            (await ReadOneFrameAsync(stream)).TemplateId);
+
+        int length = EntryPointFixpFrameCodec.EncodeEstablish(buffer,
+            sessionId: sessionId,
+            sessionVerId: sessionVerId,
+            timestampNanos: 0,
+            keepAliveIntervalMillis: 10_000,
+            nextSeqNo: 1,
+            cancelOnDisconnectType: 0,
+            codTimeoutWindowMillis: 0,
+            credentials: ReadOnlySpan<byte>.Empty);
+        await stream.WriteAsync(buffer.AsMemory(0, length));
+        Assert.Equal(EntryPointFrameReader.TidEstablishAck,
+            (await ReadOneFrameAsync(stream)).TemplateId);
+        return client;
+    }
+
+    private static async Task<TcpClient> ConnectAndSendNegotiateAsync(
+        EntryPointListener listener,
+        uint sessionId,
+        ulong sessionVerId)
+    {
+        var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var credentials = Encoding.UTF8.GetBytes(
+            "{\"auth_type\":\"basic\",\"username\":\"1\",\"access_key\":\"\"}");
+        var buffer = new byte[512];
+        int length = EntryPointFixpFrameCodec.EncodeNegotiate(buffer,
+            sessionId: sessionId,
+            sessionVerId: sessionVerId,
+            timestampNanos: 0,
+            enteringFirm: 42,
+            onBehalfFirm: null,
+            credentials: credentials,
+            clientIp: ReadOnlySpan<byte>.Empty,
+            clientAppName: ReadOnlySpan<byte>.Empty,
+            clientAppVersion: ReadOnlySpan<byte>.Empty);
+        await client.GetStream().WriteAsync(buffer.AsMemory(0, length));
+        return client;
+    }
+
+    private static async Task<ReadFrame> ReadOneFrameAsync(NetworkStream stream)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var header = new byte[EntryPointFrameReader.WireHeaderSize];
+        await ReadExactAsync(stream, header, cts.Token);
+        ushort messageLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(0, 2));
+        ushort templateId = BinaryPrimitives.ReadUInt16LittleEndian(
+            header.AsSpan(EntryPointFrameReader.SofhSize + 2, 2));
+        var body = new byte[messageLength - EntryPointFrameReader.WireHeaderSize];
+        await ReadExactAsync(stream, body, cts.Token);
+        return new ReadFrame(templateId, body);
+    }
+
+    private static async Task ReadExactAsync(
+        NetworkStream stream,
+        byte[] buffer,
+        CancellationToken cancellationToken)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int count = await stream.ReadAsync(buffer.AsMemory(read), cancellationToken);
+            if (count <= 0) throw new EndOfStreamException();
+            read += count;
+        }
     }
 
     [Fact]
@@ -251,5 +438,127 @@ public class EntryPointListenerReaperTests
         Assert.True(reaped, $"reaper did not increment Reaped within 2s (Reaped={metrics.Reaped})");
         // Sanity: Rebound stays zero (we never re-attached).
         Assert.Equal(0, metrics.Rebound);
+    }
+
+    [Fact]
+    public async Task Reaper_preserves_outbound_journal_but_removes_state_snapshot()
+    {
+        const uint sessionId = 0x594u;
+        var sink = new NoOpEngineSink();
+        var closures = new List<string>();
+        var journal = new FakeJournal();
+        var state = new FakeStatePersister();
+        journal.Append(sessionId, 1, 0L, new byte[] { 0x59, 0x40 });
+        state.Save(new FixpSessionStateSnapshot(
+            SessionId: sessionId,
+            SessionVerId: 7UL,
+            OutboundMsgSeqNum: 1u,
+            LastIncomingSeqNo: 0u,
+            EnteringFirm: 11u,
+            UpdatedAtNanos: 0L));
+        var options = new FixpSessionOptions
+        {
+            HeartbeatIntervalMs = 60_000,
+            IdleTimeoutMs = 60_000,
+            TestRequestGraceMs = 60_000,
+            SuspendedTimeoutMs = 200,
+        };
+
+        await using var listener = new EntryPointListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            sink,
+            new SessionRegistry(),
+            NullLoggerFactory.Instance,
+            identityFactory: _ => new EntryPointListener.AcceptedConnection(1, EnteringFirm: 11, SessionId: sessionId),
+            sessionOptions: options,
+            onSessionClosed: (_, reason) => { lock (closures) closures.Add(reason); },
+            outboundJournal: journal,
+            statePersister: state);
+        listener.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, listener.LocalEndpoint!.Port);
+        var registered = await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.Count == 1,
+            TimeSpan.FromSeconds(2));
+        Assert.True(registered, "listener never registered the accepted session");
+
+        var session = listener.ActiveSessions[0];
+        session.ApplyTransition(FixpEvent.Negotiate);
+        session.ApplyTransition(FixpEvent.Establish);
+        client.Close();
+
+        var reaped = await TestUtil.WaitUntilAsync(
+            () =>
+            {
+                lock (closures)
+                    return !session.IsOpen
+                        && session.SuspendedSinceMs is null
+                        && closures.Count == 1;
+            },
+            TimeSpan.FromSeconds(2));
+        Assert.True(reaped, "reaper did not fully close the suspended session within 2s");
+
+        Assert.DoesNotContain(session, listener.ActiveSessions);
+        Assert.Equal(0, journal.RemoveCalls);
+        Assert.Equal(1L, journal.EntryCount(sessionId));
+        Assert.Single(journal.ReadRange(sessionId, 1, 10));
+        Assert.Equal(1, state.RemoveCalls);
+        Assert.Null(state.Load(sessionId));
+
+        using var resumedClient = await ConnectAndEstablishAsync(listener, sessionId, sessionVerId: 8);
+        var resumedRegistered = await TestUtil.WaitUntilAsync(
+            () => listener.ActiveSessions.Count == 1 && listener.ActiveSessions[0].IsOpen,
+            TimeSpan.FromSeconds(2));
+        Assert.True(resumedRegistered, "listener never registered the replacement session");
+
+        var resumedSession = listener.ActiveSessions[0];
+        var result = resumedSession.WriteOrderMassActionReport(
+            clOrdIdValue: 7003,
+            massActionResponse: OrderMassActionReportEncoder.MassActionResponseAccepted,
+            massActionRejectReason: null,
+            side: null,
+            securityId: 0,
+            transactTimeNanos: 2);
+        Assert.True(result.IsCommitted);
+        Assert.Equal(1u, resumedSession.OutboundSeq);
+        Assert.Equal(new uint[] { 1u }, journal.ReadRange(sessionId, 1, 10).Select(x => x.Seq).ToArray());
+        Assert.Equal(new uint[] { 1u }, Assert.Single(journal.RetiredSequences(sessionId)));
+    }
+
+    [Fact]
+    public async Task RetentionSweep_prunes_expired_abandoned_journal_without_future_append()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fixp-reaper-retention-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var journal = new FileFixpOutboundJournal(
+                dir,
+                NullLogger<FileFixpOutboundJournal>.Instance,
+                segmentMaxBytes: 220,
+                maxRetention: TimeSpan.FromHours(1));
+            const uint sessionId = 0x596u;
+            journal.Append(sessionId, 1, 1_000_000_000L, new byte[100]);
+            journal.Append(sessionId, 2, 2_000_000_000L, new byte[100]);
+            journal.ConfirmPeerAck(sessionId, 2);
+
+            await using var listener = new EntryPointListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new NoOpEngineSink(),
+                new SessionRegistry(),
+                NullLoggerFactory.Instance,
+                sessionOptions: new FixpSessionOptions { SuspendedTimeoutMs = 200 },
+                outboundJournal: journal);
+
+            listener.SweepOutboundJournalRetentionOnce(8_000_000_000_000L);
+
+            Assert.Empty(journal.ReadRange(sessionId, 1, 10));
+            Assert.Equal(new uint[] { 2u }, journal.ReadRange(sessionId, 2, 10).Select(x => x.Seq).ToArray());
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
     }
 }

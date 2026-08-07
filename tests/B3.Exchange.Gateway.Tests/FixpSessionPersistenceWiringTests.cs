@@ -19,9 +19,9 @@ namespace B3.Exchange.Gateway.Tests;
 ///   SessionVerId / EnteringFirm / LastIncomingSeqNo and resumes
 ///   the outbound seq at <c>max(snapshot, journal.MaxSeq)</c>.</item>
 ///   <item>CloseKind-gated removal: terminal kinds (PeerTerminate,
-///   SuspendedTimeout) erase journal + state; preserving kinds
-///   (HostShutdown, TransportError) keep them and save a final
-///   snapshot.</item>
+///   DailyReset) erase journal + state; suspended-timeout only erases
+///   the resumability snapshot; preserving kinds (HostShutdown,
+///   TransportError) keep them and save a final snapshot.</item>
 ///   <item>Establish/Suspend save the snapshot opportunistically.</item>
 /// </list>
 /// </summary>
@@ -41,6 +41,7 @@ public sealed class FixpSessionPersistenceWiringTests
     private sealed class FakeJournal : IFixpOutboundJournal
     {
         private readonly Dictionary<uint, SortedDictionary<uint, byte[]>> _data = new();
+        private readonly Dictionary<uint, List<SortedDictionary<uint, byte[]>>> _retired = new();
         public int RemoveCalls { get; private set; }
         public void Append(uint sessionId, uint seq, long ts, ReadOnlySpan<byte> frame)
         {
@@ -66,6 +67,25 @@ public sealed class FixpSessionPersistenceWiringTests
             => _data.TryGetValue(sessionId, out var s) && s.Count > 0 ? s.Keys.Max() : 0u;
         public long EntryCount(uint sessionId)
             => _data.TryGetValue(sessionId, out var s) ? s.Count : 0;
+        public void RollGeneration(uint sessionId)
+        {
+            if (_data.Remove(sessionId, out var entries))
+            {
+                if (!_retired.TryGetValue(sessionId, out var retired))
+                    _retired[sessionId] = retired = new();
+                retired.Add(entries);
+            }
+        }
+        public void RestoreLatestGeneration(uint sessionId)
+        {
+            if (_retired.TryGetValue(sessionId, out var retired) && retired.Count > 0)
+            {
+                _data[sessionId] = retired[^1];
+                retired.RemoveAt(retired.Count - 1);
+            }
+        }
+        public void ReleaseActive(uint sessionId) { }
+        public void EnforceRetention(uint sessionId, long nowNanos) { }
         public void Remove(uint sessionId)
         {
             RemoveCalls++;
@@ -290,13 +310,21 @@ public sealed class FixpSessionPersistenceWiringTests
     }
 
     [Fact]
-    public async Task SuspendedTimeout_close_removes_journal_and_state()
+    public async Task SuspendedTimeout_close_preserves_journal_but_removes_state()
     {
         var (listener, serverSide, client) = await ConnectPairAsync();
         try
         {
             var journal = new FakeJournal();
             var state = new FakeStatePersister();
+            journal.Append(88, 1, 0L, new byte[] { 0x2A });
+            state.Save(new FixpSessionStateSnapshot(
+                SessionId: 88,
+                SessionVerId: 1UL,
+                OutboundMsgSeqNum: 1u,
+                LastIncomingSeqNo: 0u,
+                EnteringFirm: 1u,
+                UpdatedAtNanos: 0L));
             var session = new FixpSession(
                 connectionId: 1, enteringFirm: 1, sessionId: 88,
                 stream: serverSide,
@@ -307,8 +335,11 @@ public sealed class FixpSessionPersistenceWiringTests
 
             session.Close("idle reap", CloseKind.SuspendedTimeout);
 
-            Assert.Equal(1, journal.RemoveCalls);
+            Assert.Equal(0, journal.RemoveCalls);
+            Assert.Equal(1L, journal.EntryCount(88));
+            Assert.Single(journal.ReadRange(88, 1, 10));
             Assert.Equal(1, state.RemoveCalls);
+            Assert.Null(state.Load(88));
         }
         finally
         {

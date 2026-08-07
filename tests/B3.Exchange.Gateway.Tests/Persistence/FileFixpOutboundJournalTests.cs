@@ -343,6 +343,91 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
     }
 
     [Fact]
+    public void EnforceRetention_applies_age_policy_without_future_append()
+    {
+        using var j = NewJournal(segmentMaxBytes: 220, maxRetention: TimeSpan.FromHours(1));
+        const uint sid = 0x434u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 96));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2, extraBytes: 96));
+        j.ConfirmPeerAck(sid, 2);
+
+        j.EnforceRetention(sid, 8_000_000_000_000L);
+
+        Assert.Empty(j.ReadRange(sid, 1, 10));
+        Assert.Equal(new uint[] { 2 }, j.ReadRange(sid, 2, 10).Select(e => e.Seq).ToArray());
+    }
+
+    [Fact]
+    public void ReleaseActive_allows_retention_to_prune_expired_only_segment()
+    {
+        using var j = NewJournal(segmentMaxBytes: 1_024, maxRetention: TimeSpan.FromHours(1));
+        const uint sid = 0x436u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 64));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2, extraBytes: 64));
+        j.ConfirmPeerAck(sid, 2);
+
+        j.ReleaseActive(sid);
+        j.EnforceRetention(sid, 8_000_000_000_000L);
+
+        Assert.Equal(0u, j.MaxSeq(sid));
+        Assert.Equal(0L, j.EntryCount(sid));
+        Assert.Empty(j.ReadRange(sid, 1, 10));
+    }
+
+    [Fact]
+    public void Retired_generation_is_listed_and_pruned_by_retention()
+    {
+        using var j = NewJournal(maxRetention: TimeSpan.FromHours(1));
+        const uint sid = 0x437u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1, extraBytes: 64));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2, extraBytes: 64));
+
+        j.RollGeneration(sid);
+        Assert.Contains(sid, j.ListSessions());
+
+        j.EnforceRetention(sid, 8_000_000_000_000L);
+
+        Assert.DoesNotContain(sid, j.ListSessions());
+    }
+
+    [Fact]
+    public void RestoreLatestGeneration_restores_rolled_active_sequence_space()
+    {
+        using var j = NewJournal();
+        const uint sid = 0x438u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2));
+        j.RollGeneration(sid);
+
+        j.RestoreLatestGeneration(sid);
+
+        Assert.Equal(2u, j.MaxSeq(sid));
+        Assert.Equal(new uint[] { 1, 2 }, j.ReadRange(sid, 1, 10).Select(e => e.Seq).ToArray());
+    }
+
+    [Fact]
+    public void RollGeneration_preserves_retired_bytes_and_resets_active_sequence_space()
+    {
+        using var j = NewJournal();
+        const uint sid = 0x435u;
+        j.Append(sid, 1, 1_000_000_000L, Frame(1));
+        j.Append(sid, 2, 2_000_000_000L, Frame(2));
+
+        j.RollGeneration(sid);
+
+        Assert.Equal(0u, j.MaxSeq(sid));
+        Assert.Equal(0L, j.EntryCount(sid));
+
+        var retiredDir = Path.Combine(_root, FileFixpOutboundJournal.JournalSubdir,
+            "retired", $"session-{sid:x8}");
+        Assert.True(Directory.Exists(retiredDir));
+        Assert.True(Directory.EnumerateFiles(retiredDir, "segment-*.log", SearchOption.AllDirectories).Any());
+
+        j.Append(sid, 1, 3_000_000_000L, Frame(1));
+        Assert.Equal(1u, j.MaxSeq(sid));
+    }
+
+    [Fact]
     public void Rotation_never_drops_entries_above_peer_confirmed_sequence()
     {
         using var j = NewJournal(segmentMaxBytes: 250, maxBytesPerSession: 500);

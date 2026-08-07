@@ -506,6 +506,16 @@ public sealed partial class FixpSession : IAsyncDisposable
             uint resumedSeq = state.OutboundMsgSeqNum;
             if (outboundJournal is not null)
             {
+                if (resumedSeq > 0 && outboundJournal.MaxSeq(state.SessionId) == 0)
+                {
+                    try { outboundJournal.RestoreLatestGeneration(state.SessionId); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "fixp session {ConnectionId} failed to recover latest rolled journal generation for sessionId={SessionId}",
+                            connectionId, state.SessionId);
+                    }
+                }
                 uint journalMax = outboundJournal.MaxSeq(state.SessionId);
                 if (journalMax > resumedSeq) resumedSeq = journalMax;
             }
@@ -698,27 +708,22 @@ public sealed partial class FixpSession : IAsyncDisposable
         Volatile.Write(ref _msgSeqNum, allocated - 1u);
     }
 
-    private bool TryApplyPendingNegotiateState(uint sessionId)
+    private bool TryPrepareFreshNegotiateState(uint sessionId)
     {
-        if (_pendingNegotiateState is not { } state)
-            return true;
-        if (state.SessionId != sessionId)
+        if (_pendingNegotiateState is { } state && state.SessionId != sessionId)
             return false;
+        if (_outboundJournal is null)
+            return true;
 
         try
         {
-            uint resumedSeq = state.OutboundMsgSeqNum;
-            if (_outboundJournal is not null)
-                resumedSeq = Math.Max(resumedSeq, _outboundJournal.MaxSeq(sessionId));
-            LastIncomingSeqNo = state.LastIncomingSeqNo;
-            Volatile.Write(ref _msgSeqNum, resumedSeq);
-            _pendingNegotiateStateApplied = true;
+            _outboundJournal.RollGeneration(sessionId);
             return true;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "fixp session {ConnectionId} failed to reconcile pending persisted state for sessionId={SessionId}",
+                "fixp session {ConnectionId} failed to prepare fresh negotiate state for sessionId={SessionId}",
                 ConnectionId, sessionId);
             return false;
         }
@@ -845,14 +850,15 @@ public sealed partial class FixpSession : IAsyncDisposable
         Interlocked.CompareExchange(ref _takeOverCommitFence, restoredState, 2);
     }
 
-    internal bool TryAdoptOutboundStateForTakeOver(
+    internal SessionClaimRegistry.TakeOverCommitDecision TryFinalizeOutboundStateForTakeOver(
         FixpSession previous,
-        Action commit)
+        bool freshGeneration,
+        Func<SessionClaimRegistry.TakeOverCommitDecision> commit)
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(commit);
         if (!ReferenceEquals(_outboundJournal, previous._outboundJournal))
-            return false;
+            return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
 
         var first = ConnectionId < previous.ConnectionId ? _outboundLock : previous._outboundLock;
         var second = ReferenceEquals(first, _outboundLock) ? previous._outboundLock : _outboundLock;
@@ -861,9 +867,19 @@ public sealed partial class FixpSession : IAsyncDisposable
             lock (second)
             {
                 if (!IsLiveTakeOverCandidate || !previous.IsRegistered)
-                    return false;
+                    return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
+
+                if (freshGeneration)
+                {
+                    if (_retxBuffer.Count != 0)
+                        return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
+                    Volatile.Write(ref _msgSeqNum, 0);
+                    ResetBusinessAdmissionLocked();
+                    return commit();
+                }
+
                 if (!previous._retxBuffer.TryCopyRetainedFramesTo(_retxBuffer))
-                    return false;
+                    return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
 
                 uint maxSeq = Math.Max(
                     (uint)Volatile.Read(ref _msgSeqNum),
@@ -879,7 +895,7 @@ public sealed partial class FixpSession : IAsyncDisposable
                         _logger.LogWarning(ex,
                             "fixp session {ConnectionId} failed to reconcile outbound journal during takeover",
                             ConnectionId);
-                        return false;
+                        return SessionClaimRegistry.TakeOverCommitDecision.RollBack;
                     }
                 }
 
@@ -889,9 +905,46 @@ public sealed partial class FixpSession : IAsyncDisposable
                 // passive ER or deferred completion that linearizes after the
                 // commit blocks before sequence allocation until EstablishAck.
                 ResetBusinessAdmissionLocked();
-                commit();
-                return true;
+                return commit();
             }
+        }
+    }
+
+    internal bool TryRollOutboundJournalGenerationForFreshTakeOver(uint sessionId)
+    {
+        if (_outboundJournal is null)
+            return true;
+
+        try
+        {
+            _outboundJournal.RollGeneration(sessionId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to roll outbound journal generation for sessionId={SessionId}",
+                ConnectionId, sessionId);
+            return false;
+        }
+    }
+
+    internal bool TryRestoreRolledOutboundJournalGenerationForTakeOver(uint sessionId)
+    {
+        if (_outboundJournal is null)
+            return true;
+
+        try
+        {
+            _outboundJournal.RestoreLatestGeneration(sessionId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to restore rolled outbound journal generation for sessionId={SessionId}",
+                ConnectionId, sessionId);
+            return false;
         }
     }
 
