@@ -408,19 +408,24 @@ public class FixpSessionMassActionTakeoverTests
             listener, sessionVerId: 3);
         await journal.MaxSeqEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var replacement = listener.ActiveSessions.Single(
-            session => session.SessionVerId == 3);
+            session => !ReferenceEquals(session, oldSession));
         var closeTask = Task.Run(() =>
             replacement.Close("test-close-before-takeover-seal", CloseKind.TransportError));
         Assert.True(await TestUtil.WaitUntilAsync(
-            () => !replacement.IsLiveTakeOverCandidate,
+            () => !replacement.IsRegistered
+                && replacement.LastCloseKind == CloseKind.TransportError,
             TimeSpan.FromSeconds(5)));
 
         journal.ReleaseMaxSeq();
         await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(await TestUtil.WaitUntilAsync(
-            () => listener.ActiveSessions.Contains(oldSession)
-                && !listener.ActiveSessions.Contains(replacement),
+            () => !replacement.IsOpen
+                && registry.TryGet(new SessionId("1"), out var currentSession)
+                && ReferenceEquals(currentSession, oldSession)
+                && claims.TryGetActiveClaim(1, out var claimHolder, out var claimVersion)
+                && ReferenceEquals(claimHolder, oldSession)
+                && claimVersion == 2UL,
             TimeSpan.FromSeconds(5)));
         Assert.True(registry.TryGet(new SessionId("1"), out var current));
         Assert.Same(oldSession, current);

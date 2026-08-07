@@ -724,6 +724,31 @@ public sealed partial class FixpSession : IAsyncDisposable
         }
     }
 
+    private bool TrySeedOutboundSeqFromJournal(uint sessionId)
+    {
+        if (_outboundJournal is null)
+            return true;
+
+        try
+        {
+            uint current = (uint)Volatile.Read(ref _msgSeqNum);
+            uint resumedSeq = Math.Max(current, _outboundJournal.MaxSeq(sessionId));
+            if (resumedSeq != (uint)Volatile.Read(ref _msgSeqNum))
+            {
+                Volatile.Write(ref _msgSeqNum, resumedSeq);
+                _pendingNegotiateStateApplied = true;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "fixp session {ConnectionId} failed to reconcile outbound state for sessionId={SessionId}",
+                ConnectionId, sessionId);
+            return false;
+        }
+    }
+
     private void RollbackPendingNegotiateState()
     {
         if (!_pendingNegotiateStateApplied)

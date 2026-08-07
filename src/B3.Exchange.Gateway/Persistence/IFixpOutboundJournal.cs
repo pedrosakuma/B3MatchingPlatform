@@ -40,11 +40,13 @@ namespace B3.Exchange.Gateway.Persistence;
 /// boundary for I/O efficiency.</para>
 ///
 /// <para><b>Terminal removal</b>: <see cref="Remove"/> is called by
-/// <c>FixpSession.CloseLocked</c> only on terminal close events
-/// (peer-initiated <c>Terminate(Finished)</c>, suspended-timeout
-/// reaper). Graceful host shutdown does NOT remove journals — they
-/// must survive process restart so a reconnecting peer can recover
-/// every event produced while the matching-platform was down.</para>
+/// <c>FixpSession.CloseLocked</c> only on terminal close events that
+/// intentionally retire the durable replay history itself (for example
+/// peer-initiated <c>Terminate(Finished)</c> or daily/session-local
+/// teardown). Graceful host shutdown and suspended-timeout reaping do
+/// NOT remove journals — they must survive so retention/size policy,
+/// rather than wall-clock session-slot lifetime, remains the authority
+/// on what replay data is still servable.</para>
 ///
 /// <para><b>Boot rehydration</b>: <see cref="ListSessions"/> enumerates
 /// every session whose journal survived the last process exit. The
@@ -129,9 +131,9 @@ public interface IFixpOutboundJournal : IDisposable
     /// <summary>
     /// Terminal removal: deletes every artifact for
     /// <paramref name="sessionId"/>. Idempotent — safe to call when
-    /// nothing exists for the session. Called only on peer-initiated
-    /// <c>Terminate(Finished)</c> and on suspended-timeout reaping.
-    /// Graceful host shutdown must NOT call this.
+    /// nothing exists for the session. Called only when the close path
+    /// intentionally retires the durable replay history itself; not on
+    /// graceful host shutdown or suspended-timeout reaping.
     /// </summary>
     void Remove(uint sessionId);
 

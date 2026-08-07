@@ -418,23 +418,29 @@ public sealed partial class FixpSession
                     ConnectionId);
             }
         }
-        // Issue #289 / #405 / #416: terminal close ⇒ drop the persisted
-        // retransmit ring file AND the unbounded outbound journal AND
-        // the state snapshot. Scoped to terminal close kinds
-        // so transport-error and host-shutdown closes preserve state for
-        // the reconnecting peer to resync against (SBE 5.2 §1.5
-        // recoverable serverFlow). Non-removing kinds also save the
-        // final state so the resume point on reconnect is accurate.
-        bool removePersistence =
+        // Issue #289 / #405 / #416 / #594: terminal close kinds still
+        // retire the in-memory replay window and the FIXP resumability
+        // snapshot, but SuspendedTimeout no longer preempts the durable
+        // journal's own retention policy. The reaper frees the session slot;
+        // the journal decides when bytes are no longer servable.
+        bool removeStateSnapshot =
             kind == CloseKind.PeerTerminate
             || kind == CloseKind.LocalTerminate
             || kind == CloseKind.KeepaliveLapsed
             || kind == CloseKind.SuspendedTimeout
             || kind == CloseKind.DailyReset;
-        if (removePersistence)
+        bool removeOutboundJournal =
+            kind == CloseKind.PeerTerminate
+            || kind == CloseKind.LocalTerminate
+            || kind == CloseKind.KeepaliveLapsed
+            || kind == CloseKind.DailyReset;
+        if (removeStateSnapshot)
         {
             _retxBuffer.Dispose();
-            if (ownsLogicalSession && _outboundJournal is not null && SessionId != 0)
+            if (removeOutboundJournal
+                && ownsLogicalSession
+                && _outboundJournal is not null
+                && SessionId != 0)
             {
                 try { _outboundJournal.Remove(SessionId); }
                 catch (Exception ex)

@@ -84,14 +84,29 @@ public sealed partial class FixpSession
                 return NegotiateStep.Rejected(rejectFrame,
                     $"negotiate-reject (legacy, ALREADY_NEGOTIATED, action={action})");
             }
+            SessionId = req.SessionId;
+            EnteringFirm = req.EnteringFirm;
+            SessionVerId = req.SessionVerId;
+            if (!TrySeedOutboundSeqFromJournal(req.SessionId))
+            {
+                State = FixpState.Idle;
+                SessionId = _acceptedSessionId;
+                SessionVerId = 0;
+                EnteringFirm = _acceptedEnteringFirm;
+                RollbackPendingNegotiateState();
+                var rejectFrame = new byte[NegotiateRejectEncoder.Total];
+                NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
+                    req.TimestampNanos, enteringFirm: null,
+                    B3.Entrypoint.Fixp.Sbe.V6.NegotiationRejectCode.UNSPECIFIED,
+                    currentSessionVerId: null);
+                return NegotiateStep.Rejected(rejectFrame,
+                    "negotiate-reject (legacy, outbound state reconcile failed)");
+            }
             // Issue #485: update Identity to stable FIXP SessionId (legacy path).
             UpdateIdentityAfterNegotiate(
                 req.SessionId,
                 replaceRetired: true,
                 out _);
-            SessionId = req.SessionId;
-            EnteringFirm = req.EnteringFirm;
-            SessionVerId = req.SessionVerId;
             var frame = new byte[NegotiateResponseEncoder.Total];
             NegotiateResponseEncoder.Encode(frame, req.SessionId, req.SessionVerId,
                 req.TimestampNanos, req.EnteringFirm,
@@ -183,7 +198,8 @@ public sealed partial class FixpSession
         }
 
         _claimedSessionId = req.SessionId;
-        if (!TryApplyPendingNegotiateState(req.SessionId))
+        if (!TryApplyPendingNegotiateState(req.SessionId)
+            || !TrySeedOutboundSeqFromJournal(req.SessionId))
         {
             if (evictedByTakeOver is not null)
             {
@@ -204,6 +220,7 @@ public sealed partial class FixpSession
             }
             _claims.Release(req.SessionId, this);
             _claimedSessionId = 0;
+            RollbackPendingNegotiateState();
             var rejectFrame = new byte[NegotiateRejectEncoder.Total];
             NegotiateRejectEncoder.Encode(rejectFrame, req.SessionId, req.SessionVerId,
                 req.TimestampNanos, enteringFirm: null,
