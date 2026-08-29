@@ -10,7 +10,7 @@ public class InstrumentLoaderOptionsTests
         var inst = InstrumentLoader.LoadFromString(BuildOptionJson(("optPayoutType", "\"Binary\"")))[0];
 
         Assert.Equal(32.00m, inst.StrikePrice);
-        Assert.Equal(new DateOnly(2026, 8, 21), inst.ExpirationDate);
+        Assert.Equal(FutureExpirationDate, inst.ExpirationDate);
         Assert.Equal(PutOrCall.Call, inst.PutOrCall);
         Assert.Equal(ExerciseStyle.American, inst.ExerciseStyle);
         Assert.Equal(900000000001L, inst.UnderlyingSecurityId);
@@ -85,6 +85,12 @@ public class InstrumentLoaderOptionsTests
         Assert.Contains("expirationDate must be today or later", ex.Message);
     }
 
+    // Options are rejected once expired (see Load_ExpiredOption_Throws), so the
+    // fixture date must always stay in the future relative to "today" rather
+    // than a hardcoded value that eventually lapses and breaks every other
+    // test in this file.
+    private static readonly DateOnly FutureExpirationDate = DateOnly.FromDateTime(DateTime.UtcNow).AddYears(1);
+
     private static string BuildOptionJson((string Key, string Value)? overrideField = null, string[]? omitFields = null)
     {
         var fields = new Dictionary<string, string>
@@ -99,7 +105,7 @@ public class InstrumentLoaderOptionsTests
             ["isin"] = "\"BROPTEST0001\"",
             ["securityType"] = "\"OPT\"",
             ["strikePrice"] = "\"32.00\"",
-            ["expirationDate"] = "\"2026-08-21\"",
+            ["expirationDate"] = $"\"{FutureExpirationDate:yyyy-MM-dd}\"",
             ["putOrCall"] = "\"Call\"",
             ["exerciseStyle"] = "\"American\"",
             ["underlyingSecurityId"] = "900000000001",
