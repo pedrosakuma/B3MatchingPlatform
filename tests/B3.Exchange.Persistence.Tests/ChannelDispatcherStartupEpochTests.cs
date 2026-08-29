@@ -86,6 +86,18 @@ public sealed class ChannelDispatcherStartupEpochTests
 
         public List<byte[]> Packets { get; } = new();
 
+        // Issue #596: the dispatch loop publishes packets from its own
+        // dedicated thread while tests poll for them from the xUnit test
+        // thread via WaitFor. Reading `Packets.Count` unsynchronized is a
+        // genuine data race — nothing forces the polling thread to observe
+        // the writer's mutations, so a sufficiently aggressive (Release-mode)
+        // JIT is free to cache/hoist the stale value for the lifetime of the
+        // poll loop, making the 5s deadline expire on a value that was never
+        // re-read. Debug's weaker optimizer happened to reload it, masking
+        // the bug there. Route the polled count through the same lock the
+        // writer takes so the read has a real happens-before edge.
+        public int Count { get { lock (Packets) return Packets.Count; } }
+
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet)
         {
             ushort version = MemoryMarshal.Read<ushort>(
@@ -332,7 +344,7 @@ public sealed class ChannelDispatcherStartupEpochTests
         // Snapshot rotation now emits the book snapshot packet followed by a
         // standalone SecurityStatus_3 recovery packet for the instrument
         // (issue #583), so a single tick yields 2 packets, not 1.
-        Assert.True(WaitFor(() => snapshotSink.Packets.Count == 2));
+        Assert.True(WaitFor(() => snapshotSink.Count == 2));
         Assert.True(SnapshotFullRefresh_Header_30Data.TryParse(
             snapshotSink.Packets[0].AsSpan(
                 SnapshotFrameOffset, WireOffsets.SnapHeaderBlockLength),
@@ -348,7 +360,7 @@ public sealed class ChannelDispatcherStartupEpochTests
                 "LIVE-BID", Petr, Side.Buy, OrderType.Limit, TimeInForce.Day,
                 Px(9.00m), 100, 505, 6_000),
             new SessionId("50005"), enteringFirm: 505, clOrdIdValue: 0xA005));
-        Assert.True(WaitFor(() => incremental.Packets.Count == 2));
+        Assert.True(WaitFor(() => incremental.Count == 2));
 
         Assert.Equal(5L, Assert.Single(outbound.Accepted).OrderId);
         AssertPacketHeader(incremental.Packets[1], expectedVersion: 10, expectedSequence: 2);
