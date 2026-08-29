@@ -364,6 +364,12 @@ public sealed class ChannelDispatcherStartupEpochTests
 
         Assert.Equal(5L, Assert.Single(outbound.Accepted).OrderId);
         AssertPacketHeader(incremental.Packets[1], expectedVersion: 10, expectedSequence: 2);
+        // The dispatch loop publishes the incremental packet (observed above
+        // via incremental.Count) before it persists the post-command
+        // snapshot, so waiting only on the packet count leaves a window
+        // where persister.Last can still report the prior sequence number.
+        // Wait for the persisted state to catch up too before asserting on it.
+        Assert.True(WaitFor(() => persister.Last.SequenceNumber == 2u));
         Assert.Equal((ushort)10, persister.Last.SequenceVersion);
         Assert.Equal(2u, persister.Last.SequenceNumber);
 
