@@ -5,7 +5,21 @@
     <RootNamespace>B3.Exchange.Host</RootNamespace>
     <AssemblyName>B3.Exchange.Host</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- Issue #608 (soak RSS growth): Server GC allocates one heap per
+         logical processor and sizes each heap's gen0 budget for
+         high-throughput, multi-core workloads. This host's hot path is
+         one dispatch thread per channel (ADR: single-writer matching
+         engine, see ChannelDispatcher), so Server GC's oversized gen0
+         budgets went uncollected for the entire soak window under the
+         synthetic trader's light order flow (~20 msg/s), producing a
+         steady, unbounded-looking RSS climb (confirmed via
+         dotnet-diagnostics: zero GC events over 60s while gc-heap-size
+         and working-set climbed in lockstep; forcing Workstation GC via
+         DOTNET_gcServer=0 kept RSS flat under the identical workload).
+         Workstation GC's much smaller gen0 budget collects far more
+         often, matching this host's low-thread-count, latency-sensitive
+         profile. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
