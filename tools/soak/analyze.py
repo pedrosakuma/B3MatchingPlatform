@@ -104,6 +104,37 @@ def main(csv_path: str) -> int:
         f"{statistics.mean(threads):.1f} | {linear_slope(slope_times, slope_thr) * 3600:+.2f}/h |"
     )
 
+    # Issue #608 follow-up: sample.sh (post soak-121) also captures a
+    # resident-memory breakdown (Pss_Anon/Pss_File/Pss_Shmem from
+    # smaps_rollup) and the managed heap size (dotnet_total_memory_bytes).
+    # Report them informationally — not gated by a threshold yet — so a
+    # failing run's artifact directly shows whether the RSS growth tracks
+    # the managed heap (real GC-visible leak) or is native/off-heap
+    # (mmap'd buffers, socket buffers, etc.). Guarded with .get() so older
+    # CSVs captured before this column existed still parse.
+    if rows[0].get("pss_anon_kb") is not None:
+        pss_anon_mb = [float(r.get("pss_anon_kb", 0) or 0) / 1024.0 for r in rows]
+        pss_file_mb = [float(r.get("pss_file_kb", 0) or 0) / 1024.0 for r in rows]
+        pss_shmem_mb = [float(r.get("pss_shmem_kb", 0) or 0) / 1024.0 for r in rows]
+        heap_mb = [float(r.get("dotnet_heap_bytes", 0) or 0) / (1024.0 * 1024.0) for r in rows]
+        slope_anon = [pss_anon_mb[i] for i in range(slope_start, len(rows))]
+        slope_heap = [heap_mb[i] for i in range(slope_start, len(rows))]
+
+        print()
+        print("### Memory breakdown (diagnostic, no threshold)")
+        print("| metric | first | last | peak | slope (post-warmup) |")
+        print("|---|---|---|---|---|")
+        print(
+            f"| Pss_Anon (MB) | {pss_anon_mb[0]:.1f} | {pss_anon_mb[-1]:.1f} | {max(pss_anon_mb):.1f} | "
+            f"{linear_slope(slope_times, slope_anon) * 3600:+.2f} MB/h |"
+        )
+        print(f"| Pss_File (MB) | {pss_file_mb[0]:.1f} | {pss_file_mb[-1]:.1f} | {max(pss_file_mb):.1f} | — |")
+        print(f"| Pss_Shmem (MB) | {pss_shmem_mb[0]:.1f} | {pss_shmem_mb[-1]:.1f} | {max(pss_shmem_mb):.1f} | — |")
+        print(
+            f"| Managed heap (MB) | {heap_mb[0]:.1f} | {heap_mb[-1]:.1f} | {max(heap_mb):.1f} | "
+            f"{linear_slope(slope_times, slope_heap) * 3600:+.2f} MB/h |"
+        )
+
     print()
     print("### Thresholds (override with env vars)")
     print(f"- `RSS_SLOPE_MAX_MB_PER_H` = {rss_slope_max_mb_per_h}")
