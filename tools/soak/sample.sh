@@ -39,9 +39,13 @@ end_ts=$((start_ts + DURATION_SECONDS))
 
 scrape_counter() {
     # $1: prom name; emit value or 0 if missing.
+    # The `|| true` shields a transient curl failure (timeout, connection
+    # refused, non-2xx via -f) from `pipefail`: without it, `set -e` would
+    # abort the whole sampler loop on one bad scrape instead of falling
+    # back to 0 for this sample, per the doc comment above.
     local name="$1"
     if [[ -z "$METRICS_URL" ]]; then echo 0; return; fi
-    curl -fs --max-time 2 "$METRICS_URL" 2>/dev/null \
+    { curl -fs --max-time 2 "$METRICS_URL" 2>/dev/null || true; } \
         | awk -v n="$name" '$1 == n { print $2; found=1; exit } END { if (!found) print 0 }'
 }
 
