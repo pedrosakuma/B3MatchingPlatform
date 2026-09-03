@@ -17,7 +17,10 @@ on:
         required: false
         default: '10'
       synth_clients:
-        description: 'Number of synthetic-trader processes to launch.'
+        description: >-
+          Number of synthetic-trader processes to launch (1-10 — capped by
+          the number of FIXP sessions pre-provisioned in
+          config/exchange-simulator.soak.json).
         required: false
         default: '2'
       host_malloc_arena_max:
@@ -127,6 +130,12 @@ jobs:
         # sometimes zeroing out the load a run actually applied.
         run: |
           set -euo pipefail
+          if (( SYNTH_CLIENTS > 10 )); then
+            echo "synth_clients=${SYNTH_CLIENTS} exceeds the 10 FIXP sessions" >&2
+            echo "pre-provisioned in config/exchange-simulator.soak.json (100-109)." >&2
+            echo "Add more sessions there before raising this limit." >&2
+            exit 1
+          fi
           mkdir -p artifacts/soak/traders
           for i in $(seq 1 "${SYNTH_CLIENTS}"); do
             SYNTH_TRADER_SESSION_ID=$((99 + i)) \
