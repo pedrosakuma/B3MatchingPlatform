@@ -20,6 +20,14 @@ on:
         description: 'Number of synthetic-trader processes to launch.'
         required: false
         default: '2'
+      host_malloc_arena_max:
+        description: >-
+          Issue #608 experiment: sets MALLOC_ARENA_MAX on the host process
+          to test whether glibc arena fragmentation explains the
+          Pss_Anon/RSS growth that isn't visible in the managed GC heap.
+          Leave blank for default glibc behavior.
+        required: false
+        default: ''
 
 concurrency:
   group: soak-${{ github.workflow }}-${{ github.ref }}
@@ -39,6 +47,7 @@ jobs:
     env:
       DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || (github.event_name == 'schedule' && '60') || '10' }}
       SYNTH_CLIENTS: ${{ github.event.inputs.synth_clients || '2' }}
+      HOST_MALLOC_ARENA_MAX: ${{ github.event.inputs.host_malloc_arena_max || '' }}
 
     steps:
       - name: Checkout
@@ -76,6 +85,14 @@ jobs:
           # The soak config sets `auth.requireFixpHandshake=false` so the
           # SyntheticTrader (which speaks the SBE business protocol but not
           # FIXP Negotiate/Establish) can sustain a connection.
+          # Issue #608 experiment: optionally cap glibc's arena count to
+          # test whether malloc-arena fragmentation explains the observed
+          # Pss_Anon/RSS growth that isn't visible in the managed GC heap.
+          # Unset (default) reproduces normal glibc behavior unchanged.
+          if [[ -n "${HOST_MALLOC_ARENA_MAX}" ]]; then
+            export MALLOC_ARENA_MAX="${HOST_MALLOC_ARENA_MAX}"
+            echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX} (issue #608 experiment)"
+          fi
           nohup dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
             config/exchange-simulator.soak.json \
             > artifacts/soak/host.log 2>&1 &
@@ -167,6 +184,10 @@ jobs:
           {
             echo "## Soak summary"
             echo
+            if [[ -n "${HOST_MALLOC_ARENA_MAX}" ]]; then
+              echo "_Issue #608 experiment: MALLOC_ARENA_MAX=${HOST_MALLOC_ARENA_MAX} on the host process._"
+              echo
+            fi
             cat artifacts/soak/summary.md
             echo
             echo "<details><summary>First 10 + last 10 samples</summary>"
