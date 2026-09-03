@@ -22,12 +22,13 @@ on:
         default: '2'
       host_malloc_arena_max:
         description: >-
-          Issue #608 experiment: sets MALLOC_ARENA_MAX on the host process
-          to test whether glibc arena fragmentation explains the
-          Pss_Anon/RSS growth that isn't visible in the managed GC heap.
-          Leave blank for default glibc behavior.
+          Issue #608: sets MALLOC_ARENA_MAX on the host process. Confirmed
+          via A/B soak testing that capping glibc's arena count roughly
+          halves the native RSS/Pss_Anon growth rate that isn't visible in
+          the managed GC heap; defaults to 1 to match production
+          (Dockerfile). Leave blank for default (unbounded) glibc behavior.
         required: false
-        default: ''
+        default: '1'
 
 concurrency:
   group: soak-${{ github.workflow }}-${{ github.ref }}
@@ -47,7 +48,7 @@ jobs:
     env:
       DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || (github.event_name == 'schedule' && '60') || '10' }}
       SYNTH_CLIENTS: ${{ github.event.inputs.synth_clients || '2' }}
-      HOST_MALLOC_ARENA_MAX: ${{ github.event.inputs.host_malloc_arena_max || '' }}
+      HOST_MALLOC_ARENA_MAX: ${{ github.event.inputs.host_malloc_arena_max || '1' }}
 
     steps:
       - name: Checkout
@@ -82,16 +83,18 @@ jobs:
           # Run the published DLL directly (not `dotnet run --project`) so
           # the working directory stays at the repo root and the relative
           # `instruments` path inside the JSON resolves correctly.
-          # The soak config sets `auth.requireFixpHandshake=false` so the
-          # SyntheticTrader (which speaks the SBE business protocol but not
-          # FIXP Negotiate/Establish) can sustain a connection.
-          # Issue #608 experiment: optionally cap glibc's arena count to
-          # test whether malloc-arena fragmentation explains the observed
-          # Pss_Anon/RSS growth that isn't visible in the managed GC heap.
-          # Unset (default) reproduces normal glibc behavior unchanged.
+          # The soak config keeps `auth.requireFixpHandshake=true` (the
+          # production default); each synthetic-trader instance negotiates
+          # its own FIXP session (see "Start synthetic traders" below).
+          # Issue #608: cap glibc's arena count to avoid malloc-arena
+          # fragmentation, which A/B soak testing confirmed explains a
+          # significant share of the native RSS/Pss_Anon growth that isn't
+          # visible in the managed GC heap. Defaults to 1 (matches
+          # production Dockerfile); leave the dispatch input blank to
+          # reproduce unbounded glibc behavior for comparison.
           if [[ -n "${HOST_MALLOC_ARENA_MAX}" ]]; then
             export MALLOC_ARENA_MAX="${HOST_MALLOC_ARENA_MAX}"
-            echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX} (issue #608 experiment)"
+            echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX} (issue #608)"
           fi
           nohup dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
             config/exchange-simulator.soak.json \
@@ -114,19 +117,24 @@ jobs:
           exit 1
 
       - name: Start synthetic traders
-        # The soak host config sets `auth.requireFixpHandshake = false` so
-        # SyntheticTrader can drive sustained load over its existing SBE
-        # send loop without implementing the FIXP Negotiate/Establish
-        # handshake. Production hosts leave the flag at its default (true).
+        # The soak host config keeps `auth.requireFixpHandshake = true` (the
+        # production default) and provisions one FIXP session per trader
+        # instance (see config/exchange-simulator.soak.json). Issue #608:
+        # each trader gets a distinct SYNTH_TRADER_SESSION_ID so they don't
+        # collide on the same sessionId and lose the negotiate race against
+        # each other -- previously all instances shared sessionId="100" from
+        # the trader config file, and the losers crashed on startup,
+        # sometimes zeroing out the load a run actually applied.
         run: |
           set -euo pipefail
           mkdir -p artifacts/soak/traders
           for i in $(seq 1 "${SYNTH_CLIENTS}"); do
-            nohup dotnet src/B3.Exchange.SyntheticTrader/bin/Release/net10.0/B3.Exchange.SyntheticTrader.dll \
+            SYNTH_TRADER_SESSION_ID=$((99 + i)) \
+              nohup dotnet src/B3.Exchange.SyntheticTrader/bin/Release/net10.0/B3.Exchange.SyntheticTrader.dll \
               config/synthetic-trader.soak.json \
               > "artifacts/soak/traders/trader-${i}.log" 2>&1 &
             pid=$!
-            echo "trader ${i} PID: ${pid}"
+            echo "trader ${i} PID: ${pid} sessionId=$((99 + i))"
             echo "${pid}" >> artifacts/soak/trader-pids.txt
           done
           sleep 5

@@ -3,6 +3,14 @@
   // FIXP handshake path via the synthetic trader's FixpClient. Declares one
   // firm + one session so the soak runner authenticates exactly like a real
   // OMS would in prod. devMode=true keeps access keys optional.
+  //
+  // Issue #608: soak.yml launches multiple trader processes, each given a
+  // distinct sessionId via SYNTH_TRADER_SESSION_ID ("100", "101", ...).
+  // Previously every trader instance shared the sessionId="100" from the
+  // trader config file, so only one won the FIXP negotiate race per run and
+  // the rest crashed on startup -- non-deterministically reducing (and
+  // occasionally zeroing out) the load a soak run actually applied. Ten
+  // sessions comfortably covers any plausible synth_clients count.
   "tcp": {
     "listen": "0.0.0.0:9876",
     "enteringFirm": 1,
@@ -16,7 +24,16 @@
     { "id": "soakFirm", "name": "Soak Firm", "enteringFirmCode": 1 }
   ],
   "sessions": [
-    { "sessionId": "100", "firmId": "soakFirm" }
+    { "sessionId": "100", "firmId": "soakFirm" },
+    { "sessionId": "101", "firmId": "soakFirm" },
+    { "sessionId": "102", "firmId": "soakFirm" },
+    { "sessionId": "103", "firmId": "soakFirm" },
+    { "sessionId": "104", "firmId": "soakFirm" },
+    { "sessionId": "105", "firmId": "soakFirm" },
+    { "sessionId": "106", "firmId": "soakFirm" },
+    { "sessionId": "107", "firmId": "soakFirm" },
+    { "sessionId": "108", "firmId": "soakFirm" },
+    { "sessionId": "109", "firmId": "soakFirm" }
   ],
   "http": {
     "listen": "0.0.0.0:8080",

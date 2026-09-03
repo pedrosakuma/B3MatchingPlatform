@@ -17,6 +17,16 @@ catch (Exception ex)
     return 3;
 }
 
+// Issue #608: soak.yml launches multiple trader processes off the *same*
+// config file. Without this override every instance would present the
+// same FIXP sessionId, so only one wins the negotiate race and the rest
+// crash on startup -- silently reducing the soak test's applied load
+// (occasionally to zero, defeating the whole point of the run). Set to
+// give each launched instance a distinct session identity.
+var sessionIdOverride = Environment.GetEnvironmentVariable("SYNTH_TRADER_SESSION_ID");
+if (!string.IsNullOrEmpty(sessionIdOverride) && cfg.Fixp != null)
+    cfg.Fixp.SessionId = sessionIdOverride;
+
 void Info(string s) => Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss.fff}Z] {s}");
 void Warn(string s) => Console.Error.WriteLine($"[{DateTime.UtcNow:HH:mm:ss.fff}Z] WARN {s}");
 void Debug(string s)
