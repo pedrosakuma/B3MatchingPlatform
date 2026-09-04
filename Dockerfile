@@ -28,6 +28,16 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /app .
 
+# Issue #608: soak testing showed glibc's default arena count (8 * ncpus)
+# lets native malloc arenas fragment under sustained operation, growing
+# resident memory (RSS) steadily over hours even though the managed GC
+# heap stays flat -- confirmed by an A/B soak run (MALLOC_ARENA_MAX=1 cut
+# the RSS growth rate roughly in half vs. the glibc default). Capping to a
+# single arena trades a little malloc concurrency (irrelevant here: this
+# process runs Workstation GC with a modest thread count) for materially
+# better long-run memory stability.
+ENV MALLOC_ARENA_MAX=1
+
 # Issue #260: persistence snapshots (when the channel config opts in via
 # a `persistence.dataDir` block) are written here. Mount a durable volume
 # at this path (e.g. `-v b3matching-state:/var/lib/b3matching`) for

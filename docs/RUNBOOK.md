@@ -634,14 +634,41 @@ HOST_PID=$HOST_PID OUTPUT_CSV=/tmp/samples.csv DURATION_SECONDS=900 \
 python3 tools/soak/analyze.py /tmp/samples.csv
 ```
 
-**Note on the soak config:** `config/exchange-simulator.soak.json` sets
-`auth.requireFixpHandshake = false` so the SyntheticTrader's plain-SBE
-business protocol can drive sustained client load. Production hosts
-must keep the flag at its default (`true`).
+**Note on the soak config:** `config/exchange-simulator.soak.json` keeps
+`auth.requireFixpHandshake = true` (the production default) and
+provisions the production FIXP Negotiate/Establish handshake path via
+the synthetic trader's `FixpClient`. It pre-provisions ten sessions
+(`"100"`-`"109"`) against one firm so multiple trader instances can each
+negotiate their own session — see §1.3 and `.github/workflows/soak.yml`'s
+`SYNTH_TRADER_SESSION_ID` env var (issue #608).
 
 ---
 
 ## 6. Common tuning + debugging
+
+### 6.0 Long-run native memory growth (RSS climbing, managed heap flat)
+
+Issue #608: soak testing found RSS growing steadily for hours (~45-130
+MB/h depending on load) while `GC.GetTotalMemory` (the managed heap,
+exposed as `dotnet_total_memory_bytes` on `/metrics`) stayed flat — i.e.
+not a C# object leak. `/proc/$PID/smaps_rollup`'s `Pss_Anon` field tracked
+the RSS growth closely. An A/B soak comparison confirmed glibc's default
+arena count (`8 * ncpus`) fragmenting under sustained `malloc`/`free`
+churn as a real, significant contributor: capping to a single arena cut
+the RSS growth rate roughly in half.
+
+The published Docker image sets `MALLOC_ARENA_MAX=1` already (see
+`Dockerfile`). If you run the host directly with `dotnet run`/the
+published DLL (§1.1) instead of the container, set it yourself:
+
+```bash
+MALLOC_ARENA_MAX=1 dotnet src/B3.Exchange.Host/bin/Release/net10.0/B3.Exchange.Host.dll \
+  config/exchange-simulator.json
+```
+
+If you still see RSS growth after this, compare `Pss_Anon` (native) vs
+`dotnet_total_memory_bytes` (managed) over a long run before assuming
+it's a new leak — see §5.8's sampler, which captures both.
 
 ### 6.1 "Liveness probe is flapping"
 
