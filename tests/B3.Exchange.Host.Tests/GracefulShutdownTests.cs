@@ -1,8 +1,11 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Text;
 using B3.EntryPoint.Wire;
 using B3.Exchange.Core;
+using B3.Exchange.Gateway.Persistence;
 using B3.Exchange.TestSupport;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Exchange.Host.Tests;
 
@@ -17,6 +20,8 @@ namespace B3.Exchange.Host.Tests;
 /// </summary>
 public class GracefulShutdownTests
 {
+    private const long Petr = 900_000_000_001L;
+
     private sealed class NullSink : IUmdfPacketSink
     {
         public void Publish(byte channelNumber, ReadOnlySpan<byte> packet) { }
@@ -121,6 +126,114 @@ public class GracefulShutdownTests
         Assert.True(sw.ElapsedMilliseconds < 500, $"second StopAsync should short-circuit, took {sw.ElapsedMilliseconds}ms");
     }
 
+    [Fact]
+    public async Task StopAsync_WithRetransmitPersistenceDir_PreservesFixpStateAndJournal_ForEstablishResume()
+    {
+        const uint sessionId = 613;
+        const ulong sessionVerId = 9;
+        const uint enteringFirm = 7;
+
+        var root = CreateRepoTestDir("graceful-shutdown-fixp-");
+        try
+        {
+            var cfg = BuildConfig();
+            cfg.Auth = new AuthConfig { DevMode = true, RequireFixpHandshake = true };
+            cfg.Tcp.RetransmitPersistenceDir = root;
+            cfg.Tcp.HeartbeatIntervalMs = 60_000;
+            cfg.Tcp.IdleTimeoutMs = 60_000;
+            cfg.Tcp.TestRequestGraceMs = 60_000;
+            cfg.Firms.Add(new FirmConfig
+            {
+                Id = "firm-613",
+                Name = "Issue 613 regression",
+                EnteringFirmCode = enteringFirm,
+            });
+            cfg.Sessions.Add(new SessionConfig
+            {
+                SessionId = sessionId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                FirmId = "firm-613",
+            });
+
+            await using (var host = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink()))
+            {
+                await host.StartAsync();
+                var ep = host.TcpEndpoint!;
+
+                using var client = new TcpClient();
+                await client.ConnectAsync(ep.Address, ep.Port);
+                var stream = client.GetStream();
+
+                await WriteNegotiateAsync(stream, sessionId, sessionVerId, enteringFirm);
+                Assert.Equal(EntryPointFrameReader.TidNegotiateResponse,
+                    (await ReadFrameAsync(stream, TimeSpan.FromSeconds(5))).TemplateId);
+
+                await WriteEstablishAsync(stream, sessionId, sessionVerId, nextSeqNo: 1);
+                var establishAck = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck, establishAck.TemplateId);
+                Assert.True(EntryPointFixpFrameCodec.TryDecodeEstablishAck(establishAck.Body, out var ack));
+                Assert.Equal(1u, ack.NextSeqNo);
+
+                await stream.WriteAsync(BuildSimpleNewOrder(
+                    clOrdId: 61301,
+                    secId: Petr,
+                    side: '1',
+                    ordType: '2',
+                    tif: '0',
+                    qty: 100,
+                    priceMantissa: 123_400,
+                    sessionId: sessionId,
+                    msgSeqNum: 1));
+
+                var er = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+                Assert.Equal(EntryPointFrameReader.TidExecutionReportNew, er.TemplateId);
+
+                await host.StopAsync();
+            }
+
+            using (var persister = new FileFixpSessionStatePersister(
+                root,
+                NullLogger<FileFixpSessionStatePersister>.Instance))
+            {
+                var snapshot = persister.Load(sessionId);
+                Assert.NotNull(snapshot);
+                Assert.Equal(sessionVerId, snapshot.Value.SessionVerId);
+                Assert.Equal(1u, snapshot.Value.OutboundMsgSeqNum);
+                Assert.Equal(1u, snapshot.Value.LastIncomingSeqNo);
+            }
+
+            using (var journal = new FileFixpOutboundJournal(
+                root,
+                NullLogger<FileFixpOutboundJournal>.Instance))
+            {
+                Assert.Equal(1u, journal.MaxSeq(sessionId));
+                Assert.Single(journal.ReadRange(sessionId, fromSeq: 1, count: 10));
+            }
+
+            await using (var restarted = new ExchangeHost(cfg, packetSinkFactory: _ => new NullSink()))
+            {
+                await restarted.StartAsync();
+                var ep = restarted.TcpEndpoint!;
+
+                using var client = new TcpClient();
+                await client.ConnectAsync(ep.Address, ep.Port);
+                var stream = client.GetStream();
+
+                await WriteEstablishAsync(stream, sessionId, sessionVerId, nextSeqNo: 2);
+                var resumedAckFrame = await ReadFrameAsync(stream, TimeSpan.FromSeconds(5));
+                Assert.Equal(EntryPointFrameReader.TidEstablishAck, resumedAckFrame.TemplateId);
+                Assert.True(EntryPointFixpFrameCodec.TryDecodeEstablishAck(resumedAckFrame.Body, out var resumedAck));
+                Assert.Equal(sessionVerId, resumedAck.SessionVerId);
+                Assert.Equal(2u, resumedAck.NextSeqNo);
+
+                await restarted.StopAsync();
+            }
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static ShutdownReadinessProbe GetShutdownProbe(ExchangeHost host)
     {
         var f = typeof(ExchangeHost)
@@ -158,5 +271,79 @@ public class GracefulShutdownTests
             if (n <= 0) throw new EndOfStreamException("connection closed");
             read += n;
         }
+    }
+
+    private static async Task WriteNegotiateAsync(NetworkStream stream, uint sessionId, ulong sessionVerId, uint enteringFirm)
+    {
+        var credentials = Encoding.ASCII.GetBytes($"{{\"auth_type\":\"basic\",\"username\":\"{sessionId}\",\"access_key\":\"\"}}");
+        var buffer = new byte[EntryPointFrameReader.MaxInboundMessageLength];
+        int length = EntryPointFixpFrameCodec.EncodeNegotiate(
+            buffer,
+            sessionId,
+            sessionVerId,
+            timestampNanos: 0,
+            enteringFirm,
+            onBehalfFirm: null,
+            credentials,
+            clientIp: "127.0.0.1"u8,
+            clientAppName: "test"u8,
+            clientAppVersion: "1"u8);
+        await stream.WriteAsync(buffer.AsMemory(0, length));
+    }
+
+    private static async Task WriteEstablishAsync(NetworkStream stream, uint sessionId, ulong sessionVerId, uint nextSeqNo)
+    {
+        var buffer = new byte[EntryPointFrameReader.MaxInboundMessageLength];
+        int length = EntryPointFixpFrameCodec.EncodeEstablish(
+            buffer,
+            sessionId,
+            sessionVerId,
+            timestampNanos: 0,
+            keepAliveIntervalMillis: 60_000,
+            nextSeqNo,
+            cancelOnDisconnectType: 0,
+            codTimeoutWindowMillis: 0,
+            credentials: ReadOnlySpan<byte>.Empty);
+        await stream.WriteAsync(buffer.AsMemory(0, length));
+    }
+
+    private static byte[] BuildSimpleNewOrder(ulong clOrdId, long secId, char side, char ordType,
+        char tif, long qty, long priceMantissa, uint sessionId, uint msgSeqNum)
+    {
+        var frame = new byte[EntryPointFrameReader.WireHeaderSize + 82];
+        EntryPointFrameReader.WriteHeader(frame.AsSpan(0, EntryPointFrameReader.WireHeaderSize),
+            messageLength: (ushort)frame.Length,
+            blockLength: 82,
+            templateId: EntryPointFrameReader.TidSimpleNewOrder,
+            version: 2);
+
+        var body = frame.AsSpan(EntryPointFrameReader.WireHeaderSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(0, 4), sessionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.Slice(4, 4), msgSeqNum);
+        ulong sendingTimeNanos = checked((ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000UL);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(8, 8), sendingTimeNanos);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.Slice(20, 8), clOrdId);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(48, 8), secId);
+        body[56] = (byte)side;
+        body[57] = (byte)ordType;
+        body[58] = (byte)tif;
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(60, 8), qty);
+        BinaryPrimitives.WriteInt64LittleEndian(body.Slice(68, 8), priceMantissa);
+        return frame;
+    }
+
+    private static string CreateRepoTestDir(string prefix)
+    {
+        var config = TestPaths.ResolveRepoFile("config/instruments-eqt.json");
+        var repoRoot = Directory.GetParent(Path.GetDirectoryName(config)!)!.FullName;
+        var dir = Path.Combine(repoRoot, "artifacts", "test-dirs", prefix + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void TryDelete(string dir)
+    {
+        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+        catch { }
     }
 }
