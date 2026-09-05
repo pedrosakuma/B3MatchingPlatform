@@ -290,6 +290,22 @@ public sealed class FileFixpOutboundJournalTests : IDisposable
     }
 
     [Fact]
+    public void Append_increments_cumulative_journal_metrics()
+    {
+        var metrics = new FixpJournalMetrics();
+        using var j = NewJournal(metrics: metrics);
+        const uint sid = 0x615u;
+
+        j.Append(sid, 1, 1, Frame(1, extraBytes: 96));
+        j.Append(sid, 2, 2, Frame(2, extraBytes: 10));
+
+        var snap = Assert.Single(metrics.Snapshot());
+        Assert.Equal(154L, snap.AppendedBytes);
+        Assert.Equal(2L, snap.AppendedFrames);
+        Assert.Equal(154L, snap.Bytes);
+    }
+
+    [Fact]
     public void Bytes_quota_without_peer_ack_warns_and_allows_growth()
     {
         // record overhead 20 + frame 100 = 120 bytes per record.

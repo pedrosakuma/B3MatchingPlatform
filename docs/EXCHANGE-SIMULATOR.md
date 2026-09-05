@@ -167,6 +167,16 @@ Exposes:
   trade reference exists yet, the decoder accepts and leaves downstream
   validation unchanged. Breaches produce
   `ER_Reject(OrdRejReason=16 Price exceeds current price band)`.
+* `tcp.retransmitPersistenceDir` — directory for durable FIXP session-resync
+  state. Empty/unset disables it, so a process restart forces peers down the
+  renegotiate path even if channel WAL/snapshots preserved the public book.
+* `tcp.maxJournalBytes` — per-session outbound retransmit journal byte budget.
+  Default `268435456` (256 MiB). Rotation is ACK-watermark-gated: if no
+  segment is provably safe to delete, the journal is allowed to grow and
+  metrics/logs alert the operator instead of dropping recoverable frames.
+* `tcp.maxJournalRetentionHours` — per-session outbound retransmit journal age
+  target. Default `24`. Retention is also conservative and never deletes
+  frames the peer may still request.
 * `http` — **optional** Kestrel-hosted operability endpoint exposing
   `/health/live`, `/health/ready`, and `/metrics`. Omit the entire block to
   disable HTTP.
@@ -306,11 +316,12 @@ Exposes:
     closed). Case-insensitive.
 * Snapshot evolution and on-disk schema versioning are described in the
   *Snapshot file format* and *Snapshot schema evolution* sections below.
-* Limitations: auction-top throttling state, the UMDF retransmit ring,
-  snapshot-rotator cursor, and FIXP session counters are not persisted.
-  Operators that depend on auction throttling should drain in-flight
-  indicative state before restart. Omit the `persistence` block to keep
-  the legacy stateless boot.
+* Limitations: auction-top throttling state, the UMDF retransmit ring, and
+  snapshot-rotator cursor are not persisted by the per-channel block. FIXP
+  session envelope counters and outbound business-frame recovery are persisted
+  only when the top-level `tcp.retransmitPersistenceDir` is set. Operators that
+  depend on auction throttling should drain in-flight indicative state before
+  restart. Omit the `persistence` block to keep the legacy stateless boot.
 
 ### FIXP session resync persistence (`tcp.retransmitPersistenceDir`)
 

@@ -159,6 +159,7 @@ public sealed class FileFixpOutboundJournal : IFixpOutboundJournal
             segment.Stream.Flush(flushToDisk: true);
             segment.LastSeq = seq;
             segment.EntryCount++;
+            _metrics?.IncAppend(sessionId, recordBytes);
         }
         lock (_lock)
         {

@@ -488,6 +488,8 @@ public class MetricsRegistryTests
     {
         var reg = new MetricsRegistry();
         reg.Journal.Observe(0x431u, bytes: 1234, oldestAgeSeconds: 3600);
+        reg.Journal.IncAppend(0x431u, bytes: 120);
+        reg.Journal.IncAppend(0x431u, bytes: 130);
         reg.Journal.IncRotation(0x431u, "bytes");
         reg.Journal.IncRotation(0x431u, "age");
 
@@ -495,6 +497,8 @@ public class MetricsRegistryTests
 
         Assert.Contains("fixp_journal_bytes{session=\"0x00000431\"} 1234\n", text);
         Assert.Contains("fixp_journal_oldest_age_seconds{session=\"0x00000431\"} 3600\n", text);
+        Assert.Contains("fixp_journal_appended_bytes_total{session=\"0x00000431\"} 250\n", text);
+        Assert.Contains("fixp_journal_appended_frames_total{session=\"0x00000431\"} 2\n", text);
         Assert.Contains("fixp_journal_rotation_total{session=\"0x00000431\",reason=\"bytes\"} 1\n", text);
         Assert.Contains("fixp_journal_rotation_total{session=\"0x00000431\",reason=\"age\"} 1\n", text);
     }

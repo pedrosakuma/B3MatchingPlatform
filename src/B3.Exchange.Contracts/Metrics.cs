@@ -162,6 +162,15 @@ public sealed class FixpJournalMetrics
         Interlocked.Exchange(ref s.OldestAgeSeconds, oldestAgeSeconds);
     }
 
+    public void IncAppend(uint sessionId, long bytes)
+    {
+        if (bytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(bytes), "must be >= 0");
+        var s = Get(sessionId);
+        Interlocked.Add(ref s.AppendedBytes, bytes);
+        Interlocked.Increment(ref s.AppendedFrames);
+    }
+
     public void IncRotation(uint sessionId, string reason)
     {
         var s = Get(sessionId);
@@ -180,6 +189,8 @@ public sealed class FixpJournalMetrics
                 kv.Key,
                 Interlocked.Read(ref kv.Value.Bytes),
                 Interlocked.Read(ref kv.Value.OldestAgeSeconds),
+                Interlocked.Read(ref kv.Value.AppendedBytes),
+                Interlocked.Read(ref kv.Value.AppendedFrames),
                 Interlocked.Read(ref kv.Value.RotationsBytes),
                 Interlocked.Read(ref kv.Value.RotationsAge)))
             .OrderBy(s => s.Session, StringComparer.Ordinal)
@@ -196,6 +207,8 @@ public sealed class FixpJournalMetrics
     {
         public long Bytes;
         public long OldestAgeSeconds;
+        public long AppendedBytes;
+        public long AppendedFrames;
         public long RotationsBytes;
         public long RotationsAge;
     }
@@ -205,5 +218,7 @@ public readonly record struct FixpJournalMetricsSnapshot(
     string Session,
     long Bytes,
     long OldestAgeSeconds,
+    long AppendedBytes,
+    long AppendedFrames,
     long RotationsBytes,
     long RotationsAge);

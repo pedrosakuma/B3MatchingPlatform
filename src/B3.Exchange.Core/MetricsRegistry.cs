@@ -941,6 +941,28 @@ public sealed class MetricsRegistry
               .Append('\n');
         }
 
+        sb.Append("# HELP fixp_journal_appended_bytes_total Total bytes durably appended to the FIXP outbound retransmit journal per session, including journal record overhead.\n");
+        sb.Append("# TYPE fixp_journal_appended_bytes_total counter\n");
+        foreach (var s in snap)
+        {
+            sb.Append("fixp_journal_appended_bytes_total{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\"} ")
+              .Append(s.AppendedBytes.ToString(CultureInfo.InvariantCulture))
+              .Append("\n");
+        }
+
+        sb.Append("# HELP fixp_journal_appended_frames_total Total business frames durably appended to the FIXP outbound retransmit journal per session.\n");
+        sb.Append("# TYPE fixp_journal_appended_frames_total counter\n");
+        foreach (var s in snap)
+        {
+            sb.Append("fixp_journal_appended_frames_total{session=\"")
+              .Append(EscapeLabel(s.Session))
+              .Append("\"} ")
+              .Append(s.AppendedFrames.ToString(CultureInfo.InvariantCulture))
+              .Append("\n");
+        }
+
         sb.Append("# HELP fixp_journal_rotation_total Total FIXP retransmit journal segment rotations by trigger reason.\n");
         sb.Append("# TYPE fixp_journal_rotation_total counter\n");
         foreach (var s in snap)

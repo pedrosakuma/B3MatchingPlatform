@@ -12,9 +12,11 @@ it, and triggering the recovery scenarios that consumers care about.
 > scope**: running two instances against the same UMDF multicast group
 > would emit duplicate sequence numbers and ER frames, and the engine
 > state lives in process memory only. When HA becomes a goal it will
-> require external coordination (lease / fencing) plus persistent
-> journaling — neither of which exists today. Plan deployments around a
-> single primary with manual failover.
+> require external coordination (lease / fencing) plus replicated engine
+> state, which does not exist today. Plan deployments around a single
+> primary with manual failover. The optional FIXP replay journal described
+> in §7.5 preserves private session replay across restarts, but it is not
+> an active-active fencing or replicated-engine-state mechanism.
 
 ---
 
@@ -977,31 +979,99 @@ not a designed-in recovery path.
 | --- | --- | --- |
 | Live socket write path | OS socket buffer | Until kernel flushes / connection drops |
 | `RetransmitBuffer` (per FIXP session) | **In-memory ring**, capacity = `session.outboundRetransmitCapacity` | Until the FIXP session is reaped (`SuspendedTimeoutMs`, default **5 min**) or evicted by a newer record |
-| WAL / snapshot | Persisted, but stores **commands**, not the resulting `ExecutionReport`s | Bounded by snapshot cadence |
+| FIXP outbound journal (when `tcp.retransmitPersistenceDir` is set) | Durable business-frame journal under `{dir}/journal/session-{sessionId:x8}/segment-*.log` | Quota/retention-managed by `tcp.maxJournalBytes` and `tcp.maxJournalRetentionHours`, but never pruned below the peer ACK watermark |
+| Channel WAL / snapshot | Persisted, but stores **commands**, not the resulting `ExecutionReport`s | Bounded by snapshot cadence |
 
 **The good news (issue [#217](https://github.com/pedrosakuma/B3MatchingPlatform/issues/217)):**
 passive `ExecutionReport`s emitted while the owning FIXP session is
 in `FixpState.Suspended` (transport disconnected but session still
 alive) are appended to that session's `RetransmitBuffer` rather
 than dropped. A subsequent `Establish` + `RetransmitRequest`
-delivers them with `PossResend = 1` as a normal recovery cycle.
+delivers them with `PossResend = 1` as a normal recovery cycle. If
+`tcp.retransmitPersistenceDir` is set, the same outbound business frames
+are also appended to the durable FIXP journal, so replay can fall back to
+disk after a ring eviction or host restart.
+
+**Graceful process shutdown / rolling restart (issue
+[#613](https://github.com/pedrosakuma/B3MatchingPlatform/issues/613)):**
+`SIGINT`/`SIGTERM` drive `ExchangeHost.StopAsync`, which marks readiness
+`NOT_READY`, stops new accepts, drains inbound and outbound queues, then
+sends `Terminate(FINISHED)` with `CloseKind.HostShutdown` to every live
+FIXP session. `HostShutdown` is a preserving close kind: it does not
+delete the state snapshot or outbound journal and it saves a final
+snapshot before the host disposes. On the next boot, if
+`tcp.retransmitPersistenceDir` points at the same durable directory, the
+host loads the snapshots, seeds `SessionClaimRegistry`, and accepts an
+`Establish` for the same `SessionId`/`SessionVerId`; cold
+`RetransmitRequest` reads are served from the journal. If
+`tcp.retransmitPersistenceDir` is empty, the shutdown is still orderly
+on the wire, but FIXP resumability is process-local and a rolling restart
+cannot avoid a fresh `Negotiate`/session roll.
 
 **The known gaps (none of these are silent — alert on them):**
 
 | Scenario | Outcome | Mitigation today | Eventual fix |
 | --- | --- | --- | --- |
 | Disconnect window ≤ `SuspendedTimeoutMs`, fills fit in ring | All ERs replayed on `Establish` ✅ | — | — |
-| Disconnect window ≤ `SuspendedTimeoutMs`, **fills exceed ring capacity** | Oldest ERs evicted; `Establish` with too-low `NextSeqNo` ⇒ `Establishment Reject` | Size `outboundRetransmitCapacity` for worst-case fill rate × `SuspendedTimeoutMs`; alert on `exch_fixp_retransmit_buffer_utilization` ([#288](https://github.com/pedrosakuma/B3MatchingPlatform/issues/288)) | Persisted `RetransmitBuffer` ([#289](https://github.com/pedrosakuma/B3MatchingPlatform/issues/289)) |
-| **Host crash** while session is `Suspended` | Ring is in-memory; if `tcp.retransmitPersistenceDir` is unset, all buffered ERs are lost. With persistence enabled, the per-session ring is mirrored to `{retransmitPersistenceDir}/sessions/session-{sessionId:x8}.ring` and rehydrated on the next boot ([#289](https://github.com/pedrosakuma/B3MatchingPlatform/issues/289)). | Set `tcp.retransmitPersistenceDir` on durable storage; alerts unchanged | Covered (issue [#289](https://github.com/pedrosakuma/B3MatchingPlatform/issues/289)) |
+| Disconnect window ≤ `SuspendedTimeoutMs`, **fills exceed ring capacity** | With `tcp.retransmitPersistenceDir` set, cold reads come from the durable outbound journal; without it, oldest ERs are evicted and `Establish` with too-low `NextSeqNo` ⇒ `Establishment Reject`. | Enable FIXP resync persistence, then still size `outboundRetransmitCapacity` for hot-path replay and alert on `exch_fixp_retransmit_buffer_utilization` ([#288](https://github.com/pedrosakuma/B3MatchingPlatform/issues/288)). | Covered by journal-backed resync persistence ([#405](https://github.com/pedrosakuma/B3MatchingPlatform/issues/405)) |
+| **Host crash** while session is `Suspended` | If `tcp.retransmitPersistenceDir` is unset, the ring and FIXP envelope state are lost and the peer must renegotiate. With persistence enabled, envelope snapshots re-seed `SessionClaimRegistry` and the outbound journal serves cold `RetransmitRequest` reads, so the peer can reattach with its original `SessionVerId` ([#405](https://github.com/pedrosakuma/B3MatchingPlatform/issues/405)). | Set `tcp.retransmitPersistenceDir` on durable storage mounted with the channel WAL; alert on `fixp_journal_bytes`, `fixp_journal_oldest_age_seconds`, and rotation blockers. | Covered (issue [#405](https://github.com/pedrosakuma/B3MatchingPlatform/issues/405)) |
 | Disconnect window > `SuspendedTimeoutMs` | `TryReapIfSuspended` removes the session from `SessionRegistry`; ring goes to GC | Size `SuspendedTimeoutMs` to the worst-case operational disconnect for the firm; alert on `exch_fixp_sessions_reaped_total` ([#288](https://github.com/pedrosakuma/B3MatchingPlatform/issues/288)) | Tunable per-firm; protocol-level `OrderMassStatus` on next reconnect (Tier 3) |
 | Cancel-on-Disconnect (CoD) armed, mode 1/3, window expired | `MassCancel` fires ⇒ no passive fills can happen ⇒ no problem | Configure CoD per firm policy | — |
 
-**Operational implication:** the **dimensioning tuple** that
-determines whether a disconnect causes data loss is
-`(outboundRetransmitCapacity, SuspendedTimeoutMs, expected fill
-rate while disconnected)`. Document the chosen values per firm
-and alert on the utilization metrics rather than discovering the
-limit when a real disconnect happens.
+For Helm deployments, prefer a sibling of the existing durable channel
+persistence mount (for example
+`/var/lib/b3matching/fixp-sessions`) rather than adding a second PVC. The
+chart default leaves `tcp.retransmitPersistenceDir` empty so local/ephemeral
+installs keep the old renegotiate-on-restart behavior; production-like
+overlays must opt in explicitly. The chart also exposes the FIXP outbound
+journal quotas as `tcp.maxJournalBytes` (default 256 MiB per session) and
+`tcp.maxJournalRetentionHours` (default 24h); both are conservative targets,
+not permission to delete frames the peer has not acknowledged.
+
+**Cold-journal sizing formula (#615):** size the durable replay window from
+observed per-session journal append throughput, not from a speculative global
+default. The journal stores each outbound business frame plus 20 bytes of
+record overhead:
+
+```text
+record_bytes = wire_frame_bytes + 20
+bytes_per_second = rate(fixp_journal_appended_bytes_total{session=...}[5m])
+frames_per_second = rate(fixp_journal_appended_frames_total{session=...}[5m])
+avg_record_bytes = bytes_per_second / max(frames_per_second, 1)
+effective_window_seconds = min(maxJournalRetentionHours * 3600,
+                               maxJournalBytes / bytes_per_second)
+required_maxJournalBytes = bytes_per_second * target_window_seconds
+```
+
+With the defaults, the 24h budget is only `268435456 / 86400 = 3106.9 B/s`
+per session, so high-throughput firms can exhaust the byte cap before the age
+limit. Do not raise defaults or split quota per firm without production
+`fixp_journal_appended_*` history and the effective values deployed in that
+environment.
+
+Suggested 80% PromQL alerts for deployments using the defaults:
+
+```promql
+fixp_journal_bytes > 0.8 * 268435456
+fixp_journal_oldest_age_seconds > 0.8 * 24 * 60 * 60
+rate(fixp_journal_appended_bytes_total[5m]) * 24 * 60 * 60 > 0.8 * 268435456
+increase(fixp_journal_rotation_total{reason="bytes"}[5m]) > 0
+```
+
+The first two catch retained journal state approaching the configured limits.
+The append-rate projection catches sessions whose current throughput cannot
+sustain a 24h replay window under the 256 MiB cap. Treat byte-triggered
+rotations as a sizing signal: the effective replay floor has moved forward to
+the peer-confirmed pruning watermark.
+
+**Operational implication:** without durable FIXP resync persistence, the
+**dimensioning tuple** that determines whether a disconnect causes data loss is
+`(outboundRetransmitCapacity, SuspendedTimeoutMs, expected fill rate while
+disconnected)`. With `tcp.retransmitPersistenceDir` set, that tuple still
+controls the hot-path ring hit rate, while `tcp.maxJournalBytes` and
+`tcp.maxJournalRetentionHours` bound the cold replay store. Document the chosen
+values per firm and alert on the utilization metrics rather than discovering
+the limit when a real disconnect happens.
 
 **What an operator should NOT do:** rely on out-of-band
 reconciliation (back-office, manual `OrderStatusRequest` sweep) as
