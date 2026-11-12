@@ -1,7 +1,7 @@
 # $BUILDPLATFORM keeps the SDK stage on the runner's native architecture so
 # the (slow) build never runs under QEMU emulation. Only the runtime layer is
 # emitted for $TARGETARCH via `dotnet publish -a`.
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:11.0 AS build
 
 # TARGETARCH is injected by buildx (amd64 / arm64); `dotnet publish -a`
 # accepts these Docker arch names directly.
