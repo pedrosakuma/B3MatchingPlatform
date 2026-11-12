@@ -22,7 +22,7 @@ RUN dotnet restore src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.c
 RUN dotnet publish src/B3.Exchange.SyntheticTrader/B3.Exchange.SyntheticTrader.csproj \
     -a $TARGETARCH -c Release -o /app --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:11.0 AS runtime
 
 WORKDIR /app
 COPY --from=build /app .

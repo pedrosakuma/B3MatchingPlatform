@@ -17,7 +17,7 @@ RUN dotnet restore src/B3.Exchange.Host/B3.Exchange.Host.csproj -a $TARGETARCH
 RUN dotnet publish src/B3.Exchange.Host/B3.Exchange.Host.csproj \
     -a $TARGETARCH -c Release -o /app --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:11.0 AS runtime
 
 # wget is needed by the HEALTHCHECK directive below; the aspnet base image
 # does not ship it.
